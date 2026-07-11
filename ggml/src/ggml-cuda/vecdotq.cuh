@@ -725,9 +725,9 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
 
     const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
 
-    // Q2_0: 128 elements with ONE scale, 2 bits per element (4 elements per byte)
+    // Q2_0 (group 64): 64 elements with ONE scale, 2 bits per element (4 elements per byte)
     // Q8_1: 32 elements per block with individual scales
-    // iqs selects which of the 4 chunks of 32 elements to process (0-3)
+    // iqs selects which of the 2 chunks of 32 elements to process (0-1)
 
     const float d2 = bq2_0->d;
 
