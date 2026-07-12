@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -17,6 +18,9 @@ struct socket_t {
     bool recv_data(void * data, size_t size);
 
     socket_ptr accept();
+
+    // "ip:port" of the remote end, for logging
+    std::string peer_str() const;
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);

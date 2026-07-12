@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <thread>
+#include <ctime>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -575,6 +576,11 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
     auto sock = get_socket(buft_ctx->endpoint);
+    if (sock == nullptr) {
+        // report as an allocation failure so the caller errors out cleanly
+        GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, buft_ctx->endpoint.c_str());
+        return nullptr;
+    }
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
@@ -629,6 +635,12 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
         auto sock = get_socket(buft_ctx->endpoint);
+        if (sock == nullptr) {
+            // best-effort fallback; a dead endpoint will fail the subsequent
+            // alloc with a clean error anyway
+            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, buft_ctx->endpoint.c_str());
+            return ggml_nbytes(tensor);
+        }
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
@@ -731,6 +743,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
+        if (sock == nullptr) {
+            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, rpc_ctx->endpoint.c_str());
+            return GGML_STATUS_FAILED;
+        }
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
@@ -738,6 +754,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
+        if (sock == nullptr) {
+            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, rpc_ctx->endpoint.c_str());
+            return GGML_STATUS_FAILED;
+        }
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         RPC_STATUS_ASSERT(status);
     }
@@ -1777,10 +1797,20 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             fprintf(stderr, "Failed to accept client connection\n");
             return;
         }
-        printf("Accepted client connection\n");
+        char ts[32];
+        {
+            time_t now = time(nullptr);
+            strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+        }
+        std::string peer = client_socket->peer_str();
+        printf("[%s] accepted connection from %s\n", ts, peer.c_str());
         fflush(stdout);
         rpc_serve_client(backends, cache_dir, client_socket);
-        printf("Client connection closed\n");
+        {
+            time_t now = time(nullptr);
+            strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+        }
+        printf("[%s] connection from %s closed\n", ts, peer.c_str());
         fflush(stdout);
     }
     rpc_transport_shutdown();
