@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -17048,6 +17049,29 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             }
         }
     }
+
+#if defined(__linux__)
+    // On UMA devices the heap budget spans the same physical memory the OS and
+    // other processes are using, so an otherwise idle GPU can report more free
+    // memory than the host could actually hand over (e.g. AMD BC-250: 16.5 GiB
+    // GTT budget on a 15.2 GiB machine). Clamp to the host's MemAvailable so
+    // consumers of this number (--fit, proportional tensor splits, rpc-server
+    // memory advertisement) do not overcommit and get the process OOM-killed.
+    if (is_integrated_gpu) {
+        FILE * meminfo = fopen("/proc/meminfo", "r");
+        if (meminfo != nullptr) {
+            char line[128];
+            while (fgets(line, sizeof(line), meminfo) != nullptr) {
+                size_t avail_kib = 0;
+                if (sscanf(line, "MemAvailable: %zu kB", &avail_kib) == 1) {
+                    *free = std::min(*free, avail_kib * 1024);
+                    break;
+                }
+            }
+            fclose(meminfo);
+        }
+    }
+#endif
 }
 
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
