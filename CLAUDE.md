@@ -57,9 +57,13 @@ Toolchain is already installed **system-wide** — nothing to download: VS2022 B
 
 ```powershell
 # from llama_loader\llamacpp-src, on the `integration` branch
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T cuda=12.9 `
-      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+      -DGGML_CUDA=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release `
+      -DCUDAToolkit_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9"
 cmake --build build --config Release -j
 ```
 
-The VS generator lets MSBuild drive the CUDA integration, so no `vcvars` shell is needed; `-T cuda=12.9` pins the CUDA toolset (avoids defaulting to a newer, possibly-unsupported CUDA). Binaries land in `build\bin\Release\`.
+The VS generator lets MSBuild drive the CUDA integration, so no `vcvars` shell is needed; `-T cuda=12.9` pins the CUDA toolset. This machine also has CUDA 13.3 installed, and CMake's `FindCUDAToolkit` will happily pick up its headers even though `-T` pinned the compiler to 12.9 — that mismatch is a hard compiler error (`C1189`), so **both** `CUDA_PATH` and `-DCUDAToolkit_ROOT` must explicitly point at the same 12.9 install. `-DGGML_RPC=ON` is required for cluster work: without it, neither the `--rpc` client flag in `llama-server` nor the RPC server binary get built.
+
+Binaries land in `build\bin\Release\`. Note the RPC server binary is named **`ggml-rpc-server.exe`**, not `rpc-server.exe` (despite the source living at `tools/rpc/rpc-server.cpp` and most upstream docs calling it `rpc-server`).
