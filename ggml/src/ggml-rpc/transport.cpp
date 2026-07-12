@@ -17,7 +17,9 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 
@@ -647,6 +649,8 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    // wrap the fd right away so every failure path below closes it
+    socket_ptr sock(new socket_t(std::make_unique<impl>(sockfd)));
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
@@ -661,9 +665,14 @@ socket_ptr socket_t::connect(const char * host, int port) {
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+#ifdef _WIN32
+        GGML_LOG_WARN("[rpc] connect(%s:%d) failed: WSA error %d\n", host, port, WSAGetLastError());
+#else
+        GGML_LOG_WARN("[rpc] connect(%s:%d) failed: %s\n", host, port, strerror(errno));
+#endif
         return nullptr;
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return sock;
 }
 
 #ifdef _WIN32
