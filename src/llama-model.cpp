@@ -961,7 +961,13 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     }
 
     // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    // this can be null for RPC devices whose endpoint cannot be reached -
+    // fail the load cleanly instead of asserting later in the loader
+    ggml_backend_buffer_type_t default_buft = ggml_backend_dev_buffer_type(dev);
+    if (default_buft == nullptr) {
+        throw std::runtime_error(format("failed to get buffer type for device %s (RPC endpoint unreachable?)", ggml_backend_dev_name(dev)));
+    }
+    buft_list.emplace_back(dev, default_buft);
 
     // add the device extra buffer type (if any)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
