@@ -22,6 +22,7 @@ Goal: stay easy to merge against fast-moving upstream, keep each feature isolate
   `git fetch origin master && git checkout master && git merge --ff-only origin/master`
 - **`feat/*`** — one branch per feature, based off `master`, **code only** (no fork docs/config), so each stays rebasable and potentially upstreamable. Current:
   - **`feat/disk-cache`** — the disk cache-streaming feature (see below).
+  - **`feat/puzzle-port`** — Nemotron-3-Puzzle-75B-A9B support (per-layer heterogeneous MoE + mamba2 hybrid + MTP head), tracked from [YanissAmz/llama.cpp `puzzle-port`](https://github.com/YanissAmz/llama.cpp/tree/puzzle-port) rather than authored here; refresh by fetching that branch, not by rebasing onto our `master`. Runs the `Puzzle-75B-A9B-UD-IQ4-XL.gguf` on `G:\lm_studio_models`. MTP speculative decoding (`--spec-type draft-mtp`) loads but is currently *slower* than plain decoding (mamba2 states can't roll back yet) — leave it off.
 - **`integration`** — the build/deploy branch: latest `master` + every `feat/*` merged in + this `CLAUDE.md`. **This is the branch we compile and run.** Refresh it by: ff `master` to upstream, then (re)merge each `feat/*` into `integration`, then build.
 
 ## Feature: `--cache-disk` (branch `feat/disk-cache`)
