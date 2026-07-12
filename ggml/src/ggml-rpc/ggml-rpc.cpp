@@ -357,13 +357,16 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    // hold a strong reference to every endpoint socket for the lifetime of the
+    // process: the rpc-server serves one client at a time, so reconnecting per
+    // operation (what a weak_ptr cache degrades to whenever no buffer holds a
+    // strong ref) floods the server with one-shot connections and starves every
+    // reconnect attempt while the server is busy with a long request
+    static std::unordered_map<std::string, std::shared_ptr<socket_t>> sockets;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
-        }
+        return it->second;
     }
     std::string host;
     int port;
