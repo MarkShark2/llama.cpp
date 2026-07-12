@@ -4889,8 +4889,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SSM_SCAN: {
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
-                // (kernel only supports (d_state == 128 || d_state == 256) && d_head % 16 == 0)
-                return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % 16 == 0;
+                // (kernel only supports (d_state == 96 || d_state == 128 || d_state == 256) && d_head % 16 == 0;
+                //  each warp covers d_state/WARP_SIZE state chunks, so d_state must divide evenly)
+                return (op->src[0]->ne[0] == 96 || op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) &&
+                       op->src[0]->ne[0] % WARP_SIZE == 0 && op->src[0]->ne[1] % 16 == 0;
             } else {
                 // Mamba
                 // (kernel only supports d_state == 16, d_head == 1, n_head % 128 == 0, n_group == 1)

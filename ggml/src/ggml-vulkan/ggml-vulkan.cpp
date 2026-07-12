@@ -939,6 +939,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_ssm_scan_f32_d96;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -5490,9 +5491,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+        // d_state 96 (NVIDIA Nemotron-3-Puzzle) needs d_state % subgroup_size == 0 (see c_factor in ssm_scan.comp)
+        if (device->subgroup_size != 0 && 96 % device->subgroup_size == 0) {
+            ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d96, "ssm_scan_96_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {96, device->subgroup_size}, 1, true, true);
+        }
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size}, 1, true, true);
     } else {
+        if (device->subgroup_size != 0 && 96 % device->subgroup_size == 0) {
+            ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d96, "ssm_scan_96_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {96, device->subgroup_size, 16}, 1, true, true);
+        }
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size, 16}, 1, true, true);
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
@@ -11043,7 +11051,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_SSM_SCAN:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t d_state = src0->ne[0];
-            if (d_state == 128) {
+            if (d_state == 96) {
+                return ctx->device->pipeline_ssm_scan_f32_d96;
+            } else if (d_state == 128) {
                 return ctx->device->pipeline_ssm_scan_f32_d128;
             } else if (d_state == 256) {
                 return ctx->device->pipeline_ssm_scan_f32_d256;
@@ -17698,7 +17708,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
 
-                if ((d_state != 128 && d_state != 256) || head_dim % 16 != 0) {
+                if ((d_state != 96 && d_state != 128 && d_state != 256) || head_dim % 16 != 0) {
+                    return false;
+                }
+
+                // the shader distributes d_state across whole subgroups (c_factor)
+                if (device->subgroup_size == 0 || d_state % device->subgroup_size != 0) {
                     return false;
                 }
 
