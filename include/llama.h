@@ -912,6 +912,27 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Same as llama_state_seq_save_file, but respects the state flags (e.g. LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY).
+    // The state is streamed to the file through a bounded staging buffer, so peak host memory
+    // usage stays independent of the total state size.
+    LLAMA_API size_t llama_state_seq_save_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+           llama_state_seq_flags   flags);
+
+    // Counterpart of llama_state_seq_save_file_ext - the flags must match the ones used when saving
+    LLAMA_API size_t llama_state_seq_load_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //

@@ -53,6 +53,7 @@
 #if defined(__linux__)
 #include <sys/types.h>
 #include <pwd.h>
+#include <fcntl.h>
 #endif
 
 #if defined(_AIX)
@@ -2066,12 +2067,37 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+common_state_file::common_state_file(const std::string & path, size_t size) : path(path), size(size) {
+#if defined(__linux__)
+    // flush dirty pages and drop them from the page cache right away - spilled state must not
+    // linger in RAM (on UMA systems the page cache competes with VRAM for the same memory)
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        fdatasync(fd);
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+#endif
+}
+
+common_state_file::~common_state_file() {
+    if (!path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}
+
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    size_t res = data_tgt.size() + data_dft.size() + data_spec.size();
+
+    res += file_tgt ? file_tgt->size : 0;
+    res += file_dft ? file_dft->size : 0;
+
+    return res;
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return data_tgt.empty() && !file_tgt;
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2083,6 +2109,9 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    file_tgt.reset();
+    file_dft.reset();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2130,11 +2159,62 @@ void common_prompt_checkpoint::update_dft(
     }
 }
 
+void common_prompt_checkpoint::update_tgt_file(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        const std::string & path) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    data_tgt.clear();
+    file_tgt.reset();
+
+    const size_t n = llama_state_seq_save_file_ext(ctx, path.c_str(), seq_id, nullptr, 0, flags);
+    if (n == 0) {
+        LOG_ERR("%s: failed to save checkpoint state to '%s'\n", __func__, path.c_str());
+        return;
+    }
+
+    file_tgt = std::make_shared<common_state_file>(path, n);
+}
+
+void common_prompt_checkpoint::update_dft_file(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        const std::string & path) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    data_dft.clear();
+    file_dft.reset();
+
+    const size_t n = llama_state_seq_save_file_ext(ctx, path.c_str(), seq_id, nullptr, 0, flags);
+    if (n == 0) {
+        LOG_ERR("%s: failed to save checkpoint state to '%s'\n", __func__, path.c_str());
+        return;
+    }
+
+    file_dft = std::make_shared<common_state_file>(path, n);
+}
+
 void common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
+        return;
+    }
+
+    if (file_tgt) {
+        size_t n_token_count = 0;
+        const size_t n = llama_state_seq_load_file_ext(ctx, file_tgt->path.c_str(), seq_id, nullptr, 0, &n_token_count, flags);
+        if (n == 0) {
+            GGML_ABORT("failed to load checkpoint state from '%s'\n", file_tgt->path.c_str());
+        }
         return;
     }
 
@@ -2156,6 +2236,15 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
+    if (file_dft) {
+        size_t n_token_count = 0;
+        const size_t n = llama_state_seq_load_file_ext(ctx, file_dft->path.c_str(), seq_id, nullptr, 0, &n_token_count, flags);
+        if (n == 0) {
+            GGML_ABORT("failed to load checkpoint state from '%s'\n", file_dft->path.c_str());
+        }
+        return;
+    }
+
     if (data_dft.empty()) {
         return;
     }
@@ -2168,9 +2257,11 @@ void common_prompt_checkpoint::load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    file_tgt.reset();
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+    file_dft.reset();
 }
