@@ -584,12 +584,27 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+// unique file path for state spilled to disk under `dir` (--cache-disk)
+std::string server_state_file_path(const std::string & dir, const char * tag);
+
+// prepare `dir` for state spilling: create it and remove stale spill files from previous runs
+bool server_state_dir_init(const std::string & dir);
+
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
+    // when set, the state lives on disk instead of in the vectors above (--cache-disk)
+    common_state_file_ptr file_main;
+    common_state_file_ptr file_drft;
+
     size_t size() const {
-        return main.size() + drft.size();
+        size_t res = main.size() + drft.size();
+
+        res += file_main ? file_main->size : 0;
+        res += file_drft ? file_drft->size : 0;
+
+        return res;
     }
 };
 
@@ -626,18 +641,31 @@ struct server_prompt {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_dir, int32_t disk_limit_mib) {
+        if (disk_dir.empty()) {
+            this->limit_size = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+        } else {
+            // disk mode: the size limit applies to the on-disk footprint instead of RAM
+            this->limit_size = 1024ull*1024ull*(disk_limit_mib < 0 ? 0 : disk_limit_mib);
+        }
         this->limit_tokens = limit_tokens;
+        this->disk_dir     = disk_dir;
     }
 
     std::list<server_prompt> states;
+
+    // when non-empty, cache states are streamed to files in this directory instead of RAM
+    std::string disk_dir;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    bool disk_mode() const {
+        return !disk_dir.empty();
+    }
 
     size_t size() const;
 

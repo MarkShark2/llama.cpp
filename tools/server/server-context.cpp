@@ -235,9 +235,38 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (prompt_cache.disk_mode()) {
+            // stream the state directly to disk - peak RAM usage stays bounded by the io staging buffer
+            const std::string path_tgt = server_state_file_path(prompt_cache.disk_dir, "prompt-tgt");
+
+            const size_t n_tgt = llama_state_seq_save_file_ext(ctx_tgt, path_tgt.c_str(), id, nullptr, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_tgt == 0) {
+                SRV_ERR("failed to save prompt cache state to '%s'\n", path_tgt.c_str());
+
+                prompt_cache.states.pop_back();
+
+                return false;
+            }
+            cur->data.file_main = std::make_shared<common_state_file>(path_tgt, n_tgt);
+
+            if (ctx_dft) {
+                const std::string path_dft = server_state_file_path(prompt_cache.disk_dir, "prompt-dft");
+
+                const size_t n_dft = llama_state_seq_save_file_ext(ctx_dft, path_dft.c_str(), id, nullptr, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (n_dft == 0) {
+                    SRV_ERR("failed to save prompt cache state to '%s'\n", path_dft.c_str());
+
+                    prompt_cache.states.pop_back();
+
+                    return false;
+                }
+                cur->data.file_drft = std::make_shared<common_state_file>(path_dft, n_dft);
+            }
+        } else {
+            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (ctx_dft) {
+                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
         }
 
         return true;
@@ -1343,7 +1372,17 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel));
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        if (!params_base.cache_disk.empty()) {
+            if (!server_state_dir_init(params_base.cache_disk)) {
+                return false;
+            }
+
+            SRV_INF("prompt cache is enabled, streaming to disk: %s (size limit: %d MiB, 0 = no limit)\n",
+                    params_base.cache_disk.c_str(), params_base.cache_disk_limit_mib);
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                    params_base.cache_ram_mib, n_ctx, params_base.cache_disk, params_base.cache_disk_limit_mib);
+        } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
@@ -1351,7 +1390,7 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, "", 0);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1413,8 +1452,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (params_base.cache_ram_mib == 0 && params_base.cache_disk.empty()) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
@@ -2307,8 +2346,24 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (!params_base.cache_disk.empty()) {
+            // stream the checkpoint state directly to disk instead of materializing it in RAM
+            cur.update_tgt_file(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+                    server_state_file_path(params_base.cache_disk, "ckpt-tgt"));
+            cur.update_dft_file(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+                    server_state_file_path(params_base.cache_disk, "ckpt-dft"));
+
+            if (cur.empty()) {
+                SLT_WRN(slot, "%s", "failed to save context checkpoint to disk, discarding it\n");
+
+                slot.prompt.checkpoints.pop_back();
+
+                return;
+            }
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 

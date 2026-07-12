@@ -10,6 +10,11 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <atomic>
+#include <cinttypes>
+#include <filesystem>
+#include <system_error>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1632,6 +1637,37 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+std::string server_state_file_path(const std::string & dir, const char * tag) {
+    static std::atomic<uint64_t> counter{0};
+
+    return (std::filesystem::path(dir) / string_format("cache-%s-%" PRIu64 ".llstate", tag, (uint64_t) counter.fetch_add(1))).string();
+}
+
+bool server_state_dir_init(const std::string & dir) {
+    std::error_code ec;
+
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        SRV_ERR("failed to create state cache directory '%s': %s\n", dir.c_str(), ec.message().c_str());
+        return false;
+    }
+
+    // remove stale spill files from a previous run
+    for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("cache-", 0) == 0 && entry.path().extension() == ".llstate") {
+            std::error_code ec_rm;
+            std::filesystem::remove(entry.path(), ec_rm);
+        }
+    }
+
+    return true;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1704,20 +1740,23 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
 
-    // check if we can allocate enough memory for the new state
-    try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
-    } catch (const std::bad_alloc & e) {
-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+    // in disk mode the state is streamed to files by the caller - no RAM staging needed here
+    if (!disk_mode()) {
+        // check if we can allocate enough memory for the new state
+        try {
+            state_data_tgt.resize(state_size_tgt);
+            state_data_dft.resize(state_size_dft);
+        } catch (const std::bad_alloc & e) {
+            SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
-        limit_size = std::max<size_t>(1, 0.4*size());
+            limit_size = std::max<size_t>(1, 0.4*size());
 
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+            SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
-        update();
+            update();
 
-        return nullptr;
+            return nullptr;
+        }
     }
 
     states.push_back({
@@ -1765,7 +1804,21 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-        {
+        if (it_best->data.file_main) {
+            auto & file = it_best->data.file_main;
+
+            size_t n_token_count = 0;
+            const size_t n = llama_state_seq_load_file_ext(ctx_tgt, file->path.c_str(), id_slot, nullptr, 0, &n_token_count, 0);
+            if (n == 0) {
+                SRV_ERR("failed to restore state from '%s'\n", file->path.c_str());
+
+                states.erase(it_best);
+
+                return false;
+            }
+
+            file.reset();
+        } else {
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
@@ -1780,7 +1833,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             data.shrink_to_fit();
         }
 
-        {
+        if (it_best->data.file_drft) {
+            GGML_ASSERT(ctx_dft);
+
+            auto & file = it_best->data.file_drft;
+
+            size_t n_token_count = 0;
+            const size_t n = llama_state_seq_load_file_ext(ctx_dft, file->path.c_str(), id_slot, nullptr, 0, &n_token_count, 0);
+            if (n == 0) {
+                SRV_WRN("failed to restore state from '%s'\n", file->path.c_str());
+
+                states.erase(it_best);
+
+                return false;
+            }
+
+            file.reset();
+        } else {
             auto & data = it_best->data.drft;
 
             if (!data.empty()) {

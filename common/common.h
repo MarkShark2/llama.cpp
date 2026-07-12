@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -625,6 +626,9 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    std::string cache_disk;              // directory to stream prompt-cache states and context checkpoints to (empty = keep them in RAM)
+    int32_t cache_disk_limit_mib = 0;    // on-disk prompt cache size limit in MiB, 0 = no limit
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -1078,6 +1082,22 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// RAII handle for a state blob spilled to disk - unlinks the file on destruction.
+// Shared ownership so that copies of a checkpoint list (e.g. into the server prompt cache)
+// keep the backing file alive without duplicating it.
+struct common_state_file {
+    std::string path;
+    size_t size = 0;
+
+    common_state_file(const std::string & path, size_t size);
+    ~common_state_file();
+
+    common_state_file(const common_state_file &) = delete;
+    common_state_file & operator=(const common_state_file &) = delete;
+};
+
+using common_state_file_ptr = std::shared_ptr<common_state_file>;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1086,6 +1106,10 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+
+    // when set, the tgt/dft state lives on disk instead of in data_tgt/data_dft
+    common_state_file_ptr file_tgt;
+    common_state_file_ptr file_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
@@ -1110,6 +1134,19 @@ struct common_prompt_checkpoint {
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
+
+    // stream the state to a file instead of materializing it in RAM
+    void update_tgt_file(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            const std::string & path);
+
+    void update_dft_file(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            const std::string & path);
 
     void load_tgt(
             llama_context * ctx,
