@@ -585,6 +585,21 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+std::string socket_t::peer_str() const {
+    struct sockaddr_in addr;
+#ifdef _WIN32
+    int len = sizeof(addr);
+#else
+    socklen_t len = sizeof(addr);
+#endif
+    if (getpeername(pimpl->fd, (struct sockaddr *)&addr, &len) != 0) {
+        return "unknown";
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(addr.sin_addr), (int)ntohs(addr.sin_port));
+    return std::string(buf);
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
