@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -334,7 +336,12 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     sock->get_caps(request.conn_caps);
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        // do not abort here: the connection may have been accepted and dropped
+        // (e.g. server busy with another client) - let the caller retry
+        GGML_LOG_WARN("[%s] HELLO handshake failed\n", __func__);
+        return false;
+    }
 
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
@@ -367,11 +374,28 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!rpc_transport_init()) {
         return nullptr;
     }
-    auto sock = socket_t::connect(host.c_str(), port);
-    if (sock == nullptr) {
-        return nullptr;
+    // the rpc-server handles one client at a time, so transient connect
+    // failures are expected when several clients/probes hit the same
+    // endpoint - retry with backoff before giving up
+    constexpr int max_attempts = 5;
+    std::shared_ptr<socket_t> sock;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        sock = socket_t::connect(host.c_str(), port);
+        if (sock != nullptr && negotiate_hello(sock)) {
+            break;
+        }
+        sock = nullptr;
+        if (attempt < max_attempts) {
+            int delay_ms = 250 * attempt;
+            GGML_LOG_WARN("[%s] connect to %s failed (attempt %d/%d), retrying in %d ms\n",
+                          __func__, endpoint.c_str(), attempt, max_attempts, delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        } else {
+            GGML_LOG_ERROR("[%s] connect to %s failed after %d attempts\n",
+                           __func__, endpoint.c_str(), max_attempts);
+        }
     }
-    if (!negotiate_hello(sock)) {
+    if (sock == nullptr) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());

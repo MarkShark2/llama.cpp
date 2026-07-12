@@ -618,7 +618,10 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    // backlog > 1: rpc-server serves one client at a time, so concurrent
+    // connects (health probes, multi-endpoint clients) must be able to queue
+    // instead of being refused
+    if (listen(sockfd, 16) < 0) {
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
