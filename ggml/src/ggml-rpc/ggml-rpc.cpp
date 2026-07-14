@@ -697,15 +697,29 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
     if (tensor == nullptr) {
         return;
     }
-    if (visited.find(tensor) != visited.end()) {
-        return;
+    // iterative post-order DFS: recursing per src/view_src overflows the stack
+    // on graphs whose longest dependency chain spans thousands of tensors
+    // (e.g. recurrent-state models under --split-mode tensor)
+    std::vector<std::pair<ggml_tensor *, bool>> stack;
+    stack.push_back({tensor, false});
+    while (!stack.empty()) {
+        auto [t, expanded] = stack.back();
+        stack.pop_back();
+        if (expanded) {
+            tensors.push_back(serialize_tensor(t));
+            continue;
+        }
+        if (t == nullptr || visited.find(t) != visited.end()) {
+            continue;
+        }
+        visited.insert(t);
+        // pop order must mirror the recursive version: src[0..n], view_src, then t itself
+        stack.push_back({t, true});
+        stack.push_back({t->view_src, false});
+        for (int i = GGML_MAX_SRC - 1; i >= 0; i--) {
+            stack.push_back({t->src[i], false});
+        }
     }
-    visited.insert(tensor);
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        add_tensor(tensor->src[i], tensors, visited);
-    }
-    add_tensor(tensor->view_src, tensors, visited);
-    tensors.push_back(serialize_tensor(tensor));
 }
 
 static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
@@ -1067,12 +1081,27 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     if (result->buffer) {
-        // require that the tensor data does not go beyond the buffer end
+        // require that the tensor data does not go beyond the buffer end;
+        // reject the graph with an error instead of aborting so a bad client
+        // cannot take the server down. zero-sized tensors are exempt: the meta
+        // backend (split-mode tensor) emits zero-sized slice views whose data
+        // pointer can land past the buffer end, and they never get read
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        if (tensor_size > 0 &&
+            (tensor->data + tensor_size < tensor->data ||
+            tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size)) {
+            GGML_LOG_ERROR("[%s] tensor out of buffer bounds: name=%s op=%s type=%s "
+                           "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
+                           "data_offset=%" PRIu64 " tensor_size=%" PRIu64 " buffer_size=%" PRIu64 "\n",
+                           __func__, tensor->name, ggml_op_name((ggml_op) tensor->op),
+                           ggml_type_name((ggml_type) tensor->type),
+                           result->ne[0], result->ne[1], result->ne[2], result->ne[3],
+                           (size_t) result->nb[0], (size_t) result->nb[1], (size_t) result->nb[2], (size_t) result->nb[3],
+                           tensor->data - buffer_start, tensor_size, buffer_size);
+            return nullptr;
+        }
     }
 
     result->op = (ggml_op) tensor->op;
