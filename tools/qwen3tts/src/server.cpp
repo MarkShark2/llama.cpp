@@ -793,18 +793,19 @@ int main(int argc, char ** argv) {
                 std::lock_guard<std::mutex> lock(voices_mutex);
                 auto it = voices.find(voice);
                 if (it == voices.end()) {
-                    res.status = 400;
-                    json err = {{"error", {
-                        {"message", "unknown voice '" + voice + "'"},
-                        {"type", "invalid_request_error"},
-                    }}};
-                    res.set_content(err.dump(), "application/json");
-                    return;
+                    // Fall back rather than 400. OpenAI clients (Open WebUI) always
+                    // send a fixed voice name like "alloy", which means nothing here,
+                    // and a base model has no built-in speakers to match it against.
+                    // Erroring would make every such request fail with nothing the
+                    // client can do about it, so use the default voice and say so.
+                    fprintf(stderr, "[/v1/audio/speech] unknown voice '%s'; using default\n",
+                            voice.c_str());
+                } else {
+                    voice_embedding = it->second.embedding;
+                    voice_ref_text = it->second.ref_text;
+                    voice_ref_codes = it->second.ref_codes;
+                    voice_n_ref_frames = it->second.n_ref_frames;
                 }
-                voice_embedding = it->second.embedding;
-                voice_ref_text = it->second.ref_text;
-                voice_ref_codes = it->second.ref_codes;
-                voice_n_ref_frames = it->second.n_ref_frames;
             }
         }
 
