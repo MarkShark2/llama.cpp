@@ -482,6 +482,107 @@ namespace s2
                     << " -> " << res.status
                     << " (" << duration << "ms)" << std::endl); });
 
+        svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content(json{{"status", "ok"}}.dump(), "application/json");
+            });
+
+        svr.Get("/v1/health", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content(json{{"status", "ok"}}.dump(), "application/json");
+            });
+
+        // OpenAI-compatible text-to-speech, so clients that speak the OpenAI TTS
+        // API (Open WebUI and friends) can drive this server. It is a thin
+        // wrapper over the same synthesis path as /generate, with no streaming
+        // and no per-request reference audio: the voice comes from a saved
+        // profile, either the one --voice selected at startup or one named here.
+        svr.Post("/v1/audio/speech", [pipeline, server_busy, &params](const httplib::Request & req, httplib::Response & res) {
+            auto res_error = [&res](int status, const std::string & message) {
+                res.status = status;
+                res.set_content(json{{"error", {{"message", message}, {"type", "invalid_request_error"}}}}.dump(),
+                                "application/json");
+            };
+
+            json data;
+            try {
+                data = json::parse(req.body);
+            } catch (const std::exception & e) {
+                res_error(400, std::string("Invalid JSON body: ") + e.what());
+                return;
+            }
+            if (!data.is_object()) {
+                res_error(400, "Request body must be a JSON object.");
+                return;
+            }
+
+            PipelineParams pipelineParams = params.pipeline;
+
+            if (!data.contains("input") || !data["input"].is_string()) {
+                res_error(400, "Missing required string field: input");
+                return;
+            }
+            pipelineParams.text = data["input"].get<std::string>();
+            if (trim_copy(pipelineParams.text).empty()) {
+                res_error(400, "Field 'input' is empty.");
+                return;
+            }
+
+            // Only wav can be produced: the tree bundles audio decoders, not
+            // encoders. Fail loudly rather than return a wav mislabelled as
+            // whatever was asked for.
+            std::string response_format = "wav";
+            if (data.contains("response_format") && data["response_format"].is_string()) {
+                response_format = data["response_format"].get<std::string>();
+            }
+            if (response_format != "wav") {
+                res_error(400, "Unsupported response_format '" + response_format +
+                               "'. This server can only produce 'wav'.");
+                return;
+            }
+
+            // OpenAI's fixed voice names (alloy, echo, ...) have no meaning here,
+            // and clients send them unconditionally. Honour the request only when
+            // it names a profile that exists, otherwise keep the configured voice
+            // rather than failing a request the client cannot fix.
+            if (data.contains("voice") && data["voice"].is_string()) {
+                const std::string requested = data["voice"].get<std::string>();
+                if (!requested.empty() && requested != pipelineParams.voice_id) {
+                    PipelineParams probe = pipelineParams;
+                    apply_voice_selection(probe, requested, "");
+                    const fs::path profile = fs::path(probe.voice_storage_dir) / (probe.voice_id + ".s2voice");
+                    if (fs::exists(profile)) {
+                        pipelineParams = probe;
+                    } else {
+                        S2_LOG_WARN_STREAM("[/v1/audio/speech] no voice profile '" << requested
+                            << "'; using '" << pipelineParams.voice_id << "'" << std::endl);
+                    }
+                }
+            }
+
+            bool expected_idle = false;
+            if (!server_busy->compare_exchange_strong(expected_idle, true)) {
+                res_error(503, "Server busy processing another synthesis request.");
+                return;
+            }
+
+            void * wav_buffer = nullptr;
+            size_t wav_size = 0;
+            const bool ok = pipeline->synthesize_to_memory(
+                pipelineParams, nullptr, 0, &wav_buffer, &wav_size);
+
+            if (!ok) {
+                server_busy->store(false);
+                res_error(500, "Synthesis failed.");
+                return;
+            }
+
+            std::string audio(reinterpret_cast<const char *>(wav_buffer), wav_size);
+            s2::audio_free_memory_wav(&wav_buffer, &wav_size, nullptr);
+            server_busy->store(false);
+
+            res.set_content(std::move(audio), stream_audio_content_type(
+                StreamAudioFormat::Wav, pipeline->output_sample_rate()));
+            });
+
         svr.Post("/generate", [pipeline, server_busy, &active_threads_mtx, &active_threads, &params](const httplib::Request& req, httplib::Response& res)
             {
 
