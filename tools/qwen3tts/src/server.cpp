@@ -537,7 +537,7 @@ int main(int argc, char ** argv) {
         }
 
         // expect multipart form: name (string) + audio_sample (file)
-        if (!req.has_file("audio_sample")) {
+        if (!req.form.has_file("audio_sample")) {
             res.status = 400;
             res.set_content(R"({"error":{"message":"'audio_sample' file is required","type":"invalid_request_error"}})",
                             "application/json");
@@ -545,9 +545,9 @@ int main(int argc, char ** argv) {
         }
         std::string name = "custom";
         if (req.has_param("name")) name = req.get_param_value("name");
-        if (req.has_file("name")) name = req.get_file_value("name").content;
+        if (req.form.has_field("name")) name = req.form.get_field("name");
 
-        auto audio_file = req.get_file_value("audio_sample");
+        auto audio_file = req.form.get_file("audio_sample");
 
         // write to temp file for the encoder (expects a file path)
         char tmppath[] = "/tmp/qwen3tts_voice_XXXXXX.wav";
@@ -564,7 +564,7 @@ int main(int argc, char ** argv) {
         // optional ref_text for ICL voice cloning
         std::string ref_text;
         if (req.has_param("ref_text")) ref_text = req.get_param_value("ref_text");
-        if (req.has_file("ref_text")) ref_text = req.get_file_value("ref_text").content;
+        if (req.form.has_field("ref_text")) ref_text = req.form.get_field("ref_text");
 
         // extract speaker embedding (optional when ref_text is provided for ICL mode)
         std::vector<float> embedding;
