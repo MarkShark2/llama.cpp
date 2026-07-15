@@ -42,4 +42,8 @@ else()
     endif()
     add_subdirectory(fit-params)
     add_subdirectory(results)
+    if (LLAMA_BUILD_COMMON)
+        # qwen3tts links cpp-httplib, which is only added under LLAMA_BUILD_COMMON
+        add_subdirectory(qwen3tts)
+    endif()
 endif()
