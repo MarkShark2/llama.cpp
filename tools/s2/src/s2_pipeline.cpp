@@ -511,6 +511,13 @@ bool Pipeline::init(const PipelineParams & params) {
 
     gguf_free(shared_gguf);
 
+    if (!params.lora_path.empty()) {
+        if (!model().load_lora(params.lora_path, params.lora_scale)) {
+            safe_print_error_ln("Pipeline error: failed to load LoRA adapter from " + params.lora_path);
+            return false;
+        }
+    }
+
     const auto codec_t1 = std::chrono::steady_clock::now();
 
     sync_tokenizer_config_from_model(tokenizer(), model());

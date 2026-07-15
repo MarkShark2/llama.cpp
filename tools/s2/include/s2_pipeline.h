@@ -27,6 +27,8 @@ public:
 struct PipelineParams {
     std::string model_path;
     std::string tokenizer_path;
+    std::string lora_path;
+    float lora_scale = -1.0f;  // negative: use the adapter's own alpha/rank
     std::string text;
     std::string prompt_text;
     std::string prompt_audio_path;

@@ -190,6 +190,7 @@ SlowARModel::~SlowARModel() {
     if (sched_)          ggml_backend_sched_free(sched_);
 
     if (kv_buf_) ggml_backend_buffer_free(kv_buf_);
+    free_backend_buffers(weights_.lora_bufs);
     free_backend_buffers(weights_.model_bufs_gpu);
     free_backend_buffers(weights_.model_bufs_cpu);
 
@@ -197,7 +198,9 @@ SlowARModel::~SlowARModel() {
     if (backend_cpu_)    ggml_backend_free(backend_cpu_);
 
     if (ctx_kv_)         ggml_free(ctx_kv_);
+    if (weights_.ctx_lora) ggml_free(weights_.ctx_lora);
 
+    weights_.ctx_lora = nullptr;
     weights_.ctx_w = nullptr;
 }
 
@@ -714,6 +717,211 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, Backen
     return true;
 }
 
+// mul_mat_checked plus a LoRA update, if one targets this tensor. The base
+// matmul is unchanged, so a quantized base needs no dequantization: the update
+// is computed separately in f32/f16 and added to the result.
+static ggml_tensor * mul_mat_lora(ggml_context * ctx, ggml_tensor * w, const LoraPair & lora,
+                                  ggml_tensor * x, const char * label) {
+    ggml_tensor * y = mul_mat_checked(ctx, w, x, label);
+    if (!lora.active()) {
+        return y;
+    }
+    ggml_tensor * delta = mul_mat_checked(ctx, lora.b, mul_mat_checked(ctx, lora.a, x, label), label);
+    return ggml_add(ctx, y, delta);
+}
+
+bool SlowARModel::load_lora(const std::string & lora_path, float scale) {
+    if (weights_.ctx_lora) {
+        std::cerr << "[LoRA] An adapter is already loaded." << std::endl;
+        return false;
+    }
+    if (!weights_.ctx_w) {
+        std::cerr << "[LoRA] Base model must be loaded first." << std::endl;
+        return false;
+    }
+
+    struct gguf_init_params params = { true, &weights_.ctx_lora };
+    gguf_context * ctx_gguf = gguf_init_from_file(lora_path.c_str(), params);
+    if (!ctx_gguf) {
+        std::cerr << "[LoRA] Failed to load GGUF from " << lora_path << std::endl;
+        return false;
+    }
+
+    auto fail = [&](const std::string & msg) {
+        std::cerr << "[LoRA] " << msg << std::endl;
+        gguf_free(ctx_gguf);
+        free_backend_buffers(weights_.lora_bufs);
+        if (weights_.ctx_lora) {
+            ggml_free(weights_.ctx_lora);
+            weights_.ctx_lora = nullptr;
+        }
+        return false;
+    };
+
+    int32_t rank = 0;
+    if (const int id = gguf_find_key(ctx_gguf, "s2.lora.rank"); id >= 0) {
+        rank = (int32_t) gguf_get_val_u32(ctx_gguf, id);
+    }
+    float alpha = 0.0f;
+    if (const int id = gguf_find_key(ctx_gguf, "s2.lora.alpha"); id >= 0) {
+        alpha = gguf_get_val_f32(ctx_gguf, id);
+    }
+
+    if (scale < 0.0f) {
+        if (rank <= 0 || alpha <= 0.0f) {
+            return fail("Adapter has no usable s2.lora.rank / s2.lora.alpha; pass an explicit --lora-scale.");
+        }
+        scale = alpha / (float) rank;
+    }
+
+    S2_LOG_INFO_STREAM("[LoRA] " << lora_path << " (rank " << rank << ", alpha " << alpha
+              << ") -> scale " << scale << std::endl);
+
+    // Resolve every adapter pair against its base tensor, and validate the
+    // shapes now so a mismatched adapter fails at load rather than mid-graph.
+    struct PendingPair {
+        LoraPair *    slot;
+        ggml_tensor * base;
+        std::string   stem;
+    };
+    std::vector<PendingPair> pending;
+
+    auto add_target = [&](const std::string & stem, ggml_tensor * base, LoraPair * slot) {
+        if (base) pending.push_back({ slot, base, stem });
+    };
+
+    add_target("fast_embeddings", weights_.fast_embeddings, &weights_.fast_embeddings_lora);
+    add_target("fast_output",     weights_.fast_output,     &weights_.fast_output_lora);
+    for (size_t i = 0; i < weights_.fast_layers.size(); ++i) {
+        auto & l = weights_.fast_layers[i];
+        const std::string stem = "fast_layers." + std::to_string(i) + ".";
+        add_target(stem + "attention.wqkv",  l.wqkv, &l.wqkv_lora);
+        add_target(stem + "attention.wo",    l.wo,   &l.wo_lora);
+        add_target(stem + "feed_forward.w1", l.w1,   &l.w1_lora);
+        add_target(stem + "feed_forward.w2", l.w2,   &l.w2_lora);
+        add_target(stem + "feed_forward.w3", l.w3,   &l.w3_lora);
+    }
+
+    std::vector<ggml_tensor *> lora_tensors;
+    std::vector<ggml_tensor *> gpu_tensors;
+    std::vector<ggml_tensor *> cpu_tensors;
+
+    // Put each adapter tensor on whichever backend already holds its base
+    // tensor, so the update runs where the matmul it feeds runs.
+    auto backend_of = [&](ggml_tensor * base) -> ggml_backend_t {
+        if (backend_gpu_ && base->buffer &&
+            ggml_backend_buffer_get_type(base->buffer) == ggml_backend_get_default_buffer_type(backend_gpu_)) {
+            return backend_gpu_;
+        }
+        return backend_cpu_;
+    };
+
+    int n_applied = 0;
+    for (const PendingPair & p : pending) {
+        ggml_tensor * a = ggml_get_tensor(weights_.ctx_lora, (p.stem + ".lora_a").c_str());
+        ggml_tensor * b = ggml_get_tensor(weights_.ctx_lora, (p.stem + ".lora_b").c_str());
+        if (!a && !b) continue;
+        if (!a || !b) {
+            return fail("Adapter has only one of lora_a/lora_b for " + p.stem);
+        }
+
+        // ne[0] is the reduction axis of ggml_mul_mat, so a must consume what the
+        // base consumes and b must produce what the base produces. fast_embeddings
+        // is an embedding: its base ne[0] is the row width, and lora_a is stored
+        // transposed so ggml_get_rows yields a rank-length row per id.
+        const bool is_embedding = (p.base == weights_.fast_embeddings);
+        const int64_t want_a0 = is_embedding ? p.base->ne[1] : p.base->ne[0];
+        if (a->ne[0] != want_a0) {
+            return fail(p.stem + ": lora_a ne[0]=" + std::to_string(a->ne[0]) +
+                        " does not match base " + std::to_string(want_a0));
+        }
+        if (b->ne[0] != a->ne[1]) {
+            return fail(p.stem + ": rank mismatch between lora_a and lora_b");
+        }
+        if (b->ne[1] != (is_embedding ? p.base->ne[0] : p.base->ne[1])) {
+            return fail(p.stem + ": lora_b output width does not match base");
+        }
+
+        *p.slot = { a, b };
+        for (ggml_tensor * t : { a, b }) {
+            lora_tensors.push_back(t);
+            (backend_of(p.base) == backend_gpu_ ? gpu_tensors : cpu_tensors).push_back(t);
+        }
+        ++n_applied;
+    }
+
+    if (n_applied == 0) {
+        return fail("Adapter targets no tensor in this model.");
+    }
+
+    size_t bytes = 0, max_buf = 0;
+    std::string alloc_error;
+    if (!allocate_weight_buffers(backend_gpu_, gpu_tensors, weights_.lora_bufs, bytes, max_buf, alloc_error)) {
+        return fail("GPU buffer allocation failed: " + alloc_error);
+    }
+    std::vector<ggml_backend_buffer_t> cpu_bufs;
+    if (!allocate_weight_buffers(backend_cpu_, cpu_tensors, cpu_bufs, bytes, max_buf, alloc_error)) {
+        return fail("CPU buffer allocation failed: " + alloc_error);
+    }
+    weights_.lora_bufs.insert(weights_.lora_bufs.end(), cpu_bufs.begin(), cpu_bufs.end());
+
+    // Upload, folding alpha/rank into lora_b on the way so the graph stays at
+    // two matmuls and an add per target.
+    std::FILE * f = std::fopen(lora_path.c_str(), "rb");
+    if (!f) {
+        return fail("Cannot reopen " + lora_path + " for data loading.");
+    }
+    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
+    std::vector<uint8_t> tmp;
+    size_t total_bytes = 0;
+    for (ggml_tensor * t : lora_tensors) {
+        const int ti = gguf_find_tensor(ctx_gguf, ggml_get_name(t));
+        if (ti < 0) {
+            std::fclose(f);
+            return fail(std::string("Tensor vanished from adapter: ") + ggml_get_name(t));
+        }
+        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+            std::fclose(f);
+            return fail(std::string("Adapter tensors must be f32 or f16: ") + ggml_get_name(t));
+        }
+
+        const size_t tsize = ggml_nbytes(t);
+        if (tmp.size() < tsize) tmp.resize(tsize);
+#ifdef _WIN32
+        _fseeki64(f, (int64_t)(data_offset + gguf_get_tensor_offset(ctx_gguf, ti)), SEEK_SET);
+#else
+        fseeko(f, (off_t)(data_offset + gguf_get_tensor_offset(ctx_gguf, ti)), SEEK_SET);
+#endif
+        if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
+            std::fclose(f);
+            return fail(std::string("Failed to read tensor: ") + ggml_get_name(t));
+        }
+
+        const std::string name = ggml_get_name(t);
+        if (name.size() > 7 && name.compare(name.size() - 7, 7, ".lora_b") == 0 && scale != 1.0f) {
+            const int64_t n = ggml_nelements(t);
+            if (t->type == GGML_TYPE_F32) {
+                float * v = (float *) tmp.data();
+                for (int64_t i = 0; i < n; ++i) v[i] *= scale;
+            } else {
+                ggml_fp16_t * v = (ggml_fp16_t *) tmp.data();
+                for (int64_t i = 0; i < n; ++i) {
+                    v[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(v[i]) * scale);
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+        total_bytes += tsize;
+    }
+    std::fclose(f);
+    gguf_free(ctx_gguf);
+
+    S2_LOG_INFO_STREAM("[LoRA] Applied to " << n_applied << " tensors ("
+              << total_bytes / (1024.0 * 1024.0) << " MB)" << std::endl);
+    return true;
+}
+
 bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     max_seq_len_ = max_seq_len;
     n_past_      = 0;
@@ -1153,6 +1361,11 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         if (prefix_emb->type != GGML_TYPE_F32) {
             prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
         }
+        if (weights_.fast_embeddings_lora.active()) {
+            ggml_tensor * lora_rows = ggml_get_rows(ctx0, weights_.fast_embeddings_lora.a, prefix_ids);
+            prefix_emb = ggml_add(ctx0, prefix_emb,
+                mul_mat_checked(ctx0, weights_.fast_embeddings_lora.b, lora_rows, "mul_mat:fast_emb_lora"));
+        }
         x = ggml_concat(ctx0, x, prefix_emb, 1);
     }
 
@@ -1164,7 +1377,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         const auto & layer = weights_.fast_layers[il];
 
         ggml_tensor * attn_in = rms_norm_weighted(ctx0, x, layer.attention_norm, hparams_.fast_rms_norm_eps);
-        ggml_tensor * qkv     = mul_mat_checked(ctx0, layer.wqkv, attn_in, "mul_mat:fast_wqkv");
+        ggml_tensor * qkv     = mul_mat_lora(ctx0, layer.wqkv, layer.wqkv_lora, attn_in, "mul_mat:fast_wqkv");
         const size_t elem_size = ggml_element_size(qkv);
 
         ggml_tensor * q2d = ggml_view_2d(ctx0, qkv, q_size, n_tokens, qkv->nb[1], 0);
@@ -1202,14 +1415,14 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
         ggml_tensor * attn_cur = ggml_cpy(ctx0, KQVm,
                                           ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
-        ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:fast_wo");
+        ggml_tensor * attn_out = mul_mat_lora(ctx0, layer.wo, layer.wo_lora, attn_cur, "mul_mat:fast_wo");
 
         ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
         ggml_tensor * ff_in = rms_norm_weighted(ctx0, h, layer.ffn_norm, hparams_.fast_rms_norm_eps);
-        ggml_tensor * gate  = mul_mat_checked(ctx0, layer.w1, ff_in, "mul_mat:fast_w1");
-        ggml_tensor * up    = mul_mat_checked(ctx0, layer.w3, ff_in, "mul_mat:fast_w3");
+        ggml_tensor * gate  = mul_mat_lora(ctx0, layer.w1, layer.w1_lora, ff_in, "mul_mat:fast_w1");
+        ggml_tensor * up    = mul_mat_lora(ctx0, layer.w3, layer.w3_lora, ff_in, "mul_mat:fast_w3");
         ggml_tensor * ff_h  = ggml_swiglu_split(ctx0, gate, up);
-        ggml_tensor * ff_out = mul_mat_checked(ctx0, layer.w2, ff_h, "mul_mat:fast_w2");
+        ggml_tensor * ff_out = mul_mat_lora(ctx0, layer.w2, layer.w2_lora, ff_h, "mul_mat:fast_w2");
 
         x = ggml_add(ctx0, h, ff_out);
     }
@@ -1219,7 +1432,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     ggml_tensor * fast_last = ggml_cpy(ctx0,
         last_token_view(ctx0, fast_cont, n_tokens),
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim, 1));
-    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.fast_output, fast_last, "mul_mat:fast_logits");
+    ggml_tensor * logits = mul_mat_lora(ctx0, weights_.fast_output, weights_.fast_output_lora, fast_last, "mul_mat:fast_logits");
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
