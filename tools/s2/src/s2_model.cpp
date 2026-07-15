@@ -825,21 +825,28 @@ bool SlowARModel::load_lora(const std::string & lora_path, float scale) {
             return fail("Adapter has only one of lora_a/lora_b for " + p.stem);
         }
 
-        // ne[0] is the reduction axis of ggml_mul_mat, so a must consume what the
-        // base consumes and b must produce what the base produces. fast_embeddings
-        // is an embedding: its base ne[0] is the row width, and lora_a is stored
-        // transposed so ggml_get_rows yields a rank-length row per id.
+        // b is always (rank, out) and feeds ggml_mul_mat, whose reduction axis is
+        // ne[0]. a differs by target kind: for a linear it is (in, rank) and is
+        // consumed by ggml_mul_mat too, but for an embedding it is stored
+        // transposed as (rank, vocab) so ggml_get_rows yields a rank-length row
+        // per id. So the rank sits on a different axis of a in each case.
         const bool is_embedding = (p.base == weights_.fast_embeddings);
-        const int64_t want_a0 = is_embedding ? p.base->ne[1] : p.base->ne[0];
-        if (a->ne[0] != want_a0) {
-            return fail(p.stem + ": lora_a ne[0]=" + std::to_string(a->ne[0]) +
-                        " does not match base " + std::to_string(want_a0));
+        const int64_t rank_a  = is_embedding ? a->ne[0] : a->ne[1];
+        const int64_t in_a    = is_embedding ? a->ne[1] : a->ne[0];
+        const int64_t base_in = is_embedding ? p.base->ne[1] : p.base->ne[0];
+        const int64_t base_out = is_embedding ? p.base->ne[0] : p.base->ne[1];
+
+        if (in_a != base_in) {
+            return fail(p.stem + ": lora_a input width " + std::to_string(in_a) +
+                        " does not match base " + std::to_string(base_in));
         }
-        if (b->ne[0] != a->ne[1]) {
-            return fail(p.stem + ": rank mismatch between lora_a and lora_b");
+        if (b->ne[0] != rank_a) {
+            return fail(p.stem + ": rank mismatch between lora_a (" + std::to_string(rank_a) +
+                        ") and lora_b (" + std::to_string(b->ne[0]) + ")");
         }
-        if (b->ne[1] != (is_embedding ? p.base->ne[0] : p.base->ne[1])) {
-            return fail(p.stem + ": lora_b output width does not match base");
+        if (b->ne[1] != base_out) {
+            return fail(p.stem + ": lora_b output width " + std::to_string(b->ne[1]) +
+                        " does not match base " + std::to_string(base_out));
         }
 
         *p.slot = { a, b };
