@@ -63,6 +63,8 @@ void print_uso() {
     safe_print("Options:\n");
     safe_print("  -m, --model        <path>   Path to GGUF model\n");
     safe_print("  -t, --tokenizer    <path>   Path to tokenizer.json\n");
+    safe_print("      --lora         <path>   Path to a GGUF LoRA adapter (see convert_s2_lora_to_gguf.py)\n");
+    safe_print("      --lora-scale   <float>  Override the adapter scale (default: its own alpha/rank)\n");
     safe_print("  -text, --text      <text>   Text to synthesize\n");
     safe_print("  -pa, --prompt-audio <path>  Path to reference audio for cloning\n");
     safe_print("  -pt, --prompt-text <text>   Text of the reference audio\n");
@@ -157,6 +159,8 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if      (arg == "-m"  || arg == "--model")        { if (i+1 < argc) params.model_path        = argv[++i]; }
         else if (arg == "-t"  || arg == "--tokenizer")    { if (i+1 < argc) params.tokenizer_path    = argv[++i]; }
+        else if (arg == "--lora")                         { if (i+1 < argc) params.lora_path         = argv[++i]; }
+        else if (arg == "--lora-scale")                   { if (i+1 < argc) params.lora_scale        = std::stof(argv[++i]); }
         else if (arg == "-text" || arg == "--text")       { if (i+1 < argc) params.text               = argv[++i]; }
         else if (arg == "-pa" || arg == "--prompt-audio") { if (i+1 < argc) params.prompt_audio_path = argv[++i]; }
         else if (arg == "-pt" || arg == "--prompt-text")  { if (i+1 < argc) params.prompt_text        = argv[++i]; }

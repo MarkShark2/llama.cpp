@@ -23,6 +23,16 @@
 
 namespace s2 {
 
+// A rank-r LoRA update for one base tensor: delta = b @ (a @ x). The alpha/r
+// scale is folded into b when the adapter is uploaded, so the graph does not
+// need a separate scale node. Both null when no adapter targets the tensor.
+struct LoraPair {
+    ggml_tensor * a = nullptr;
+    ggml_tensor * b = nullptr;
+
+    bool active() const { return a != nullptr && b != nullptr; }
+};
+
 struct ModelLayer {
     ggml_tensor * attention_norm = nullptr;
     ggml_tensor * ffn_norm       = nullptr;
@@ -33,6 +43,12 @@ struct ModelLayer {
     ggml_tensor * w1             = nullptr;
     ggml_tensor * w2             = nullptr;
     ggml_tensor * w3             = nullptr;
+
+    LoraPair wqkv_lora;
+    LoraPair wo_lora;
+    LoraPair w1_lora;
+    LoraPair w2_lora;
+    LoraPair w3_lora;
 };
 
 struct ModelHParams {
@@ -72,6 +88,9 @@ struct ModelWeights {
     std::vector<ggml_backend_buffer_t> model_bufs_cpu;
     std::vector<ggml_backend_buffer_t> model_bufs_gpu;
 
+    ggml_context * ctx_lora = nullptr;
+    std::vector<ggml_backend_buffer_t> lora_bufs;
+
     ggml_tensor * embeddings           = nullptr;
     ggml_tensor * codebook_embeddings  = nullptr;
     ggml_tensor * norm                 = nullptr;
@@ -79,6 +98,9 @@ struct ModelWeights {
     ggml_tensor * fast_embeddings      = nullptr;
     ggml_tensor * fast_norm            = nullptr;
     ggml_tensor * fast_output          = nullptr;
+
+    LoraPair fast_embeddings_lora;
+    LoraPair fast_output_lora;
 
     std::vector<ModelLayer> layers;
     std::vector<ModelLayer> fast_layers;
@@ -99,6 +121,11 @@ public:
     bool load_shared(gguf_context * gguf_ctx, const std::string & gguf_path, int32_t gpu_device = -1, BackendType backend_type = BackendType::CPU, int32_t n_gpu_layers = -1);
 
     bool read_tensor_data(const std::string & gguf_path, gguf_context * gguf_ctx);
+
+    // Applies a GGUF LoRA adapter on top of already-loaded weights. Base tensors
+    // are left untouched, so this works against a quantized model. Pass a
+    // negative scale to use the adapter's own alpha/rank.
+    bool load_lora(const std::string & lora_path, float scale = -1.0f);
 
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
