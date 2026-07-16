@@ -123,6 +123,20 @@ public:
     // vocoder_model_path: path to the vocoder GGUF (if empty, looks in same directory)
     bool load_model_files(const std::string & tts_model_path,
                           const std::string & vocoder_model_path = "");
+
+    // Apply a LoRA adapter (a GGUF from convert_qwen3tts_lora_to_gguf.py) to the
+    // talker. Call after the models are loaded; the path and strength are kept
+    // so the adapter is re-applied if low-memory mode reloads the transformer.
+    //
+    // strength multiplies the adapter's trained alpha/rank scale, so 1.0
+    // reproduces training and 0.5 is half as strong.
+    bool load_lora(const std::string & lora_path, float strength);
+
+    // Speaker embedding bundled with the adapter; empty if none. A LoRA is
+    // trained against the Base model, which has no speaker presets, so this is
+    // the only way to get back the voice it was trained on.
+    const std::vector<float> & get_lora_speaker_embedding() const;
+    const std::string & get_lora_voice_name() const;
     
     // Generate speech from text
     // text: input text to synthesize
@@ -233,6 +247,10 @@ private:
     tts_progress_callback_t progress_callback_;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
+
+    // Remembered so the adapter survives a low-memory transformer reload.
+    std::string lora_path_;
+    float lora_strength_ = 1.0f;
 };
 
 // Utility: Load audio file (WAV format)

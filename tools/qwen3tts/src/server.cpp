@@ -251,6 +251,8 @@ struct custom_voice {
 struct server_params {
     std::string model;
     std::string vocoder;
+    std::string lora;        // LoRA adapter GGUF (convert_qwen3tts_lora_to_gguf.py)
+    float       lora_strength = 1.0f;
     std::string hf_repo;     // e.g. "khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF:Q8_0"
     std::string hf_file;     // override filename within --hf-repo
     std::string hf_repo_v;   // vocoder HF repo
@@ -337,6 +339,8 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  -v,  --vocoder <file>           vocoder GGUF file (default: same dir as model)\n");
     fprintf(stderr, "  -hf, --hf-repo <repo[:quant]>   HuggingFace model repo (default quant: Q8_0)\n");
     fprintf(stderr, "       --hf-file <file>            override GGUF filename within --hf-repo\n");
+    fprintf(stderr, "       --lora <path>               LoRA adapter GGUF; its voice becomes the default\n");
+    fprintf(stderr, "       --lora-strength <f>         scale the adapter's trained strength (default: 1.0)\n");
     fprintf(stderr, "       --hf-repo-v <repo[:quant]>  HuggingFace vocoder repo\n");
     fprintf(stderr, "       --hf-file-v <file>          override GGUF filename within --hf-repo-v\n");
     fprintf(stderr, "  -H,  --host <host>              listen host (default: 127.0.0.1)\n");
@@ -362,6 +366,12 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "-v" || arg == "--vocoder") {
             if (++i >= argc) { fprintf(stderr, "error: missing vocoder path\n"); return false; }
             sp.vocoder = argv[i];
+        } else if (arg == "--lora") {
+            if (++i >= argc) { fprintf(stderr, "error: missing lora path\n"); return false; }
+            sp.lora = argv[i];
+        } else if (arg == "--lora-strength") {
+            if (++i >= argc) { fprintf(stderr, "error: missing lora-strength\n"); return false; }
+            sp.lora_strength = std::stof(argv[i]);
         } else if (arg == "-H" || arg == "--host") {
             if (++i >= argc) { fprintf(stderr, "error: missing host\n"); return false; }
             sp.host = argv[i];
@@ -441,6 +451,11 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "models loaded (type=%s, speakers=%zu)\n",
             tts.get_model_type().c_str(), tts.get_speaker_names().size());
 
+    if (!sp.lora.empty() && !tts.load_lora(sp.lora, sp.lora_strength)) {
+        fprintf(stderr, "fatal: %s\n", tts.get_error().c_str());
+        return 1;
+    }
+
     // derive model id from filename (e.g. "qwen3-tts-0.6b-f16" from path)
     std::string model_id = sp.model;
     auto slash = model_id.rfind('/');
@@ -455,6 +470,18 @@ int main(int argc, char ** argv) {
     std::map<std::string, custom_voice> voices;
     std::mutex voices_mutex;
     int next_voice_id = 1;
+
+    // Voice used when the request names none, or names one that does not exist.
+    // Without this the talker invents a new speaker per request, and since
+    // OpenAI clients send one request per chunk, the voice changes mid-message.
+    // A LoRA's bundled embedding is the voice it was trained on, so it becomes
+    // the default and is also addressable by name.
+    std::vector<float> default_voice_embedding;
+    if (!tts.get_lora_speaker_embedding().empty()) {
+        default_voice_embedding = tts.get_lora_speaker_embedding();
+        voices[tts.get_lora_voice_name()] = { tts.get_lora_voice_name(), default_voice_embedding, "", {}, 0 };
+        fprintf(stderr, "default voice: '%s' (from LoRA)\n", tts.get_lora_voice_name().c_str());
+    }
 
     httplib::Server svr;
 
@@ -770,8 +797,9 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // resolve voice to speaker embedding (and optional ICL data)
-        std::vector<float> voice_embedding;
+        // resolve voice to speaker embedding (and optional ICL data), starting
+        // from the default so an unset or unknown voice lands there
+        std::vector<float> voice_embedding = default_voice_embedding;
         std::string voice_ref_text;
         std::vector<int32_t> voice_ref_codes;
         int32_t voice_n_ref_frames = 0;

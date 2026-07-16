@@ -537,6 +537,12 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
             result.error_msg = "Failed to reload TTS transformer: " + transformer_.get_error();
             return result;
         }
+        // The adapter is freed with the base weights, so it has to go back on
+        // here or the reloaded transformer would quietly be the base model.
+        if (!lora_path_.empty() && !transformer_.load_lora(lora_path_, lora_strength_)) {
+            result.error_msg = "Failed to re-apply LoRA after reload: " + transformer_.get_error();
+            return result;
+        }
         transformer_.set_abort_callback(abort_cb_, abort_data_);
         transformer_loaded_ = true;
         if (params.print_timing) {
@@ -846,6 +852,32 @@ int32_t Qwen3TTS::get_hidden_size() const {
 
 const std::string & Qwen3TTS::get_model_type() const {
     return transformer_.get_config().model_type;
+}
+
+bool Qwen3TTS::load_lora(const std::string & lora_path, float strength) {
+    if (!models_loaded_) {
+        error_msg_ = "Models must be loaded before a LoRA";
+        return false;
+    }
+    if (!transformer_loaded_) {
+        error_msg_ = "TTS transformer is not loaded";
+        return false;
+    }
+    if (!transformer_.load_lora(lora_path, strength)) {
+        error_msg_ = transformer_.get_error();
+        return false;
+    }
+    lora_path_ = lora_path;
+    lora_strength_ = strength;
+    return true;
+}
+
+const std::vector<float> & Qwen3TTS::get_lora_speaker_embedding() const {
+    return transformer_.get_lora_speaker_embedding();
+}
+
+const std::string & Qwen3TTS::get_lora_voice_name() const {
+    return transformer_.get_lora_voice_name();
 }
 
 const std::vector<std::string> & Qwen3TTS::get_speaker_names() const {

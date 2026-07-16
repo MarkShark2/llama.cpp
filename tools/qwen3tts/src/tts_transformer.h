@@ -116,22 +116,41 @@ struct tts_transformer_config {
     int32_t english_language_id = 2050;
 };
 
+// A LoRA update for one linear: y += B(A(x)). The trained alpha/rank scale is
+// folded into b at load time, so the graph stays at two matmuls and an add.
+struct lora_pair {
+    struct ggml_tensor * a = nullptr;
+    struct ggml_tensor * b = nullptr;
+
+    bool active() const { return a && b; }
+};
+
 // Transformer layer weights
 struct transformer_layer {
     struct ggml_tensor * attn_norm = nullptr;
-    
+
     struct ggml_tensor * attn_q = nullptr;
     struct ggml_tensor * attn_k = nullptr;
     struct ggml_tensor * attn_v = nullptr;
     struct ggml_tensor * attn_output = nullptr;
     struct ggml_tensor * attn_q_norm = nullptr;
     struct ggml_tensor * attn_k_norm = nullptr;
-    
+
     struct ggml_tensor * ffn_norm = nullptr;
-    
+
     struct ggml_tensor * ffn_gate = nullptr;
     struct ggml_tensor * ffn_up = nullptr;
     struct ggml_tensor * ffn_down = nullptr;
+
+    // Optional LoRA updates, one per linear above. Inactive unless load_lora
+    // resolved an adapter pair for the tensor.
+    lora_pair attn_q_lora;
+    lora_pair attn_k_lora;
+    lora_pair attn_v_lora;
+    lora_pair attn_output_lora;
+    lora_pair ffn_gate_lora;
+    lora_pair ffn_up_lora;
+    lora_pair ffn_down_lora;
 };
 
 // TTS Transformer model weights
@@ -173,12 +192,23 @@ struct tts_transformer_model {
     
     // GGML context for tensor metadata
     struct ggml_context * ctx = nullptr;
-    
+
     // Backend buffer for weights
     ggml_backend_buffer_t buffer = nullptr;
-    
+
     // Tensor name to tensor mapping
     std::map<std::string, struct ggml_tensor *> tensors;
+
+    // LoRA adapter, held in its own context/buffer so it can be freed with the
+    // base weights without disturbing them.
+    struct ggml_context * ctx_lora = nullptr;
+    ggml_backend_buffer_t lora_buffer = nullptr;
+
+    // Speaker embedding carried by the adapter, if any. A LoRA is trained
+    // against the Base model, which has no speaker presets, so the voice it was
+    // trained with only exists as this vector.
+    std::vector<float> lora_speaker_embedding;
+    std::string lora_voice_name;
 };
 
 // KV cache for autoregressive generation
@@ -216,6 +246,19 @@ public:
     
     // Load model from GGUF file
     bool load_model(const std::string & model_path);
+
+    // Apply a LoRA adapter (a GGUF from convert_qwen3tts_lora_to_gguf.py) on top
+    // of the loaded base weights. Must be called after load_model, and again
+    // after any reload: the adapter lives with the base weights and is dropped
+    // when they are.
+    //
+    // strength multiplies the adapter's trained alpha/rank scale, so 1.0
+    // reproduces training and 0.5 is half as strong.
+    bool load_lora(const std::string & lora_path, float strength);
+
+    // Speaker embedding bundled with the adapter; empty if it carried none.
+    const std::vector<float> & get_lora_speaker_embedding() const { return model_.lora_speaker_embedding; }
+    const std::string & get_lora_voice_name() const { return model_.lora_voice_name; }
 
     // Release all model/runtime resources
     void unload_model();
