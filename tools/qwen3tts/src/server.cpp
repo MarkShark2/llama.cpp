@@ -700,7 +700,7 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
-        [&tts, &synth_mutex, &sp, &voices, &voices_mutex](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &synth_mutex, &sp, &voices, &voices_mutex, &default_voice_embedding](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
