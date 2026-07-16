@@ -1379,6 +1379,250 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
     return true;
 }
 
+// ggml_mul_mat plus a LoRA update, if one targets this tensor. The base matmul
+// is untouched, so a quantized base needs no dequantization: the update is
+// computed separately in f32 and added to the result.
+static struct ggml_tensor * mul_mat_lora(struct ggml_context * ctx, struct ggml_tensor * w,
+                                         const lora_pair & lora, struct ggml_tensor * x) {
+    struct ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    if (!lora.active()) {
+        return y;
+    }
+    struct ggml_tensor * delta = ggml_mul_mat(ctx, lora.b, ggml_mul_mat(ctx, lora.a, x));
+    return ggml_add(ctx, y, delta);
+}
+
+bool TTSTransformer::load_lora(const std::string & lora_path, float strength) {
+    if (!model_.ctx) {
+        error_msg_ = "Base model must be loaded before a LoRA";
+        return false;
+    }
+    if (model_.ctx_lora) {
+        error_msg_ = "A LoRA adapter is already loaded";
+        return false;
+    }
+
+    struct gguf_init_params params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ &model_.ctx_lora,
+    };
+
+    struct gguf_context * ctx_gguf = gguf_init_from_file(lora_path.c_str(), params);
+    if (!ctx_gguf) {
+        error_msg_ = "Failed to load LoRA GGUF: " + lora_path;
+        return false;
+    }
+
+    auto fail = [&](const std::string & msg) {
+        error_msg_ = msg;
+        gguf_free(ctx_gguf);
+        if (model_.lora_buffer) {
+            ggml_backend_buffer_free(model_.lora_buffer);
+            model_.lora_buffer = nullptr;
+        }
+        if (model_.ctx_lora) {
+            ggml_free(model_.ctx_lora);
+            model_.ctx_lora = nullptr;
+        }
+        // Drop any pairs already wired up, so a failed load cannot leave the
+        // graph pointing at freed tensors.
+        for (auto * layers : { &model_.layers, &model_.code_pred_layers }) {
+            for (auto & l : *layers) {
+                l.attn_q_lora = l.attn_k_lora = l.attn_v_lora = l.attn_output_lora = lora_pair();
+                l.ffn_gate_lora = l.ffn_up_lora = l.ffn_down_lora = lora_pair();
+            }
+        }
+        return false;
+    };
+
+    int32_t rank = 0;
+    if (const int id = gguf_find_key(ctx_gguf, "qwen3-tts.lora.rank"); id >= 0) {
+        rank = (int32_t) gguf_get_val_u32(ctx_gguf, id);
+    }
+    float alpha = 0.0f;
+    if (const int id = gguf_find_key(ctx_gguf, "qwen3-tts.lora.alpha"); id >= 0) {
+        alpha = gguf_get_val_f32(ctx_gguf, id);
+    }
+    if (rank <= 0 || alpha <= 0.0f) {
+        return fail("LoRA has no usable qwen3-tts.lora.rank / qwen3-tts.lora.alpha");
+    }
+
+    const float scale = strength * (alpha / (float) rank);
+    fprintf(stderr, "  LoRA: %s (rank %d, alpha %.1f) strength %.2f -> scale %.4f\n",
+            lora_path.c_str(), rank, alpha, strength, scale);
+
+    // Resolve every adapter pair against its base tensor and validate shapes now,
+    // so a mismatched adapter fails at load rather than mid-graph.
+    struct pending_pair {
+        lora_pair *   slot;
+        struct ggml_tensor * base;
+        std::string   stem;
+    };
+    std::vector<pending_pair> pending;
+
+    auto add_target = [&](const std::string & stem, struct ggml_tensor * base, lora_pair * slot) {
+        if (base) pending.push_back({ slot, base, stem });
+    };
+
+    auto add_block = [&](const std::string & prefix, std::vector<transformer_layer> & layers) {
+        for (size_t i = 0; i < layers.size(); ++i) {
+            auto & l = layers[i];
+            const std::string stem = prefix + std::to_string(i) + ".";
+            add_target(stem + "attn_q",      l.attn_q,      &l.attn_q_lora);
+            add_target(stem + "attn_k",      l.attn_k,      &l.attn_k_lora);
+            add_target(stem + "attn_v",      l.attn_v,      &l.attn_v_lora);
+            add_target(stem + "attn_output", l.attn_output, &l.attn_output_lora);
+            add_target(stem + "ffn_gate",    l.ffn_gate,    &l.ffn_gate_lora);
+            add_target(stem + "ffn_up",      l.ffn_up,      &l.ffn_up_lora);
+            add_target(stem + "ffn_down",    l.ffn_down,    &l.ffn_down_lora);
+        }
+    };
+
+    add_block("talker.blk.",    model_.layers);
+    add_block("code_pred.blk.", model_.code_pred_layers);
+
+    std::vector<struct ggml_tensor *> lora_tensors;
+    int n_applied = 0;
+
+    for (const pending_pair & p : pending) {
+        struct ggml_tensor * a = ggml_get_tensor(model_.ctx_lora, (p.stem + ".lora_a").c_str());
+        struct ggml_tensor * b = ggml_get_tensor(model_.ctx_lora, (p.stem + ".lora_b").c_str());
+        if (!a && !b) continue;
+        if (!a || !b) {
+            return fail("LoRA has only one of lora_a/lora_b for " + p.stem);
+        }
+        if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) {
+            return fail("LoRA tensors must be f32 or f16: " + p.stem);
+        }
+        if (b->type != a->type) {
+            return fail("LoRA lora_a/lora_b types differ for " + p.stem);
+        }
+
+        // Both factors feed ggml_mul_mat, whose reduction axis is ne[0]: a is
+        // (in, rank) and b is (rank, out), against a base of (in, out).
+        if (a->ne[0] != p.base->ne[0]) {
+            return fail(p.stem + ": lora_a input width " + std::to_string(a->ne[0]) +
+                        " does not match base " + std::to_string(p.base->ne[0]));
+        }
+        if (a->ne[1] != b->ne[0]) {
+            return fail(p.stem + ": rank mismatch between lora_a (" + std::to_string(a->ne[1]) +
+                        ") and lora_b (" + std::to_string(b->ne[0]) + ")");
+        }
+        if (b->ne[1] != p.base->ne[1]) {
+            return fail(p.stem + ": lora_b output width " + std::to_string(b->ne[1]) +
+                        " does not match base " + std::to_string(p.base->ne[1]));
+        }
+
+        *p.slot = { a, b };
+        lora_tensors.push_back(a);
+        lora_tensors.push_back(b);
+        ++n_applied;
+    }
+
+    // The speaker embedding is not a graph tensor: it is read back to the host
+    // and handed to generate() as an ordinary input, so keep it out of the
+    // backend buffer.
+    struct ggml_tensor * spk = ggml_get_tensor(model_.ctx_lora, "speaker_embedding");
+    const int64_t spk_elems = spk ? ggml_nelements(spk) : 0;
+
+    if (n_applied == 0 && !spk) {
+        return fail("LoRA targets no tensor in this model and carries no speaker embedding");
+    }
+
+    if (!state_.backend) {
+        return fail("No backend available for LoRA tensors");
+    }
+
+    // This also allocates the speaker embedding, which the graph never reads;
+    // one unused row is not worth a second context to avoid.
+    if (!lora_tensors.empty()) {
+        model_.lora_buffer = ggml_backend_alloc_ctx_tensors(model_.ctx_lora, state_.backend);
+        if (!model_.lora_buffer) {
+            return fail("Failed to allocate LoRA tensor buffer");
+        }
+    }
+
+    FILE * f = fopen(lora_path.c_str(), "rb");
+    if (!f) {
+        return fail("Failed to open LoRA for reading: " + lora_path);
+    }
+
+    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
+    std::vector<uint8_t> read_buf;
+
+    auto read_tensor = [&](struct ggml_tensor * t) -> bool {
+        const int ti = gguf_find_tensor(ctx_gguf, ggml_get_name(t));
+        if (ti < 0) return false;
+        const size_t nbytes = ggml_nbytes(t);
+        read_buf.resize(nbytes);
+        if (fseek(f, (long)(data_offset + gguf_get_tensor_offset(ctx_gguf, ti)), SEEK_SET) != 0) {
+            return false;
+        }
+        return fread(read_buf.data(), 1, nbytes, f) == nbytes;
+    };
+
+    // Upload, folding the scale into lora_b on the way so the graph stays at two
+    // matmuls and an add per target.
+    for (struct ggml_tensor * t : lora_tensors) {
+        if (!read_tensor(t)) {
+            fclose(f);
+            return fail(std::string("Failed to read LoRA tensor: ") + ggml_get_name(t));
+        }
+
+        const std::string name = ggml_get_name(t);
+        if (name.size() > 7 && name.compare(name.size() - 7, 7, ".lora_b") == 0 && scale != 1.0f) {
+            const int64_t n = ggml_nelements(t);
+            if (t->type == GGML_TYPE_F32) {
+                float * v = (float *) read_buf.data();
+                for (int64_t i = 0; i < n; ++i) v[i] *= scale;
+            } else {
+                ggml_fp16_t * v = (ggml_fp16_t *) read_buf.data();
+                for (int64_t i = 0; i < n; ++i) {
+                    v[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(v[i]) * scale);
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(t, read_buf.data(), 0, ggml_nbytes(t));
+    }
+
+    if (spk) {
+        const int32_t expected = model_.config.hidden_size;
+        if (spk->type != GGML_TYPE_F32) {
+            fclose(f);
+            return fail("LoRA speaker_embedding must be f32");
+        }
+        if (spk_elems != expected) {
+            fclose(f);
+            return fail("LoRA speaker_embedding has " + std::to_string(spk_elems) +
+                        " dims, expected " + std::to_string(expected));
+        }
+        if (!read_tensor(spk)) {
+            fclose(f);
+            return fail("Failed to read LoRA speaker_embedding");
+        }
+        model_.lora_speaker_embedding.resize(spk_elems);
+        memcpy(model_.lora_speaker_embedding.data(), read_buf.data(), spk_elems * sizeof(float));
+
+        model_.lora_voice_name = "lora";
+        if (const int id = gguf_find_key(ctx_gguf, "qwen3-tts.lora.voice_name"); id >= 0) {
+            model_.lora_voice_name = gguf_get_val_str(ctx_gguf, id);
+        }
+    }
+
+    fclose(f);
+    gguf_free(ctx_gguf);
+
+    if (spk) {
+        fprintf(stderr, "  LoRA: applied to %d tensors, speaker embedding -> voice '%s'\n",
+                n_applied, model_.lora_voice_name.c_str());
+    } else {
+        fprintf(stderr, "  LoRA: applied to %d tensors\n", n_applied);
+    }
+
+    return true;
+}
+
 struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_tokens, int32_t n_past) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
@@ -1418,9 +1662,9 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+        struct ggml_tensor * Qcur = mul_mat_lora(ctx0, layer.attn_q, layer.attn_q_lora, cur);
+        struct ggml_tensor * Kcur = mul_mat_lora(ctx0, layer.attn_k, layer.attn_k_lora, cur);
+        struct ggml_tensor * Vcur = mul_mat_lora(ctx0, layer.attn_v, layer.attn_v_lora, cur);
         
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
@@ -1477,22 +1721,22 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
         
-        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = mul_mat_lora(ctx0, layer.attn_output, layer.attn_output_lora, cur);
         cur = ggml_add(ctx0, cur, inpL);
         struct ggml_tensor * inpFF = cur;
         
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+        struct ggml_tensor * gate = mul_mat_lora(ctx0, layer.ffn_gate, layer.ffn_gate_lora, cur);
+        struct ggml_tensor * up = mul_mat_lora(ctx0, layer.ffn_up, layer.ffn_up_lora, cur);
         
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
         
         struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, ffn_down_f32, cur);
+        cur = mul_mat_lora(ctx0, ffn_down_f32, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1559,9 +1803,9 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+        struct ggml_tensor * Qcur = mul_mat_lora(ctx0, layer.attn_q, layer.attn_q_lora, cur);
+        struct ggml_tensor * Kcur = mul_mat_lora(ctx0, layer.attn_k, layer.attn_k_lora, cur);
+        struct ggml_tensor * Vcur = mul_mat_lora(ctx0, layer.attn_v, layer.attn_v_lora, cur);
         
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
@@ -1611,22 +1855,22 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
         
-        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = mul_mat_lora(ctx0, layer.attn_output, layer.attn_output_lora, cur);
         cur = ggml_add(ctx0, cur, inpL);
         struct ggml_tensor * inpFF = cur;
         
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+        struct ggml_tensor * gate = mul_mat_lora(ctx0, layer.ffn_gate, layer.ffn_gate_lora, cur);
+        struct ggml_tensor * up = mul_mat_lora(ctx0, layer.ffn_up, layer.ffn_up_lora, cur);
         
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
         
         struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, ffn_down_f32, cur);
+        cur = mul_mat_lora(ctx0, ffn_down_f32, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1706,9 +1950,9 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+        struct ggml_tensor * Qcur = mul_mat_lora(ctx0, layer.attn_q, layer.attn_q_lora, cur);
+        struct ggml_tensor * Kcur = mul_mat_lora(ctx0, layer.attn_k, layer.attn_k_lora, cur);
+        struct ggml_tensor * Vcur = mul_mat_lora(ctx0, layer.attn_v, layer.attn_v_lora, cur);
         
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, 1);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, 1);
@@ -1732,22 +1976,22 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
         
-        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = mul_mat_lora(ctx0, layer.attn_output, layer.attn_output_lora, cur);
         cur = ggml_add(ctx0, cur, inpL);
         struct ggml_tensor * inpFF = cur;
         
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+        struct ggml_tensor * gate = mul_mat_lora(ctx0, layer.ffn_gate, layer.ffn_gate_lora, cur);
+        struct ggml_tensor * up = mul_mat_lora(ctx0, layer.ffn_up, layer.ffn_up_lora, cur);
         
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
         
         struct ggml_tensor * old_ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, old_ffn_down_f32, cur);
+        cur = mul_mat_lora(ctx0, old_ffn_down_f32, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1827,9 +2071,9 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+        struct ggml_tensor * Qcur = mul_mat_lora(ctx0, layer.attn_q, layer.attn_q_lora, cur);
+        struct ggml_tensor * Kcur = mul_mat_lora(ctx0, layer.attn_k, layer.attn_k_lora, cur);
+        struct ggml_tensor * Vcur = mul_mat_lora(ctx0, layer.attn_v, layer.attn_v_lora, cur);
         
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
@@ -1878,22 +2122,22 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
         
-        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = mul_mat_lora(ctx0, layer.attn_output, layer.attn_output_lora, cur);
         cur = ggml_add(ctx0, cur, inpL);
         struct ggml_tensor * inpFF = cur;
         
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+        struct ggml_tensor * gate = mul_mat_lora(ctx0, layer.ffn_gate, layer.ffn_gate_lora, cur);
+        struct ggml_tensor * up = mul_mat_lora(ctx0, layer.ffn_up, layer.ffn_up_lora, cur);
         
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
         
         struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, ffn_down_f32, cur);
+        cur = mul_mat_lora(ctx0, ffn_down_f32, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1978,9 +2222,9 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
         
-        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
-        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
-        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+        struct ggml_tensor * Qcur = mul_mat_lora(ctx0, layer.attn_q, layer.attn_q_lora, cur);
+        struct ggml_tensor * Kcur = mul_mat_lora(ctx0, layer.attn_k, layer.attn_k_lora, cur);
+        struct ggml_tensor * Vcur = mul_mat_lora(ctx0, layer.attn_v, layer.attn_v_lora, cur);
         
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
@@ -2030,22 +2274,22 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
         
-        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = mul_mat_lora(ctx0, layer.attn_output, layer.attn_output_lora, cur);
         cur = ggml_add(ctx0, cur, inpL);
         struct ggml_tensor * inpFF = cur;
         
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
-        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+        struct ggml_tensor * gate = mul_mat_lora(ctx0, layer.ffn_gate, layer.ffn_gate_lora, cur);
+        struct ggml_tensor * up = mul_mat_lora(ctx0, layer.ffn_up, layer.ffn_up_lora, cur);
         
         gate = ggml_silu(ctx0, gate);
         
         cur = ggml_mul(ctx0, gate, up);
         
         struct ggml_tensor * step_ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, step_ffn_down_f32, cur);
+        cur = mul_mat_lora(ctx0, step_ffn_down_f32, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -3196,6 +3440,16 @@ bool TTSTransformer::forward_with_audio(const int32_t * tokens, int32_t n_tokens
 }
 
 void free_transformer_model(tts_transformer_model & model) {
+    if (model.lora_buffer) {
+        ggml_backend_buffer_free(model.lora_buffer);
+        model.lora_buffer = nullptr;
+    }
+    if (model.ctx_lora) {
+        ggml_free(model.ctx_lora);
+        model.ctx_lora = nullptr;
+    }
+    model.lora_speaker_embedding.clear();
+    model.lora_voice_name.clear();
     if (model.buffer) {
         ggml_backend_buffer_free(model.buffer);
         model.buffer = nullptr;

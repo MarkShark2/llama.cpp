@@ -11,6 +11,8 @@ void print_usage(const char * program) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -m, --model <path>     Talker gguf file, or directory containing talker+tokenizer ggufs (required)\n");
     fprintf(stderr, "      --vocoder <file>   Tokenizer/vocoder gguf (required when -m is a file; else auto-discovered)\n");
+    fprintf(stderr, "      --lora <file>      LoRA adapter gguf; its bundled voice is used unless -r is given\n");
+    fprintf(stderr, "      --lora-strength <f> Scale the adapter's trained strength (default: 1.0)\n");
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output file; .wav, or .mp3/.opus if built with libav (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
@@ -36,6 +38,8 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
+    std::string lora_path;
+    float lora_strength = 1.0f;
     int32_t streaming_batch_size = 0;
 
     qwen3_tts::tts_params params;
@@ -56,6 +60,12 @@ int main(int argc, char ** argv) {
         } else if (arg == "--vocoder") {
             if (++i >= argc) { fprintf(stderr, "Error: missing vocoder path\n"); return 1; }
             vocoder_path = argv[i];
+        } else if (arg == "--lora") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing lora path\n"); return 1; }
+            lora_path = argv[i];
+        } else if (arg == "--lora-strength") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing lora-strength\n"); return 1; }
+            lora_strength = std::stof(argv[i]);
         } else if (arg == "-t" || arg == "--text") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing text\n");
@@ -191,7 +201,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
     }
-    
+
+    if (!lora_path.empty() && !tts.load_lora(lora_path, lora_strength)) {
+        fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
+        return 1;
+    }
+
     // Set progress callback
     tts.set_progress_callback([](int tokens, int max_tokens) {
         fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);
@@ -211,7 +226,16 @@ int main(int argc, char ** argv) {
         };
     }
 
-    if (reference_audio.empty()) {
+    if (reference_audio.empty() && !tts.get_lora_speaker_embedding().empty()) {
+        // The adapter's voice only exists as this embedding, so plain
+        // synthesize() would apply the LoRA weights to an invented speaker.
+        const auto & emb = tts.get_lora_speaker_embedding();
+        fprintf(stderr, "Synthesizing with LoRA voice '%s': \"%s\"\n",
+                tts.get_lora_voice_name().c_str(), text.c_str());
+        result = tts.synthesize_with_embedding(text, emb.data(), (int32_t) emb.size(), params,
+                                               nullptr, 0,
+                                               streaming_batch_size > 0 ? &stream_opts : nullptr);
+    } else if (reference_audio.empty()) {
         fprintf(stderr, "Synthesizing: \"%s\"\n", text.c_str());
         if (streaming_batch_size > 0) {
             result = tts.synthesize(text, params, &stream_opts);
