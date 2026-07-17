@@ -590,6 +590,28 @@ std::string server_state_file_path(const std::string & dir, const char * tag);
 // prepare `dir` for state spilling: create it and remove stale spill files from previous runs
 bool server_state_dir_init(const std::string & dir);
 
+struct server_prompt {
+    server_tokens tokens;
+
+    std::list<common_prompt_checkpoint> checkpoints;
+
+    void clear() {
+        tokens.clear();
+        checkpoints.clear();
+    }
+
+    int n_tokens() const {
+        return tokens.size();
+    }
+
+    server_prompt clone() const {
+        return server_prompt {
+            tokens.clone(),
+            checkpoints,
+        };
+    }
+};
+
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
@@ -608,35 +630,18 @@ struct server_prompt_data {
     }
 };
 
-struct server_prompt {
-    server_tokens tokens;
-
+struct server_prompt_cache_state {
+    server_prompt prompt;
     server_prompt_data data;
 
-    std::list<common_prompt_checkpoint> checkpoints;
-
     size_t size() const {
-        size_t res = 0;
+        size_t res = data.size();
 
-        res += data.size();
-
-        for (const auto & ckpt : checkpoints) {
+        for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
         }
 
         return res;
-    }
-
-    int n_tokens() const {
-        return tokens.size();
-    }
-
-    server_prompt clone() const {
-        return server_prompt {
-            tokens.clone(),
-            data,
-            checkpoints,
-        };
     }
 };
 
@@ -652,7 +657,7 @@ struct server_prompt_cache {
         this->disk_dir     = disk_dir;
     }
 
-    std::list<server_prompt> states;
+    std::list<server_prompt_cache_state> states;
 
     // when non-empty, cache states are streamed to files in this directory instead of RAM
     std::string disk_dir;
@@ -671,7 +676,7 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
