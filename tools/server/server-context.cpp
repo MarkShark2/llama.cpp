@@ -1098,9 +1098,18 @@ private:
                 }
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
                 GGML_ASSERT(!params_base.fit_params_target.empty());
+                // fit_params_target is indexed by position in the device list used for fitting,
+                // not by global backend device index; devices outside the list (e.g. CPU with
+                // --no-mmproj-offload) are not fitted and get no reservation
+                std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+                if (tgt_devices.empty()) {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        tgt_devices.push_back(ggml_backend_dev_get(i));
+                    }
+                }
                 for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
+                    for (size_t i = 0; i < tgt_devices.size(); i++) {
+                        if (tgt_devices[i] == dev) {
                             if (i < params_base.fit_params_target.size()) {
                                 SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                 params_base.fit_params_target[i] += size;
