@@ -977,15 +977,64 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
     return gf;
 }
 
+// Chunk size (in code frames) for one-shot decode. The one-shot graph's
+// activation memory scales with n_frames, so a whole 30s utterance is a
+// multi-GB Vulkan/GTT compute buffer that ggml_backend_sched reserves and
+// never releases -- on the shared-memory APU that ratchets the process
+// footprint up until the memory guard kills it. Decoding in fixed-size
+// chunks bounds that buffer to a constant regardless of utterance length.
+// Env-tunable so it can be adjusted without a rebuild; 0 (or negative)
+// forces the old unbounded single-graph path.
+static int32_t decode_batch_frames() {
+    static int32_t cached = []() {
+        const char * e = std::getenv("QWEN3_TTS_DECODE_BATCH");
+        int32_t v = (e && *e) ? atoi(e) : 50;
+        fprintf(stderr, "  decode batch: %d frames%s\n", v,
+                v <= 0 ? " (one-shot, unbounded memory)" : "");
+        return v;
+    }();
+    return cached;
+}
+
 bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
                                     std::vector<float> & samples) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
     }
-    
+
+    // Short inputs decode in one graph (no chunking overhead); long inputs go
+    // through the streaming path in batches. The header guarantees chunked
+    // streaming is bit-identical to a single-shot decode, so this only bounds
+    // peak memory -- it does not change the audio.
+    const int32_t batch = decode_batch_frames();
+    if (batch <= 0 || n_frames <= batch) {
+        return decode_oneshot(codes, n_frames, samples);
+    }
+
+    samples.clear();
+    stream_reset();
+    const int n_cb = model_.config.n_codebooks;
+    for (int32_t off = 0; off < n_frames; off += batch) {
+        const int32_t chunk = std::min(batch, n_frames - off);
+        if (!stream_decode(codes + (size_t)off * n_cb, chunk, samples)) {
+            stream_reset();
+            return false;
+        }
+    }
+    stream_reset();
+    return true;
+}
+
+bool AudioTokenizerDecoder::decode_oneshot(const int32_t * codes, int32_t n_frames,
+                                    std::vector<float> & samples) {
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+
     const auto & cfg = model_.config;
-    
+
     codes_buf_.resize(n_frames * cfg.n_codebooks);
     for (int f = 0; f < n_frames; ++f) {
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
