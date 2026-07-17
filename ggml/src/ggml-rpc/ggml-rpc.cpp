@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <optional>
@@ -327,6 +328,16 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC client-side implementation
 
+// When enabled, large tensor uploads are hashed and offered to the server's
+// local tensor cache (SET_TENSOR_HASH). The server only writes new cache
+// entries for uploads that went through this path, so this flag effectively
+// controls per-client whether the model gets cached on the server.
+static std::atomic<bool> g_rpc_client_cache{false};
+
+void ggml_backend_rpc_set_client_cache(bool enabled) {
+    g_rpc_client_cache.store(enabled, std::memory_order_relaxed);
+}
+
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
@@ -493,7 +504,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    if (size > HASH_THRESHOLD && g_rpc_client_cache.load(std::memory_order_relaxed)) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
@@ -877,10 +888,57 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 // RPC server-side implementation
 
+// Evict least recently used cache entries until the directory fits within
+// limit bytes. Entry mtimes double as the LRU clock: get_cached_file bumps
+// the mtime of every entry it serves.
+static void rpc_cache_enforce_limit(const char * cache_dir, size_t limit) {
+    if (cache_dir == nullptr || limit == 0) {
+        return;
+    }
+    struct cache_entry {
+        fs::path                path;
+        size_t                  size;
+        fs::file_time_type      mtime;
+    };
+    std::vector<cache_entry> entries;
+    size_t total = 0;
+    std::error_code ec;
+    for (const auto & it : fs::directory_iterator(cache_dir, ec)) {
+        if (!it.is_regular_file(ec)) {
+            continue;
+        }
+        size_t size = it.file_size(ec);
+        if (ec) {
+            continue;
+        }
+        auto mtime = it.last_write_time(ec);
+        if (ec) {
+            continue;
+        }
+        entries.push_back({it.path(), size, mtime});
+        total += size;
+    }
+    if (total <= limit) {
+        return;
+    }
+    std::sort(entries.begin(), entries.end(), [](const cache_entry & a, const cache_entry & b) {
+        return a.mtime < b.mtime;
+    });
+    for (const auto & entry : entries) {
+        if (total <= limit) {
+            break;
+        }
+        if (fs::remove(entry.path, ec)) {
+            total -= entry.size;
+            GGML_LOG_INFO("[%s] evicted '%s' (%zu bytes)\n", __func__, entry.path.string().c_str(), entry.size);
+        }
+    }
+}
+
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, size_t cache_limit)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), cache_limit(cache_limit) {
         stored_graphs.resize(backends.size());
     }
     ~rpc_server();
@@ -918,6 +976,13 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    size_t cache_limit;
+    // set on a SET_TENSOR_HASH cache miss; the client's follow-up SET_TENSOR
+    // for the same tensor region is the only upload that gets cached. Clients
+    // that never offer hashes never grow the cache.
+    bool       cache_pending = false;
+    rpc_tensor cache_pending_tensor = {};
+    uint64_t   cache_pending_offset = 0;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
@@ -1153,7 +1218,12 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
+    // only cache uploads the client offered a hash for first (see cache_pending)
+    const bool cache_this = cache_pending
+        && memcmp(&cache_pending_tensor, in_tensor, sizeof(rpc_tensor)) == 0
+        && cache_pending_offset == offset;
+    cache_pending = false;
+    if (cache_dir && cache_this && size > HASH_THRESHOLD) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
@@ -1162,6 +1232,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         std::ofstream ofs(cache_file, std::ios::binary);
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        rpc_cache_enforce_limit(cache_dir, cache_limit);
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -1184,6 +1255,8 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     ifs.seekg(0, std::ios::beg);
     data.resize(size);
     ifs.read((char *)data.data(), size);
+    // bump the mtime so LRU eviction sees this entry as recently used
+    fs::last_write_time(cache_file, fs::file_time_type::clock::now(), ec);
     return true;
 }
 
@@ -1191,6 +1264,11 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 {
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
+        // cache miss: the client will follow up with a full SET_TENSOR for
+        // this region - mark it as eligible for caching
+        cache_pending        = true;
+        cache_pending_tensor = request.tensor;
+        cache_pending_offset = request.offset;
         response.result = 0;
         return true;
     }
@@ -1502,8 +1580,8 @@ rpc_server::~rpc_server() {
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             size_t cache_limit, socket_ptr sock) {
+    rpc_server server(backends, cache_dir, cache_limit);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -1768,7 +1846,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir, size_t cache_limit,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
@@ -1781,6 +1859,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    if (cache_dir && cache_limit > 0) {
+        printf("  cache limit    : %zu MiB\n", cache_limit / (1024 * 1024));
+        rpc_cache_enforce_limit(cache_dir, cache_limit);
+    }
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
@@ -1837,7 +1919,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         std::string peer = client_socket->peer_str();
         printf("[%s] accepted connection from %s\n", ts, peer.c_str());
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, cache_limit, client_socket);
         {
             time_t now = time(nullptr);
             strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
@@ -1972,6 +2054,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_client_cache") == 0) {
+        return (void *)ggml_backend_rpc_set_client_cache;
     }
     return NULL;
 

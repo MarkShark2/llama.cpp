@@ -24,7 +24,13 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
-GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+// opt this client in to server-side tensor caching: only then are large tensors
+// hashed and offered to the server's local cache (server must run with -c)
+GGML_BACKEND_API void ggml_backend_rpc_set_client_cache(bool enabled);
+
+// cache_limit caps the total size in bytes of the cache_dir contents; least
+// recently used entries are evicted when the cap is exceeded (0 = unlimited)
+GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir, size_t cache_limit,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
