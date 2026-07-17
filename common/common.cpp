@@ -1559,6 +1559,18 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
+
+    // embedded-MTP speculative decoding (spec-type draft-mtp without a separate draft model)
+    // reuses the target model's nextn layers and output head. pin them to the first
+    // --device-draft device so drafting does not round-trip the whole pipeline split
+    {
+        const bool spec_mtp = std::find(params.speculative.types.begin(),
+                                        params.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (spec_mtp && !params.speculative.has_dft() && !params.speculative.draft.devices.empty()) {
+            mparams.mtp_dev = params.speculative.draft.devices[0];
+        }
+    }
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;

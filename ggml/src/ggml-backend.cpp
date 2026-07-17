@@ -820,6 +820,14 @@ struct ggml_backend_sched {
 
     int debug;
 
+    // per-backend split wall time, printed every 5s when GGML_SCHED_TIMING=1 [fork]
+    // note: when enabled, each split is synchronized after compute so the time is
+    // attributed to the backend that did the work instead of the next split's input copy
+    int     timing;
+    int64_t timing_t_split[GGML_SCHED_MAX_BACKENDS];
+    int64_t timing_n_graph;
+    int64_t timing_t_print;
+
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
@@ -1551,6 +1559,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        const int64_t t_split_start = sched->timing ? ggml_time_us() : 0;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1719,6 +1729,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+
+        if (sched->timing) {
+            ggml_backend_synchronize(split_backend);
+            sched->timing_t_split[split_backend_id] += ggml_time_us() - t_split_start;
+        }
+    }
+
+    if (sched->timing) {
+        sched->timing_n_graph++;
+
+        const int64_t t_now = ggml_time_us();
+        if (t_now - sched->timing_t_print > 5*1000*1000) {
+            sched->timing_t_print = t_now;
+
+            char buf[1024];
+            size_t off = 0;
+            for (int i = 0; i < sched->n_backends && off < sizeof(buf) - 64; i++) {
+                if (sched->timing_t_split[i] == 0) {
+                    continue;
+                }
+                off += snprintf(buf + off, sizeof(buf) - off, "%s%s %.2f ms",
+                        off > 0 ? " | " : "",
+                        ggml_backend_name(sched->backends[i]),
+                        (double) sched->timing_t_split[i] / 1000.0 / (double) sched->timing_n_graph);
+                sched->timing_t_split[i] = 0;
+            }
+            GGML_LOG_INFO("sched timing (avg per graph, %lld graphs): %s\n", (long long) sched->timing_n_graph, buf);
+            sched->timing_n_graph = 0;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1739,6 +1778,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+
+    const char * GGML_SCHED_TIMING = getenv("GGML_SCHED_TIMING");
+    sched->timing = GGML_SCHED_TIMING ? atoi(GGML_SCHED_TIMING) : 0;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
