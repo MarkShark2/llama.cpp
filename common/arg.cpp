@@ -962,6 +962,20 @@ static void add_rpc_devices(const std::string & servers) {
     }
 }
 
+static void set_rpc_client_cache(bool enabled) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    typedef void (*ggml_backend_rpc_set_client_cache_t)(bool enabled);
+    auto set_client_cache_fn = (ggml_backend_rpc_set_client_cache_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_set_client_cache");
+    if (!set_client_cache_fn) {
+        throw std::invalid_argument("failed to find RPC set client cache function");
+    }
+    set_client_cache_fn(enabled);
+}
+
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
     common_params dummy_params;
     common_params_context ctx_arg = common_params_parser_init(dummy_params, ex, nullptr);
@@ -2412,6 +2426,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 GGML_UNUSED(params);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--rpc-cache"},
+            "ask RPC servers to keep this model's tensors in their local file cache "
+            "(only servers started with -c honor this; default: disabled)",
+            [](common_params & params) {
+                set_rpc_client_cache(true);
+                GGML_UNUSED(params);
+            }
+        ).set_env("LLAMA_ARG_RPC_CACHE"));
     }
     add_opt(common_arg(
         {"--mlock"},

@@ -11,6 +11,7 @@
 #  include <sys/stat.h>
 #endif
 #include <algorithm>
+#include <cctype>
 #include <clocale>
 #include <codecvt>
 #include <filesystem>
@@ -173,9 +174,39 @@ struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
+    size_t                   cache_limit = 0; // bytes, 0 = unlimited
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
+
+// parse a size string like "20G", "512M" or a plain number of MiB
+static bool parse_size_arg(const std::string & arg, size_t & out) {
+    if (arg.empty()) {
+        return false;
+    }
+    size_t pos = 0;
+    unsigned long long value;
+    try {
+        value = std::stoull(arg, &pos);
+    } catch (const std::exception &) {
+        return false;
+    }
+    size_t multiplier = 1024ull * 1024ull; // default MiB
+    if (pos < arg.size()) {
+        if (pos + 1 != arg.size()) {
+            return false;
+        }
+        switch (toupper(arg[pos])) {
+            case 'K': multiplier = 1024ull; break;
+            case 'M': multiplier = 1024ull * 1024ull; break;
+            case 'G': multiplier = 1024ull * 1024ull * 1024ull; break;
+            case 'T': multiplier = 1024ull * 1024ull * 1024ull * 1024ull; break;
+            default:  return false;
+        }
+    }
+    out = (size_t)value * multiplier;
+    return true;
+}
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "Usage: %s [options]\n\n", argv[0]);
@@ -186,6 +217,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  --cache-limit SIZE               evict least recently used cache entries above SIZE\n");
+    fprintf(stderr, "                                   (plain number = MiB, or K/M/G/T suffix; default: unlimited)\n");
     fprintf(stderr, "\n");
 }
 
@@ -233,6 +266,14 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--cache-limit") {
+            if (++i >= argc) {
+                return false;
+            }
+            if (!parse_size_arg(argv[i], params.cache_limit)) {
+                fprintf(stderr, "error: invalid cache limit: %s\n", argv[i]);
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -337,6 +378,6 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.cache_limit, params.n_threads, devices.size(), devices.data());
     return 0;
 }
