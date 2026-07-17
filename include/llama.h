@@ -296,6 +296,11 @@ extern "C" {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
 
+        // optional device override for the MTP/nextn draft layers and the output head (NULL = follow the layer split).
+        // useful with embedded-MTP speculative decoding over slow interconnects: keeps every draft step and the
+        // logits matmul on a fast local device instead of the last device of the pipeline split
+        ggml_backend_dev_t mtp_dev;
+
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 

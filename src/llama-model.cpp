@@ -1288,10 +1288,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
+    // optional override: pin the MTP/nextn draft layers and the output head to a chosen device.
+    // trailing blocks (il >= n_layer) and the output head otherwise land on the last device of the
+    // split, which puts every MTP draft step and the logits matmul behind the full RPC pipeline
+    ggml_backend_dev_t mtp_dev = params.mtp_dev;
+    if (mtp_dev != nullptr && pimpl->gpu_buft_list.find(mtp_dev) == pimpl->gpu_buft_list.end()) {
+        LLAMA_LOG_WARN("load_tensors: mtp_dev %s is not in the device list, ignoring the MTP placement override\n",
+                ggml_backend_dev_name(mtp_dev));
+        mtp_dev = nullptr;
+    }
+    if (mtp_dev != nullptr) {
+        LLAMA_LOG_INFO("load_tensors: placing MTP/nextn layers (%d..%d) and the output head on %s\n",
+                (int) hparams.n_layer(), n_layer_all - 1, ggml_backend_dev_name(mtp_dev));
+    }
+
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
-    auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+    auto get_layer_buft_list = [&, mtp_dev](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (mtp_dev != nullptr && il >= (int) hparams.n_layer()) {
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s (mtp_dev override), is_swa = %d\n", il, ggml_backend_dev_name(mtp_dev), is_swa);
+            return {mtp_dev, &pimpl->gpu_buft_list.at(mtp_dev)};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -2300,6 +2318,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 llama_model_params llama_model_default_params() {
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
+        /*.mtp_dev                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
