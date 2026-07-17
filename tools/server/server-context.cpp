@@ -2687,8 +2687,22 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
-#ifdef DEBUG_TIMINGS
+
+    // speculative phase timings, printed every 5s when LLAMA_SERVER_TIMINGS=1 [fork]
+    int64_t t_spec_draft = 0;
+    int64_t t_spec_verif = 0;
+    int64_t t_spec_submt = 0; // llama_decode() call only, without the final synchronize
+    int64_t t_spec_procs = 0;
+    int64_t n_spec_draft = 0;
+    int64_t n_spec_verif = 0;
+    int64_t n_spec_submt = 0;
+    int64_t n_spec_procs = 0;
+
+    static bool timings_enabled() {
+        static const bool on = std::getenv("LLAMA_SERVER_TIMINGS") != nullptr;
+        return on;
+    }
+
     struct scoped_timer {
         int64_t & t;
         int64_t & n;
@@ -2701,26 +2715,25 @@ private:
             n++;
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     void update_slots() {
-#ifdef DEBUG_TIMINGS
-        static int64_t t_prev = 0;
-        int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
-            t_prev = t_start;
-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+        if (timings_enabled()) {
+            static int64_t t_prev = 0;
+            const int64_t t_start = ggml_time_us();
+            if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+                t_prev = t_start;
+                auto avg = [](int64_t t, int64_t n) { return n > 0 ? (double) t / (double) n / 1000.0 : 0.0; };
+                SRV_INF("timings (avg ms/call): draft %7.2f (n=%" PRId64 ") | verify %7.2f (n=%" PRId64 ", submit %7.2f) | spec_proc %7.2f | sample %7.2f | pre %7.2f | decode %7.2f | post %7.2f\n",
+                        avg(t_spec_draft, n_spec_draft), n_spec_draft,
+                        avg(t_spec_verif, n_spec_verif), n_spec_verif,
+                        avg(t_spec_submt, n_spec_submt),
+                        avg(t_spec_procs, n_spec_procs),
+                        avg(t_sampl,      n_sampl),
+                        avg(t_pre_decode, n_pre_decode),
+                        avg(t_decode,     n_decode),
+                        avg(t_post_decode, n_post_decode));
+            }
         }
-#endif
 
         // check if all slots are idle
         {
@@ -2766,9 +2779,6 @@ private:
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
-#ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
-#endif
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
@@ -2939,6 +2949,7 @@ private:
 
         // generate the actual drafts (if any)
         {
+            scoped_timer timer(t_spec_draft, n_spec_draft);
             common_speculative_draft(spec.get());
         }
 
@@ -3564,7 +3575,18 @@ private:
             n_empty_consecutive = 0;
         }
 
-        const int ret = llama_decode(ctx_tgt, batch_view);
+        int ret;
+        {
+            scoped_timer timer(t_spec_verif, n_spec_verif);
+            {
+                scoped_timer timer_submit(t_spec_submt, n_spec_submt);
+                ret = llama_decode(ctx_tgt, batch_view);
+            }
+            if (timings_enabled()) {
+                // make the timing reflect the full pipeline pass, not just graph submission
+                llama_synchronize(ctx_tgt);
+            }
+        }
 
         metrics.on_decoded(slots);
 
@@ -3621,11 +3643,14 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
-            SRV_ERR("%s", "failed to process speculative batch\n");
+        {
+            scoped_timer timer(t_spec_procs, n_spec_procs);
+            if (!common_speculative_process(spec.get(), batch_view)) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
 
-            // TODO: handle error
-            throw std::runtime_error("failed to process speculative batch");
+                // TODO: handle error
+                throw std::runtime_error("failed to process speculative batch");
+            }
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
