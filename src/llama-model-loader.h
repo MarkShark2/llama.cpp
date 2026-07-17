@@ -14,8 +14,10 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+using llama_ctx_buf_maps = std::vector<std::pair<ggml_context *, llama_buf_map>>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -81,6 +83,7 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -102,6 +105,7 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    std::unordered_set<const ggml_tensor *> rpc_preloaded;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -197,6 +201,15 @@ struct llama_model_loader {
     bool load_all_data(
             struct ggml_context * ctx,
             llama_buf_map & bufs,
+            llama_mlocks * lmlocks,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data);
+
+    // Loads independent RPC devices concurrently. Cache-manifest hits are
+    // resolved before reading GGUF payloads; non-RPC contexts continue loading
+    // on the calling thread while the remote workers run.
+    bool load_all_data_parallel(
+            llama_ctx_buf_maps & ctx_buf_maps,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
