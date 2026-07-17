@@ -338,6 +338,14 @@ void ggml_backend_rpc_set_client_cache(bool enabled) {
     g_rpc_client_cache.store(enabled, std::memory_order_relaxed);
 }
 
+bool ggml_backend_rpc_get_client_cache(void) {
+    return g_rpc_client_cache.load(std::memory_order_relaxed);
+}
+
+size_t ggml_backend_rpc_cache_threshold(void) {
+    return HASH_THRESHOLD;
+}
+
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
@@ -501,30 +509,51 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static bool rpc_buffer_set_tensor_raw(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD && g_rpc_client_cache.load(std::memory_order_relaxed)) {
-        rpc_msg_set_tensor_hash_req request;
-        request.tensor = rpc_tensor;
-        request.offset = offset;
-        request.hash = fnv_hash((const uint8_t*)data, size);
-        rpc_msg_set_tensor_hash_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
-        if (response.result) {
-            // the server has the same data, no need to send it
-            return;
-        }
-    }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
     std::vector<uint8_t> input(input_size, 0);
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-    RPC_STATUS_ASSERT(status);
+    return send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+}
+
+int ggml_backend_rpc_buffer_cache_query(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        size_t offset, size_t size, uint64_t hash) {
+    GGML_UNUSED(size);
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
+    rpc_msg_set_tensor_hash_req request;
+    request.tensor = serialize_tensor(tensor);
+    request.offset = offset;
+    request.hash   = hash;
+    rpc_msg_set_tensor_hash_rsp response;
+    if (!send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response))) {
+        return -1;
+    }
+    return response.result ? 1 : 0;
+}
+
+bool ggml_backend_rpc_buffer_cache_upload(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    return rpc_buffer_set_tensor_raw(buffer, tensor, data, offset, size);
+}
+
+static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (size > HASH_THRESHOLD && g_rpc_client_cache.load(std::memory_order_relaxed)) {
+        int result = ggml_backend_rpc_buffer_cache_query(buffer, tensor, offset, size, fnv_hash((const uint8_t *) data, size));
+        RPC_STATUS_ASSERT(result >= 0);
+        if (result > 0) {
+            return;
+        }
+    }
+    RPC_STATUS_ASSERT(rpc_buffer_set_tensor_raw(buffer, tensor, data, offset, size));
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -983,6 +1012,11 @@ private:
     bool       cache_pending = false;
     rpc_tensor cache_pending_tensor = {};
     uint64_t   cache_pending_offset = 0;
+    uint64_t   cache_pending_hash   = 0;
+    size_t     cache_hits           = 0;
+    size_t     cache_misses         = 0;
+    size_t     cache_hit_bytes      = 0;
+    size_t     cache_upload_bytes   = 0;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
@@ -1224,15 +1258,15 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         && cache_pending_offset == offset;
     cache_pending = false;
     if (cache_dir && cache_this && size > HASH_THRESHOLD) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
-        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, cache_pending_hash);
         // save to cache_dir/hash_str
         fs::path cache_file = fs::path(cache_dir) / hash_str;
         std::ofstream ofs(cache_file, std::ios::binary);
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
         rpc_cache_enforce_limit(cache_dir, cache_limit);
+        cache_upload_bytes += size;
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -1262,6 +1296,7 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
+    cache_pending = false;
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
         // cache miss: the client will follow up with a full SET_TENSOR for
@@ -1269,6 +1304,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         cache_pending        = true;
         cache_pending_tensor = request.tensor;
         cache_pending_offset = request.offset;
+        cache_pending_hash   = request.hash;
+        cache_misses++;
         response.result = 0;
         return true;
     }
@@ -1303,6 +1340,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         }
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    cache_hits++;
+    cache_hit_bytes += size;
     response.result = 1;
     return true;
 }
@@ -1574,6 +1613,11 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    if (cache_hits > 0 || cache_misses > 0) {
+        GGML_LOG_INFO("[rpc_cache] hits=%zu (%.2f GiB), misses=%zu, uploaded=%.2f GiB\n",
+                cache_hits, cache_hit_bytes / double(1024ull * 1024ull * 1024ull),
+                cache_misses, cache_upload_bytes / double(1024ull * 1024ull * 1024ull));
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2057,6 +2101,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_set_client_cache") == 0) {
         return (void *)ggml_backend_rpc_set_client_cache;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_get_client_cache") == 0) {
+        return (void *)ggml_backend_rpc_get_client_cache;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_cache_threshold") == 0) {
+        return (void *)ggml_backend_rpc_cache_threshold;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_cache_query") == 0) {
+        return (void *)ggml_backend_rpc_buffer_cache_query;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_cache_upload") == 0) {
+        return (void *)ggml_backend_rpc_buffer_cache_upload;
     }
     return NULL;
 

@@ -1661,11 +1661,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
+    // load tensor data; independent RPC devices can populate concurrently
+    if (!ml.load_all_data_parallel(ctx_buf_maps, use_mlock ? &pimpl->mlock_mmaps : NULL,
+                params.progress_callback, params.progress_callback_user_data)) {
+        return false;
     }
 
     if (use_mmap_buffer) {

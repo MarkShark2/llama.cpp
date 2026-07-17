@@ -28,6 +28,19 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 // hashed and offered to the server's local cache (server must run with -c)
 GGML_BACKEND_API void ggml_backend_rpc_set_client_cache(bool enabled);
 
+// Helpers for model loaders that can identify a cached tensor before reading
+// its payload. cache_query returns 1 for a hit, 0 for a miss, and -1 for a
+// transport error. After a miss, cache_upload sends the payload without a
+// second hash or query.
+GGML_BACKEND_API bool   ggml_backend_rpc_get_client_cache(void);
+GGML_BACKEND_API size_t ggml_backend_rpc_cache_threshold(void);
+GGML_BACKEND_API int    ggml_backend_rpc_buffer_cache_query(
+        ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+        size_t offset, size_t size, uint64_t hash);
+GGML_BACKEND_API bool   ggml_backend_rpc_buffer_cache_upload(
+        ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size);
+
 // cache_limit caps the total size in bytes of the cache_dir contents; least
 // recently used entries are evicted when the cap is exceeded (0 = unlimited)
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir, size_t cache_limit,
