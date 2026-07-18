@@ -268,6 +268,31 @@ is now the production mode for House serving (launch script `-Stage2 1`). Remain
 floor: the ~80 ms lane pipeline (≈ (n_stages + n_tokens − 1) × stage time) — next
 levers are draft-step overlap and sibling-branch lanes (see above).
 
+## Deferred verify group — draft overlap (2026-07-18, commit 70b0dda1e)
+
+`GGML_PIPEDEC_DEFER=1` (requires STAGE2): before running the MTP draft, the server
+submits the sampled token's stage-2 lane as a *deferred group member*
+(`llama_pipedec_defer` + a 1-token `llama_decode`: lanes submitted, no drain, no
+head). The MTP draft steps then overlap that lane's 6-stage walk. The iteration's
+regular decode carries only the draft tokens and *closes* the group: one drain, one
+LM head over all group rows, logits indexed by group row (identity output mapping;
+`spec_i_batch` holds group rows). Fork API: `llama_pipedec_defer/abort/group_n` in
+`llama-ext.h`. Stage-2 hidden rows always land in the fixed-capacity
+`pipedec_group_h` buffer (deferred GETs snapshot their destination address) and are
+copied into `embd_nextn` at close.
+
+Safety rails: empty draft → `llama_pipedec_abort` + `seq_rm` of the deferred row +
+combined fallback; deferral only fires when the pass's batch will contain nothing
+but the drafting slot's tokens (one generating+drafting slot, all others IDLE —
+n_parallel auto-defaults to 4 slots); `release()` aborts any open group; a
+non-eligible decode with a group open aborts it defensively.
+
+Measured (same prompt, temp 0): output **bit-identical** in all modes; 21.0 →
+**21.6 t/s**. The draft's serial 7-8 ms moves into the pipeline shadow (its wall
+time grows to ~14 ms from CUDA0-stream contention with lane 0 but is overlapped).
+The decode-without-drain + group-close machinery is the foundation for
+cross-iteration overlap.
+
 ## Later — dynamic prediction tree + pruning + tree attention
 
 The paper's accuracy machinery: keep all stages fed with tokens likely to survive
