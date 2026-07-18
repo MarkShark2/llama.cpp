@@ -225,6 +225,27 @@ ships OFF; the machinery is the foundation for the real pipeline.
   **decode 13.8-15.6 t/s** at 55-85 % MTP acceptance (was 9.7 stock). This placement is
   the new baseline every pipelining experiment must beat.
 
+## Design-deciding measurements (2026-07-18, 6-stage no-spill config)
+
+- Per-iteration: draft 13.4 + **verify 146.2** (submit 5, rest = drain) + spec_proc 12.7 +
+  sample 8.1 + pre 13.7 ≈ 194 ms for 2.82 tokens/iter.
+- **Width is NOT free**: batched-bench per-forward latency at widths 1/2/4/8/16 =
+  62/113/139/272/642 ms. MoE expert streaming scales with tokens — the BC-250 stages are
+  expert-streaming-bound. Wide (batched) tree levels are therefore expensive; STPP-style
+  trees lose as batches. (Gotcha: step35 `chain_heads` clamps `n_max` to its 3 MTP heads —
+  a `--spec-draft-n-max 8` run still drafts 3.)
+- **Top-K probe** (always-on, logs `spec tree probe` every 32 rejections): at rejections the
+  target's token is in the draft's top-2 ~40-46 %, top-3 ~53-58 % → a K=3 sibling level
+  lifts per-level acceptance 0.56 → ~0.8. The uplift is real if width can be made cheap.
+- **Stage-2 lanes are vindicated on graph time**: 105 ms body drain + 11 ms head beats the
+  ~135-146 ms batched verify — stage overlap dodges the expert-streaming width cost. The
+  7.7 t/s regression was pure overhead (spec_proc 43 ms vs 12.7, per-lane syncs).
+
+Next: (1) fix stage-2 overheads (spec_proc / lane-sync granularity) → ~16.5 t/s projected;
+(2) pipeline the MTP draft steps into the lane pipeline; (3) add K=2-3 first-level sibling
+branches as *extra lanes* (width via pipeline, not batch), with tree attention via scratch
+seq-ids (branch in own seq, prefix seq_cp'd in, accepted branch seq_cp'd back).
+
 ## Later — dynamic prediction tree + pruning + tree attention
 
 The paper's accuracy machinery: keep all stages fed with tokens likely to survive
