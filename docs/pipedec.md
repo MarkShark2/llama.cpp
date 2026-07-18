@@ -68,6 +68,14 @@ the async RPC backend from Phase 1 remain, all env-gated / off by default.)
 Keep `--fit`'s exact placement and **serial-sized** per-device compute buffers (NO
 `n_copies`). Get stage overlap from the Phase-1 per-endpoint async streams.
 
+Use `--fit-whole-layers` with `--fit on` for PipeDec profiles. It keeps fit dynamic—model
+metadata, context size, current free memory, and per-device `--fit-target` margins are still
+probed at every load—but treats MoE layers as indivisible. The result is a contiguous tensor
+split with no per-tensor/CPU expert overrides, avoiding the cross-stage expert traffic that
+previous fit output introduced. PipeDec also suppresses llama.cpp's built-in four-copy
+pipeline scheduler automatically, because a clean tensor split no longer has overrides that
+would otherwise disable that scheduler heuristic.
+
 Key memory insight: each device (client CUDA0 + each RPC node) owns its own compute buffer.
 If micro-batches are pipelined so that at any instant each device is working on a *different*
 micro-batch, each device only ever holds **one** micro-batch's working set = the serial fit
