@@ -483,6 +483,12 @@ struct rpc_stream {
     std::deque<std::function<void()>> tasks;
     uint64_t submitted = 0;
     uint64_t completed = 0;
+    // barrier bookkeeping: a synchronize() only needs the server round-trip ping
+    // when work was enqueued after the last completed ping. dirty_seq = submitted
+    // index of the newest task needing a barrier; barrier_seq = highest submitted
+    // index known to be server-drained.
+    uint64_t dirty_seq   = 0;
+    uint64_t barrier_seq = 0;
     bool stop = false;
 
     explicit rpc_stream(std::string ep) : endpoint(std::move(ep)) {
@@ -504,7 +510,30 @@ struct rpc_stream {
         std::lock_guard<std::mutex> l(m);
         tasks.push_back(std::move(fn));
         submitted++;
+        dirty_seq = submitted;
         cv.notify_one();
+    }
+
+    // enqueue a barrier ping; returns the submitted index it covers. Does NOT
+    // mark the stream dirty (the ping itself needs no later barrier).
+    uint64_t enqueue_barrier(std::function<void()> fn) {
+        std::lock_guard<std::mutex> l(m);
+        tasks.push_back(std::move(fn));
+        submitted++;
+        cv.notify_one();
+        return submitted;
+    }
+
+    bool needs_barrier() {
+        std::lock_guard<std::mutex> l(m);
+        return dirty_seq > barrier_seq;
+    }
+
+    void mark_barrier(uint64_t covered) {
+        std::lock_guard<std::mutex> l(m);
+        if (covered > barrier_seq) {
+            barrier_seq = covered;
+        }
     }
 
     // Run a response-bearing operation in FIFO order on this endpoint. The
@@ -922,9 +951,18 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     const uint32_t device = rpc_ctx->device;
     rpc_stream * stream = get_stream(endpoint);
     // make sure the server has drained every in-order command (incl. the last
-    // fire-and-forget GRAPH_COMPUTE), then wait for all worker tasks to finish
-    stream->enqueue([endpoint, device]{ rpc_ping(endpoint, device); });
-    stream->drain();
+    // fire-and-forget GRAPH_COMPUTE), then wait for all worker tasks to finish.
+    // when nothing was enqueued since the last completed ping the socket is
+    // quiescent and the round-trip is skipped - llama_context::synchronize()
+    // fires per sched x per backend and would otherwise storm the LAN with
+    // redundant pings (the dominant stage-2 spec_proc overhead).
+    if (stream->needs_barrier()) {
+        const uint64_t covered = stream->enqueue_barrier([endpoint, device]{ rpc_ping(endpoint, device); });
+        stream->drain();
+        stream->mark_barrier(covered);
+    } else {
+        stream->drain();
+    }
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
