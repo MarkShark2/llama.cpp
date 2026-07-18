@@ -246,6 +246,28 @@ Next: (1) fix stage-2 overheads (spec_proc / lane-sync granularity) → ~16.5 t/
 branches as *extra lanes* (width via pipeline, not batch), with tree attention via scratch
 seq-ids (branch in own seq, prefix seq_cp'd in, accepted branch seq_cp'd back).
 
+## The ping-storm fix (2026-07-18, commit a09fcbcfd) — stage 2 becomes the fast path
+
+The stage-2 "overhead" was almost entirely **redundant RPC barrier pings**:
+`ggml_backend_rpc_synchronize` always did a GET_ALIGNMENT round-trip;
+`llama_context::synchronize()` fires it per sched × per backend (~10 scheds under
+stage 2), and every logits/embeddings accessor triggers a context synchronize.
+`rpc_stream` now tracks `dirty_seq` (newest enqueued task) vs `barrier_seq` (covered
+by the last completed ping) and skips the round-trip on quiescent streams.
+
+Same prompt, same ~53 % acceptance, measured end-to-end:
+
+| mode | before | after | per-iter after |
+|---|---:|---:|---|
+| stage-2 lanes | 7.7 t/s | **21.9 t/s** | draft 7.7 + verify 116.8 (drain ~80, head ~11) + spec_proc 3.1 + sample 0.4 + pre 8.1 ≈ 136 ms |
+| batched verify | 13.8 t/s | 18.6 t/s | verify ~136 ms dominates |
+
+spec_proc 43 → 3.1 ms, sample 8 → 0.4 ms. The lanes beat the batched graph by ~17 %,
+exactly the body-drain vs batched-walk gap measured earlier. `GGML_PIPEDEC_STAGE2=1`
+is now the production mode for House serving (launch script `-Stage2 1`). Remaining
+floor: the ~80 ms lane pipeline (≈ (n_stages + n_tokens − 1) × stage time) — next
+levers are draft-step overlap and sibling-branch lanes (see above).
+
 ## Later — dynamic prediction tree + pruning + tree attention
 
 The paper's accuracy machinery: keep all stages fed with tokens likely to survive
