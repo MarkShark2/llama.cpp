@@ -3901,6 +3901,34 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // [fork, PipeDec probe] when the top-1 draft chain is rejected, count how
+                // often the target's actual token was among the draft sampler's top-K
+                // candidates at that level - the acceptance a K-wide tree level would get.
+                if (accepted.size() - 1 < n_draft) {
+                    static size_t p_rej = 0, p_top2 = 0, p_top3 = 0, p_top8 = 0, p_lvl[8] = {0};
+                    const int i_rej = (int) accepted.size() - 1;
+                    const llama_token tgt = accepted.back();
+                    if (const auto * topk = common_speculative_dbg_topk(spec.get(), slot.id, i_rej)) {
+                        p_rej++;
+                        if (i_rej < 8) {
+                            p_lvl[i_rej]++;
+                        }
+                        for (size_t k = 1; k < topk->size(); ++k) {
+                            if ((*topk)[k] == tgt) {
+                                if (k < 2) { p_top2++; }
+                                if (k < 3) { p_top3++; }
+                                p_top8++;
+                                break;
+                            }
+                        }
+                        if (p_rej % 32 == 0) {
+                            SRV_INF("spec tree probe: rejections=%zu  tgt in draft top2=%.1f%% top3=%.1f%% top8=%.1f%%  rej@lvl 0/1/2=%zu/%zu/%zu\n",
+                                    p_rej, 100.0*p_top2/p_rej, 100.0*p_top3/p_rej, 100.0*p_top8/p_rej,
+                                    p_lvl[0], p_lvl[1], p_lvl[2]);
+                        }
+                    }
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =

@@ -176,6 +176,10 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // [fork, PipeDec probe] top candidates the draft sampler saw at draft step `step`
+    // of the most recent draft() for this seq, best first. nullptr if unavailable.
+    virtual const std::vector<llama_token> * dbg_topk(llama_seq_id /*seq_id*/, int /*step*/) const { return nullptr; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1237,6 +1241,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // [fork, PipeDec probe] per seq, per draft step: the sampler's top candidates
+    // (best first) seen while drafting - lets the server measure how often a
+    // rejected top-1 draft would have been saved by a top-K sibling in a tree.
+    std::vector<std::vector<std::vector<llama_token>>> probe_topk;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1316,6 +1325,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        probe_topk.assign(n_seq, {});
+    }
+
+    const std::vector<llama_token> * dbg_topk(llama_seq_id seq_id, int step) const override {
+        if (seq_id < 0 || (size_t) seq_id >= probe_topk.size() ||
+            step < 0 || (size_t) step >= probe_topk[seq_id].size()) {
+            return nullptr;
+        }
+        return &probe_topk[seq_id][step];
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1495,6 +1514,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            probe_topk[seq_id].clear();
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1547,6 +1567,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                {
+                    auto & topk = probe_topk[seq_id].emplace_back();
+                    const int n_keep = std::min(8, (int) cur_p->size);
+                    topk.reserve(n_keep);
+                    for (int k = 0; k < n_keep; ++k) {
+                        topk.push_back(cur_p->data[k].id);
+                    }
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -2623,6 +2652,11 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+const std::vector<llama_token> * common_speculative_dbg_topk(common_speculative * spec, llama_seq_id seq_id, int step) {
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+    return impl ? impl->dbg_topk(seq_id, step) : nullptr;
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
