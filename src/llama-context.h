@@ -153,6 +153,14 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // [fork, PipeDec] deferred verify group: a decode marked deferred submits its
+    // stage-2 token lanes and returns without draining or running the LM head;
+    // the next regular stage-2 decode closes the group (one head over all rows).
+    // Lets the caller overlap MTP drafting with the first lane's pipeline walk.
+    void     pipedec_defer_mark();  // next decode() call is a deferred group member
+    void     pipedec_abort_group(); // drain + discard in-flight group rows (no head)
+    uint32_t pipedec_group_n() const { return pipedec_group_tokens; }
+
     //
     // state save/load
     //
@@ -369,6 +377,13 @@ private:
     // Avoid repeating the Stage 2 activation banner for every speculative
     // verification batch handled by this context.
     bool pipedec_stage2_reported = false;
+
+    // [fork, PipeDec] deferred verify group state. pipedec_group_h has fixed
+    // capacity (PIPEDEC_STAGE2_MAX_LANES rows) and is never resized once
+    // allocated: deferred hidden-row GETs snapshot their destination address.
+    bool               pipedec_defer_next   = false;
+    uint32_t           pipedec_group_tokens = 0;
+    std::vector<float> pipedec_group_h;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // [fork, PipeDec] llama_pipedec_defer/abort
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -175,6 +176,12 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // [fork, PipeDec] the sampled token's stage-2 lane was submitted as a
+    // deferred group member before drafting; spec_i_batch holds group row
+    // indices instead of batch indices for this iteration
+    bool      spec_deferred     = false;
+    llama_pos spec_deferred_pos = -1;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -470,6 +477,41 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
+
+        // [fork, PipeDec] deferred verify: with an empty draft no closing decode
+        // happens this iteration, so discard the in-flight deferred lane and its
+        // KV and fall back to the normal (non-deferred) paths below
+        if (spec_deferred && spec_draft.empty()) {
+            llama_pipedec_abort(ctx_tgt);
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, spec_deferred_pos, -1);
+            spec_deferred = false;
+        }
+
+        if (spec_deferred) {
+            SLT_DBG(*this, "generate_draft (deferred): id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
+                    sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
+
+            GGML_ASSERT(spec_i_batch.empty());
+
+            // group row indices: row 0 = the deferred sampled token, then drafts
+            for (size_t i = 0; i < spec_draft.size() + 1; i++) {
+                spec_i_batch.push_back((int32_t) i);
+            }
+
+            auto pos0 = prompt.tokens.pos_next(); // deferred token's pos, already decoded
+            GGML_ASSERT(pos0 == spec_deferred_pos);
+
+            for (auto token : spec_draft) {
+                add_ok &= batch.add(this->id, token, ++pos0, true);
+            }
+
+            GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
+
+            prompt.tokens.push_back(sampled);
+            prompt.tokens.insert(spec_draft);
+            return;
+        }
+
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
@@ -504,6 +546,12 @@ struct server_slot {
     }
 
     void release() {
+        // [fork, PipeDec] never leave a deferred verify group in flight
+        if (spec_deferred) {
+            llama_pipedec_abort(ctx_tgt);
+            spec_deferred = false;
+        }
+
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -3047,6 +3095,51 @@ private:
             }
         });
 
+        // [fork, PipeDec] deferred verify: submit the sampled token's stage-2 lane
+        // before drafting, so the MTP draft steps overlap its pipeline walk. The
+        // group is closed by this iteration's regular decode (drafts only).
+        iterate(slots, [&](server_slot & slot) { slot.spec_deferred = false; });
+        {
+            static const bool defer_enabled =
+                (getenv("GGML_PIPEDEC")        && atoi(getenv("GGML_PIPEDEC"))        != 0) &&
+                (getenv("GGML_PIPEDEC_STAGE2") && atoi(getenv("GGML_PIPEDEC_STAGE2")) != 0) &&
+                (getenv("GGML_PIPEDEC_DEFER")  && atoi(getenv("GGML_PIPEDEC_DEFER"))  != 0);
+
+            // only defer when this pass's batch will contain nothing but this
+            // slot's tokens: one generating+drafting slot, every other slot idle
+            // (otherwise a prompt chunk could join the closing decode and break
+            // stage-2 eligibility with a group in flight)
+            bool defer_ok = defer_enabled && drafting.size() == 1 && generating.size() == 1;
+            if (defer_ok) {
+                for (auto & s : slots) {
+                    if (&s != drafting.front() && s.state != SLOT_STATE_IDLE) {
+                        defer_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (defer_ok) {
+                auto & slot = *drafting.front();
+
+                llama_token    tok  = slot.sampled;
+                llama_pos      pos  = slot.prompt.tokens.pos_next();
+                int32_t       nsid  = 1;
+                llama_seq_id   sid  = slot.id;
+                llama_seq_id * sids = &sid;
+                int8_t         lg   = 1;
+                llama_batch    b    = { 1, &tok, nullptr, &pos, &nsid, &sids, &lg };
+
+                llama_pipedec_defer(ctx_tgt);
+                if (llama_decode(ctx_tgt, b) == 0) {
+                    slot.spec_deferred     = true;
+                    slot.spec_deferred_pos = pos;
+                } else {
+                    SRV_WRN("%s", "deferred stage-2 decode failed - falling back to combined verify\n");
+                }
+            }
+        }
+
         // generate the actual drafts (if any)
         {
             scoped_timer timer(t_spec_draft, n_spec_draft);
@@ -3729,7 +3822,33 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         {
             scoped_timer timer(t_spec_procs, n_spec_procs);
-            if (!common_speculative_process(spec.get(), batch_view)) {
+
+            // [fork, PipeDec] with a deferred verify group the sampled token was
+            // decoded separately, so hand process() the logical [sampled + drafts]
+            // batch - its tokens then align 1:1 with the group's nextn rows
+            llama_batch batch_proc = batch_view;
+            std::vector<llama_token>    ptok;
+            std::vector<llama_pos>      ppos;
+            std::vector<int32_t>        pnsid;
+            std::vector<llama_seq_id *> psid;
+            std::vector<int8_t>         plog;
+            for (auto & slot : slots) {
+                if (!slot.spec_deferred || slot.spec_draft.empty()) {
+                    continue;
+                }
+                ptok.push_back(slot.sampled);
+                ptok.insert(ptok.end(), slot.spec_draft.begin(), slot.spec_draft.end());
+                for (size_t i = 0; i < ptok.size(); ++i) {
+                    ppos.push_back(slot.spec_deferred_pos + (llama_pos) i);
+                    pnsid.push_back(1);
+                    psid.push_back(&slot.id);
+                    plog.push_back(1);
+                }
+                batch_proc = { (int32_t) ptok.size(), ptok.data(), nullptr, ppos.data(), pnsid.data(), psid.data(), plog.data() };
+                break;
+            }
+
+            if (!common_speculative_process(spec.get(), batch_proc)) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
@@ -3772,6 +3891,11 @@ private:
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
+            // [fork, PipeDec] deferred verify: spec_i_batch holds group row
+            // indices, not batch indices - the group spans this whole batch
+            if (slot.spec_deferred) {
+                return;
+            }
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));

@@ -116,6 +116,17 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// [PipeDec] deferred verify group (requires GGML_PIPEDEC_STAGE2 eligibility):
+// llama_pipedec_defer marks the NEXT llama_decode as a deferred group member -
+// its stage-2 token lanes are submitted but no head runs and no logits are
+// produced. The next regular stage-2 decode closes the group: one LM head over
+// all group rows, logits indexed by group row [0..n). llama_pipedec_abort
+// drains and discards an open group without running the head (the caller
+// removes the tokens' KV itself if unwanted).
+LLAMA_API void     llama_pipedec_defer  (struct llama_context * ctx);
+LLAMA_API void     llama_pipedec_abort  (struct llama_context * ctx);
+LLAMA_API uint32_t llama_pipedec_group_n(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //
