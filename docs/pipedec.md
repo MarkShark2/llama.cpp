@@ -192,6 +192,39 @@ with the original estimate discounted for depth-5 and heterogeneity.
   off the CPU (L40) and minimize mid-chain straddles (L13, L41-44) — these shape the
   serial verify floor for every route.
 
+## Stage 2 groundwork — token-body lanes + deferred head (2026-07-18, env-gated OFF)
+
+`GGML_PIPEDEC_STAGE2=1` (step35 only, narrow eligibility, everything else falls through
+to the normal decoder): an MTP verification batch is split into per-token decoder-body
+graphs, each on its own persistent scheduler lane (`sched_pipedec_body[lane]`, stable
+graphs/activations, no buffer races), bodies stop at `h_nextn`; the hidden rows are then
+fed to one batched output-norm/LM-head graph on a separate persistent head scheduler.
+The lanes opt into the scheduler's new stable-host-inputs mode (async dst-stream upload
+of host-backed split inputs — exported `extern "C"` from ggml-backend.cpp, deliberately
+NOT in ggml-backend.h so the public header, a dependency of every CUDA object, stays
+untouched).
+
+**Measured on the 6-stage config** (below): correct output, body_submit ~9 ms (the
+stable-input fix removed the progressive serialization), body_drain ~105 ms, head
+~11 ms → verify ~120-135 ms per 4-token group, decode 7.7 t/s. The plain batched
+verify graph does the same 4 tokens in one ~80 ms walk — batching is nearly free on
+weight-streaming-bound stages, so **chain-splitting a single iteration cannot beat the
+batched graph**. The lanes + deferred head only pay off with *cross-iteration* overlap
+(submit iteration k+1's draft/bodies before draining iteration k). Stage 2 therefore
+ships OFF; the machinery is the foundation for the real pipeline.
+
+## Config change that mattered more (2026-07-18): whole-layer fit, 6 stages
+
+- shredder's daemon now exposes **both** GTX 1080s (`device: CUDA0,CUDA1` in
+  `serve.rpc-shredder.json`) → RPC3/RPC4 on one endpoint; with `--device
+  CUDA0,RPC0,RPC1,RPC2,RPC3,RPC4 --fit-target 1024,512,512,512,512,512`.
+- `--fit-whole-layers` + the extra ~8 GB VRAM ⇒ **no spill at all**: CUDA0 18.6 GB,
+  fedora ×3 13.1 GB, shredder 6.5/5.3 GB, CPU only the 413 MB token embedding. The
+  CUDA_Host expert re-upload, the L40 CPU trampoline, and the straddled layers are gone.
+- Result (normal path, `GGML_PIPEDEC=1`, stage2 off): **prefill 92 t/s** (was 75),
+  **decode 13.8-15.6 t/s** at 55-85 % MTP acceptance (was 9.7 stock). This placement is
+  the new baseline every pipelining experiment must beat.
+
 ## Later — dynamic prediction tree + pruning + tree attention
 
 The paper's accuracy machinery: keep all stages fed with tokens likely to survive
