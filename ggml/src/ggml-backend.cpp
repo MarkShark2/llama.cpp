@@ -1546,6 +1546,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// [fork, PipeDec] with GGML_PIPEDEC=1 the scheduler avoids blocking the submission
+// thread on split-input copies when n_copies == 1, so consecutive graphs (ubatches)
+// can be in flight on different backends at once. Correctness relies on every copy
+// path landing on the dst backend's stream/socket in submission order.
+static bool ggml_sched_pipedec_enabled(void) {
+    static const bool enabled = getenv("GGML_PIPEDEC") != NULL && atoi(getenv("GGML_PIPEDEC")) != 0;
+    return enabled;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1553,6 +1562,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+
+    // [fork, PipeDec] optional walk trace: where the submission thread spends its time
+    static const bool pd_trace = getenv("GGML_PIPEDEC_TRACE") != NULL && atoi(getenv("GGML_PIPEDEC_TRACE")) != 0;
+    int64_t pd_t0 = 0, pd_inp = 0, pd_moe_ids = 0, pd_moe_cpy = 0, pd_fallback = 0, pd_submit = 0;
+    if (pd_trace) {
+        pd_t0 = ggml_time_us();
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1568,18 +1584,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                const int64_t pd_t = pd_trace ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                if (ggml_sched_pipedec_enabled() && sched->n_copies == 1 &&
+                    ggml_backend_buffer_is_host(input->buffer) &&
+                    split_backend->iface.set_tensor_async != NULL) {
+                    // [fork, PipeDec] an async set copies/stages the payload at call time
+                    // (snapshot semantics) and is ordered behind the backend's previous
+                    // graph on its stream, so no host-side synchronize is needed
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (pd_trace) {
+                    pd_inp += ggml_time_us() - pd_t;
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!(ggml_sched_pipedec_enabled() && sched->n_copies == 1)) {
+                    // [fork, PipeDec] skipped when pipelining: with n_copies == 1 every
+                    // copy path below lands on the dst backend's stream/socket in
+                    // submission order, so overwrite-before-use cannot happen (the
+                    // synchronous fallback below does its own synchronization)
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -1594,6 +1627,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    // [fork, PipeDec] when the batch is large enough that (nearly) every
+                    // expert is used anyway, the router-ids read is pure loss: it stalls
+                    // the submission thread until the split backend has computed the
+                    // router for THIS ubatch (a per-layer pipeline barrier). Upload the
+                    // whole expert tensor asynchronously instead - the copy overlaps
+                    // compute on the backend's stream and needs no synchronization.
+                    if (ggml_sched_pipedec_enabled() && node->op == GGML_OP_MUL_MAT_ID) {
+                        const ggml_tensor * ids_probe = node->src[2];
+                        if (ids_probe->ne[0] * ids_probe->ne[1] >= n_expert) {
+                            const int64_t pd_t_all = pd_trace ? ggml_time_us() : 0;
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                            if (pd_trace) {
+                                pd_moe_cpy += ggml_time_us() - pd_t_all;
+                            }
+                            continue;
+                        }
+                    }
+
+                    const int64_t pd_t_ids = pd_trace ? ggml_time_us() : 0;
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1629,6 +1682,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         prev_ids_tensor = ids_tensor;
                     }
+
+                    if (pd_trace) {
+                        pd_moe_ids += ggml_time_us() - pd_t_ids;
+                    }
+                    const int64_t pd_t_cpy = pd_trace ? ggml_time_us() : 0;
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1668,7 +1726,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    if (pd_trace) {
+                        pd_moe_cpy += ggml_time_us() - pd_t_cpy;
+                    }
                 } else {
+                    const int64_t pd_t_fb = pd_trace ? ggml_time_us() : 0;
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1679,13 +1741,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (pd_trace) {
+                            const int64_t pd_d = ggml_time_us() - pd_t_fb;
+                            if (pd_d > 5000) {
+                                GGML_LOG_INFO("pipedec fallback: %s <- %s '%s' (%zu bytes) %.1fms\n",
+                                        ggml_backend_name(split_backend), ggml_backend_name(input_backend),
+                                        input->name, ggml_nbytes(input), pd_d * 1e-3);
+                            }
+                        }
+                    }
+                    if (pd_trace) {
+                        pd_fallback += ggml_time_us() - pd_t_fb;
                     }
                 }
             }
         }
 
         if (!sched->callback_eval) {
+            const int64_t pd_t_sub = pd_trace ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (pd_trace) {
+                pd_submit += ggml_time_us() - pd_t_sub;
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1734,6 +1811,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_synchronize(split_backend);
             sched->timing_t_split[split_backend_id] += ggml_time_us() - t_split_start;
         }
+    }
+
+    if (pd_trace) {
+        const double ms = 1e-3;
+        GGML_LOG_INFO("pipedec walk: splits=%d n_nodes=%d total=%.1fms inp=%.1f moe_ids=%.1f moe_cpy=%.1f fallback=%.1f submit=%.1f\n",
+                sched->n_splits, sched->graph.n_nodes,
+                (ggml_time_us() - pd_t0) * ms, pd_inp * ms, pd_moe_ids * ms, pd_moe_cpy * ms, pd_fallback * ms, pd_submit * ms);
     }
 
     if (sched->timing) {
@@ -1884,6 +1968,29 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+
+    // [fork] GGML_SCHED_PROBE=1: this is the no-alloc size path (used by --fit's
+    // estimator). Log the per-backend pipeline compute-buffer sizes and break the
+    // duplicated cross-backend split inputs into weights vs activations, to diagnose
+    // the n_copies buffer blow-up. Costs nothing and allocates nothing.
+    if (sched->n_copies > 1 && getenv("GGML_SCHED_PROBE")) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            GGML_LOG_INFO("sched probe: n_copies=%d n_splits=%d backend %-24s buffer = %10.1f MiB\n",
+                sched->n_copies, sched->n_splits, ggml_backend_name(sched->backends[i]), sizes[i] / 1048576.0);
+        }
+        size_t w_bytes = 0, a_bytes = 0; int w_n = 0, a_n = 0;
+        for (int s = 0; s < sched->n_splits; s++) {
+            struct ggml_backend_sched_split * sp = &sched->splits[s];
+            for (int k = 0; k < sp->n_inputs; k++) {
+                struct ggml_tensor * in = sp->inputs[k];
+                const size_t nb = ggml_nbytes(in) * (size_t) sched->n_copies;
+                const bool is_w = in->buffer != NULL && in->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                if (is_w) { w_bytes += nb; w_n++; } else { a_bytes += nb; a_n++; }
+            }
+        }
+        GGML_LOG_INFO("sched probe: split inputs x n_copies -> weights=%d (%.1f MiB), activations=%d (%.1f MiB)\n",
+            w_n, w_bytes / 1048576.0, a_n, a_bytes / 1048576.0);
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {

@@ -8,6 +8,9 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -426,6 +429,126 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return sock;
 }
 
+// ---------------------------------------------------------------------------
+// Async RPC streams + events  [fork, PipeDec Phase 1]
+//
+// Opt-in via GGML_RPC_ASYNC=1. Each endpoint's persistent socket is already a
+// strictly in-order command stream (the server serves one client, FIFO). We
+// drive it from a dedicated worker thread so the scheduler thread can hand work
+// to several endpoints without blocking on any single one - which is what lets
+// ggml_backend_sched overlap the pipeline stages of a layer-split model and
+// fill the decode "bubble". Client-only: the rpc-server is unchanged.
+// ---------------------------------------------------------------------------
+
+static bool rpc_async_enabled() {
+    static const bool enabled = []{
+        const char * e = std::getenv("GGML_RPC_ASYNC");
+        return e && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// one-shot data-ready gate used to hand a tensor payload between two streams
+struct rpc_gate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool ready = false;
+    void set()  { std::lock_guard<std::mutex> l(m); ready = true; cv.notify_all(); }
+    void wait() { std::unique_lock<std::mutex> l(m); cv.wait(l, [&]{ return ready; }); }
+};
+
+// reusable event: monotonic "record" generation vs highest "completed" generation.
+// A gen counter (rather than a bool) is robust to the scheduler reusing one event
+// object across n_copies iterations while an older completion is still in flight.
+struct rpc_event {
+    std::mutex m;
+    std::condition_variable cv;
+    uint64_t last = 0;   // gen assigned by the most recent record
+    uint64_t done = 0;   // highest gen the stream has completed
+    uint64_t record() { std::lock_guard<std::mutex> l(m); return ++last; }
+    uint64_t peek()   { std::lock_guard<std::mutex> l(m); return last; }
+    void complete(uint64_t g) { std::lock_guard<std::mutex> l(m); if (g > done) { done = g; } cv.notify_all(); }
+    void wait_for(uint64_t target) { std::unique_lock<std::mutex> l(m); cv.wait(l, [&]{ return done >= target; }); }
+};
+
+// per-endpoint worker thread that owns socket IO for that endpoint
+struct rpc_stream {
+    std::string endpoint;
+    std::thread worker;
+    std::mutex m;
+    std::condition_variable cv;       // tasks available / stop
+    std::condition_variable cv_done;  // completed == submitted
+    std::deque<std::function<void()>> tasks;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+    bool stop = false;
+
+    explicit rpc_stream(std::string ep) : endpoint(std::move(ep)) {
+        worker = std::thread([this]{ run(); });
+    }
+
+    void enqueue(std::function<void()> fn) {
+        std::lock_guard<std::mutex> l(m);
+        tasks.push_back(std::move(fn));
+        submitted++;
+        cv.notify_one();
+    }
+
+    // block the calling (host) thread until every enqueued task has finished
+    void drain() {
+        std::unique_lock<std::mutex> l(m);
+        cv_done.wait(l, [&]{ return completed == submitted; });
+    }
+
+    void run() {
+        for (;;) {
+            std::function<void()> fn;
+            {
+                std::unique_lock<std::mutex> l(m);
+                cv.wait(l, [&]{ return stop || !tasks.empty(); });
+                if (stop && tasks.empty()) {
+                    return;
+                }
+                fn = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            fn();
+            {
+                std::lock_guard<std::mutex> l(m);
+                completed++;
+                cv_done.notify_all();
+            }
+        }
+    }
+};
+
+static rpc_stream * get_stream(const std::string & endpoint) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::unique_ptr<rpc_stream>> streams;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = streams.find(endpoint);
+    if (it != streams.end()) {
+        return it->second.get();
+    }
+    auto s = std::make_unique<rpc_stream>(endpoint);
+    rpc_stream * ptr = s.get();
+    streams[endpoint] = std::move(s);
+    return ptr;
+}
+
+// cheap round-trip that returns only after the server has drained all prior
+// in-order commands on this socket (so a preceding fire-and-forget GRAPH_COMPUTE
+// is known to have finished). Used as the async synchronize() barrier.
+static void rpc_ping(const std::string & endpoint, uint32_t device) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return;
+    }
+    rpc_msg_get_alignment_req request = {device};
+    rpc_msg_get_alignment_rsp response;
+    send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
+}
+
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
@@ -735,8 +858,19 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
-    GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    if (!rpc_async_enabled()) {
+        // legacy path: graph_compute is a blocking send and there are no async
+        // ops in flight, so nothing to wait for
+        return;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    const std::string endpoint = rpc_ctx->endpoint;
+    const uint32_t device = rpc_ctx->device;
+    rpc_stream * stream = get_stream(endpoint);
+    // make sure the server has drained every in-order command (incl. the last
+    // fire-and-forget GRAPH_COMPUTE), then wait for all worker tasks to finish
+    stream->enqueue([endpoint, device]{ rpc_ping(endpoint, device); });
+    stream->drain();
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -802,12 +936,27 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+    const std::string endpoint = rpc_ctx->endpoint;
+    const uint32_t device = rpc_ctx->device;
+    const bool async = rpc_async_enabled();
     if (reuse) {
         rpc_msg_graph_recompute_req request;
-        request.device = rpc_ctx->device;
-        auto sock = get_socket(rpc_ctx->endpoint);
+        request.device = device;
+        if (async) {
+            // enqueue on the endpoint's stream so the scheduler thread does not block
+            get_stream(endpoint)->enqueue([endpoint, request]{
+                auto sock = get_socket(endpoint);
+                if (sock == nullptr) {
+                    GGML_LOG_ERROR("[rpc graph_recompute] lost connection to %s\n", endpoint.c_str());
+                    return;
+                }
+                send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+            });
+            return GGML_STATUS_SUCCESS;
+        }
+        auto sock = get_socket(endpoint);
         if (sock == nullptr) {
-            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, rpc_ctx->endpoint.c_str());
+            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, endpoint.c_str());
             return GGML_STATUS_FAILED;
         }
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
@@ -815,10 +964,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
-        serialize_graph(rpc_ctx->device, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
+        serialize_graph(device, cgraph, input);
+        if (async) {
+            auto in = std::make_shared<std::vector<uint8_t>>(std::move(input));
+            get_stream(endpoint)->enqueue([endpoint, in]{
+                auto sock = get_socket(endpoint);
+                if (sock == nullptr) {
+                    GGML_LOG_ERROR("[rpc graph_compute] lost connection to %s\n", endpoint.c_str());
+                    return;
+                }
+                send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, in->data(), in->size());
+            });
+            return GGML_STATUS_SUCCESS;
+        }
+        auto sock = get_socket(endpoint);
         if (sock == nullptr) {
-            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, rpc_ctx->endpoint.c_str());
+            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, endpoint.c_str());
             return GGML_STATUS_FAILED;
         }
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
@@ -827,22 +988,222 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     return GGML_STATUS_SUCCESS;
 }
 
+// --- async backend ops [fork, PipeDec Phase 1] ---
+//
+// Tasks must capture everything they need BY VALUE at enqueue time: the graph
+// tensor structs they reference live in scheduler/graph memory that may be
+// rewritten for the next ubatch before the task runs on the stream worker.
+
+// serialized SET_TENSOR wire message: | rpc_tensor | offset (8) | payload (size) |
+// built on the enqueuing thread; the payload may be filled in later by a task
+static const size_t RPC_SET_TENSOR_HDR = sizeof(rpc_tensor) + sizeof(uint64_t);
+
+static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor(
+        const ggml_tensor * tensor, const void * data, uint64_t offset, size_t size) {
+    rpc_tensor rt = serialize_tensor(tensor);
+    auto msg = std::make_shared<std::vector<uint8_t>>(RPC_SET_TENSOR_HDR + size);
+    memcpy(msg->data(), &rt, sizeof(rt));
+    memcpy(msg->data() + sizeof(rt), &offset, sizeof(offset));
+    if (data != nullptr) {
+        memcpy(msg->data() + RPC_SET_TENSOR_HDR, data, size);
+    }
+    return msg;
+}
+
+// pool of events recorded on a source backend at enqueue time (i.e. in submission
+// order, right after that backend's graph_compute was submitted) so a stream worker
+// can wait for the source's async compute to finish before reading its output buffer.
+// Without this, reading e.g. a CUDA tensor on the worker races the CUDA stream.
+struct rpc_src_events {
+    std::mutex mtx;
+    std::unordered_map<ggml_backend_dev_t, std::vector<ggml_backend_event_t>> pool;
+    static rpc_src_events & instance() { static rpc_src_events p; return p; }
+};
+
+static ggml_backend_event_t rpc_src_event_record(ggml_backend_t backend_src) {
+    ggml_backend_dev_t dev = backend_src->device;
+    if (dev == nullptr || backend_src->iface.event_record == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.caps.events) {
+        return nullptr;
+    }
+    auto & p = rpc_src_events::instance();
+    ggml_backend_event_t ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(p.mtx);
+        auto & pool = p.pool[dev];
+        if (!pool.empty()) {
+            ev = pool.back();
+            pool.pop_back();
+        }
+    }
+    if (ev == nullptr) {
+        ev = ggml_backend_event_new(dev);
+        if (ev == nullptr) {
+            return nullptr;
+        }
+    }
+    ggml_backend_event_record(ev, backend_src);
+    return ev;
+}
+
+static void rpc_src_event_release(ggml_backend_event_t ev) {
+    auto & p = rpc_src_events::instance();
+    std::lock_guard<std::mutex> lock(p.mtx);
+    p.pool[ev->device].push_back(ev);
+}
+
+static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!rpc_async_enabled()) {
+        ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    // snapshot the full wire message now: the caller may reuse `data` (and the graph
+    // may rewrite `tensor`) once we return
+    auto msg = rpc_prepare_set_tensor(tensor, data, offset, size);
+    const std::string endpoint = rpc_ctx->endpoint;
+    get_stream(endpoint)->enqueue([endpoint, msg]{
+        auto sock = get_socket(endpoint);
+        if (sock == nullptr) {
+            GGML_LOG_ERROR("[rpc set_tensor_async] lost connection to %s\n", endpoint.c_str());
+            return;
+        }
+        send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, msg->data(), msg->size());
+    });
+}
+
+static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (!rpc_async_enabled()) {
+        ggml_backend_rpc_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
+    // route the read through the endpoint stream: the worker may be mid-send on this
+    // socket (e.g. the scheduler reads MoE router ids while pipelined graphs are still
+    // being submitted), so a direct socket read would corrupt the wire protocol.
+    // Truly asynchronous: per the get_tensor_async contract, `data` is only guaranteed
+    // valid after the caller synchronizes this backend - which drains the stream, and
+    // the server's FIFO orders the read after any in-flight graph on this endpoint.
+    // Blocking here instead would serialize the pipeline (e.g. the per-ubatch MTP
+    // nextn-embedding read from the LAST stage would stall every prefill ubatch).
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_msg_get_tensor_req request;
+    request.tensor = serialize_tensor(tensor);
+    request.offset = offset;
+    request.size   = size;
+    const std::string endpoint = rpc_ctx->endpoint;
+    get_stream(endpoint)->enqueue([endpoint, request, data, size]{
+        auto sock = get_socket(endpoint);
+        if (sock != nullptr) {
+            send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+        } else {
+            GGML_LOG_ERROR("[rpc get_tensor_async] lost connection to %s\n", endpoint.c_str());
+        }
+    });
+}
+
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!rpc_async_enabled()) {
+        return false; // let the scheduler fall back to its synchronous copy
+    }
+    if (!ggml_backend_buffer_is_rpc(dst->buffer)) {
+        return false; // RPC -> non-RPC copies use the scheduler's synchronous fallback
+    }
+    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
+    const size_t size = ggml_nbytes(src);
+    rpc_stream * dst_stream = get_stream(dst_ctx->endpoint);
+    const std::string dst_endpoint = dst_ctx->endpoint;
+    // snapshot the SET message header now; the payload is filled in by the tasks below
+    auto msg = rpc_prepare_set_tensor(dst, nullptr, 0, size);
+
+    if (ggml_backend_buffer_is_rpc(src->buffer)) {
+        // RPC -> RPC (star topology): read on the source stream (the server's FIFO
+        // orders the read after the source's compute), hand the payload to the dst
+        // stream which uploads it
+        ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
+        rpc_stream * src_stream = get_stream(src_ctx->endpoint);
+        const std::string src_endpoint = src_ctx->endpoint;
+        rpc_msg_get_tensor_req get_req;
+        get_req.tensor = serialize_tensor(src);
+        get_req.offset = 0;
+        get_req.size   = size;
+        auto gate = std::make_shared<rpc_gate>();
+        src_stream->enqueue([src_endpoint, get_req, msg, size, gate]{
+            auto sock = get_socket(src_endpoint);
+            if (sock != nullptr) {
+                send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &get_req, sizeof(get_req), msg->data() + RPC_SET_TENSOR_HDR, size);
+            } else {
+                GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", src_endpoint.c_str());
+            }
+            gate->set();
+        });
+        dst_stream->enqueue([dst_endpoint, msg, gate]{
+            gate->wait();
+            auto sock = get_socket(dst_endpoint);
+            if (sock == nullptr) {
+                GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", dst_endpoint.c_str());
+                return;
+            }
+            send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, msg->data(), msg->size());
+        });
+    } else {
+        // host-visible source (CUDA/CPU): its async compute may still be running, so
+        // record an event on the source backend NOW (submission order) and have the
+        // dst stream wait for it before reading - the scheduler thread never blocks
+        ggml_backend_event_t ev = rpc_src_event_record(backend_src);
+        ggml_tensor src_snap = *src; // struct snapshot; data/buffer stay valid on device
+        dst_stream->enqueue([dst_endpoint, msg, src_snap, size, ev, backend_src]() mutable {
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize(ev);
+                rpc_src_event_release(ev);
+            } else if (backend_src->iface.synchronize != nullptr) {
+                ggml_backend_synchronize(backend_src);
+            }
+            ggml_backend_tensor_get(&src_snap, msg->data() + RPC_SET_TENSOR_HDR, 0, size);
+            auto sock = get_socket(dst_endpoint);
+            if (sock == nullptr) {
+                GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", dst_endpoint.c_str());
+                return;
+            }
+            send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, msg->data(), msg->size());
+        });
+    }
+    return true;
+}
+
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_event * ev = (rpc_event *)event->context;
+    uint64_t g = ev->record();
+    get_stream(rpc_ctx->endpoint)->enqueue([ev, g]{ ev->complete(g); });
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_event * ev = (rpc_event *)event->context;
+    uint64_t target = ev->peek();
+    get_stream(rpc_ctx->endpoint)->enqueue([ev, target]{ ev->wait_for(target); });
+}
+
 static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_name                = */ ggml_backend_rpc_name,
     /* .free                    = */ ggml_backend_rpc_free,
-    /* .set_tensor_async        = */ NULL,
-    /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_async        = */ ggml_backend_rpc_set_tensor_async,
+    /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_rpc_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -2014,11 +2375,32 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ rpc_async_enabled(),
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ rpc_async_enabled(),
     };
+}
+
+// --- device-level event ops [fork, PipeDec Phase 1] ---
+
+static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_event_t event = new ggml_backend_event();
+    event->device  = dev;
+    event->context = new rpc_event();
+    return event;
+}
+
+static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    delete (rpc_event *)event->context;
+    delete event;
+}
+
+static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    rpc_event * ev = (rpc_event *)event->context;
+    ev->wait_for(ev->peek());
 }
 
 static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
@@ -2066,9 +2448,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_rpc_device_event_new,
+    /* .event_free           = */ ggml_backend_rpc_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
 };
 
 // backend reg interface
