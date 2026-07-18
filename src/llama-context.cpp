@@ -427,6 +427,14 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // [fork] LLAMA_PIPELINE_PARALLEL=1/0 forces the heuristic on/off. Needed for
+        // RPC + --fit: fit expresses its contiguous per-layer placement as tensor-buft
+        // overrides, which trips !has_tensor_overrides() above even though the split is
+        // still a clean layer pipeline. The device async/events check below still applies.
+        if (const char * e = std::getenv("LLAMA_PIPELINE_PARALLEL")) {
+            pipeline_parallel = atoi(e) != 0;
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
