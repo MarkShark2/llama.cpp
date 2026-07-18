@@ -2664,6 +2664,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT"));
     add_opt(common_arg(
+        { "--fit-whole-layers" },
+        "restrict --fit to contiguous whole layers (no per-tensor or CPU expert spill)",
+        [](common_params & params) {
+            params.fit_params_whole_layers = true;
+        }
+    ).set_env("LLAMA_ARG_FIT_WHOLE_LAYERS"));
+    add_opt(common_arg(
         { "-fitp", "--fit-print" }, "[on|off]",
         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
         [](common_params & params, const std::string & value) {
