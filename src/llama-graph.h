@@ -36,6 +36,12 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    // PipeDec splits a speculative verification pass into token-sized decoder
+    // bodies followed by one batched output head. These graph types are kept
+    // distinct so the scheduler never reuses a full decoder graph for either
+    // half of the split computation.
+    LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY,
+    LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD,
 };
 
 enum llm_fused_op {

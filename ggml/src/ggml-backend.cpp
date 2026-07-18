@@ -818,6 +818,11 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // The caller guarantees host-backed split inputs stay immutable until the
+    // scheduler is synchronized, allowing destination-stream uploads without a
+    // destination-wide synchronization.
+    bool stable_host_inputs;
+
     int debug;
 
     // per-backend split wall time, printed every 5s when GGML_SCHED_TIMING=1 [fork]
@@ -1733,7 +1738,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t pd_t_fb = pd_trace ? ggml_time_us() : 0;
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (sched->stable_host_inputs &&
+                        ggml_backend_buffer_is_host(input->buffer) &&
+                        split_backend->iface.set_tensor_async != NULL) {
+                        // CPU work is normally synchronous, but honor the backend
+                        // contract before queuing a copy that retains its storage.
+                        ggml_backend_synchronize(input_backend);
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    } else if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2067,6 +2079,13 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+// [fork, PipeDec] deliberately NOT declared in ggml-backend.h: touching that header
+// rebuilds every CUDA object. Callers declare this extern "C" locally.
+extern "C" GGML_API void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable) {
+    GGML_ASSERT(sched);
+    sched->stable_host_inputs = stable;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

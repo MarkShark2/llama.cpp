@@ -2130,5 +2130,9 @@ struct llama_model_step35 : public llama_model_base {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
+    struct graph_pipedec_head : public llm_graph_context {
+        graph_pipedec_head(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
