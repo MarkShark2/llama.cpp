@@ -404,6 +404,17 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // PipeDec owns cross-stage overlap in software and requires the
+        // scheduler's serial-sized (single-copy) buffers. In particular, a
+        // clean explicit tensor split has no overrides and would otherwise
+        // enable the built-in four-copy pipeline, which is prohibitively large
+        // for the RPC star topology.
+        if (const char * e = std::getenv("GGML_PIPEDEC")) {
+            if (atoi(e) != 0) {
+                pipeline_parallel = false;
+            }
+        }
+
         // [fork] LLAMA_PIPELINE_PARALLEL=1/0 forces the heuristic on/off. Needed for
         // RPC + --fit: fit expresses its contiguous per-layer placement as tensor-buft
         // overrides, which trips !has_tensor_overrides() above even though the split is
