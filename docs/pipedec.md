@@ -149,8 +149,40 @@ verify into 1-token chained graphs hits the **CUDA0 head cycle**: CUDA0 hosts st
 pipeline collapses to depth 1. The paper's answer is the one that works: pipeline
 across *timesteps* with the dynamic tree — feed tree level k+1 into stage 0 while
 level k is mid-pipeline, defer accept/prune decisions by the pipeline depth, and keep
-the head off the per-level critical path. That is the next implementation phase
-(llama-context/server surgery: level-wise micro-graphs, two-level KV, deferred head).
+the head off the per-level critical path.
+
+### Measured decode anatomy (2026-07-18, walk trace during 200-tok generation)
+
+- verify walk ≈ **190-210 ms** for a 4-token verify graph (34 splits, 4092 nodes);
+  baseline "verify 294 ms" has compressed to ~200 ms under async submission.
+- of that, `submit` ≈ **50 ms** — CUDA0 appears in many small splits (L0-12, L13
+  experts, L41-44 experts, head), each its own graph launch.
+- the walk's blocking waits concentrate at the placement pathologies: `ffn_moe_probs-13`
+  (CUDA0 ← fedora, L13 attn/router on fedora but experts on CUDA0) ~35 ms, then
+  `ffn_moe_swiglu-40` (CPU ← shredder, L40 experts on CPU) ~100 ms — the latter absorbs
+  the remaining upstream chain time (first blocking point), it is not additive.
+- draft (MTP head, CUDA0) walks: ~3-7 ms each, 3 per iteration.
+- effective avg stage time ≈ 40 ms (Σ≈200 ms over ~5 stages); max stage ~60 ms.
+
+**Projection**: steady-state cross-iteration pipeline emits one tree level per
+max-stage time (~60 ms). Because the BC-250 stages are weight-streaming-bound,
+t_stage(8 tok) ≈ t_stage(1 tok) — so *wide* tree levels are nearly free and raise
+accepted-tokens-per-level; realistic ceiling ~1.5-2x decode (→ 15-20 t/s), consistent
+with the original estimate discounted for depth-5 and heterogeneity.
+
+### Hook points identified
+
+- server verify: `tools/server/server-context.cpp` `decode()` (~line 3647) —
+  `llama_decode(ctx_tgt, batch_view)` + `common_speculative_process`.
+- MTP draft: `common/speculative.cpp` `common_speculative_impl_draft_mtp` (~line 1204)
+  — feeds `llama_get_embeddings_nextn(ctx_tgt)` rows into per-head draft decodes on
+  ctx_dft via `llama_set_nextn_layer_offset`.
+- deferred head needs a new head-only graph type (input: host-provided hidden rows →
+  final norm → lm_head → logits) plus target decodes that request nextn embeddings but
+  no logits (the nextn read is already async/deferred after milestone 1).
+- config-level counterpart worth testing first: keep fit's late-layer expert spillover
+  off the CPU (L40) and minimize mid-chain straddles (L13, L41-44) — these shape the
+  serial verify floor for every route.
 
 ## Later — dynamic prediction tree + pruning + tree attention
 
