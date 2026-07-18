@@ -2083,9 +2083,13 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 
 // [fork, PipeDec] deliberately NOT declared in ggml-backend.h: touching that header
 // rebuilds every CUDA object. Callers declare this extern "C" locally.
-extern "C" GGML_API void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable) {
+// (block form: on Linux GGML_API expands to `... extern`, which GCC rejects
+// directly after a single-declaration linkage specification)
+extern "C" {
+GGML_API void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable) {
     GGML_ASSERT(sched);
     sched->stable_host_inputs = stable;
+}
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
