@@ -545,6 +545,12 @@ bool ggml_backend_rpc_buffer_cache_upload(
     return rpc_buffer_set_tensor_raw(buffer, tensor, data, offset, size);
 }
 
+const char * ggml_backend_rpc_buffer_endpoint(ggml_backend_buffer_t buffer) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    ggml_backend_rpc_buffer_type_context * ctx = (ggml_backend_rpc_buffer_type_context *) buft->context;
+    return ctx->endpoint.c_str();
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (size > HASH_THRESHOLD && g_rpc_client_cache.load(std::memory_order_relaxed)) {
         int result = ggml_backend_rpc_buffer_cache_query(buffer, tensor, offset, size, fnv_hash((const uint8_t *) data, size));
@@ -2113,6 +2119,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_buffer_cache_upload") == 0) {
         return (void *)ggml_backend_rpc_buffer_cache_upload;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_endpoint") == 0) {
+        return (void *)ggml_backend_rpc_buffer_endpoint;
     }
     return NULL;
 

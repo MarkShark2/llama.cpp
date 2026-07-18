@@ -45,9 +45,11 @@ struct rpc_cache_api {
     using threshold_fn_t = size_t (*)(void);
     using query_fn_t      = int    (*)(ggml_backend_buffer_t, ggml_tensor *, size_t, size_t, uint64_t);
     using upload_fn_t     = bool   (*)(ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t);
+    using endpoint_fn_t   = const char * (*)(ggml_backend_buffer_t);
 
-    query_fn_t  query  = nullptr;
-    upload_fn_t upload = nullptr;
+    query_fn_t    query    = nullptr;
+    upload_fn_t   upload   = nullptr;
+    endpoint_fn_t endpoint = nullptr;
     size_t threshold = 0;
 };
 
@@ -170,7 +172,8 @@ static bool rpc_cache_api_for_buffer(ggml_backend_buffer_t buffer, rpc_cache_api
     auto threshold = (rpc_cache_api::threshold_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_cache_threshold");
     api.query = (rpc_cache_api::query_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_cache_query");
     api.upload = (rpc_cache_api::upload_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_cache_upload");
-    if (enabled == nullptr || threshold == nullptr || api.query == nullptr || api.upload == nullptr || !enabled()) {
+    api.endpoint = (rpc_cache_api::endpoint_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_endpoint");
+    if (enabled == nullptr || threshold == nullptr || api.query == nullptr || api.upload == nullptr || api.endpoint == nullptr || !enabled()) {
         return false;
     }
     api.threshold = threshold();
@@ -1893,12 +1896,13 @@ bool llama_model_loader::load_all_data_parallel(
 
     struct rpc_job {
         ggml_backend_dev_t device = nullptr;
+        std::string endpoint;
         rpc_cache_api api;
         std::vector<ggml_context *> contexts;
     };
 
     std::vector<rpc_job> jobs;
-    std::unordered_map<ggml_backend_dev_t, size_t> jobs_by_device;
+    std::unordered_map<std::string, size_t> jobs_by_endpoint;
     std::unordered_set<ggml_context *> rpc_contexts;
     size_t n_rpc_tensors = 0;
     size_t n_rpc_bytes = 0;
@@ -1907,22 +1911,25 @@ bool llama_model_loader::load_all_data_parallel(
         ggml_context * ctx = item.first;
         rpc_cache_api api;
         ggml_backend_dev_t device = nullptr;
+        std::string endpoint;
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
             if (get_weight(ggml_get_name(cur)) == nullptr || !rpc_cache_api_for_buffer(cur->buffer, api)) {
                 continue;
             }
             device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            endpoint = api.endpoint(cur->buffer);
             break;
         }
-        if (device == nullptr) {
+        if (device == nullptr || endpoint.empty()) {
             continue;
         }
 
         rpc_contexts.insert(ctx);
-        auto inserted = jobs_by_device.emplace(device, jobs.size());
+        auto inserted = jobs_by_endpoint.emplace(endpoint, jobs.size());
         if (inserted.second) {
             rpc_job job;
             job.device = device;
+            job.endpoint = endpoint;
             job.api = api;
             jobs.emplace_back(std::move(job));
         }
