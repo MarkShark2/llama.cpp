@@ -183,6 +183,11 @@ struct server_slot {
     bool      spec_deferred     = false;
     llama_pos spec_deferred_pos = -1;
 
+    // [fork, PipeDec] leading draft tokens whose lanes were streamed into the
+    // deferred group from inside the draft loop (on_draft_token); the closing
+    // decode carries only spec_draft[spec_deferred_drafts..]
+    int32_t   spec_deferred_drafts = 0;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -478,18 +483,20 @@ struct server_slot {
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
 
-        // [fork, PipeDec] deferred verify: with an empty draft no closing decode
-        // happens this iteration, so discard the in-flight deferred lane and its
-        // KV and fall back to the normal (non-deferred) paths below
-        if (spec_deferred && spec_draft.empty()) {
+        // [fork, PipeDec] deferred verify: with no token left to carry the
+        // closing decode (empty draft, or every draft lane was streamed and the
+        // draft then stopped early), discard the in-flight deferred lanes and
+        // their KV and fall back to the normal (non-deferred) paths below
+        if (spec_deferred && spec_draft.size() <= (size_t) spec_deferred_drafts) {
             llama_pipedec_abort(ctx_tgt);
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, spec_deferred_pos, -1);
-            spec_deferred = false;
+            spec_deferred        = false;
+            spec_deferred_drafts = 0;
         }
 
         if (spec_deferred) {
-            SLT_DBG(*this, "generate_draft (deferred): id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
-                    sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
+            SLT_DBG(*this, "generate_draft (deferred): id=%d, #tokens=%zu, #draft=%zu, #streamed=%d, pos_next=%d\n",
+                    sampled, prompt.tokens.size(), spec_draft.size(), spec_deferred_drafts, prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
 
@@ -501,8 +508,10 @@ struct server_slot {
             auto pos0 = prompt.tokens.pos_next(); // deferred token's pos, already decoded
             GGML_ASSERT(pos0 == spec_deferred_pos);
 
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, ++pos0, true);
+            // the first spec_deferred_drafts drafts were already submitted as
+            // streamed deferred lanes; the closing decode carries the rest
+            for (size_t i = spec_deferred_drafts; i < spec_draft.size(); i++) {
+                add_ok &= batch.add(this->id, spec_draft[i], pos0 + 1 + (llama_pos) i, true);
             }
 
             GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
@@ -549,7 +558,8 @@ struct server_slot {
         // [fork, PipeDec] never leave a deferred verify group in flight
         if (spec_deferred) {
             llama_pipedec_abort(ctx_tgt);
-            spec_deferred = false;
+            spec_deferred        = false;
+            spec_deferred_drafts = 0;
         }
 
         if (is_processing()) {
@@ -3098,7 +3108,7 @@ private:
         // [fork, PipeDec] deferred verify: submit the sampled token's stage-2 lane
         // before drafting, so the MTP draft steps overlap its pipeline walk. The
         // group is closed by this iteration's regular decode (drafts only).
-        iterate(slots, [&](server_slot & slot) { slot.spec_deferred = false; });
+        iterate(slots, [&](server_slot & slot) { slot.spec_deferred = false; slot.spec_deferred_drafts = 0; });
         {
             static const bool defer_enabled =
                 (getenv("GGML_PIPEDEC")        && atoi(getenv("GGML_PIPEDEC"))        != 0) &&
@@ -3132,8 +3142,46 @@ private:
 
                 llama_pipedec_defer(ctx_tgt);
                 if (llama_decode(ctx_tgt, b) == 0) {
-                    slot.spec_deferred     = true;
-                    slot.spec_deferred_pos = pos;
+                    slot.spec_deferred        = true;
+                    slot.spec_deferred_pos    = pos;
+                    slot.spec_deferred_drafts = 0;
+
+                    // stream each drafted token's lane behind the sampled token's,
+                    // so lanes enter the pipeline while the draft loop still runs.
+                    // n_max_cap guards against the post-draft dp.n_max truncation
+                    // AND keeps at least one token for the closing decode.
+                    static const bool stream_enabled =
+                        getenv("GGML_PIPEDEC_STREAM") && atoi(getenv("GGML_PIPEDEC_STREAM")) != 0;
+
+                    if (stream_enabled) {
+                        const int32_t n_max_cap = slot.get_n_draft_max();
+                        server_slot * slot_ptr  = &slot;
+
+                        auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                        dp.on_draft_token = [this, slot_ptr, n_max_cap](llama_token id, int32_t depth) -> bool {
+                            auto & slot = *slot_ptr;
+
+                            if (depth != slot.spec_deferred_drafts || depth + 1 >= n_max_cap) {
+                                return false;
+                            }
+
+                            llama_pos      pos  = slot.spec_deferred_pos + 1 + depth;
+                            int32_t       nsid  = 1;
+                            llama_seq_id   sid  = slot.id;
+                            llama_seq_id * sids = &sid;
+                            int8_t         lg   = 1;
+                            llama_batch    b    = { 1, &id, nullptr, &pos, &nsid, &sids, &lg };
+
+                            llama_pipedec_defer(ctx_tgt);
+                            if (llama_decode(ctx_tgt, b) != 0) {
+                                SRV_WRN("%s", "streamed draft lane decode failed - remaining drafts ride the closing decode\n");
+                                return false;
+                            }
+
+                            slot.spec_deferred_drafts++;
+                            return true;
+                        };
+                    }
                 } else {
                     SRV_WRN("%s", "deferred stage-2 decode failed - falling back to combined verify\n");
                 }

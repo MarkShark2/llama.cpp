@@ -293,6 +293,43 @@ time grows to ~14 ms from CUDA0-stream contention with lane 0 but is overlapped)
 The decode-without-drain + group-close machinery is the foundation for
 cross-iteration overlap.
 
+## Proto v5 deployed + marginal-lane cost (2026-07-18 evening)
+
+Multi-slot RPC graph cache (proto v5, bcd103546) deployed to all daemons (fedora ×3 +
+shredder rebuilt + restarted). One fix on the way: `extern "C" GGML_API` is invalid on
+GCC (GGML_API expands to `... extern` on Linux) — block-form `extern "C" { }` instead
+(4c7150ce2). New baseline with the cache: **23.5-25.2 t/s** (was 21.6).
+
+**Marginal-lane cost** (DraftMax 1 vs 3, steady-state): marginal verify 65 ms @ 2 lanes
+vs 93 ms @ 4 lanes → **~14 ms per extra lane** (≈ one stage time, as the
+(n_stages + n_lanes − 1) × t_stage model predicts; t_stage ≈ 10 ms).
+
+**Sibling-branch lanes are rejected on this data**: a K=2 sibling chain of depth 3 adds
+3 lanes (+42 ms, +45 % verify) for only ~10-13 % more accepted tokens (probe coverage
+40-46 % of level-0 rejections × rejection rate). Width is not free even via lanes —
+every extra lane pays a full stage time. Shelved unless per-lane cost drops a lot.
+
+## Streamed draft lanes (2026-07-18, env-gated OFF — groundwork)
+
+`GGML_PIPEDEC_STREAM=1` (requires DEFER): `common_speculative_draft_params.on_draft_token`
+callback fires as each MTP draft token is sampled; the server submits that token's lane
+as another deferred group member mid-draft, so lanes stream into the pipeline instead of
+lump-submitting after the 16 ms draft loop. Safety: never fires for a token that could be
+the draft's last (n_max_cap gate); if the draft stops early right after a streamed token,
+`handle_last_sampled_token` aborts the group + seq_rm + combined fallback.
+
+Measured: **loses ~3 t/s** (21.4-21.8 vs 24-25 off). The pipeline effect is real — the
+closing lane's body_drain drops 67 → 53 ms — but each streamed 1-token `llama_decode`
+costs ~10 ms of CPU-side submission (balloc/memory init, graph build+alloc), serial inside
+the draft loop (draft 15 → 39 ms) and it also pushes `pre` 19 → 43 ms. The stagger gain
+(~10 ms/lane) cannot beat a ~10 ms/lane submission cost. **Ships OFF.** To revisit:
+make lane submission cheap (prebuilt per-lane graph with input rebind, skip balloc/mctx
+for the 1-token steady case) — then streaming becomes nearly free and should win ~10 ms.
+
+Note: stream on/off produce *different* (both-deterministic) outputs at temp 0 — KV padding
+/ ubatch-boundary numerics, not a correctness issue (per-mode output is bit-stable across
+server restarts).
+
 ## Later — dynamic prediction tree + pruning + tree attention
 
 The paper's accuracy machinery: keep all stages fed with tokens likely to survive

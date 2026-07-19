@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -48,6 +50,16 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // [fork, PipeDec] streamed draft-lane submission: invoked right after draft
+    // token `result[depth]` is sampled, while the draft loop continues. The
+    // callback may submit the token's verify lane immediately (deferred group
+    // member) so it pipelines behind the earlier lanes instead of waiting for
+    // the whole draft. Return false to stop being called for this draft()
+    // (remaining tokens then ride the regular closing decode).
+    // Never invoked for a token that could be the draft's last (depth == n_max-1),
+    // so the closing decode always has at least one token to carry.
+    std::function<bool(llama_token id, int32_t depth)> on_draft_token;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

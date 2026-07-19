@@ -1607,6 +1607,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // [fork, PipeDec] stream this draft token's verify lane into the
+                // pipeline while the next draft step runs. Not reached for the
+                // final (n_max) token - that one rides the closing decode.
+                if (dp.on_draft_token) {
+                    if (!dp.on_draft_token(id, (int32_t) result.size() - 1)) {
+                        dp.on_draft_token = nullptr;
+                    }
+                }
+
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
@@ -2651,6 +2660,10 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+
+        // [fork, PipeDec] never let a stale streamed-lane callback (capturing a
+        // slot from this iteration) survive into the next draft() call
+        dp.on_draft_token = nullptr;
     }
 }
 
