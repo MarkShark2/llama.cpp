@@ -758,7 +758,9 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
-#define GGML_SCHED_MAX_COPIES 4
+// [fork] compile-time ceiling raised 4 -> 8; the runtime default stays 4 and
+// GGML_SCHED_COPIES selects 1..GGML_SCHED_MAX_COPIES (see ggml_backend_sched_new).
+#define GGML_SCHED_MAX_COPIES 8
 #endif
 
 struct ggml_backend_sched_split {
@@ -1537,6 +1539,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // [fork] this is a full pipeline drain - flag it on stderr when tracing
+        if (getenv("GGML_SCHED_SUBMIT_TRACE") && atoi(getenv("GGML_SCHED_SUBMIT_TRACE"))) {
+            fprintf(stderr, "[sched] REALLOC drain (backend_ids_changed or galloc alloc failed)\n");
+            fflush(stderr);
+        }
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
@@ -1591,12 +1598,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 const int64_t pd_t = pd_trace ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (ggml_sched_pipedec_enabled() && sched->n_copies == 1 &&
+                if ((sched->n_copies > 1 || (ggml_sched_pipedec_enabled() && sched->n_copies == 1)) &&
                     ggml_backend_buffer_is_host(input->buffer) &&
                     split_backend->iface.set_tensor_async != NULL) {
                     // [fork, PipeDec] an async set copies/stages the payload at call time
                     // (snapshot semantics) and is ordered behind the backend's previous
-                    // graph on its stream, so no host-side synchronize is needed
+                    // graph on its stream, so no host-side synchronize is needed.
+                    // [fork, pipeline-prefill] same ordering argument holds with
+                    // n_copies > 1: input_cpy is the cur_copy slot, and the async set
+                    // lands on the dst stream behind the graph that last read that slot,
+                    // so the event_synchronize + blocking copy below (which serialized
+                    // the whole RPC pipeline per ubatch) is unnecessary.
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1830,6 +1842,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         GGML_LOG_INFO("pipedec walk: splits=%d n_nodes=%d total=%.1fms inp=%.1f moe_ids=%.1f moe_cpy=%.1f fallback=%.1f submit=%.1f\n",
                 sched->n_splits, sched->graph.n_nodes,
                 (ggml_time_us() - pd_t0) * ms, pd_inp * ms, pd_moe_ids * ms, pd_moe_cpy * ms, pd_fallback * ms, pd_submit * ms);
+        // [fork] raw stderr mirror (server log filter hides lib INFO lines)
+        fprintf(stderr, "[pd walk] splits=%d n_nodes=%d total=%.1fms inp=%.1f moe_ids=%.1f moe_cpy=%.1f fallback=%.1f submit=%.1f\n",
+                sched->n_splits, sched->graph.n_nodes,
+                (ggml_time_us() - pd_t0) * ms, pd_inp * ms, pd_moe_ids * ms, pd_moe_cpy * ms, pd_fallback * ms, pd_submit * ms);
+        fflush(stderr);
     }
 
     if (sched->timing) {
@@ -1852,6 +1869,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->timing_t_split[i] = 0;
             }
             GGML_LOG_INFO("sched timing (avg per graph, %lld graphs): %s\n", (long long) sched->timing_n_graph, buf);
+            // [fork] also emit on raw stderr: the server's log filter hides
+            // lib INFO lines, and this table is the point of GGML_SCHED_TIMING.
+            fprintf(stderr, "[sched timing] avg per graph over %lld graphs: %s\n", (long long) sched->timing_n_graph, buf);
+            fflush(stderr);
             sched->timing_n_graph = 0;
         }
     }
@@ -1886,7 +1907,21 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->n_copies = parallel ? 4 : 1;
+    if (parallel) {
+        // [fork] GGML_SCHED_COPIES overrides the pipeline depth (in-flight
+        // ubatches). With more stages than copies the deepest stages idle,
+        // so a 6-stage RPC pipeline wants more than the historical 4.
+        const char * GGML_SCHED_COPIES = getenv("GGML_SCHED_COPIES");
+        if (GGML_SCHED_COPIES) {
+            const int n = atoi(GGML_SCHED_COPIES);
+            if (n >= 1 && n <= GGML_SCHED_MAX_COPIES) {
+                sched->n_copies = n;
+            }
+        }
+        fprintf(stderr, "[sched] pipeline parallelism: n_copies=%d\n", sched->n_copies);
+        fflush(stderr);
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2030,10 +2065,28 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    // [fork] GGML_SCHED_SUBMIT_TRACE: split vs alloc timing (>300ms graphs)
+    static const int alloc_trace = [] {
+        const char * e = getenv("GGML_SCHED_SUBMIT_TRACE");
+        return e ? atoi(e) : 0;
+    }();
+    const int64_t ta0 = alloc_trace ? ggml_time_us() : 0;
+
     ggml_backend_sched_split_graph(sched, graph);
+
+    const int64_t ta1 = alloc_trace ? ggml_time_us() : 0;
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+
+    if (alloc_trace) {
+        const int64_t ta2 = ggml_time_us();
+        if (ta2 - ta0 > 300*1000) {
+            fprintf(stderr, "[sched-alloc] split_graph=%.1fms alloc_splits=%.1fms\n",
+                    (ta1 - ta0) / 1000.0, (ta2 - ta1) / 1000.0);
+            fflush(stderr);
+        }
     }
 
     sched->is_alloc = true;
@@ -2049,6 +2102,17 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+
+    // [fork] GGML_SCHED_SUBMIT_TRACE=1: per-graph submission timing on raw
+    // stderr. Splits "scheduler thread blocks inside submit" from "caller
+    // blocks between submissions" when diagnosing pipeline-parallel stalls.
+    static const int submit_trace = [] {
+        const char * e = getenv("GGML_SCHED_SUBMIT_TRACE");
+        return e ? atoi(e) : 0;
+    }();
+    static int64_t t_prev_submit = 0;
+    const int64_t t0 = submit_trace ? ggml_time_us() : 0;
+
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -2059,7 +2123,18 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    const int64_t t1 = submit_trace ? ggml_time_us() : 0;
+    enum ggml_status status = ggml_backend_sched_compute_splits(sched);
+    if (submit_trace) {
+        const int64_t t2 = ggml_time_us();
+        fprintf(stderr, "[submit] nodes=%d splits=%d copy=%d gap=%.1fms alloc=%.1fms submit=%.1fms\n",
+                graph->n_nodes, sched->n_splits, sched->cur_copy,
+                t_prev_submit ? (t0 - t_prev_submit) / 1000.0 : 0.0,
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
+        fflush(stderr);
+        t_prev_submit = t2;
+    }
+    return status;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

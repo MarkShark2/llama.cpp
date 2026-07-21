@@ -905,6 +905,49 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+
+        // [fork, pipeline-prefill] cache the remote responses, keyed by shapes.
+        // galloc asks for every FLASH_ATTN_EXT / MUL_MAT_ID node on every graph
+        // allocation, and the ordered round trip queues behind in-flight compute
+        // on the endpoint's socket - under pipeline parallelism that serialized
+        // prefill to one full pipeline drain per ubatch. Shapes repeat across
+        // ubatches, so the steady state becomes fully local.
+        static std::mutex alloc_size_cache_mutex;
+        static std::unordered_map<std::string, uint64_t> alloc_size_cache;
+
+        std::string key;
+        key.reserve(512);
+        key += buft_ctx->endpoint;
+        {
+            char dev_buf[16];
+            snprintf(dev_buf, sizeof(dev_buf), "#%u", buft_ctx->device);
+            key += dev_buf;
+        }
+        auto append_tensor = [&key](const ggml_tensor * t) {
+            if (t == nullptr) {
+                key += "|-";
+                return;
+            }
+            char buf[192];
+            snprintf(buf, sizeof(buf), "|%d:%d:%lld,%lld,%lld,%lld:%zu,%zu,%zu,%zu",
+                     (int) t->type, (int) t->op,
+                     (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                     t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+            key += buf;
+        };
+        append_tensor(tensor);
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            append_tensor(tensor->src[i]);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(alloc_size_cache_mutex);
+            auto it = alloc_size_cache.find(key);
+            if (it != alloc_size_cache.end()) {
+                return it->second;
+            }
+        }
+
         auto sock = get_socket(buft_ctx->endpoint);
         if (sock == nullptr) {
             // best-effort fallback; a dead endpoint will fail the subsequent
@@ -924,10 +967,14 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd_ordered(buft_ctx->endpoint, sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
+
+        {
+            std::lock_guard<std::mutex> lock(alloc_size_cache_mutex);
+            alloc_size_cache.emplace(key, response.alloc_size);
+        }
 
         return response.alloc_size;
     }
