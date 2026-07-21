@@ -88,6 +88,7 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_pos_per_embd(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+LLAMA_API ggml_backend_dev_t llama_model_layer_device(const struct llama_model * model, int32_t layer);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 

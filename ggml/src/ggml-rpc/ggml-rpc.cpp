@@ -2590,6 +2590,11 @@ static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     return ctx->name.c_str();
 }
 
+static const char * ggml_backend_rpc_device_get_endpoint(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    return ctx->endpoint.c_str();
+}
+
 static const char * ggml_backend_rpc_device_get_description(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 
@@ -2744,6 +2749,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_buffer_endpoint") == 0) {
         return (void *)ggml_backend_rpc_buffer_endpoint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_device_endpoint") == 0) {
+        return (void *)ggml_backend_rpc_device_get_endpoint;
     }
     return NULL;
 
