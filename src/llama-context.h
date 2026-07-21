@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
 #include <vector>
 
@@ -140,8 +141,25 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    // Stage 2 body submission uses one token-sized scheduler lane per in-flight
+    // speculative token. This keeps every lane's graph and activations stable
+    // without multiplying the much larger prompt/prefill graph buffers.
+    llm_graph_result * process_ubatch_pipedec_body(
+                const llama_ubatch & ubatch,
+            llama_memory_context_i * mctx,
+                           uint32_t   lane,
+                       ggml_status & ret);
+
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // [fork, PipeDec] deferred verify group: a decode marked deferred submits its
+    // stage-2 token lanes and returns without draining or running the LM head;
+    // the next regular stage-2 decode closes the group (one head over all rows).
+    // Lets the caller overlap MTP drafting with the first lane's pipeline walk.
+    void     pipedec_defer_mark();  // next decode() call is a deferred group member
+    void     pipedec_abort_group(); // drain + discard in-flight group rows (no head)
+    uint32_t pipedec_group_n() const { return pipedec_group_tokens; }
 
     //
     // state save/load
@@ -260,9 +278,10 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                ggml_backend_sched_t       sched_override = nullptr) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_override = nullptr) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -345,7 +364,26 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 8;
+    std::array<ggml_backend_sched_ptr, PIPEDEC_STAGE2_MAX_LANES> sched_pipedec_body;
+
+    // Stage 2 keeps the deferred output head on a separate scheduler so
+    // switching to the tiny head graph does not evict the reusable 4k-node
+    // decoder-body graph from the primary scheduler every iteration.
+    ggml_backend_sched_ptr sched_pipedec_head;
+
     bool sched_need_reserve = true;
+
+    // Avoid repeating the Stage 2 activation banner for every speculative
+    // verification batch handled by this context.
+    bool pipedec_stage2_reported = false;
+
+    // [fork, PipeDec] deferred verify group state. pipedec_group_h has fixed
+    // capacity (PIPEDEC_STAGE2_MAX_LANES rows) and is never resized once
+    // allocated: deferred hidden-row GETs snapshot their destination address.
+    bool               pipedec_defer_next   = false;
+    uint32_t           pipedec_group_tokens = 0;
+    std::vector<float> pipedec_group_h;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -368,6 +406,8 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    std::array<llm_graph_result_ptr, PIPEDEC_STAGE2_MAX_LANES> gf_res_pipedec_body;
+    llm_graph_result_ptr gf_res_pipedec_head;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

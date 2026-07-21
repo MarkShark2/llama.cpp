@@ -106,6 +106,7 @@ enum llama_example {
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
+    LLAMA_EXAMPLE_TOKENIZE,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -477,6 +478,8 @@ struct common_params {
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
+    bool    fit_params_whole_layers = false; // fit using contiguous whole layers only (no tensor overrides)
+    bool    fit_params_fill_rpc_first = false; // fill non-primary devices with whole layers first, spill MoE experts of the remainder on device 0 to CPU
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
@@ -635,6 +638,14 @@ struct common_params {
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
+
+    // server CORS params
+    std::string cors_origins = "*";
+    std::string cors_methods = "GET, POST, DELETE, OPTIONS";
+    std::string cors_headers = "*";
+    bool cors_credentials = true;
+    bool cors_origins_explicit = false; // for --agent option
+
     bool enable_chat_template = true;
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
@@ -720,6 +731,12 @@ struct common_params {
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;
+
+    // tokenize params
+    bool tokenize_ids        = false; // if true, only print the token IDs
+    bool tokenize_stdin      = false; // if true, read the prompt from stdin
+    bool tokenize_no_bos     = false; // if true, do not add the BOS token
+    bool tokenize_show_count = false; // if true, print the total token count
 
     // common params
     std::string out_file; // output filename for all example programs
@@ -1101,6 +1118,9 @@ using common_state_file_ptr = std::shared_ptr<common_state_file>;
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
+
+    // (optional) id of the task that created the checkpoint
+    int id_task = -1;
 
     llama_pos pos_min;
     llama_pos pos_max;

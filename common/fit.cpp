@@ -176,9 +176,12 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, bool whole_layers, bool fill_rpc_first, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+    }
+    if (fill_rpc_first && whole_layers) {
+        throw common_params_fit_exception("--fit-whole-layers and --fit-fill-rpc-first are mutually exclusive, abort");
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
@@ -194,6 +197,11 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
+
+    if (fill_rpc_first && (hp_nex == 0 || nd < 2)) {
+        LOG_WRN("%s: --fit-fill-rpc-first requires a MoE model and at least 2 devices, ignoring\n", __func__);
+        fill_rpc_first = false;
+    }
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -322,7 +330,7 @@ static void common_params_fit_impl(
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
                         const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
-                        sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
+                        sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 || whole_layers ? 2 : 6);
                     }
 
                     int64_t sum_projected_used_min_ctx = 0;
@@ -397,9 +405,10 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
     }
 
-    // step 3: iteratively fill the back to front with "dense" layers
+    // step 3: iteratively fill the back to front with layers
     //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
     //   - for a MoE model, same as dense model but with all MoE tensors in system memory
+    //   - in whole_layers mode, treat MoE layers like dense layers so fit emits only a tensor split
 
     // utility function that returns a static C string matching the tensors for a specific layer index and layer fraction:
     auto get_overflow_pattern = [&](const size_t il, const common_layer_fraction_t lf) -> const char * {
@@ -525,7 +534,7 @@ static void common_params_fit_impl(
     };
 
     int64_t global_surplus_cpu_moe = 0;
-    if (hp_nex > 0) {
+    if (hp_nex > 0 && !whole_layers && !fill_rpc_first) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
@@ -570,6 +579,118 @@ static void common_params_fit_impl(
     std::vector<ngl_t> ngl_per_device(nd);
     std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
 
+    // fill-rpc-first mode: give every non-primary device as many whole layers as fit its target,
+    //   back-to-front, then assign ALL remaining layers to the primary device (id 0) and spill as
+    //   many of their MoE expert tensors to system memory as needed to meet the primary's target.
+    //   Non-primary devices never hold partial layers and nothing overflows across devices, so
+    //   expert tensors in system memory only ever belong to layers whose attention runs on device 0.
+    if (fill_rpc_first) {
+        LOG_TRC("%s: fill-rpc-first: filling non-primary devices back-to-front with whole layers:\n", __func__);
+        for (int id = nd - 1; id >= 1; id--) {
+            uint32_t n_unassigned = hp_ngl + 1;
+            for (size_t jd = id + 1; jd < nd; ++jd) {
+                assert(n_unassigned >= ngl_per_device[jd].n_layer);
+                n_unassigned -= ngl_per_device[jd].n_layer;
+            }
+
+            std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+            ngl_per_device_high[id].n_layer = n_unassigned;
+            if (ngl_per_device_high[id].n_layer > 0) {
+                std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+                if (mem_high[id] > targets[id]) {
+                    uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                    while (delta > 1) {
+                        uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                        step_size = std::max(step_size, uint32_t(1));
+                        step_size = std::min(step_size, delta - 1);
+
+                        std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                        ngl_per_device_test[id].n_layer += step_size;
+                        const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
+
+                        if (mem_test[id] <= targets[id]) {
+                            ngl_per_device = ngl_per_device_test;
+                            mem            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                        } else {
+                            ngl_per_device_high = ngl_per_device_test;
+                            mem_high            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
+                        }
+                        delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                    }
+                } else {
+                    ngl_per_device = ngl_per_device_high;
+                    mem            = mem_high;
+                }
+            }
+
+            const int64_t projected_margin = dmds_full[id].free - mem[id];
+            LOG_TRC("%s:   - %s: %2" PRIu32 " whole layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+                __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        }
+
+        uint32_t n_unassigned = hp_ngl + 1;
+        for (size_t jd = 1; jd < nd; jd++) {
+            assert(n_unassigned >= ngl_per_device[jd].n_layer);
+            n_unassigned -= ngl_per_device[jd].n_layer;
+        }
+
+        if (n_unassigned > 0) {
+            // lower bound: every remaining layer dense-only with its MoE experts in system memory
+            std::vector<ngl_t> ngl_lo = ngl_per_device;
+            ngl_lo[0].n_layer = n_unassigned;
+            ngl_lo[0].n_part  = n_unassigned;
+            std::vector<int64_t> mem_lo = get_memory_for_layers(__func__, ngl_lo, overflow_bufts);
+            if (mem_lo[0] > targets[0]) {
+                throw common_params_fit_exception(
+                    "fill-rpc-first: even with all MoE experts in system memory the dense parts of the "
+                    + std::to_string(n_unassigned) + " remaining layers exceed the primary device's target, abort");
+            }
+
+            // upper bound: every remaining layer fully on the primary device
+            std::vector<ngl_t> ngl_hi = ngl_lo;
+            ngl_hi[0].n_part = 0;
+            std::vector<int64_t> mem_hi = get_memory_for_layers(__func__, ngl_hi, overflow_bufts);
+            if (mem_hi[0] <= targets[0]) {
+                ngl_lo = ngl_hi;
+                mem_lo = mem_hi;
+            } else {
+                LOG_TRC("%s: fill-rpc-first: converting primary-device layers to full layers:\n", __func__);
+                uint32_t delta = ngl_lo[0].n_part - ngl_hi[0].n_part;
+                while (delta > 1) {
+                    uint32_t step_size = int64_t(delta) * (targets[0] - mem_lo[0]) / (mem_hi[0] - mem_lo[0]);
+                    step_size = std::max(step_size, uint32_t(1));
+                    step_size = std::min(step_size, delta - 1);
+
+                    std::vector<ngl_t> ngl_test = ngl_lo;
+                    ngl_test[0].n_part -= step_size;
+                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_test, overflow_bufts);
+
+                    if (mem_test[0] <= targets[0]) {
+                        ngl_lo = ngl_test;
+                        mem_lo = mem_test;
+                        LOG_TRC("%s: set ngl_per_device[0].n_part=%" PRIu32 "\n", __func__, ngl_lo[0].n_part);
+                    } else {
+                        ngl_hi = ngl_test;
+                        mem_hi = mem_test;
+                        LOG_TRC("%s: set ngl_per_device_high[0].n_part=%" PRIu32 "\n", __func__, ngl_hi[0].n_part);
+                    }
+                    delta = ngl_lo[0].n_part - ngl_hi[0].n_part;
+                }
+            }
+            ngl_per_device = ngl_lo;
+            mem            = mem_lo;
+        }
+
+        const int64_t projected_margin = dmds_full[0].free - mem[0];
+        LOG_TRC("%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " with experts in system memory), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+            __func__, dev_names[0].c_str(), ngl_per_device[0].n_layer, ngl_per_device[0].n_part, mem[0]/MiB, projected_margin/MiB);
+
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        return;
+    }
+
     // optimize the number of layers per device using the method of false position:
     //   - ngl_per_device has 0 layers for each device, lower bound
     //   - try a "high" configuration where a device is given all unassigned layers
@@ -577,7 +698,7 @@ static void common_params_fit_impl(
     //   - check memory use of our guess, replace either the low or high bound
     //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
     //   - the last device has the output layer, which cannot be a partial layer
-    if (hp_nex == 0) {
+    if (hp_nex == 0 || whole_layers) {
         LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
     } else {
         LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
@@ -591,7 +712,7 @@ static void common_params_fit_impl(
 
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
         ngl_per_device_high[id].n_layer = n_unassigned;
-        if (hp_nex > 0) {
+        if (hp_nex > 0 && !whole_layers) {
             ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
         }
         if (ngl_per_device_high[id].n_layer > 0) {
@@ -607,7 +728,7 @@ static void common_params_fit_impl(
 
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;
-                    if (hp_nex) {
+                    if (hp_nex > 0 && !whole_layers) {
                         ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
                             step_size - 1 : step_size; // the first layer is the output layer which must always be full
                     }
@@ -637,7 +758,7 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
-    if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+    if (hp_nex == 0 || whole_layers || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -794,11 +915,13 @@ enum common_params_fit_status common_fit_params(
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
         uint32_t n_ctx_min,
+        bool whole_layers,
+        bool fill_rpc_first,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, whole_layers, fill_rpc_first, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

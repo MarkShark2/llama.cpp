@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // [fork, PipeDec] llama_pipedec_defer/abort
 #include "log.h"
 #include "sampling.h"
 #include "spd-pipeline.h"
@@ -177,6 +178,17 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
+    // [fork, PipeDec] the sampled token's stage-2 lane was submitted as a
+    // deferred group member before drafting; spec_i_batch holds group row
+    // indices instead of batch indices for this iteration
+    bool      spec_deferred     = false;
+    llama_pos spec_deferred_pos = -1;
+
+    // [fork, PipeDec] leading draft tokens whose lanes were streamed into the
+    // deferred group from inside the draft loop (on_draft_token); the closing
+    // decode carries only spec_draft[spec_deferred_drafts..]
+    int32_t   spec_deferred_drafts = 0;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -220,8 +232,6 @@ struct server_slot {
         if (prompt.tokens.size() == 0) {
             return false;
         }
-
-        GGML_ASSERT(prompt.data.size() == 0);
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -282,11 +292,7 @@ struct server_slot {
         return res;
     }
 
-    void prompt_clear(bool allow_processing) {
-        if (!allow_processing) {
-            GGML_ASSERT(!is_processing());
-        }
-
+    void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         common_context_seq_rm(ctx_tgt, id, -1, -1);
@@ -294,7 +300,7 @@ struct server_slot {
             common_context_seq_rm(ctx_dft, id, -1, -1);
         }
 
-        prompt.tokens.clear();
+        prompt.clear();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -477,6 +483,45 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
+
+        // [fork, PipeDec] deferred verify: with no token left to carry the
+        // closing decode (empty draft, or every draft lane was streamed and the
+        // draft then stopped early), discard the in-flight deferred lanes and
+        // their KV and fall back to the normal (non-deferred) paths below
+        if (spec_deferred && spec_draft.size() <= (size_t) spec_deferred_drafts) {
+            llama_pipedec_abort(ctx_tgt);
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, spec_deferred_pos, -1);
+            spec_deferred        = false;
+            spec_deferred_drafts = 0;
+        }
+
+        if (spec_deferred) {
+            SLT_DBG(*this, "generate_draft (deferred): id=%d, #tokens=%zu, #draft=%zu, #streamed=%d, pos_next=%d\n",
+                    sampled, prompt.tokens.size(), spec_draft.size(), spec_deferred_drafts, prompt.tokens.pos_next());
+
+            GGML_ASSERT(spec_i_batch.empty());
+
+            // group row indices: row 0 = the deferred sampled token, then drafts
+            for (size_t i = 0; i < spec_draft.size() + 1; i++) {
+                spec_i_batch.push_back((int32_t) i);
+            }
+
+            auto pos0 = prompt.tokens.pos_next(); // deferred token's pos, already decoded
+            GGML_ASSERT(pos0 == spec_deferred_pos);
+
+            // the first spec_deferred_drafts drafts were already submitted as
+            // streamed deferred lanes; the closing decode carries the rest
+            for (size_t i = spec_deferred_drafts; i < spec_draft.size(); i++) {
+                add_ok &= batch.add(this->id, spec_draft[i], pos0 + 1 + (llama_pos) i, true);
+            }
+
+            GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
+
+            prompt.tokens.push_back(sampled);
+            prompt.tokens.insert(spec_draft);
+            return;
+        }
+
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
@@ -511,6 +556,13 @@ struct server_slot {
     }
 
     void release() {
+        // [fork, PipeDec] never leave a deferred verify group in flight
+        if (spec_deferred) {
+            llama_pipedec_abort(ctx_tgt);
+            spec_deferred        = false;
+            spec_deferred_drafts = 0;
+        }
+
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -523,7 +575,7 @@ struct server_slot {
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
-                prompt_clear(false);
+                prompt_clear();
             }
 
             reset();
@@ -1731,7 +1783,7 @@ private:
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear(false);
+                    ret->prompt_clear();
                 }
 
                 prompt_cache->update();
@@ -1763,7 +1815,7 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear(false);
+                slot.prompt_clear();
 
                 res = true;
 
@@ -1829,7 +1881,7 @@ private:
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.tokens.clear();
+                    slot.prompt.clear();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -2155,10 +2207,13 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // if multimodal is enabled, send an error and return false
-    bool check_no_mtmd(const int id_task) {
-        if (mctx) {
-            send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
+    // Gate slot save/restore/erase on slot content (does it hold media),
+    // not model capability: a multimodal model may hold a pure-text slot.
+    bool check_slot_no_media(const server_slot & slot, const int id_task) {
+        if (slot.prompt.tokens.has_media()) {
+            send_error(id_task,
+                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
+                ERROR_TYPE_NOT_SUPPORTED);
             return false;
         }
         return true;
@@ -2428,6 +2483,24 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        const int id_task = slot.task->id;
+
+        // evict checkpoints within min-step of a previous checkpoint, unless they were
+        // created by the current task
+        int64_t last = -1;
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+
+                it = slot.prompt.checkpoints.erase(it);
+                continue;
+            }
+
+            last = it->n_tokens;
+            ++it;
+        }
+
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
@@ -2439,6 +2512,8 @@ private:
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        cur.id_task = id_task;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2548,7 +2623,7 @@ private:
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear(false);
+                                    slot.prompt_clear();
                                 }
                             }
                         }
@@ -2651,14 +2726,13 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -2668,13 +2742,13 @@ private:
                         break;
                     }
 
-                    const size_t token_count = slot->prompt.tokens.size();
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
+                    const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
                     const int64_t t_end = ggml_time_us();
@@ -2692,7 +2766,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2716,12 +2789,12 @@ private:
                     size_t token_count = 0;
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        slot->prompt.tokens.clear(); // KV may already been invalidated?
+                        slot->prompt.clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
-                    slot->prompt.tokens.clear();
+                    slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
                     const int64_t t_end = ggml_time_us();
@@ -2739,13 +2812,14 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    // Gate on slot content, consistent with save/restore.
+                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -2758,7 +2832,7 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    slot->prompt_clear(false);
+                    slot->prompt_clear();
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -3076,6 +3150,27 @@ private:
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
         }
 
+        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+        if (batch.slot_batched) {
+            auto & slot_batched      = batch.slot_batched;
+            auto & alora_scale       = batch.alora_scale;
+            auto & alora_disabled_id = batch.alora_disabled_id;
+
+            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
+            // apply lora, only need to do it once per batch
+            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+
+            // if the lora is temporarily disabled for an alora, re-enable it
+            // for next time
+            if (alora_scale > 0.0f) {
+                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
+                slot_batched->lora[alora_disabled_id].scale = alora_scale;
+            }
+
+            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+        }
+
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
@@ -3112,7 +3207,6 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
-
         }
     }
 
@@ -3178,7 +3272,7 @@ private:
 
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
-                    slot.prompt.tokens.clear();
+                    slot.prompt.clear();
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
@@ -3254,6 +3348,97 @@ private:
                 }
             }
         });
+
+        // [fork, PipeDec] deferred verify: submit the sampled token's stage-2 lane
+        // before drafting, so the MTP draft steps overlap its pipeline walk. The
+        // group is closed by this iteration's regular decode (drafts only).
+        iterate(slots, [&](server_slot & slot) { slot.spec_deferred = false; slot.spec_deferred_drafts = 0; });
+        {
+            // latched off after the first hard decode failure: the deferred batch
+            // shape never varies, so ineligibility (e.g. a non-stage-2 arch) is
+            // permanent for the lifetime of the process
+            static bool defer_enabled =
+                (getenv("GGML_PIPEDEC")        && atoi(getenv("GGML_PIPEDEC"))        != 0) &&
+                (getenv("GGML_PIPEDEC_STAGE2") && atoi(getenv("GGML_PIPEDEC_STAGE2")) != 0) &&
+                (getenv("GGML_PIPEDEC_DEFER")  && atoi(getenv("GGML_PIPEDEC_DEFER"))  != 0);
+
+            // only defer when this pass's batch will contain nothing but this
+            // slot's tokens: one generating+drafting slot, every other slot idle
+            // (otherwise a prompt chunk could join the closing decode and break
+            // stage-2 eligibility with a group in flight)
+            bool defer_ok = defer_enabled && drafting.size() == 1 && generating.size() == 1;
+            if (defer_ok) {
+                for (auto & s : slots) {
+                    if (&s != drafting.front() && s.state != SLOT_STATE_IDLE) {
+                        defer_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (defer_ok) {
+                auto & slot = *drafting.front();
+
+                llama_token    tok  = slot.sampled;
+                llama_pos      pos  = slot.prompt.tokens.pos_next();
+                int32_t       nsid  = 1;
+                llama_seq_id   sid  = slot.id;
+                llama_seq_id * sids = &sid;
+                int8_t         lg   = 1;
+                llama_batch    b    = { 1, &tok, nullptr, &pos, &nsid, &sids, &lg };
+
+                llama_pipedec_defer(ctx_tgt);
+                const int defer_ret = llama_decode(ctx_tgt, b);
+                if (defer_ret == 0) {
+                    slot.spec_deferred        = true;
+                    slot.spec_deferred_pos    = pos;
+                    slot.spec_deferred_drafts = 0;
+
+                    // stream each drafted token's lane behind the sampled token's,
+                    // so lanes enter the pipeline while the draft loop still runs.
+                    // n_max_cap guards against the post-draft dp.n_max truncation
+                    // AND keeps at least one token for the closing decode.
+                    static const bool stream_enabled =
+                        getenv("GGML_PIPEDEC_STREAM") && atoi(getenv("GGML_PIPEDEC_STREAM")) != 0;
+
+                    if (stream_enabled) {
+                        const int32_t n_max_cap = slot.get_n_draft_max();
+                        server_slot * slot_ptr  = &slot;
+
+                        auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                        dp.on_draft_token = [this, slot_ptr, n_max_cap](llama_token id, int32_t depth) -> bool {
+                            auto & slot = *slot_ptr;
+
+                            if (depth != slot.spec_deferred_drafts || depth + 1 >= n_max_cap) {
+                                return false;
+                            }
+
+                            llama_pos      pos  = slot.spec_deferred_pos + 1 + depth;
+                            int32_t       nsid  = 1;
+                            llama_seq_id   sid  = slot.id;
+                            llama_seq_id * sids = &sid;
+                            int8_t         lg   = 1;
+                            llama_batch    b    = { 1, &id, nullptr, &pos, &nsid, &sids, &lg };
+
+                            llama_pipedec_defer(ctx_tgt);
+                            if (llama_decode(ctx_tgt, b) != 0) {
+                                SRV_WRN("%s", "streamed draft lane decode failed - remaining drafts ride the closing decode\n");
+                                return false;
+                            }
+
+                            slot.spec_deferred_drafts++;
+                            return true;
+                        };
+                    }
+                } else {
+                    SRV_WRN("%s", "deferred stage-2 decode failed - falling back to combined verify\n");
+                    if (defer_ret < 0) {
+                        SRV_WRN("%s", "this model/context is not stage-2 eligible - disabling deferred verify for this run\n");
+                        defer_enabled = false;
+                    }
+                }
+            }
+        }
 
         // generate the actual drafts (if any)
         {
@@ -3830,7 +4015,10 @@ private:
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || is_last_user_message || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    do_checkpoint = do_checkpoint && (
+                            slot.prompt.checkpoints.empty() ||
+                            is_last_user_message || near_prompt_end ||
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
@@ -3851,25 +4039,6 @@ private:
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
-
-        auto & slot_batched      = batch.slot_batched;
-        auto & alora_scale       = batch.alora_scale;
-        auto & alora_disabled_id = batch.alora_disabled_id;
-
-        // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
-        if (slot_batched) {
-            // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
-
-            // if the lora is temporarily disabled for an alora, re-enable it
-            // for next time
-            if (alora_scale > 0.0f) {
-                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
-                slot_batched->lora[alora_disabled_id].scale = alora_scale;
-            }
-
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
-        }
 
         if (batch.size() == 0) {
             SRV_WRN("%s", "no tokens to decode\n");
@@ -3929,7 +4098,7 @@ private:
 
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear(false);
+                            slot.prompt_clear();
                         }
                     }
 
@@ -3953,7 +4122,33 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         {
             scoped_timer timer(t_spec_procs, n_spec_procs);
-            if (!common_speculative_process(spec.get(), batch_view)) {
+
+            // [fork, PipeDec] with a deferred verify group the sampled token was
+            // decoded separately, so hand process() the logical [sampled + drafts]
+            // batch - its tokens then align 1:1 with the group's nextn rows
+            llama_batch batch_proc = batch_view;
+            std::vector<llama_token>    ptok;
+            std::vector<llama_pos>      ppos;
+            std::vector<int32_t>        pnsid;
+            std::vector<llama_seq_id *> psid;
+            std::vector<int8_t>         plog;
+            for (auto & slot : slots) {
+                if (!slot.spec_deferred || slot.spec_draft.empty()) {
+                    continue;
+                }
+                ptok.push_back(slot.sampled);
+                ptok.insert(ptok.end(), slot.spec_draft.begin(), slot.spec_draft.end());
+                for (size_t i = 0; i < ptok.size(); ++i) {
+                    ppos.push_back(slot.spec_deferred_pos + (llama_pos) i);
+                    pnsid.push_back(1);
+                    psid.push_back(&slot.id);
+                    plog.push_back(1);
+                }
+                batch_proc = { (int32_t) ptok.size(), ptok.data(), nullptr, ppos.data(), pnsid.data(), psid.data(), plog.data() };
+                break;
+            }
+
+            if (!common_speculative_process(spec.get(), batch_proc)) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
@@ -3996,6 +4191,11 @@ private:
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
+            // [fork, PipeDec] deferred verify: spec_i_batch holds group row
+            // indices, not batch indices - the group spans this whole batch
+            if (slot.spec_deferred) {
+                return;
+            }
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
@@ -4124,6 +4324,34 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // [fork, PipeDec probe] when the top-1 draft chain is rejected, count how
+                // often the target's actual token was among the draft sampler's top-K
+                // candidates at that level - the acceptance a K-wide tree level would get.
+                if (accepted.size() - 1 < n_draft) {
+                    static size_t p_rej = 0, p_top2 = 0, p_top3 = 0, p_top8 = 0, p_lvl[8] = {0};
+                    const int i_rej = (int) accepted.size() - 1;
+                    const llama_token tgt = accepted.back();
+                    if (const auto * topk = common_speculative_dbg_topk(spec.get(), slot.id, i_rej)) {
+                        p_rej++;
+                        if (i_rej < 8) {
+                            p_lvl[i_rej]++;
+                        }
+                        for (size_t k = 1; k < topk->size(); ++k) {
+                            if ((*topk)[k] == tgt) {
+                                if (k < 2) { p_top2++; }
+                                if (k < 3) { p_top3++; }
+                                p_top8++;
+                                break;
+                            }
+                        }
+                        if (p_rej % 32 == 0) {
+                            SRV_INF("spec tree probe: rejections=%zu  tgt in draft top2=%.1f%% top3=%.1f%% top8=%.1f%%  rej@lvl 0/1/2=%zu/%zu/%zu\n",
+                                    p_rej, 100.0*p_top2/p_rej, 100.0*p_top3/p_rej, 100.0*p_top8/p_rej,
+                                    p_lvl[0], p_lvl[1], p_lvl[2]);
+                        }
+                    }
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

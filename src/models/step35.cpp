@@ -185,6 +185,9 @@ std::unique_ptr<llm_graph_context> llama_model_step35::build_arch_graph(const ll
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
+        return std::make_unique<graph_pipedec_head>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -195,7 +198,13 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
     inpL = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos     = build_inp_pos();
     auto        * inp_attn    = build_attn_inp_kv_iswa();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // The PipeDec body returns every unmasked hidden row directly and never
+    // gathers output rows. Do not register an unused out_ids input: unused
+    // graph inputs are intentionally not allocated, but set_inputs() would
+    // still attempt to populate one if it were registered here.
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+            ? nullptr
+            : build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -347,9 +356,43 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    // Stage 2 PipeDec queues token-sized trunk graphs across the layer devices.
+    // The output norm/head lives on the first CUDA device, so including it here
+    // would serialize head(token N) ahead of trunk(token N + 1) and recreate the
+    // very bubble this path is meant to fill. The hidden rows are copied out and
+    // fed to one batched graph_pipedec_head after the body pipeline drains.
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// Deferred output norm + LM head for a group of completed PipeDec body rows.
+llama_model_step35::graph_pipedec_head::graph_pipedec_head(
+        const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    cb(inp->embd, "pipedec_h_input", -1);
+
+    ggml_tensor * cur = inp->embd;
+    res->add_input(std::move(inp));
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

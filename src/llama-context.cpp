@@ -19,6 +19,10 @@
 #include <stdexcept>
 #include <string>
 
+// [fork, PipeDec] fork-internal ggml export, kept out of ggml-backend.h so the
+// public header (a dependency of every CUDA object) stays untouched.
+extern "C" void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable);
+
 //
 // llama_context
 //
@@ -61,6 +65,24 @@ static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+    /*.name             =*/ "fused DeepSeek V4 HC pre",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
+    /*.name             =*/ "fused DeepSeek V4 HC comb",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
+    /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
 
@@ -254,6 +276,11 @@ llama_context::llama_context(
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
+
+    cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_comb = true;
+    cparams.fused_dsv4_hc_post = true;
+    cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -587,6 +614,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_lid_probe, cparams.fused_lid);
         cparams.auto_flid = false;
     }
+
+    if (cparams.auto_fhc) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        cparams.auto_fhc = false;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -611,6 +646,15 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+
+    // Any change that invalidates the primary graph topology (LoRA, samplers,
+    // attention settings, etc.) invalidates the PipeDec graph caches as well.
+    for (uint32_t lane = 0; lane < PIPEDEC_STAGE2_MAX_LANES; ++lane) {
+        gf_res_pipedec_body[lane].reset();
+        sched_pipedec_body[lane].reset();
+    }
+    gf_res_pipedec_head.reset();
+    sched_pipedec_head.reset();
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -721,6 +765,14 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    for (auto & lane_sched : sched_pipedec_body) {
+        if (lane_sched) {
+            ggml_backend_sched_synchronize(lane_sched.get());
+        }
+    }
+    if (sched_pipedec_head) {
+        ggml_backend_sched_synchronize(sched_pipedec_head.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1438,6 +1490,79 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+llm_graph_result * llama_context::process_ubatch_pipedec_body(
+        const llama_ubatch & ubatch, llama_memory_context_i * mctx, uint32_t lane, ggml_status & ret) {
+    if (mctx && !mctx->apply()) {
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    GGML_ASSERT(lane < PIPEDEC_STAGE2_MAX_LANES);
+
+    auto & lane_sched = sched_pipedec_body[lane];
+    auto & lane_res   = gf_res_pipedec_body[lane];
+
+    if (!lane_sched) {
+        const size_t max_nodes = graph_max_nodes(1);
+        // Each lane owns a token-sized graph and activation buffers. Four Step
+        // MTP lanes together remain tiny compared with a prompt graph, while
+        // avoiding graph mutation and buffer reuse during asynchronous work.
+        lane_sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes, false, cparams.op_offload));
+        ggml_backend_sched_set_stable_host_inputs(lane_sched.get(), true);
+        lane_res.reset(new llm_graph_result(max_nodes));
+    }
+
+    auto * res = lane_res.get();
+    auto * gf  = res->get_gf();
+    const auto gparams = graph_params(
+            res, ubatch, mctx, LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY, lane_sched.get());
+
+    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+        n_reused++;
+    } else {
+        res->reset();
+        ggml_backend_sched_reset(lane_sched.get());
+        ggml_backend_sched_set_eval_callback(
+                lane_sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        gf = model.build_graph(gparams);
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (!ggml_backend_sched_alloc_graph(lane_sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        LLAMA_LOG_INFO("%s: initialized token-body lane %u\n", __func__, lane);
+        if (lane == 0) {
+            for (ggml_backend_t backend : backend_ptrs) {
+                const size_t size = ggml_backend_sched_get_buffer_size(lane_sched.get(), backend);
+                if (size > 0) {
+                    LLAMA_LOG_INFO("%s: %10s per-lane body compute buffer size = %8.2f MiB\n",
+                            __func__, ggml_backend_name(backend), size/1024.0/1024.0);
+                }
+            }
+        }
+    }
+
+    res->set_inputs(&ubatch);
+
+    ret = ggml_backend_sched_graph_compute_async(lane_sched.get(), res->get_gf());
+    if (ret != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute graph, status: %d\n", __func__, (int) ret);
+        return nullptr;
+    }
+
+    return res;
+}
+
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1749,6 +1874,65 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// Stage 2 currently targets the linear Step-3.5 MTP verification group. Keeping
+// the eligibility test deliberately narrow makes every unsupported batch fall
+// through to the established decoder path without changing its behavior.
+static bool pipedec_stage2_eligible(
+        const llama_model   & model,
+        const llama_cparams & cparams,
+        const llama_batch   & batch,
+        uint32_t              n_tokens,
+        uint32_t              n_outputs,
+        bool                  has_samplers,
+        bool                  allow_single) {
+    const char * pipedec = getenv("GGML_PIPEDEC");
+    const char * stage2  = getenv("GGML_PIPEDEC_STAGE2");
+    if (!pipedec || atoi(pipedec) == 0 || !stage2 || atoi(stage2) == 0) {
+        return false;
+    }
+
+    uint32_t max_tokens = 8;
+    if (const char * value = getenv("GGML_PIPEDEC_STAGE2_MAX_TOKENS")) {
+        const int parsed = atoi(value);
+        if (parsed > 0) {
+            max_tokens = std::min<uint32_t>((uint32_t) parsed, 8);
+        }
+    }
+
+    if (model.arch != LLM_ARCH_STEP35 ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+        !cparams.causal_attn ||
+        cparams.embeddings ||
+        !cparams.embeddings_nextn ||
+        cparams.embeddings_nextn_masked ||
+        cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
+        has_samplers ||
+        model.hparams.n_embd != model.hparams.n_embd_out() ||
+        n_tokens < (allow_single ? 1u : 2u) || n_tokens > max_tokens ||
+        n_outputs != n_tokens ||
+        !batch.token || batch.embd || !batch.pos || !batch.logits ||
+        !batch.n_seq_id || !batch.seq_id) {
+        return false;
+    }
+
+    for (bool enabled : cparams.embeddings_layer_inp) {
+        if (enabled) {
+            return false;
+        }
+    }
+
+    const llama_seq_id seq_id = batch.seq_id[0][0];
+    const llama_pos    pos_0  = batch.pos[0];
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (batch.logits[i] == 0 || batch.n_seq_id[i] != 1 ||
+            batch.seq_id[i][0] != seq_id || batch.pos[i] != pos_0 + (llama_pos) i) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1808,6 +1992,56 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    // [fork, PipeDec] a deferred decode submits lanes only; the group it opens is
+    // closed (drained + one LM head over all rows) by the next stage-2 decode.
+    const bool pipedec_defer_this = pipedec_defer_next;
+    pipedec_defer_next = false;
+
+    const bool pipedec_stage2 = pipedec_stage2_eligible(
+            model, cparams, balloc->get_batch(), n_tokens_all, n_outputs_all, has_samplers,
+            pipedec_defer_this || pipedec_group_tokens > 0);
+
+    if (pipedec_defer_this && !pipedec_stage2) {
+        LLAMA_LOG_ERROR("%s: deferred decode requested but the batch is not stage-2 eligible\n", __func__);
+        return -1;
+    }
+    if (pipedec_group_tokens > 0 && !pipedec_stage2) {
+        // should not happen (the caller controls both sides) - discard the group
+        // rather than mixing deferred lanes into a normal decode
+        LLAMA_LOG_WARN("%s: non-stage-2 decode with %u deferred group rows in flight - aborting group\n",
+                __func__, pipedec_group_tokens);
+        pipedec_abort_group();
+    }
+    if (pipedec_stage2) {
+        GGML_ASSERT(pipedec_group_tokens + n_tokens_all <= PIPEDEC_STAGE2_MAX_LANES);
+        if (pipedec_group_h.empty()) {
+            pipedec_group_h.resize((size_t) PIPEDEC_STAGE2_MAX_LANES * model.hparams.n_embd_out());
+        }
+    }
+
+    if (!pipedec_stage2 && n_tokens_all > 1 && n_tokens_all <= 8 &&
+        getenv("GGML_PIPEDEC_STAGE2") && atoi(getenv("GGML_PIPEDEC_STAGE2")) != 0 &&
+        getenv("GGML_PIPEDEC_TRACE")  && atoi(getenv("GGML_PIPEDEC_TRACE"))  != 0) {
+        uint32_t n_layer_inputs = 0;
+        for (bool enabled : cparams.embeddings_layer_inp) {
+            n_layer_inputs += enabled;
+        }
+        const auto & batch = balloc->get_batch();
+        LLAMA_LOG_INFO(
+                "%s: PipeDec Stage 2 bypass: arch=%d ctx_type=%d causal=%d embd=%d nextn=%d masked=%d pool=%d samplers=%d layer_inputs=%u n_tokens=%u n_outputs=%u token=%d embd_in=%d pos=%d logits=%d seq=%d\n",
+                __func__, (int) model.arch, (int) cparams.ctx_type, (int) cparams.causal_attn,
+                (int) cparams.embeddings, (int) cparams.embeddings_nextn,
+                (int) cparams.embeddings_nextn_masked, (int) cparams.pooling_type,
+                (int) has_samplers, n_layer_inputs, n_tokens_all, n_outputs_all,
+                batch.token != nullptr, batch.embd != nullptr, batch.pos != nullptr,
+                batch.logits != nullptr, batch.seq_id != nullptr);
+    }
+
+    if (pipedec_stage2 && !pipedec_stage2_reported) {
+        LLAMA_LOG_INFO("%s: PipeDec Stage 2 active: token-sized decoder bodies + deferred batched LM head\n", __func__);
+        pipedec_stage2_reported = true;
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
@@ -1840,7 +2074,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, pipedec_stage2 ? 1 : cparams.n_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -1883,13 +2117,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+    // [fork, PipeDec] a group-closing stage-2 decode also emits logits for the
+    // deferred rows already in flight, so reserve for the whole group
+    const int32_t n_outputs_reserve = n_outputs_all + (pipedec_stage2 ? (int32_t) pipedec_group_tokens : 0);
+    if (output_reserve(n_outputs_reserve) < n_outputs_reserve) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_reserve);
         return -2;
     };
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+
+    const bool    pipedec_trace   = pipedec_stage2 && getenv("GGML_PIPEDEC_TRACE") && atoi(getenv("GGML_PIPEDEC_TRACE")) != 0;
+    const int64_t pipedec_body_t0 = pipedec_stage2 ? ggml_time_us() : 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -1912,7 +2152,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const uint32_t pipedec_lane = pipedec_group_tokens + n_tokens_prev;
+        const auto * res = pipedec_stage2
+                ? process_ubatch_pipedec_body(ubatch, mctx.get(), pipedec_lane, status)
+                : process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2043,13 +2286,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(
+                        pipedec_stage2 ? sched_pipedec_body[pipedec_lane].get() : sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                const uint32_t n_embd = hparams.n_embd_out();
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                // [fork, PipeDec] stage-2 rows land in the fixed group buffer: with a
+                // deferred group the GET may still be in flight when the NEXT decode's
+                // output_reserve would touch embd_nextn, so the destination must be
+                // stable. Rows are copied into embd_nextn at group close.
+                float * embd_nextn_out = pipedec_stage2
+                        ? pipedec_group_h.data() + (size_t) pipedec_lane * n_embd
+                        : embd_nextn.data + offset*n_embd;
+
+                if (pipedec_stage2) {
+                    GGML_ASSERT((size_t) (pipedec_lane + n_rows) * n_embd <= pipedec_group_h.size());
+                } else {
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                }
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
             }
         }
@@ -2071,7 +2326,150 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
+    if (pipedec_stage2 && pipedec_defer_this) {
+        // deferred group member: lanes and hidden-row GETs are in flight; the
+        // next stage-2 decode drains them and runs one head over the group
+        pipedec_group_tokens += n_tokens_all;
+        n_outputs = 0;
+        return 0;
+    }
+
+    const uint32_t pipedec_total = pipedec_stage2 ? pipedec_group_tokens + n_tokens_all : 0;
+
+    if (pipedec_stage2) {
+        const int64_t body_submit_us = ggml_time_us() - pipedec_body_t0;
+        const int64_t body_drain_t0  = ggml_time_us();
+
+        // The hidden-state GETs above are ordered after their body graphs. Drain
+        // once after all bodies have been submitted, then reuse those host rows
+        // as the input to a single output norm/LM-head graph on CUDA0.
+        for (uint32_t lane = 0; lane < pipedec_total; ++lane) {
+            GGML_ASSERT(sched_pipedec_body[lane]);
+            ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        }
+        const int64_t body_drain_us = ggml_time_us() - body_drain_t0;
+
+        // group rows are all accounted for from here on
+        pipedec_group_tokens = 0;
+
+        // make the group's hidden rows visible to llama_get_embeddings_nextn*
+        if (embd_nextn.data) {
+            const uint32_t n_embd = hparams.n_embd_out();
+            GGML_ASSERT((size_t) pipedec_total * n_embd <= embd_nextn.size);
+            std::memcpy(embd_nextn.data, pipedec_group_h.data(), (size_t) pipedec_total * n_embd * sizeof(float));
+        }
+
+        llama_ubatch head_ubatch = {};
+        head_ubatch.b_equal_seqs = false;
+        head_ubatch.n_tokens     = pipedec_total;
+        head_ubatch.n_seq_tokens = pipedec_total;
+        head_ubatch.n_seqs       = 1;
+        head_ubatch.n_seqs_unq   = 1;
+        head_ubatch.n_pos        = 1;
+        head_ubatch.embd         = pipedec_group_h.data();
+
+        n_outputs = pipedec_total;
+
+        const int64_t head_t0 = ggml_time_us();
+
+        if (!sched_pipedec_head) {
+            const size_t max_nodes = graph_max_nodes(std::max<uint32_t>(8, n_tokens_all));
+            sched_pipedec_head.reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, false, cparams.op_offload));
+            gf_res_pipedec_head.reset(new llm_graph_result(max_nodes));
+        }
+
+        auto * head_res = gf_res_pipedec_head.get();
+        auto * head_gf  = head_res->get_gf();
+        const auto head_params = graph_params(
+                head_res, head_ubatch, nullptr, LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD,
+                sched_pipedec_head.get());
+
+        if (!graph_reuse_disable && head_res->can_reuse(head_params)) {
+            n_reused++;
+        } else {
+            head_res->reset();
+            ggml_backend_sched_reset(sched_pipedec_head.get());
+            ggml_backend_sched_set_eval_callback(
+                    sched_pipedec_head.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            head_gf = model.build_graph(head_params);
+            if (!head_gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize PipeDec deferred head graph\n", __func__);
+                const auto & batch = balloc->get_batch();
+                memory->seq_rm(batch.seq_id[0][0], batch.pos[0], -1);
+                return -3;
+            }
+            if (!ggml_backend_sched_alloc_graph(sched_pipedec_head.get(), head_gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate PipeDec deferred head graph\n", __func__);
+                const auto & batch = balloc->get_batch();
+                memory->seq_rm(batch.seq_id[0][0], batch.pos[0], -1);
+                return -2;
+            }
+        }
+
+        head_res->set_inputs(&head_ubatch);
+        const ggml_status head_status = ggml_backend_sched_graph_compute_async(
+                sched_pipedec_head.get(), head_res->get_gf());
+
+        if (head_status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute PipeDec deferred head graph, status: %d\n",
+                    __func__, (int) head_status);
+            const auto & batch = balloc->get_batch();
+            memory->seq_rm(batch.seq_id[0][0], batch.pos[0], -1);
+            switch (head_status) {
+                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ALLOC_FAILED: return -2;
+                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        auto * t_logits = head_res->get_logits();
+        if (!t_logits || !logits.data) {
+            LLAMA_LOG_ERROR("%s: PipeDec deferred head did not produce logits\n", __func__);
+            const auto & batch = balloc->get_batch();
+            memory->seq_rm(batch.seq_id[0][0], batch.pos[0], -1);
+            return -3;
+        }
+
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_pipedec_head.get(), t_logits);
+        GGML_ASSERT(backend_res != nullptr);
+        GGML_ASSERT((int64_t) pipedec_total*n_vocab <= (int64_t) logits.size);
+        GGML_ASSERT(ggml_nelements(t_logits) == (int64_t) pipedec_total*n_vocab);
+        ggml_backend_tensor_get_async(
+                backend_res, t_logits, logits.data, 0, (size_t) pipedec_total*n_vocab*sizeof(float));
+
+        const int64_t head_submit_us = ggml_time_us() - head_t0;
+        const int64_t head_drain_t0  = ggml_time_us();
+        ggml_backend_sched_synchronize(sched_pipedec_head.get());
+        const int64_t head_drain_us = ggml_time_us() - head_drain_t0;
+
+        if (pipedec_trace) {
+            LLAMA_LOG_INFO(
+                    "%s: PipeDec Stage 2 tokens=%u body_submit=%.3f ms body_drain=%.3f ms head_submit=%.3f ms head_drain=%.3f ms total=%.3f ms\n",
+                    __func__, n_tokens_all,
+                    body_submit_us/1000.0, body_drain_us/1000.0,
+                    head_submit_us/1000.0, head_drain_us/1000.0,
+                    (ggml_time_us() - pipedec_body_t0)/1000.0);
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    // [fork, PipeDec] a stage-2 close emits one logits row per group token (all
+    // batch tokens have logits set, deferred rows included) - identity mapping
+    if (pipedec_stage2) {
+        n_outputs = pipedec_total;
+
+        std::fill(output_ids.begin(), output_ids.end(), -1);
+        for (uint32_t i = 0; i < pipedec_total; ++i) {
+            output_ids[i] = i;
+        }
+
+        return 0;
+    }
+
     n_outputs = n_outputs_all;
 
     // set output mappings
@@ -2474,14 +2872,16 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                ggml_backend_sched_t       sched_override) const {
+    ggml_backend_sched_t sched_use = sched_override ? sched_override : sched.get();
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
+        /*.sched       =*/ sched_use,
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
@@ -2489,7 +2889,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(sched_use),
         /*.res         =*/ res,
     };
 }
@@ -2523,8 +2923,9 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_override) const {
+    ggml_backend_sched_t sched_use = sched_override ? sched_override : sched.get();
+    return [this, sched_use](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2540,7 +2941,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched_use, cur, backend.get());
                         }
                     }
                 }
@@ -3799,6 +4200,34 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+void llama_context::pipedec_defer_mark() {
+    pipedec_defer_next = true;
+}
+
+void llama_context::pipedec_abort_group() {
+    // drain so the in-flight hidden-row GETs into pipedec_group_h complete
+    // before the buffer rows are reused
+    for (uint32_t lane = 0; lane < pipedec_group_tokens; ++lane) {
+        if (sched_pipedec_body[lane]) {
+            ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        }
+    }
+    pipedec_group_tokens = 0;
+    pipedec_defer_next   = false;
+}
+
+void llama_pipedec_defer(llama_context * ctx) {
+    ctx->pipedec_defer_mark();
+}
+
+void llama_pipedec_abort(llama_context * ctx) {
+    ctx->pipedec_abort_group();
+}
+
+uint32_t llama_pipedec_group_n(llama_context * ctx) {
+    return ctx->pipedec_group_n();
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

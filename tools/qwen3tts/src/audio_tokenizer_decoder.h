@@ -197,6 +197,12 @@ public:
     const std::string & get_error() const { return error_msg_; }
     
 private:
+    // One-shot decode: builds a single graph over all n_frames. decode()
+    // calls this directly for short inputs and falls back to chunked
+    // streaming for long ones to keep the compute buffer bounded.
+    bool decode_oneshot(const int32_t * codes, int32_t n_frames,
+                        std::vector<float> & samples);
+
     // Build computation graph for decoding. n_past is the KV-cache /
     // causal-conv history length from prior calls; 0 for one-shot decode.
     // When n_past > 0, the graph additionally reads per-layer past_K/past_V
