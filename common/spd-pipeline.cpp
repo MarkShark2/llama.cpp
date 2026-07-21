@@ -13,7 +13,7 @@
 
 namespace {
 
-constexpr uint32_t SPD_STAGE_COUNT = 8;
+constexpr uint32_t SPD_STAGE_COUNT = COMMON_SPD_STAGE_COUNT;
 constexpr uint32_t SPD_ROLLBACK_TOKENS = SPD_STAGE_COUNT - 1;
 
 using clock_type = std::chrono::steady_clock;
@@ -132,6 +132,7 @@ struct common_spd_pipeline::impl {
     llama_context * sidecar = nullptr;
 
     std::string last_error;
+    bool ready = false;
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params)
         : model_target(model_target), model_spd(model_spd), params(params) {
@@ -153,12 +154,20 @@ struct common_spd_pipeline::impl {
         }
     }
 
-    llama_context_params make_context_params(uint32_t n_batch) const {
-        llama_context_params cp = llama_context_default_params();
+    llama_context_params make_context_params(uint32_t n_batch, bool is_sidecar = false) const {
+        llama_context_params cp = is_sidecar ? params.sidecar_context : params.target_context;
         cp.n_ctx = params.n_ctx;
         cp.n_batch = n_batch;
         cp.n_ubatch = std::min(n_batch, params.n_ubatch);
         cp.n_seq_max = 1;
+        cp.n_rs_seq = 0;
+        cp.n_outputs_max = 0;
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        cp.embeddings = false;
+        cp.kv_unified = false;
+        cp.samplers = nullptr;
+        cp.n_samplers = 0;
+        cp.ctx_other = nullptr;
         cp.no_perf = false;
         if (params.n_threads > 0) {
             cp.n_threads = params.n_threads;
@@ -244,11 +253,14 @@ struct common_spd_pipeline::impl {
             return;
         }
 
-        llama_context_params sp = make_context_params(std::max<uint32_t>(params.n_batch, SPD_STAGE_COUNT + 1));
+        llama_context_params sp = make_context_params(
+                std::max<uint32_t>(params.n_batch, SPD_STAGE_COUNT + 1), true);
         sidecar = llama_init_from_model(model_spd, sp);
         if (sidecar == nullptr) {
             fail("failed to initialize the SPD sidecar context");
+            return;
         }
+        ready = true;
     }
 
     void reset_memories() {
@@ -797,7 +809,7 @@ common_spd_pipeline::common_spd_pipeline(
 common_spd_pipeline::~common_spd_pipeline() = default;
 
 bool common_spd_pipeline::valid() const {
-    return pimpl->last_error.empty();
+    return pimpl->ready;
 }
 
 const std::string & common_spd_pipeline::error() const {
@@ -808,7 +820,7 @@ bool common_spd_pipeline::generate(
         const std::vector<llama_token> & prompt,
         int32_t n_predict,
         common_spd_result & result) {
-    if (!valid()) {
+    if (!pimpl->ready) {
         return false;
     }
     return pimpl->generate(prompt, n_predict, result);

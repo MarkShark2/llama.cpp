@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+constexpr uint32_t COMMON_SPD_STAGE_COUNT = 8;
+
 struct common_spd_params {
     uint32_t n_ctx = 4096;
     uint32_t n_batch = 512;
@@ -14,6 +16,11 @@ struct common_spd_params {
     int32_t n_threads = 0;
     int32_t n_threads_batch = 0;
     bool parallel_stages = true;
+
+    // Context templates keep SPD's target stages and sidecar aligned with the
+    // caller's cache types, Flash Attention, RoPE, and offload settings.
+    llama_context_params target_context = llama_context_default_params();
+    llama_context_params sidecar_context = llama_context_default_params();
 };
 
 struct common_spd_result {
@@ -53,4 +60,3 @@ private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
-

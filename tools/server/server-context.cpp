@@ -13,6 +13,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "spd-pipeline.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -936,6 +937,9 @@ private:
 
     common_speculative_ptr spec;
 
+    bool spd_mode = false;
+    std::unique_ptr<common_spd_pipeline> spd_pipeline;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -969,6 +973,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        spd_pipeline.reset();
+        spd_mode = false;
+
         spec.reset();
         spec_init.reset();
 
@@ -1047,7 +1054,29 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        const bool spec_spd = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_SPD) != params_base.speculative.types.end();
+        const bool has_spec = has_draft || spec_mtp || spec_spd;
+
+        if (spec_spd) {
+            if (!has_draft) {
+                SRV_ERR("%s", "SPD requires --model-draft with a converted SPD sidecar GGUF\n");
+                return false;
+            }
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("SPD currently requires exactly one server slot (--parallel 1), got %d\n", params_base.n_parallel);
+                return false;
+            }
+            if (has_mmproj) {
+                SRV_ERR("%s", "SPD does not currently support multimodal input\n");
+                return false;
+            }
+            if (!params_base.lora_adapters.empty()) {
+                SRV_ERR("%s", "SPD does not currently support LoRA adapters\n");
+                return false;
+            }
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1223,13 +1252,15 @@ private:
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (!spec_spd && ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+                if (!spec_spd) {
+                    params_base.speculative.draft.ctx_dft = ctx_dft;
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1314,8 +1345,9 @@ private:
             slots.emplace_back();
         }
 
-        // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        // try ordinary speculative decoding. SPD owns separate stage contexts
+        // and is initialized below instead of through common_speculative_init().
+        if (!spec_spd && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -1329,10 +1361,35 @@ private:
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
-        } else {
+        } else if (!spec_spd) {
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        if (spec_spd) {
+            common_spd_params spd_params;
+            spd_params.n_ctx           = n_ctx_slot;
+            spd_params.n_batch         = params_base.n_batch;
+            spd_params.n_ubatch        = params_base.n_ubatch;
+            spd_params.n_threads       = params_base.cpuparams.n_threads;
+            spd_params.n_threads_batch = params_base.cpuparams_batch.n_threads == -1
+                ? params_base.cpuparams.n_threads
+                : params_base.cpuparams_batch.n_threads;
+            spd_params.parallel_stages = true;
+            spd_params.target_context  = common_context_params_to_llama(params_base);
+
+            const common_params params_dft = common_base_params_to_speculative(params_base);
+            spd_params.sidecar_context = common_context_params_to_llama(params_dft);
+
+            spd_pipeline = std::make_unique<common_spd_pipeline>(model_tgt, model_dft, spd_params);
+            if (!spd_pipeline->valid()) {
+                SRV_ERR("failed to initialize SPD pipeline: %s\n", spd_pipeline->error().c_str());
+                spd_pipeline.reset();
+                return false;
+            }
+            spd_mode = true;
+            SRV_INF("%s", "initialized eight-stage SPD pipeline (single-slot, greedy)\n");
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1732,6 +1789,39 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (spd_mode) {
+            const auto & sampling = task.params.sampling;
+            const bool raw_greedy = sampling.temp <= 0.0f &&
+                sampling.n_probs == 0 &&
+                sampling.grammar.empty() &&
+                sampling.logit_bias.empty() &&
+                sampling.penalty_repeat == 1.0f &&
+                sampling.penalty_freq == 0.0f &&
+                sampling.penalty_present == 0.0f &&
+                sampling.dry_multiplier == 0.0f &&
+                !sampling.ignore_eos &&
+                sampling.reasoning_budget_tokens < 0;
+
+            if (task.type != SERVER_TASK_TYPE_COMPLETION) {
+                send_error(task, "SPD currently supports text completion tasks only", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (task.is_parent() || task.is_child()) {
+                send_error(task, "SPD currently supports one completion per request", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (!raw_greedy) {
+                send_error(task,
+                        "SPD currently requires raw greedy sampling (temperature <= 0, no logit bias, grammar, probabilities, or penalties)",
+                        ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (!task.params.lora.empty()) {
+                send_error(task, "SPD does not currently support LoRA adapters", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2399,6 +2489,15 @@ private:
 
                     const int id_task = task.id;
 
+                    if (spd_mode && (task.type != SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child())) {
+                        send_error(task,
+                                task.type == SERVER_TASK_TYPE_COMPLETION
+                                    ? "SPD currently supports one completion per request"
+                                    : "SPD currently supports text completion tasks only",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2780,7 +2879,152 @@ private:
         }
     };
 
+    void update_slots_spd() {
+        bool has_work = false;
+        for (const auto & slot : slots) {
+            has_work |= slot.is_processing();
+        }
+        if (!has_work) {
+            SRV_TRC("%s", "all SPD slots are idle\n");
+            return;
+        }
+
+        // Keep the queue moving after this synchronous single-slot request.
+        server_task next(SERVER_TASK_TYPE_NEXT_RESPONSE);
+        next.id = queue_tasks.get_new_id();
+        queue_tasks.post(std::move(next));
+
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_STARTED) {
+                return;
+            }
+
+            slot.t_start_process_prompt = ggml_time_us();
+            slot.t_start_generation = 0;
+            slot.n_decoded = 0;
+            slot.n_decoded_last = 0;
+            slot.n_remaining = -1;
+            slot.has_next_token = true;
+            slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+            const llama_tokens prompt = slot.task->tokens.get_text_tokens();
+            if (prompt.empty()) {
+                send_error(slot, "SPD prompt must not be empty", ERROR_TYPE_INVALID_REQUEST);
+                slot.release();
+                return;
+            }
+            if (prompt.size() < COMMON_SPD_STAGE_COUNT) {
+                send_error(slot,
+                        string_format("SPD requires a prompt of at least %u tokens; received %zu",
+                                COMMON_SPD_STAGE_COUNT, prompt.size()),
+                        ERROR_TYPE_INVALID_REQUEST);
+                slot.release();
+                return;
+            }
+
+            const int32_t n_available = slot.n_ctx - (int32_t) prompt.size() -
+                (int32_t) COMMON_SPD_STAGE_COUNT - 1;
+            if (n_available <= 0) {
+                send_error(slot,
+                        string_format("SPD prompt (%zu tokens) leaves no decode space in the %d-token context",
+                                prompt.size(), slot.n_ctx),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                slot.release();
+                return;
+            }
+
+            int32_t n_predict = slot.task->params.n_predict >= 0
+                ? slot.task->params.n_predict
+                : params_base.n_predict;
+            if (n_predict < 0) {
+                n_predict = n_available;
+            }
+            if (n_predict == 0) {
+                send_error(slot, "SPD prediction count must be positive", ERROR_TYPE_INVALID_REQUEST);
+                slot.release();
+                return;
+            }
+            if (n_predict > n_available) {
+                SLT_WRN(slot, "capping SPD prediction count from %d to %d to fit the context\n", n_predict, n_available);
+                n_predict = n_available;
+                slot.truncated = true;
+            }
+
+            slot.n_prompt_tokens_cache = 0;
+            slot.n_prompt_tokens_processed = (int32_t) prompt.size();
+            slot.prompt.tokens.clear();
+            slot.prompt.tokens.insert(prompt);
+
+            if (slot.task->params.stream) {
+                send_partial_response(slot, {}, slot.task->params.return_progress,
+                        !slot.task->params.return_progress);
+            }
+
+            common_spd_result spd_result;
+            if (!spd_pipeline->generate(prompt, n_predict, spd_result)) {
+                send_error(slot, "SPD generation failed: " + spd_pipeline->error(), ERROR_TYPE_SERVER);
+                slot.release();
+                return;
+            }
+
+            slot.state = SLOT_STATE_GENERATING;
+            slot.t_start_generation = ggml_time_us();
+            slot.t_prompt_processing = std::max(0.001, spd_result.prefill_seconds*1e3);
+            slot.t_token_generation = std::max(0.001, spd_result.decode_seconds*1e3);
+            slot.n_draft_accepted = (int32_t) (spd_result.n_accepted > 0 ? spd_result.n_accepted - 1 : 0);
+            slot.n_draft_total = slot.n_draft_accepted + (int32_t) spd_result.n_rejected;
+            slot.n_draft_verif_steps = (int32_t) spd_result.decode_steps;
+            metrics.on_prompt_eval(slot);
+
+            SLT_INF(slot,
+                    "SPD generated %zu tokens in %.3f s (accepted %d/%d drafts, %" PRIu64 " pipeline steps)\n",
+                    spd_result.tokens.size(), spd_result.decode_seconds,
+                    slot.n_draft_accepted, slot.n_draft_total, spd_result.decode_steps);
+
+            bool stopped = false;
+            for (size_t i = 0; i < spd_result.tokens.size(); ++i) {
+                if (i > 0) {
+                    slot.prompt.tokens.push_back(spd_result.tokens[i - 1]);
+                }
+
+                completion_token_output token;
+                token.tok = spd_result.tokens[i];
+                const bool special = params_base.special ||
+                    slot.task->params.sampling.preserved_tokens.find(token.tok) !=
+                    slot.task->params.sampling.preserved_tokens.end();
+                token.text_to_send = common_token_to_piece(slot.ctx_tgt, token.tok, special);
+                token.prob = 1.0f;
+
+                ++slot.n_decoded;
+                if (!process_token(token, slot)) {
+                    stopped = true;
+                    break;
+                }
+            }
+
+            if (!stopped) {
+                slot.stop = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
+            }
+
+            // process_token() and streaming responses use these controller
+            // timings. release() overwrites them only after the final result
+            // and metrics have already consumed them.
+            slot.t_prompt_processing = std::max(0.001, spd_result.prefill_seconds*1e3);
+            slot.t_token_generation = std::max(0.001, spd_result.decode_seconds*1e3);
+            slot.print_timings();
+            send_final_response(slot);
+            metrics.on_prediction(slot);
+            slot.release();
+        });
+    }
+
     void update_slots() {
+        if (spd_mode) {
+            update_slots_spd();
+            return;
+        }
+
         if (timings_enabled()) {
             static int64_t t_prev = 0;
             const int64_t t_start = ggml_time_us();

@@ -1567,7 +1567,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         const bool spec_mtp = std::find(params.speculative.types.begin(),
                                         params.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        if (spec_mtp && !params.speculative.has_dft() && !params.speculative.draft.devices.empty()) {
+        const bool spec_spd = std::find(params.speculative.types.begin(),
+                                        params.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_SPD) != params.speculative.types.end();
+        if (((spec_mtp && !params.speculative.has_dft()) || spec_spd) &&
+            !params.speculative.draft.devices.empty()) {
             mparams.mtp_dev = params.speculative.draft.devices[0];
         }
     }

@@ -1323,8 +1323,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 (int) hparams.n_layer(), n_layer_all - 1, ggml_backend_dev_name(mtp_dev));
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // When the MTP/output override is active, normalize the ordinary layer
+    // split over the target transformer layers only. The overridden trailing
+    // MTP blocks and output head must not consume fractions of the target
+    // split (e.g. an 8/8/8/4/4 SPD layout).
+    const int n_split_layers = mtp_dev != nullptr ? (int) hparams.n_layer() : n_layer_all + 1;
+    const int i_gpu_start = std::max(n_split_layers - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_split_layers);
     auto get_layer_buft_list = [&, mtp_dev](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (mtp_dev != nullptr && il >= (int) hparams.n_layer()) {
