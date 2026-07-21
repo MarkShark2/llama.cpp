@@ -281,6 +281,44 @@ std::string detokenize(const llama_vocab * vocab, const std::vector<llama_token>
     return result;
 }
 
+size_t matching_prefix(
+        const std::vector<llama_token> & expected,
+        const std::vector<llama_token> & actual) {
+    size_t matched = 0;
+    while (matched < expected.size() && matched < actual.size() &&
+           expected[matched] == actual[matched]) {
+        ++matched;
+    }
+    return matched;
+}
+
+void print_mismatch(
+        const std::vector<llama_token> & expected,
+        const std::vector<llama_token> & actual) {
+    const size_t matched = matching_prefix(expected, actual);
+    std::fprintf(stderr, "mismatch after %zu token(s): expected=", matched);
+    if (matched < expected.size()) {
+        std::fprintf(stderr, "%d", expected[matched]);
+    } else {
+        std::fprintf(stderr, "<end>");
+    }
+    std::fprintf(stderr, " actual=");
+    if (matched < actual.size()) {
+        std::fprintf(stderr, "%d", actual[matched]);
+    } else {
+        std::fprintf(stderr, "<end>");
+    }
+    std::fprintf(stderr, "\nexpected ids:");
+    for (llama_token token : expected) {
+        std::fprintf(stderr, " %d", token);
+    }
+    std::fprintf(stderr, "\nactual ids:  ");
+    for (llama_token token : actual) {
+        std::fprintf(stderr, " %d", token);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -539,6 +577,7 @@ int main(int argc, char ** argv) {
         }
         if (current.tokens != baseline.tokens) {
             std::fprintf(stderr, "FAIL: verified SPD iteration differs from the full-target greedy baseline\n");
+            print_mismatch(baseline.tokens, current.tokens);
             pipeline.reset();
             llama_model_free(sidecar);
             llama_model_free(target);
@@ -555,11 +594,7 @@ int main(int argc, char ** argv) {
     const double spd_wall_seconds = seconds_since(spd_wall_start);
     phase_marker(phase_file, "spd", "end");
 
-    size_t matched = 0;
-    while (matched < baseline.tokens.size() && matched < actual.tokens.size() &&
-           baseline.tokens[matched] == actual.tokens[matched]) {
-        ++matched;
-    }
+    const size_t matched = matching_prefix(baseline.tokens, actual.tokens);
     const double spd_pp = spd_prefill_seconds > 0.0 ?
             (double) spd_requests*prompt_tokens.size()/spd_prefill_seconds : 0.0;
     const double spd_tps = spd_decode_seconds > 0.0 ? spd_generated/spd_decode_seconds : 0.0;

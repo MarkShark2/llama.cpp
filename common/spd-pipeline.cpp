@@ -183,6 +183,10 @@ struct common_spd_pipeline::impl {
             fail("SPD requires both a target model and a sidecar model");
             return;
         }
+        if (params.n_ctx > UINT32_MAX/SPD_STAGE_COUNT) {
+            fail("SPD context length is too large for rollback sequence allocation");
+            return;
+        }
 
         n_embd = llama_model_n_embd(model_target);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_target));
@@ -221,6 +225,12 @@ struct common_spd_pipeline::impl {
             cp.spd_stage = stage;
             cp.spd_stage_count = SPD_STAGE_COUNT;
             cp.n_seq_max = SPD_STAGE_COUNT;
+            // llama_context derives n_ctx_seq by dividing total n_ctx by
+            // n_seq_max. SPD uses the extra sequence IDs as rollback aliases,
+            // but seq 0 must still retain the caller-requested context length.
+            // Without this expansion an 8192-token SPD context silently became
+            // an effective 1024-token context and diverged on longer prompts.
+            cp.n_ctx = params.n_ctx*SPD_STAGE_COUNT;
             cp.kv_unified = true;
             cp.n_rs_seq = 0;
             cp.embeddings = true;
