@@ -2671,6 +2671,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_WHOLE_LAYERS"));
     add_opt(common_arg(
+        { "--fit-fill-rpc-first" },
+        "with --fit on MoE models: fill all non-primary devices with whole layers first, then place every remaining layer "
+        "on the first device with as many MoE expert tensors as needed spilled to system memory",
+        [](common_params & params) {
+            params.fit_params_fill_rpc_first = true;
+        }
+    ).set_env("LLAMA_ARG_FIT_FILL_RPC_FIRST"));
+    add_opt(common_arg(
         { "-fitp", "--fit-print" }, "[on|off]",
         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
         [](common_params & params, const std::string & value) {
