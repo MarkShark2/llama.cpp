@@ -231,7 +231,11 @@ struct common_spd_pipeline::impl {
             // Without this expansion an 8192-token SPD context silently became
             // an effective 1024-token context and diverged on longer prompts.
             cp.n_ctx = params.n_ctx*SPD_STAGE_COUNT;
-            cp.kv_unified = true;
+            // Keep seq 0 on the same per-sequence KV layout as an ordinary
+            // target context. Rollback snapshots use seq_cp aliases and do not
+            // require a unified cache; forcing one changes long-context target
+            // numerics enough to flip close greedy decisions.
+            cp.kv_unified = false;
             cp.n_rs_seq = 0;
             cp.embeddings = true;
             stages[stage] = llama_init_from_model(model_target, cp);
