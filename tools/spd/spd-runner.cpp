@@ -51,7 +51,7 @@ void usage(const char * argv0) {
             "       [--cache-type-k q8_0] [--cache-type-v q8_0]\n"
             "       [--flash-attn on|off|auto] [--no-mmap]\n"
             "       [--prompt-file path] [--duration seconds] [--phase-file path]\n"
-            "       [--arm both|baseline|spd]\n",
+            "       [--arm both|baseline|spd] [--spd-draft-top-k 1|2|4]\n",
             argv0);
 }
 
@@ -330,6 +330,7 @@ int main(int argc, char ** argv) {
     int32_t n_gpu_layers_draft = 99;
     uint32_t n_ctx = 4096;
     uint32_t n_batch = 512;
+    uint32_t spd_draft_top_k = 1;
     int32_t duration_seconds = 0;
     bool parallel_stages = true;
     bool rpc_cache = false;
@@ -390,6 +391,8 @@ int main(int argc, char ** argv) {
             phase_file = argv[++i];
         } else if (std::strcmp(argv[i], "--arm") == 0 && i + 1 < argc) {
             arm = argv[++i];
+        } else if (std::strcmp(argv[i], "--spd-draft-top-k") == 0 && i + 1 < argc) {
+            spd_draft_top_k = std::stoul(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -399,7 +402,8 @@ int main(int argc, char ** argv) {
     const bool run_baseline_arm = arm == "both" || arm == "baseline";
     const bool run_spd_arm = arm == "both" || arm == "spd";
     if (target_path.empty() || (run_spd_arm && sidecar_path.empty()) ||
-        (!run_baseline_arm && !run_spd_arm) || n_predict <= 0 || n_batch == 0 || duration_seconds < 0) {
+        (!run_baseline_arm && !run_spd_arm) || n_predict <= 0 || n_batch == 0 || duration_seconds < 0 ||
+        (spd_draft_top_k != 1 && spd_draft_top_k != 2 && spd_draft_top_k != 4)) {
         usage(argv[0]);
         return 1;
     }
@@ -539,6 +543,7 @@ int main(int argc, char ** argv) {
     sp.n_batch = n_batch;
     sp.n_ubatch = n_batch;
     sp.parallel_stages = parallel_stages;
+    sp.draft_top_k = spd_draft_top_k;
     sp.target_context = target_context;
 
     auto pipeline = std::make_unique<common_spd_pipeline>(target, sidecar, sp);
@@ -549,7 +554,8 @@ int main(int argc, char ** argv) {
         llama_model_free(target);
         return 1;
     }
-    std::fprintf(stderr, "[spd] initialized %u-stage SPD controller\n", pipeline->stage_count());
+    std::fprintf(stderr, "[spd] initialized %u-stage SPD controller (draft width %u)\n",
+            pipeline->stage_count(), spd_draft_top_k);
 
     common_spd_result actual;
     double spd_prefill_seconds = 0.0;
@@ -559,6 +565,7 @@ int main(int argc, char ** argv) {
     uint64_t spd_steps = 0;
     uint64_t spd_accepted = 0;
     uint64_t spd_rejected = 0;
+    uint64_t spd_branch_rescued = 0;
     std::fprintf(stderr, "[spd] running verified speculative pipeline decoding%s\n",
             duration_seconds > 0 ? " duration benchmark" : "");
     phase_marker(phase_file, "spd", "start");
@@ -589,6 +596,7 @@ int main(int argc, char ** argv) {
         spd_steps += current.decode_steps;
         spd_accepted += current.n_accepted;
         spd_rejected += current.n_rejected;
+        spd_branch_rescued += current.n_branch_rescued;
         ++spd_requests;
     } while (duration_seconds > 0 && seconds_since(spd_wall_start) < duration_seconds);
     const double spd_wall_seconds = seconds_since(spd_wall_start);
@@ -611,10 +619,12 @@ int main(int argc, char ** argv) {
     std::printf("%s TG: %.3f tok/s\n", baseline_phase, baseline_tps);
     std::printf("SPD TG:           %.3f tok/s\n", spd_tps);
     std::printf("SPD steps:        %llu\n", (unsigned long long) spd_steps);
+    std::printf("SPD draft width:  %u\n", spd_draft_top_k);
     std::printf("SPD acceptance:   %.2f%% (%llu accepted, %llu rejected)\n",
             acceptance,
             (unsigned long long) verified_drafts,
             (unsigned long long) spd_rejected);
+    std::printf("SPD branch saves: %llu\n", (unsigned long long) spd_branch_rescued);
     std::printf("correctness:      %zu/%d greedy tokens matched\n", matched, n_predict);
     std::printf("baseline ids:     ");
     for (llama_token token : baseline.tokens) {

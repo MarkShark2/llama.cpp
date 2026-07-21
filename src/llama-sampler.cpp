@@ -1297,6 +1297,13 @@ static void llama_sampler_top_k_backend_apply(
         data->candidates = top_k;
     }
 
+    if (data->probs) {
+        struct ggml_tensor * probs_rows = ggml_reshape_2d(ctx, data->probs, 1, data->probs->ne[0]);
+        data->probs = ggml_get_rows(ctx, probs_rows, top_k);
+        data->probs = ggml_reshape_1d(ctx, data->probs, sctx->k);
+        ggml_set_name(data->probs, "top_k_probs");
+    }
+
     struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, data->logits, 1, data->logits->ne[0]);
     struct ggml_tensor * top_k_rows = ggml_get_rows(ctx, logits_rows, top_k);
     data->logits = ggml_reshape_1d(ctx, top_k_rows, sctx->k);

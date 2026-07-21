@@ -3909,6 +3909,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 
     add_opt(common_arg(
+        {"--spd-draft-top-k"}, "N",
+        string_format("number of cumulative-probability draft-tree paths retained by SPD (1, 2, or 4; default: %u)",
+                      params.speculative.spd_draft_top_k),
+        [](common_params & params, int value) {
+            if (value != 1 && value != 2 && value != 4) {
+                throw std::invalid_argument("SPD draft tree width must be 1, 2, or 4");
+            }
+            params.speculative.spd_draft_top_k = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPD_DRAFT_TOP_K"));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

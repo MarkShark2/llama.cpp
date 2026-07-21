@@ -1426,9 +1426,10 @@ private:
             spd_params.n_ubatch        = params_base.n_ubatch;
             spd_params.n_threads       = params_base.cpuparams.n_threads;
             spd_params.n_threads_batch = params_base.cpuparams_batch.n_threads == -1
-                ? params_base.cpuparams.n_threads
-                : params_base.cpuparams_batch.n_threads;
+                    ? params_base.cpuparams.n_threads
+                    : params_base.cpuparams_batch.n_threads;
             spd_params.parallel_stages = true;
+            spd_params.draft_top_k     = params_base.speculative.spd_draft_top_k;
             spd_params.target_context  = common_context_params_to_llama(params_base);
 
             const common_params params_dft = common_base_params_to_speculative(params_base);
@@ -1441,8 +1442,8 @@ private:
                 return false;
             }
             spd_mode = true;
-            SRV_INF("initialized %u-stage SPD pipeline (single-slot, greedy)\n",
-                    spd_pipeline->stage_count());
+            SRV_INF("initialized %u-stage SPD pipeline (single-slot, greedy, draft width %u)\n",
+                    spd_pipeline->stage_count(), spd_params.draft_top_k);
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {

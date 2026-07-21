@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <utility>
 
@@ -20,6 +22,7 @@ namespace {
 
 constexpr uint32_t SPD_MAX_STAGE_COUNT = COMMON_SPD_MAX_STAGE_COUNT;
 constexpr uint32_t SPD_MAX_ROLLBACK_TOKENS = SPD_MAX_STAGE_COUNT - 1;
+constexpr uint32_t SPD_MAX_DRAFT_TOP_K = COMMON_SPD_MAX_DRAFT_TOP_K;
 
 using clock_type = std::chrono::steady_clock;
 
@@ -43,6 +46,9 @@ struct batch_storage {
     std::vector<float> embeddings;
     std::vector<llama_pos> positions;
     std::vector<int8_t> logits;
+    std::vector<int32_t> n_seq_id;
+    std::vector<llama_seq_id> seq_ids;
+    std::vector<llama_seq_id *> seq_id_ptrs;
 
     batch_storage() = default;
 
@@ -53,8 +59,11 @@ struct batch_storage {
             int32_t n_embd,
             int32_t n_pos_per_embd,
             llama_pos first_pos,
-            bool output_all) {
-        set(n_tokens, token_data, embedding_data, n_embd, n_pos_per_embd, first_pos, output_all);
+            bool output_all,
+            const llama_pos * position_data = nullptr,
+            const llama_seq_id * sequence_data = nullptr) {
+        set(n_tokens, token_data, embedding_data, n_embd, n_pos_per_embd,
+                first_pos, output_all, position_data, sequence_data);
     }
 
     void set(
@@ -64,7 +73,9 @@ struct batch_storage {
             int32_t n_embd,
             int32_t n_pos_per_embd,
             llama_pos first_pos,
-            bool output_all) {
+            bool output_all,
+            const llama_pos * position_data = nullptr,
+            const llama_seq_id * sequence_data = nullptr) {
         batch = {};
         batch.n_tokens = n_tokens;
 
@@ -84,7 +95,7 @@ struct batch_storage {
         std::fill(logits.begin(), logits.end(), 0);
         for (int32_t p = 0; p < (embedding_data != nullptr ? n_pos_per_embd : 1); ++p) {
             for (int32_t i = 0; i < n_tokens; ++i) {
-                positions[(size_t) p*n_tokens + i] = first_pos + i;
+                positions[(size_t) p*n_tokens + i] = position_data != nullptr ? position_data[i] : first_pos + i;
             }
         }
         for (int32_t i = 0; i < n_tokens; ++i) {
@@ -92,6 +103,20 @@ struct batch_storage {
         }
         batch.pos = positions.data();
         batch.logits = logits.data();
+
+        n_seq_id.clear();
+        seq_ids.clear();
+        seq_id_ptrs.clear();
+        if (sequence_data != nullptr) {
+            n_seq_id.assign(n_tokens, 1);
+            seq_ids.assign(sequence_data, sequence_data + n_tokens);
+            seq_id_ptrs.resize(n_tokens);
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                seq_id_ptrs[i] = &seq_ids[i];
+            }
+            batch.n_seq_id = n_seq_id.data();
+            batch.seq_id = seq_id_ptrs.data();
+        }
     }
 
     batch_storage(
@@ -106,24 +131,46 @@ struct batch_storage {
             const std::vector<llama_token> & selectors,
             const std::vector<float> & features,
             int32_t n_embd,
-            const std::vector<llama_pos> & pos) {
+            const std::vector<llama_pos> & pos,
+            const std::vector<llama_seq_id> * sequences = nullptr,
+            const std::vector<int8_t> * output_flags = nullptr) {
         batch = {};
         batch.n_tokens = (int32_t) selectors.size();
         tokens = selectors;
         embeddings = features;
         positions = pos;
         logits.resize(selectors.size(), 0);
-        std::fill(logits.begin(), logits.end(), 0);
-        if (!logits.empty()) {
-            logits.back() = 1;
+        if (output_flags != nullptr) {
+            logits = *output_flags;
+        } else {
+            std::fill(logits.begin(), logits.end(), 0);
+            if (!logits.empty()) {
+                logits.back() = 1;
+            }
         }
         batch.token = tokens.data();
         batch.embd = embeddings.data();
         batch.pos = positions.data();
         batch.logits = logits.data();
 
+        n_seq_id.clear();
+        seq_ids.clear();
+        seq_id_ptrs.clear();
+        if (sequences != nullptr) {
+            GGML_ASSERT(sequences->size() == selectors.size());
+            n_seq_id.assign(selectors.size(), 1);
+            seq_ids = *sequences;
+            seq_id_ptrs.resize(selectors.size());
+            for (size_t i = 0; i < selectors.size(); ++i) {
+                seq_id_ptrs[i] = &seq_ids[i];
+            }
+            batch.n_seq_id = n_seq_id.data();
+            batch.seq_id = seq_id_ptrs.data();
+        }
+
         GGML_ASSERT(features.size() == selectors.size()*(size_t) n_embd);
         GGML_ASSERT(pos.size() == selectors.size());
+        GGML_ASSERT(output_flags == nullptr || output_flags->size() == selectors.size());
     }
 };
 
@@ -230,6 +277,24 @@ struct common_spd_pipeline::impl {
         llama_pos min_pos = -1;
     };
 
+    struct draft_candidate {
+        llama_token token = LLAMA_TOKEN_NULL;
+        double log_probability = 0.0;
+        uint32_t rank = 0;
+    };
+
+    struct tree_chain {
+        llama_seq_id seq_id = 0;
+        std::vector<entry> pipeline;
+        std::map<llama_pos, snapshot> completed;
+        std::vector<llama_token> tokens;
+        std::vector<uint32_t> draft_ranks;
+        double score = 0.0;
+        snapshot prev_evicted;
+        llama_pos prev_evicted_pos = -1;
+        bool has_prev_evicted = false;
+    };
+
     struct stage_decode_job {
         impl * owner;
         uint32_t stage;
@@ -243,6 +308,24 @@ struct common_spd_pipeline::impl {
         impl * owner;
         const speculation_input * input;
         llama_token * sampled;
+        bool * ok;
+    };
+
+    struct tree_stage_decode_job {
+        impl * owner;
+        uint32_t stage;
+        std::vector<entry *> items;
+        std::vector<llama_seq_id> seq_ids;
+        double * elapsed;
+        std::string * error;
+        uint8_t * ok;
+    };
+
+    struct tree_speculation_job {
+        impl * owner;
+        const std::vector<tree_chain> * chains;
+        const std::vector<speculation_input> * inputs;
+        std::vector<std::vector<draft_candidate>> * candidates;
         bool * ok;
     };
 
@@ -261,8 +344,8 @@ struct common_spd_pipeline::impl {
 
     std::vector<int32_t> anchors;
     std::array<llama_context *, SPD_MAX_STAGE_COUNT> stages = {};
-    std::array<std::array<llama_pos, SPD_MAX_ROLLBACK_TOKENS>, SPD_MAX_STAGE_COUNT> checkpoint_pos = {};
-    std::array<llama_pos, SPD_MAX_STAGE_COUNT> stage_tail_pos = {};
+    std::array<std::array<std::array<llama_pos, SPD_MAX_ROLLBACK_TOKENS>, SPD_MAX_DRAFT_TOP_K>, SPD_MAX_STAGE_COUNT> checkpoint_pos = {};
+    std::array<std::array<llama_pos, SPD_MAX_DRAFT_TOP_K>, SPD_MAX_STAGE_COUNT> stage_tail_pos = {};
     std::array<std::vector<size_t>, SPD_MAX_STAGE_COUNT> stage_resources;
     std::vector<size_t> sidecar_resources;
     std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
@@ -279,6 +362,7 @@ struct common_spd_pipeline::impl {
     llama_context * sidecar = nullptr;
     llama_sampler * head_sampler = nullptr;
     llama_sampler * sidecar_sampler = nullptr;
+    std::array<llama_sampler *, SPD_MAX_DRAFT_TOP_K> sidecar_tree_samplers = {};
     bool head_backend_sampling = false;
     bool sidecar_backend_sampling = false;
 
@@ -286,6 +370,14 @@ struct common_spd_pipeline::impl {
     bool ready = false;
     bool used = false;
     bool static_decode_fast_path = true;
+
+    uint32_t tree_width() const {
+        return params.draft_top_k;
+    }
+
+    llama_seq_id checkpoint_seq_id(llama_seq_id active_seq, uint32_t slot) const {
+        return (llama_seq_id) tree_width() + active_seq*(llama_seq_id) rollback_tokens + (llama_seq_id) slot;
+    }
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params)
         : model_target(model_target), model_spd(model_spd), params(params) {
@@ -307,6 +399,9 @@ struct common_spd_pipeline::impl {
             llama_free(stages[stage]);
         }
         llama_sampler_free(sidecar_sampler);
+        for (llama_sampler * sampler : sidecar_tree_samplers) {
+            llama_sampler_free(sampler);
+        }
         llama_sampler_free(head_sampler);
     }
 
@@ -318,6 +413,17 @@ struct common_spd_pipeline::impl {
     static void execute_speculation_job(void * data) {
         auto & job = *static_cast<speculation_job *>(data);
         *job.ok = job.owner->run_speculation(*job.input, *job.sampled);
+    }
+
+    static void execute_tree_stage_decode_job(void * data) {
+        auto & job = *static_cast<tree_stage_decode_job *>(data);
+        *job.ok = job.owner->advance_entries(
+                job.stage, job.items, job.seq_ids, *job.elapsed, *job.error);
+    }
+
+    static void execute_tree_speculation_job(void * data) {
+        auto & job = *static_cast<tree_speculation_job *>(data);
+        *job.ok = job.owner->run_tree_speculation(*job.chains, *job.inputs, *job.candidates);
     }
 
     void fail(std::string message) {
@@ -393,8 +499,14 @@ struct common_spd_pipeline::impl {
                     std::to_string(SPD_MAX_STAGE_COUNT));
             return;
         }
+        if (params.draft_top_k == 0 || params.draft_top_k > SPD_MAX_DRAFT_TOP_K) {
+            fail("SPD draft tree width must be between 1 and " +
+                    std::to_string(SPD_MAX_DRAFT_TOP_K));
+            return;
+        }
         rollback_tokens = stage_count - 1;
-        if (params.n_ctx > UINT32_MAX/stage_count) {
+        const uint32_t target_sequence_count = params.draft_top_k*stage_count;
+        if (params.n_ctx > UINT32_MAX/target_sequence_count) {
             fail("SPD context length is too large for rollback sequence allocation");
             return;
         }
@@ -479,13 +591,13 @@ struct common_spd_pipeline::impl {
             cp.ctx_type = LLAMA_CONTEXT_TYPE_SPD_STAGE;
             cp.spd_stage = stage;
             cp.spd_stage_count = stage_count;
-            cp.n_seq_max = stage_count;
+            cp.n_seq_max = target_sequence_count;
             // llama_context derives n_ctx_seq by dividing total n_ctx by
             // n_seq_max. SPD uses the extra sequence IDs as rollback aliases,
             // but seq 0 must still retain the caller-requested context length.
             // Without this expansion an 8192-token SPD context silently became
             // an effective 1024-token context and diverged on longer prompts.
-            cp.n_ctx = params.n_ctx*stage_count;
+            cp.n_ctx = params.n_ctx*target_sequence_count;
             // Keep seq 0 on the same per-sequence KV layout as an ordinary
             // target context. Rollback snapshots use seq_cp aliases and do not
             // require a unified cache; forcing one changes long-context target
@@ -535,17 +647,35 @@ struct common_spd_pipeline::impl {
 
         llama_context_params sp = make_context_params(
                 std::max<uint32_t>(params.n_batch, stage_count + 1), true);
+        sp.n_seq_max = params.draft_top_k;
+        sp.n_ctx = params.n_ctx*params.draft_top_k;
         sidecar = llama_init_from_model(model_spd, sp);
         if (sidecar == nullptr) {
             fail("failed to initialize the SPD sidecar context");
             return;
         }
-        if (static_decode_fast_path) {
+        if (static_decode_fast_path && params.draft_top_k == 1) {
             sidecar_sampler = make_greedy_sampler();
             sidecar_backend_sampling = llama_set_sampler(sidecar, 0, sidecar_sampler);
             if (!sidecar_backend_sampling) {
                 llama_sampler_free(sidecar_sampler);
                 sidecar_sampler = nullptr;
+            }
+        } else if (static_decode_fast_path) {
+            for (uint32_t seq = 0; seq < params.draft_top_k; ++seq) {
+                llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                // Softmax precedes top-k so branch scores remain the full
+                // sidecar probabilities used by the reference algorithm.
+                // The sampled token from the distribution sampler is ignored;
+                // top-k gathers only the retained ids, logits, and probabilities.
+                llama_sampler_chain_add(sampler, llama_sampler_init_dist(0));
+                llama_sampler_chain_add(sampler, llama_sampler_init_top_k((int32_t) params.draft_top_k));
+                if (!llama_set_sampler(sidecar, (llama_seq_id) seq, sampler)) {
+                    llama_sampler_free(sampler);
+                    fail("failed to initialize SPD sidecar backend top-k sampler");
+                    return;
+                }
+                sidecar_tree_samplers[seq] = sampler;
             }
         }
         configure_static_context(sidecar, false);
@@ -564,10 +694,14 @@ struct common_spd_pipeline::impl {
             llama_memory_clear(llama_get_memory(stages[stage]), true);
         }
         llama_memory_clear(llama_get_memory(sidecar), true);
-        for (auto & positions : checkpoint_pos) {
-            positions.fill(-1);
+        for (auto & stage_positions : checkpoint_pos) {
+            for (auto & positions : stage_positions) {
+                positions.fill(-1);
+            }
         }
-        stage_tail_pos.fill(-1);
+        for (auto & tails : stage_tail_pos) {
+            tails.fill(-1);
+        }
     }
 
     bool decode_stage(
@@ -579,10 +713,13 @@ struct common_spd_pipeline::impl {
             std::vector<float> & output,
             const std::vector<std::pair<size_t, std::vector<float> *>> & anchor_outputs,
             std::string & error,
-            batch_storage * reusable_storage = nullptr) {
+            batch_storage * reusable_storage = nullptr,
+            const llama_pos * positions = nullptr,
+            const llama_seq_id * sequences = nullptr) {
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
-        storage.set(n_tokens, tokens, embeddings, n_embd, target_n_pos_per_embd, first_pos, true);
+        storage.set(n_tokens, tokens, embeddings, n_embd, target_n_pos_per_embd,
+                first_pos, true, positions, sequences);
         if (llama_decode(stages[stage], storage.batch) != 0) {
             error = "target SPD stage " + std::to_string(stage) + " decode failed";
             return false;
@@ -817,6 +954,120 @@ struct common_spd_pipeline::impl {
                 static_decode_fast_path ? &sidecar_decode_batch : nullptr);
     }
 
+    bool run_tree_speculation(
+            const std::vector<tree_chain> & chains,
+            const std::vector<speculation_input> & inputs,
+            std::vector<std::vector<draft_candidate>> & candidates) {
+        if (chains.size() != inputs.size() || chains.empty()) {
+            fail("invalid SPD tree speculation batch");
+            return false;
+        }
+
+        std::vector<std::unique_lock<std::mutex>> resource_locks;
+        resource_locks.reserve(sidecar_resources.size());
+        for (size_t resource : sidecar_resources) {
+            resource_locks.emplace_back(*resource_mutexes[resource]);
+        }
+
+        std::vector<llama_token> selectors;
+        std::vector<llama_pos> positions;
+        std::vector<llama_seq_id> sequences;
+        std::vector<float> features;
+        std::vector<int8_t> output_flags;
+        std::vector<int32_t> output_indices;
+        size_t total_rows = 0;
+        for (const auto & input : inputs) {
+            total_rows += input.selectors.size();
+        }
+        selectors.reserve(total_rows);
+        positions.reserve(total_rows);
+        sequences.reserve(total_rows);
+        features.reserve(total_rows*(size_t) sidecar_n_embd_inp);
+        output_flags.reserve(total_rows);
+        output_indices.reserve(chains.size());
+
+        for (size_t ci = 0; ci < chains.size(); ++ci) {
+            const auto & input = inputs[ci];
+            if (input.selectors.empty() || input.min_pos < 0) {
+                fail("empty SPD tree speculation input");
+                return false;
+            }
+            if (!llama_memory_seq_rm(
+                    llama_get_memory(sidecar), chains[ci].seq_id, input.min_pos, -1)) {
+                fail("failed to crop SPD sidecar tree cache at position " +
+                        std::to_string(input.min_pos));
+                return false;
+            }
+            for (size_t row = 0; row < input.selectors.size(); ++row) {
+                selectors.push_back(input.selectors[row]);
+                positions.push_back(input.positions[row]);
+                sequences.push_back(chains[ci].seq_id);
+                output_flags.push_back(row + 1 == input.selectors.size());
+            }
+            output_indices.push_back((int32_t) selectors.size() - 1);
+            features.insert(features.end(), input.features.begin(), input.features.end());
+        }
+
+        batch_storage local_storage;
+        batch_storage & storage = static_decode_fast_path ? sidecar_decode_batch : local_storage;
+        storage.set(selectors, features, sidecar_n_embd_inp, positions, &sequences, &output_flags);
+        if (llama_decode(sidecar, storage.batch) != 0) {
+            fail("SPD sidecar tree decode failed");
+            return false;
+        }
+
+        candidates.assign(chains.size(), {});
+        const uint32_t width = tree_width();
+        for (size_t ci = 0; ci < chains.size(); ++ci) {
+            if (static_decode_fast_path) {
+                const int32_t output_index = output_indices[ci];
+                const float * probs = llama_get_sampled_probs_ith(sidecar, output_index);
+                const llama_token * token_ids = llama_get_sampled_candidates_ith(sidecar, output_index);
+                const uint32_t count = llama_get_sampled_probs_count_ith(sidecar, output_index);
+                if (probs == nullptr || token_ids == nullptr || count < width) {
+                    fail("SPD sidecar backend top-k produced incomplete candidates for branch " +
+                            std::to_string(ci));
+                    return false;
+                }
+
+                std::vector<uint32_t> order(count);
+                std::iota(order.begin(), order.end(), 0);
+                std::sort(order.begin(), order.end(),
+                        [&](uint32_t a, uint32_t b) { return probs[a] > probs[b]; });
+                candidates[ci].reserve(width);
+                for (uint32_t rank = 0; rank < width; ++rank) {
+                    const uint32_t index = order[rank];
+                    candidates[ci].push_back({
+                        token_ids[index], std::log(std::max((double) probs[index], 1e-30)), rank,
+                    });
+                }
+            } else {
+                const float * logits = llama_get_logits_ith(sidecar, output_indices[ci]);
+                if (logits == nullptr) {
+                    fail("SPD sidecar tree produced no logits for branch " + std::to_string(ci));
+                    return false;
+                }
+
+                std::vector<int32_t> order(n_vocab);
+                std::iota(order.begin(), order.end(), 0);
+                std::partial_sort(order.begin(), order.begin() + width, order.end(),
+                        [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+                const float max_logit = *std::max_element(logits, logits + n_vocab);
+                double exp_sum = 0.0;
+                for (int32_t i = 0; i < n_vocab; ++i) {
+                    exp_sum += std::exp((double) logits[i] - max_logit);
+                }
+                const double log_normalizer = (double) max_logit + std::log(exp_sum);
+                candidates[ci].reserve(width);
+                for (uint32_t rank = 0; rank < width; ++rank) {
+                    const llama_token token = (llama_token) order[rank];
+                    candidates[ci].push_back({ token, (double) logits[token] - log_normalizer, rank });
+                }
+            }
+        }
+        return true;
+    }
+
     bool speculate(
             const std::vector<entry> & pipeline,
             const std::map<llama_pos, snapshot> & completed,
@@ -831,14 +1082,14 @@ struct common_spd_pipeline::impl {
     bool rollback(llama_pos target_pos) {
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const llama_pos restore_pos = target_pos - 1;
-            if (stage_tail_pos[stage] == restore_pos) {
+            if (stage_tail_pos[stage][0] == restore_pos) {
                 continue;
             }
 
             llama_seq_id restore_seq = -1;
             for (uint32_t i = 0; i < rollback_tokens; ++i) {
-                if (checkpoint_pos[stage][i] == restore_pos) {
-                    restore_seq = (llama_seq_id) i + 1;
+                if (checkpoint_pos[stage][0][i] == restore_pos) {
+                    restore_seq = checkpoint_seq_id(0, i);
                     break;
                 }
             }
@@ -854,7 +1105,7 @@ struct common_spd_pipeline::impl {
                 return false;
             }
             llama_memory_seq_cp(memory, restore_seq, 0, -1, -1);
-            stage_tail_pos[stage] = restore_pos;
+            stage_tail_pos[stage][0] = restore_pos;
         }
         if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, target_pos, -1)) {
             fail("failed to roll back SPD sidecar");
@@ -933,7 +1184,7 @@ struct common_spd_pipeline::impl {
         }
 
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            stage_tail_pos[stage] = n_prompt - 1;
+            stage_tail_pos[stage][0] = n_prompt - 1;
         }
         return true;
     }
@@ -968,9 +1219,9 @@ struct common_spd_pipeline::impl {
         const auto start = clock_type::now();
 
         const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
-        const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
+        const llama_seq_id checkpoint_seq = checkpoint_seq_id(0, checkpoint_slot);
         llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
-        checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
+        checkpoint_pos[stage][0][checkpoint_slot] = stage_tail_pos[stage][0];
 
         std::vector<float> local_output;
         std::vector<float> & output = static_decode_fast_path
@@ -990,15 +1241,162 @@ struct common_spd_pipeline::impl {
                 static_decode_fast_path ? &stage_decode_batches[stage] : nullptr)) {
             return false;
         }
-        if (static_decode_fast_path) {
+        if (static_decode_fast_path && params.draft_top_k == 1) {
             item.hidden.swap(output);
         } else {
             item.hidden = std::move(output);
         }
-        stage_tail_pos[stage] = item.pos;
+        stage_tail_pos[stage][0] = item.pos;
         for (auto & captured_item : wanted) {
             item.snap.values[captured_item.first] = std::move(captured[captured_item.first]);
             item.snap.present[captured_item.first] = true;
+        }
+        elapsed = seconds_since(start);
+        return true;
+    }
+
+    void fork_tree_sequence(llama_seq_id source, llama_seq_id destination) {
+        if (source == destination) {
+            return;
+        }
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            llama_memory_t memory = llama_get_memory(stages[stage]);
+            llama_memory_seq_rm(memory, destination, -1, -1);
+            llama_memory_seq_cp(memory, source, destination, -1, -1);
+            stage_tail_pos[stage][destination] = stage_tail_pos[stage][source];
+            for (uint32_t slot = 0; slot < rollback_tokens; ++slot) {
+                const llama_seq_id source_checkpoint = checkpoint_seq_id(source, slot);
+                const llama_seq_id destination_checkpoint = checkpoint_seq_id(destination, slot);
+                llama_memory_seq_rm(memory, destination_checkpoint, -1, -1);
+                llama_memory_seq_cp(memory, source_checkpoint, destination_checkpoint, -1, -1);
+                checkpoint_pos[stage][destination][slot] = checkpoint_pos[stage][source][slot];
+            }
+        }
+        llama_memory_t sidecar_memory = llama_get_memory(sidecar);
+        llama_memory_seq_rm(sidecar_memory, destination, -1, -1);
+        llama_memory_seq_cp(sidecar_memory, source, destination, -1, -1);
+    }
+
+    bool rollback_tree(llama_seq_id seq, llama_pos target_pos) {
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            const llama_pos restore_pos = target_pos - 1;
+            if (stage_tail_pos[stage][seq] == restore_pos) {
+                continue;
+            }
+
+            llama_seq_id restore_seq = -1;
+            for (uint32_t slot = 0; slot < rollback_tokens; ++slot) {
+                if (checkpoint_pos[stage][seq][slot] == restore_pos) {
+                    restore_seq = checkpoint_seq_id(seq, slot);
+                    break;
+                }
+            }
+            if (restore_seq < 0) {
+                fail("target SPD tree stage " + std::to_string(stage) +
+                        " has no checkpoint for position " + std::to_string(restore_pos));
+                return false;
+            }
+
+            llama_memory_t memory = llama_get_memory(stages[stage]);
+            if (!llama_memory_seq_rm(memory, seq, -1, -1)) {
+                fail("failed to clear target SPD tree sequence before restore");
+                return false;
+            }
+            llama_memory_seq_cp(memory, restore_seq, seq, -1, -1);
+            stage_tail_pos[stage][seq] = restore_pos;
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(sidecar), seq, target_pos, -1)) {
+            fail("failed to roll back SPD sidecar tree sequence");
+            return false;
+        }
+        return true;
+    }
+
+    bool advance_entries(
+            uint32_t stage,
+            const std::vector<entry *> & items,
+            const std::vector<llama_seq_id> & seq_ids,
+            double & elapsed,
+            std::string & error) {
+        if (items.size() != seq_ids.size() || items.empty()) {
+            error = "invalid target SPD tree stage batch";
+            return false;
+        }
+
+        std::vector<std::unique_lock<std::mutex>> resource_locks;
+        resource_locks.reserve(stage_resources[stage].size());
+        for (size_t resource : stage_resources[stage]) {
+            resource_locks.emplace_back(*resource_mutexes[resource]);
+        }
+        const auto start = clock_type::now();
+
+        for (size_t i = 0; i < items.size(); ++i) {
+            const llama_seq_id seq = seq_ids[i];
+            const uint32_t slot = (uint32_t) (items[i]->pos % rollback_tokens);
+            const llama_seq_id checkpoint_seq = checkpoint_seq_id(seq, slot);
+            llama_memory_seq_rm(llama_get_memory(stages[stage]), checkpoint_seq, -1, -1);
+            llama_memory_seq_cp(llama_get_memory(stages[stage]), seq, checkpoint_seq, -1, -1);
+            checkpoint_pos[stage][seq][slot] = stage_tail_pos[stage][seq];
+        }
+
+        std::vector<llama_token> tokens;
+        std::vector<float> embeddings;
+        std::vector<llama_pos> positions;
+        positions.reserve(items.size());
+        if (stage == 0) {
+            tokens.reserve(items.size());
+        } else {
+            embeddings.reserve(items.size()*(size_t) n_embd);
+        }
+        for (entry * item : items) {
+            positions.push_back(item->pos);
+            if (stage == 0) {
+                tokens.push_back(item->token);
+            } else {
+                embeddings.insert(embeddings.end(), item->hidden.begin(), item->hidden.end());
+            }
+        }
+
+        std::vector<float> local_output;
+        std::vector<float> & output = static_decode_fast_path
+                ? stage_decode_outputs[stage]
+                : local_output;
+        std::vector<std::vector<float>> captured(anchors.size());
+        std::vector<std::pair<size_t, std::vector<float> *>> wanted;
+        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+            if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
+                wanted.push_back({ ai, &captured[ai] });
+            }
+        }
+
+        if (!decode_stage(
+                stage,
+                stage == 0 ? tokens.data() : nullptr,
+                stage == 0 ? nullptr : embeddings.data(),
+                (int32_t) items.size(),
+                positions.front(),
+                output,
+                wanted,
+                error,
+                static_decode_fast_path ? &stage_decode_batches[stage] : nullptr,
+                positions.data(),
+                seq_ids.data())) {
+            return false;
+        }
+
+        for (size_t i = 0; i < items.size(); ++i) {
+            entry & item = *items[i];
+            item.hidden.assign(
+                    output.begin() + i*(size_t) n_embd,
+                    output.begin() + (i + 1)*(size_t) n_embd);
+            stage_tail_pos[stage][seq_ids[i]] = item.pos;
+            for (auto & captured_item : wanted) {
+                const auto & values = captured[captured_item.first];
+                item.snap.values[captured_item.first].assign(
+                        values.begin() + i*(size_t) n_embd,
+                        values.begin() + (i + 1)*(size_t) n_embd);
+                item.snap.present[captured_item.first] = true;
+            }
         }
         elapsed = seconds_since(start);
         return true;
@@ -1013,7 +1411,7 @@ struct common_spd_pipeline::impl {
         llama_synchronize(sidecar);
     }
 
-    bool generate(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result) {
+    bool generate_linear(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result) {
         result = {};
         last_error.clear();
         if (prompt.empty()) {
@@ -1267,6 +1665,408 @@ struct common_spd_pipeline::impl {
         result.tokens.resize(n_predict);
         result.accepted.resize(n_predict);
         return true;
+    }
+
+    bool generate_tree(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result) {
+        result = {};
+        last_error.clear();
+        if (prompt.empty()) {
+            fail("SPD prompt must not be empty");
+            return false;
+        }
+        if (n_predict <= 0) {
+            fail("SPD prediction count must be positive");
+            return false;
+        }
+        if ((uint64_t) prompt.size() + n_predict + stage_count >= params.n_ctx) {
+            fail("SPD prompt and prediction count exceed the configured context");
+            return false;
+        }
+
+        reset_memories();
+        const int32_t n_prompt = (int32_t) prompt.size();
+        const auto prefill_start = clock_type::now();
+
+        std::vector<float> prompt_hidden;
+        std::vector<std::vector<float>> prompt_anchors;
+        if (!prefill_target(prompt, prompt_hidden, prompt_anchors) ||
+            !prefill_sidecar(prompt_anchors, n_prompt)) {
+            return false;
+        }
+        if (static_decode_fast_path) {
+            llama_synchronize(sidecar);
+            llama_set_stable_host_inputs(sidecar, true);
+        }
+
+        std::map<llama_pos, snapshot> completed;
+        const int32_t retained_begin = std::max(0, n_prompt - (int32_t) stage_count + 1);
+        for (int32_t pos = retained_begin; pos < n_prompt; ++pos) {
+            completed.emplace(pos, snapshot_at(prompt_anchors, pos));
+        }
+
+        std::vector<float> last_hidden(
+                prompt_hidden.begin() + (size_t) (n_prompt - 1)*n_embd,
+                prompt_hidden.begin() + (size_t) n_prompt*n_embd);
+        llama_token first_token;
+        if (!target_head(last_hidden, first_token)) {
+            return false;
+        }
+        std::vector<float> first_embedding;
+        if (!embed_token(first_token, first_embedding)) {
+            return false;
+        }
+
+        result.prefill_seconds = seconds_since(prefill_start);
+        result.tokens.push_back(first_token);
+        result.accepted.push_back(true);
+        result.n_accepted = 1;
+
+        tree_chain initial;
+        initial.seq_id = 0;
+        initial.pipeline.push_back(make_entry(first_token, n_prompt, std::move(first_embedding)));
+        initial.completed = std::move(completed);
+        initial.tokens.push_back(first_token);
+        initial.draft_ranks.push_back(0);
+
+        std::vector<tree_chain> chains;
+        chains.push_back(std::move(initial));
+        llama_pos verified_up_to = n_prompt + 1;
+
+        const auto decode_start = clock_type::now();
+        while ((int32_t) result.tokens.size() < n_predict) {
+            ++result.decode_steps;
+
+            std::vector<speculation_input> pending_inputs(chains.size());
+            for (size_t ci = 0; ci < chains.size(); ++ci) {
+                tree_chain & chain = chains[ci];
+                if (!prepare_speculation(
+                        chain.pipeline,
+                        chain.completed,
+                        chain.has_prev_evicted ? &chain.prev_evicted : nullptr,
+                        chain.prev_evicted_pos,
+                        pending_inputs[ci])) {
+                    return false;
+                }
+            }
+
+            std::vector<std::vector<draft_candidate>> pending_candidates;
+            bool speculation_ok = true;
+            bool sidecar_job_submitted = false;
+            std::future<bool> speculation_work;
+            tree_speculation_job sidecar_job = {
+                this, &chains, &pending_inputs, &pending_candidates, &speculation_ok,
+            };
+            if (static_decode_fast_path && params.parallel_stages) {
+                sidecar_worker->submit(execute_tree_speculation_job, &sidecar_job);
+                sidecar_job_submitted = true;
+            } else if (params.parallel_stages) {
+                speculation_work = std::async(std::launch::async, [&]() {
+                    return run_tree_speculation(chains, pending_inputs, pending_candidates);
+                });
+            } else {
+                speculation_ok = run_tree_speculation(chains, pending_inputs, pending_candidates);
+            }
+
+            size_t active_stages = 0;
+            for (const auto & chain : chains) {
+                active_stages = std::max(active_stages, chain.pipeline.size());
+            }
+            std::array<double, SPD_MAX_STAGE_COUNT> elapsed = {};
+            std::array<std::string, SPD_MAX_STAGE_COUNT> errors;
+            std::array<uint8_t, SPD_MAX_STAGE_COUNT> ok = {};
+            std::array<tree_stage_decode_job, SPD_MAX_STAGE_COUNT> stage_jobs = {};
+            for (size_t stage = 0; stage < active_stages; ++stage) {
+                stage_jobs[stage].owner = this;
+                stage_jobs[stage].stage = (uint32_t) stage;
+                stage_jobs[stage].elapsed = &elapsed[stage];
+                stage_jobs[stage].error = &errors[stage];
+                stage_jobs[stage].ok = &ok[stage];
+                for (tree_chain & chain : chains) {
+                    if (stage < chain.pipeline.size()) {
+                        stage_jobs[stage].items.push_back(&chain.pipeline[stage]);
+                        stage_jobs[stage].seq_ids.push_back(chain.seq_id);
+                    }
+                }
+            }
+
+            std::exception_ptr worker_failure;
+            if (static_decode_fast_path && params.parallel_stages && active_stages > 1) {
+                for (size_t stage = 0; stage < active_stages; ++stage) {
+                    stage_workers[stage]->submit(execute_tree_stage_decode_job, &stage_jobs[stage]);
+                }
+                for (size_t stage = 0; stage < active_stages; ++stage) {
+                    std::exception_ptr failure = stage_workers[stage]->wait();
+                    if (worker_failure == nullptr && failure != nullptr) {
+                        worker_failure = failure;
+                    }
+                }
+            } else if (params.parallel_stages && active_stages > 1) {
+                std::vector<std::future<bool>> work;
+                work.reserve(active_stages);
+                for (size_t stage = 0; stage < active_stages; ++stage) {
+                    work.push_back(std::async(std::launch::async, [&, stage]() {
+                        return advance_entries(
+                                (uint32_t) stage,
+                                stage_jobs[stage].items,
+                                stage_jobs[stage].seq_ids,
+                                elapsed[stage],
+                                errors[stage]);
+                    }));
+                }
+                for (size_t stage = 0; stage < active_stages; ++stage) {
+                    ok[stage] = work[stage].get();
+                }
+            } else {
+                for (size_t stage = 0; stage < active_stages; ++stage) {
+                    ok[stage] = advance_entries(
+                            (uint32_t) stage,
+                            stage_jobs[stage].items,
+                            stage_jobs[stage].seq_ids,
+                            elapsed[stage],
+                            errors[stage]);
+                }
+            }
+
+            if (sidecar_job_submitted) {
+                std::exception_ptr failure = sidecar_worker->wait();
+                if (worker_failure == nullptr && failure != nullptr) {
+                    worker_failure = failure;
+                }
+            }
+            if (speculation_work.valid()) {
+                speculation_ok = speculation_work.get();
+            }
+            if (worker_failure != nullptr) {
+                try {
+                    std::rethrow_exception(worker_failure);
+                } catch (const std::exception & error) {
+                    fail(std::string("SPD tree decode worker failed: ") + error.what());
+                } catch (...) {
+                    fail("SPD tree decode worker failed");
+                }
+                return false;
+            }
+            for (size_t stage = 0; stage < active_stages; ++stage) {
+                result.stage_compute_seconds += elapsed[stage];
+                if (!ok[stage]) {
+                    fail(errors[stage]);
+                    return false;
+                }
+            }
+            if (!speculation_ok) {
+                return false;
+            }
+
+            std::map<llama_seq_id, std::vector<draft_candidate>> candidates_by_sequence;
+            for (size_t ci = 0; ci < chains.size(); ++ci) {
+                candidates_by_sequence.emplace(chains[ci].seq_id, std::move(pending_candidates[ci]));
+            }
+
+            struct verification {
+                size_t chain_index;
+                llama_pos target_pos;
+                int32_t generated_index;
+                llama_token proposed;
+                llama_token target;
+                bool accepted;
+                uint32_t rank;
+            };
+            std::vector<verification> verifications;
+            for (size_t ci = 0; ci < chains.size(); ++ci) {
+                tree_chain & chain = chains[ci];
+                if (chain.pipeline.size() < stage_count) {
+                    continue;
+                }
+                entry completed_entry = std::move(chain.pipeline.back());
+                chain.pipeline.pop_back();
+                chain.completed[completed_entry.pos] = completed_entry.snap;
+
+                const llama_pos target_pos = completed_entry.pos + 1;
+                const int32_t generated_index = target_pos - n_prompt;
+                if (target_pos != verified_up_to || generated_index < 0 ||
+                    generated_index >= (int32_t) chain.tokens.size()) {
+                    fail("SPD tree verification frontier is inconsistent");
+                    return false;
+                }
+                llama_token target_token;
+                if (!target_head(completed_entry.hidden, target_token)) {
+                    return false;
+                }
+                const llama_token proposed = chain.tokens[generated_index];
+                verifications.push_back({
+                    ci,
+                    target_pos,
+                    generated_index,
+                    proposed,
+                    target_token,
+                    proposed == target_token,
+                    chain.draft_ranks[generated_index],
+                });
+
+                chain.prev_evicted = std::move(completed_entry.snap);
+                chain.prev_evicted_pos = completed_entry.pos;
+                chain.has_prev_evicted = true;
+            }
+
+            if (!verifications.empty()) {
+                const verification * chosen = nullptr;
+                for (const auto & candidate : verifications) {
+                    if (candidate.accepted &&
+                        (chosen == nullptr || chains[candidate.chain_index].score > chains[chosen->chain_index].score)) {
+                        chosen = &candidate;
+                    }
+                }
+
+                if (chosen != nullptr) {
+                    tree_chain surviving = std::move(chains[chosen->chain_index]);
+                    result.tokens.push_back(chosen->proposed);
+                    result.accepted.push_back(true);
+                    ++result.n_accepted;
+                    if (chosen->rank > 0) {
+                        ++result.n_branch_rescued;
+                    }
+                    verified_up_to = chosen->target_pos + 1;
+                    chains.clear();
+                    chains.push_back(std::move(surviving));
+                } else {
+                    const verification * best = &verifications.front();
+                    for (const auto & candidate : verifications) {
+                        if (chains[candidate.chain_index].score > chains[best->chain_index].score) {
+                            best = &candidate;
+                        }
+                    }
+                    tree_chain surviving = std::move(chains[best->chain_index]);
+                    if (!rollback_tree(surviving.seq_id, best->target_pos)) {
+                        return false;
+                    }
+                    for (auto it = surviving.completed.lower_bound(best->target_pos);
+                         it != surviving.completed.end();) {
+                        it = surviving.completed.erase(it);
+                    }
+                    surviving.tokens.resize(best->generated_index);
+                    surviving.tokens.push_back(best->target);
+                    surviving.draft_ranks.resize(best->generated_index);
+                    surviving.draft_ranks.push_back(0);
+                    surviving.score = 0.0;
+                    surviving.has_prev_evicted = false;
+                    surviving.prev_evicted_pos = -1;
+
+                    std::vector<float> corrected_embedding;
+                    if (!embed_token(best->target, corrected_embedding)) {
+                        return false;
+                    }
+                    surviving.pipeline.clear();
+                    surviving.pipeline.push_back(make_entry(
+                            best->target, best->target_pos, std::move(corrected_embedding)));
+
+                    result.tokens.push_back(best->target);
+                    result.accepted.push_back(false);
+                    ++result.n_rejected;
+                    verified_up_to = best->target_pos + 1;
+                    chains.clear();
+                    chains.push_back(std::move(surviving));
+                    continue;
+                }
+            }
+
+            if ((int32_t) result.tokens.size() >= n_predict) {
+                break;
+            }
+
+            struct expansion {
+                size_t parent_index;
+                draft_candidate candidate;
+                double score;
+                llama_seq_id destination = -1;
+            };
+            std::vector<expansion> expansions;
+            for (size_t ci = 0; ci < chains.size(); ++ci) {
+                auto candidates_it = candidates_by_sequence.find(chains[ci].seq_id);
+                if (candidates_it == candidates_by_sequence.end()) {
+                    fail("missing SPD tree candidates for retained branch");
+                    return false;
+                }
+                for (const auto & candidate : candidates_it->second) {
+                    expansions.push_back({ ci, candidate, chains[ci].score + candidate.log_probability, -1 });
+                }
+            }
+            std::sort(expansions.begin(), expansions.end(),
+                    [](const expansion & a, const expansion & b) { return a.score > b.score; });
+            if (expansions.size() > tree_width()) {
+                expansions.resize(tree_width());
+            }
+            if (expansions.empty()) {
+                fail("SPD tree produced no branch expansions");
+                return false;
+            }
+
+            std::array<bool, SPD_MAX_DRAFT_TOP_K> retained_source = {};
+            for (auto & expansion : expansions) {
+                const llama_seq_id source = chains[expansion.parent_index].seq_id;
+                if (!retained_source[source]) {
+                    expansion.destination = source;
+                    retained_source[source] = true;
+                }
+            }
+            std::vector<llama_seq_id> free_sequences;
+            for (llama_seq_id seq = 0; seq < (llama_seq_id) tree_width(); ++seq) {
+                if (!retained_source[seq]) {
+                    free_sequences.push_back(seq);
+                }
+            }
+            size_t free_index = 0;
+            for (auto & expansion : expansions) {
+                if (expansion.destination >= 0) {
+                    continue;
+                }
+                if (free_index >= free_sequences.size()) {
+                    fail("SPD tree sequence assignment overflow");
+                    return false;
+                }
+                expansion.destination = free_sequences[free_index++];
+            }
+
+            std::vector<tree_chain> next_chains;
+            next_chains.reserve(expansions.size());
+            for (const auto & expansion : expansions) {
+                const tree_chain & parent = chains[expansion.parent_index];
+                if (expansion.destination != parent.seq_id) {
+                    fork_tree_sequence(parent.seq_id, expansion.destination);
+                }
+                tree_chain child = parent;
+                child.seq_id = expansion.destination;
+                child.score = expansion.score;
+                const llama_pos next_position = n_prompt + (llama_pos) child.tokens.size();
+                child.tokens.push_back(expansion.candidate.token);
+                child.draft_ranks.push_back(expansion.candidate.rank);
+
+                std::vector<float> embedding;
+                if (!embed_token(expansion.candidate.token, embedding)) {
+                    return false;
+                }
+                child.pipeline.insert(child.pipeline.begin(), make_entry(
+                        expansion.candidate.token, next_position, std::move(embedding)));
+
+                const llama_pos keep_from = std::max<llama_pos>(0, verified_up_to - stage_count);
+                for (auto it = child.completed.begin();
+                     it != child.completed.end() && it->first < keep_from;) {
+                    it = child.completed.erase(it);
+                }
+                next_chains.push_back(std::move(child));
+            }
+            chains = std::move(next_chains);
+        }
+
+        result.decode_seconds = seconds_since(decode_start);
+        result.tokens.resize(n_predict);
+        result.accepted.resize(n_predict);
+        return true;
+    }
+
+    bool generate(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result) {
+        return tree_width() == 1
+                ? generate_linear(prompt, n_predict, result)
+                : generate_tree(prompt, n_predict, result);
     }
 };
 
