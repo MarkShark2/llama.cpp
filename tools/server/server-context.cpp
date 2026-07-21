@@ -3110,7 +3110,10 @@ private:
         // group is closed by this iteration's regular decode (drafts only).
         iterate(slots, [&](server_slot & slot) { slot.spec_deferred = false; slot.spec_deferred_drafts = 0; });
         {
-            static const bool defer_enabled =
+            // latched off after the first hard decode failure: the deferred batch
+            // shape never varies, so ineligibility (e.g. a non-stage-2 arch) is
+            // permanent for the lifetime of the process
+            static bool defer_enabled =
                 (getenv("GGML_PIPEDEC")        && atoi(getenv("GGML_PIPEDEC"))        != 0) &&
                 (getenv("GGML_PIPEDEC_STAGE2") && atoi(getenv("GGML_PIPEDEC_STAGE2")) != 0) &&
                 (getenv("GGML_PIPEDEC_DEFER")  && atoi(getenv("GGML_PIPEDEC_DEFER"))  != 0);
@@ -3141,7 +3144,8 @@ private:
                 llama_batch    b    = { 1, &tok, nullptr, &pos, &nsid, &sids, &lg };
 
                 llama_pipedec_defer(ctx_tgt);
-                if (llama_decode(ctx_tgt, b) == 0) {
+                const int defer_ret = llama_decode(ctx_tgt, b);
+                if (defer_ret == 0) {
                     slot.spec_deferred        = true;
                     slot.spec_deferred_pos    = pos;
                     slot.spec_deferred_drafts = 0;
@@ -3184,6 +3188,10 @@ private:
                     }
                 } else {
                     SRV_WRN("%s", "deferred stage-2 decode failed - falling back to combined verify\n");
+                    if (defer_ret < 0) {
+                        SRV_WRN("%s", "this model/context is not stage-2 eligible - disabling deferred verify for this run\n");
+                        defer_enabled = false;
+                    }
                 }
             }
         }
