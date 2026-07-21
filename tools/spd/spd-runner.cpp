@@ -541,7 +541,6 @@ int main(int argc, char ** argv) {
     sp.parallel_stages = parallel_stages;
     sp.target_context = target_context;
 
-    std::fprintf(stderr, "[spd] initializing eight-stage SPD controller\n");
     auto pipeline = std::make_unique<common_spd_pipeline>(target, sidecar, sp);
     if (!pipeline->valid()) {
         std::fprintf(stderr, "SPD initialization failed: %s\n", pipeline->error().c_str());
@@ -550,6 +549,7 @@ int main(int argc, char ** argv) {
         llama_model_free(target);
         return 1;
     }
+    std::fprintf(stderr, "[spd] initialized %u-stage SPD controller\n", pipeline->stage_count());
 
     common_spd_result actual;
     double spd_prefill_seconds = 0.0;

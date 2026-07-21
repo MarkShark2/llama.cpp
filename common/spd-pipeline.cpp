@@ -14,8 +14,8 @@
 
 namespace {
 
-constexpr uint32_t SPD_STAGE_COUNT = COMMON_SPD_STAGE_COUNT;
-constexpr uint32_t SPD_ROLLBACK_TOKENS = SPD_STAGE_COUNT - 1;
+constexpr uint32_t SPD_MAX_STAGE_COUNT = COMMON_SPD_MAX_STAGE_COUNT;
+constexpr uint32_t SPD_MAX_ROLLBACK_TOKENS = SPD_MAX_STAGE_COUNT - 1;
 
 using clock_type = std::chrono::steady_clock;
 
@@ -123,12 +123,14 @@ struct common_spd_pipeline::impl {
     int32_t layers_per_stage = 0;
     int32_t target_n_pos_per_embd = 1;
     int32_t sidecar_n_embd_inp = 0;
+    uint32_t stage_count = 0;
+    uint32_t rollback_tokens = 0;
 
     std::vector<int32_t> anchors;
-    std::array<llama_context *, SPD_STAGE_COUNT> stages = {};
-    std::array<std::array<llama_pos, SPD_ROLLBACK_TOKENS>, SPD_STAGE_COUNT> checkpoint_pos = {};
-    std::array<llama_pos, SPD_STAGE_COUNT> stage_tail_pos = {};
-    std::array<std::vector<size_t>, SPD_STAGE_COUNT> stage_resources;
+    std::array<llama_context *, SPD_MAX_STAGE_COUNT> stages = {};
+    std::array<std::array<llama_pos, SPD_MAX_ROLLBACK_TOKENS>, SPD_MAX_STAGE_COUNT> checkpoint_pos = {};
+    std::array<llama_pos, SPD_MAX_STAGE_COUNT> stage_tail_pos = {};
+    std::array<std::vector<size_t>, SPD_MAX_STAGE_COUNT> stage_resources;
     std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
     llama_context * head = nullptr;
     llama_context * embed = nullptr;
@@ -147,8 +149,8 @@ struct common_spd_pipeline::impl {
         llama_free(sidecar);
         llama_free(embed);
         llama_free(head);
-        for (llama_context * ctx : stages) {
-            llama_free(ctx);
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            llama_free(stages[stage]);
         }
     }
 
@@ -203,7 +205,14 @@ struct common_spd_pipeline::impl {
             fail("SPD requires both a target model and a sidecar model");
             return;
         }
-        if (params.n_ctx > UINT32_MAX/SPD_STAGE_COUNT) {
+        stage_count = llama_model_spd_stage_count(model_spd);
+        if (stage_count < 2 || stage_count > SPD_MAX_STAGE_COUNT) {
+            fail("SPD sidecar stage count must be between 2 and " +
+                    std::to_string(SPD_MAX_STAGE_COUNT));
+            return;
+        }
+        rollback_tokens = stage_count - 1;
+        if (params.n_ctx > UINT32_MAX/stage_count) {
             fail("SPD context length is too large for rollback sequence allocation");
             return;
         }
@@ -211,14 +220,15 @@ struct common_spd_pipeline::impl {
         n_embd = llama_model_n_embd(model_target);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_target));
         n_layers = llama_model_n_layer(model_target);
-        layers_per_stage = n_layers / (int32_t) SPD_STAGE_COUNT;
+        layers_per_stage = n_layers / (int32_t) stage_count;
         target_n_pos_per_embd = llama_model_n_pos_per_embd(model_target);
         sidecar_n_embd_inp = llama_model_n_embd_inp(model_spd);
 
         const uint32_t n_anchor = llama_model_target_layer_ids_n(model_spd);
         const int32_t * anchor_data = llama_model_target_layer_ids(model_spd);
-        if (n_layers <= 0 || n_layers % (int32_t) SPD_STAGE_COUNT != 0) {
-            fail("SPD target layer count must divide evenly into eight stages");
+        if (n_layers <= 0 || n_layers % (int32_t) stage_count != 0) {
+            fail("SPD target layer count must divide evenly into " +
+                    std::to_string(stage_count) + " stages");
             return;
         }
         if (n_anchor == 0 || anchor_data == nullptr) {
@@ -245,7 +255,7 @@ struct common_spd_pipeline::impl {
         // touched by each logical stage and lock shared resources in a stable
         // order during stage advancement.
         std::map<std::string, size_t> resource_ids;
-        for (uint32_t stage = 0; stage < SPD_STAGE_COUNT; ++stage) {
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const int32_t layer_begin = (int32_t) stage*layers_per_stage;
             const int32_t layer_end = layer_begin + layers_per_stage;
             for (int32_t layer = layer_begin; layer < layer_end; ++layer) {
@@ -263,18 +273,18 @@ struct common_spd_pipeline::impl {
             std::sort(stage_resources[stage].begin(), stage_resources[stage].end());
         }
 
-        for (uint32_t stage = 0; stage < SPD_STAGE_COUNT; ++stage) {
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
             llama_context_params cp = make_context_params(params.n_batch);
             cp.ctx_type = LLAMA_CONTEXT_TYPE_SPD_STAGE;
             cp.spd_stage = stage;
-            cp.spd_stage_count = SPD_STAGE_COUNT;
-            cp.n_seq_max = SPD_STAGE_COUNT;
+            cp.spd_stage_count = stage_count;
+            cp.n_seq_max = stage_count;
             // llama_context derives n_ctx_seq by dividing total n_ctx by
             // n_seq_max. SPD uses the extra sequence IDs as rollback aliases,
             // but seq 0 must still retain the caller-requested context length.
             // Without this expansion an 8192-token SPD context silently became
             // an effective 1024-token context and diverged on longer prompts.
-            cp.n_ctx = params.n_ctx*SPD_STAGE_COUNT;
+            cp.n_ctx = params.n_ctx*stage_count;
             // Keep seq 0 on the same per-sequence KV layout as an ordinary
             // target context. Rollback snapshots use seq_cp aliases and do not
             // require a unified cache; forcing one changes long-context target
@@ -290,7 +300,7 @@ struct common_spd_pipeline::impl {
         }
 
         for (int32_t anchor : anchors) {
-            const uint32_t stage = std::min<uint32_t>(anchor / layers_per_stage, SPD_STAGE_COUNT - 1);
+            const uint32_t stage = std::min<uint32_t>(anchor / layers_per_stage, stage_count - 1);
             llama_set_embeddings_layer_inp(stages[stage], anchor, true);
         }
 
@@ -312,7 +322,7 @@ struct common_spd_pipeline::impl {
         }
 
         llama_context_params sp = make_context_params(
-                std::max<uint32_t>(params.n_batch, SPD_STAGE_COUNT + 1), true);
+                std::max<uint32_t>(params.n_batch, stage_count + 1), true);
         sidecar = llama_init_from_model(model_spd, sp);
         if (sidecar == nullptr) {
             fail("failed to initialize the SPD sidecar context");
@@ -322,8 +332,8 @@ struct common_spd_pipeline::impl {
     }
 
     void reset_memories() {
-        for (llama_context * ctx : stages) {
-            llama_memory_clear(llama_get_memory(ctx), true);
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            llama_memory_clear(llama_get_memory(stages[stage]), true);
         }
         llama_memory_clear(llama_get_memory(sidecar), true);
         for (auto & positions : checkpoint_pos) {
@@ -454,7 +464,7 @@ struct common_spd_pipeline::impl {
     }
 
     bool prefill_sidecar(const std::vector<std::vector<float>> & anchor_data, int32_t n_tokens) {
-        const int32_t prefill_len = std::max(0, n_tokens - (int32_t) SPD_STAGE_COUNT + 1);
+        const int32_t prefill_len = std::max(0, n_tokens - (int32_t) stage_count + 1);
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
         const size_t selector = anchors.size() - 1;
 
@@ -491,7 +501,7 @@ struct common_spd_pipeline::impl {
         }
 
         const llama_pos newest_pos = pipeline.front().pos;
-        const llama_pos oldest_needed = newest_pos - SPD_STAGE_COUNT + 1;
+        const llama_pos oldest_needed = newest_pos - stage_count + 1;
         if (oldest_needed < 0) {
             fail("SPD prompt is too short to construct a complete speculation window");
             return false;
@@ -508,7 +518,7 @@ struct common_spd_pipeline::impl {
         const bool has_evicted = prev_evicted != nullptr;
 
         if (has_evicted) {
-            const size_t selector = choose_anchor(*prev_evicted, SPD_STAGE_COUNT);
+            const size_t selector = choose_anchor(*prev_evicted, stage_count);
             selectors.push_back((llama_token) selector);
             positions.push_back(prev_evicted_pos);
             append_feature_row(features, *prev_evicted, selector);
@@ -529,7 +539,7 @@ struct common_spd_pipeline::impl {
             }
 
             const int32_t nominal_depth = newest_pos - pos;
-            const int32_t search_hi = nominal_depth == 0 ? 0 : has_evicted ? SPD_STAGE_COUNT - 1 : SPD_STAGE_COUNT;
+            const int32_t search_hi = nominal_depth == 0 ? 0 : has_evicted ? stage_count - 1 : stage_count;
             const size_t selector = choose_anchor(*snap, search_hi);
             selectors.push_back((llama_token) selector);
             positions.push_back(pos);
@@ -545,14 +555,14 @@ struct common_spd_pipeline::impl {
     }
 
     bool rollback(llama_pos target_pos) {
-        for (uint32_t stage = 0; stage < SPD_STAGE_COUNT; ++stage) {
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const llama_pos restore_pos = target_pos - 1;
             if (stage_tail_pos[stage] == restore_pos) {
                 continue;
             }
 
             llama_seq_id restore_seq = -1;
-            for (uint32_t i = 0; i < SPD_ROLLBACK_TOKENS; ++i) {
+            for (uint32_t i = 0; i < rollback_tokens; ++i) {
                 if (checkpoint_pos[stage][i] == restore_pos) {
                     restore_seq = (llama_seq_id) i + 1;
                     break;
@@ -588,14 +598,14 @@ struct common_spd_pipeline::impl {
         hidden.resize((size_t) n_prompt*n_embd);
         anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_prompt*n_embd));
 
-        for (uint32_t stage = 0; stage < SPD_STAGE_COUNT; ++stage) {
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
             for (int32_t begin = 0; begin < n_prompt; begin += chunk_size) {
                 const int32_t count = std::min(chunk_size, n_prompt - begin);
                 std::vector<float> chunk_output;
                 std::vector<std::vector<float>> chunk_anchors(anchors.size());
                 std::vector<std::pair<size_t, std::vector<float> *>> wanted;
                 for (size_t ai = 0; ai < anchors.size(); ++ai) {
-                    if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, SPD_STAGE_COUNT - 1) == stage) {
+                    if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
                         wanted.push_back({ ai, &chunk_anchors[ai] });
                     }
                 }
@@ -647,7 +657,7 @@ struct common_spd_pipeline::impl {
         }
         const auto start = clock_type::now();
 
-        const uint32_t checkpoint_slot = (uint32_t) (item.pos % SPD_ROLLBACK_TOKENS);
+        const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
         const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
         llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
         checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
@@ -656,7 +666,7 @@ struct common_spd_pipeline::impl {
         std::vector<std::vector<float>> captured(anchors.size());
         std::vector<std::pair<size_t, std::vector<float> *>> wanted;
         for (size_t ai = 0; ai < anchors.size(); ++ai) {
-            if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, SPD_STAGE_COUNT - 1) == stage) {
+            if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
                 wanted.push_back({ ai, &captured[ai] });
             }
         }
@@ -677,8 +687,8 @@ struct common_spd_pipeline::impl {
     }
 
     void synchronize_all() {
-        for (llama_context * ctx : stages) {
-            llama_synchronize(ctx);
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            llama_synchronize(stages[stage]);
         }
         llama_synchronize(head);
         llama_synchronize(embed);
@@ -696,7 +706,7 @@ struct common_spd_pipeline::impl {
             fail("SPD prediction count must be positive");
             return false;
         }
-        if ((uint64_t) prompt.size() + n_predict + SPD_STAGE_COUNT >= params.n_ctx) {
+        if ((uint64_t) prompt.size() + n_predict + stage_count >= params.n_ctx) {
             fail("SPD prompt and prediction count exceed the configured context");
             return false;
         }
@@ -713,7 +723,7 @@ struct common_spd_pipeline::impl {
         }
 
         std::map<llama_pos, snapshot> completed;
-        const int32_t retained_begin = std::max(0, n_prompt - (int32_t) SPD_STAGE_COUNT + 1);
+        const int32_t retained_begin = std::max(0, n_prompt - (int32_t) stage_count + 1);
         for (int32_t pos = retained_begin; pos < n_prompt; ++pos) {
             completed.emplace(pos, snapshot_at(prompt_anchors, pos));
         }
@@ -749,7 +759,7 @@ struct common_spd_pipeline::impl {
             ++result.decode_steps;
 
             llama_token pending_draft = LLAMA_TOKEN_NULL;
-            const llama_pos oldest_needed = pipeline.front().pos - SPD_STAGE_COUNT + 1;
+            const llama_pos oldest_needed = pipeline.front().pos - stage_count + 1;
             bool has_pending_draft = false;
             if (oldest_needed >= 0) {
                 if (!speculate(pipeline, completed,
@@ -790,7 +800,7 @@ struct common_spd_pipeline::impl {
                 }
             }
 
-            if (pipeline.size() >= SPD_STAGE_COUNT) {
+            if (pipeline.size() >= stage_count) {
                 entry completed_entry = std::move(pipeline.back());
                 completed[completed_entry.pos] = completed_entry.snap;
                 const llama_pos target_pos = completed_entry.pos + 1;
@@ -855,11 +865,11 @@ struct common_spd_pipeline::impl {
             pipeline.insert(pipeline.begin(), make_entry(pending_draft, next_position, std::move(next_embedding)));
             ++next_position;
 
-            // Drafts can run seven positions ahead of the verified frontier. A
-            // rejection restarts at that frontier and must be able to rebuild
-            // the preceding eight-row sidecar window, so retention follows the
+            // Drafts can run stage_count - 1 positions ahead of the verified
+            // frontier. A rejection restarts there and must be able to rebuild
+            // the preceding stage_count-row sidecar window, so retention follows
             // verified position rather than the newest speculative position.
-            const llama_pos keep_from = std::max<llama_pos>(0, verified_up_to - SPD_STAGE_COUNT);
+            const llama_pos keep_from = std::max<llama_pos>(0, verified_up_to - stage_count);
             for (auto it = completed.begin(); it != completed.end() && it->first < keep_from;) {
                 it = completed.erase(it);
             }
@@ -886,6 +896,10 @@ bool common_spd_pipeline::valid() const {
 
 const std::string & common_spd_pipeline::error() const {
     return pimpl->last_error;
+}
+
+uint32_t common_spd_pipeline::stage_count() const {
+    return pimpl->stage_count;
 }
 
 bool common_spd_pipeline::generate(

@@ -2863,3 +2863,10 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
 }
+
+uint32_t llama_model_spd_stage_count(const struct llama_model * model) {
+    if (model == nullptr || model->arch != LLM_ARCH_SPD) {
+        return 0;
+    }
+    return static_cast<const llama_model_spd *>(model)->stage_count;
+}
