@@ -113,6 +113,13 @@ struct common_spd_pipeline::impl {
         snapshot snap;
     };
 
+    struct speculation_input {
+        std::vector<llama_token> selectors;
+        std::vector<llama_pos> positions;
+        std::vector<float> features;
+        llama_pos min_pos = -1;
+    };
+
     llama_model * model_target;
     llama_model * model_spd;
     common_spd_params params;
@@ -131,6 +138,7 @@ struct common_spd_pipeline::impl {
     std::array<std::array<llama_pos, SPD_MAX_ROLLBACK_TOKENS>, SPD_MAX_STAGE_COUNT> checkpoint_pos = {};
     std::array<llama_pos, SPD_MAX_STAGE_COUNT> stage_tail_pos = {};
     std::array<std::vector<size_t>, SPD_MAX_STAGE_COUNT> stage_resources;
+    std::vector<size_t> sidecar_resources;
     std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
     llama_context * head = nullptr;
     llama_context * embed = nullptr;
@@ -252,8 +260,8 @@ struct common_spd_pipeline::impl {
         // Independent schedulers may overlap across distinct machines, but
         // schedulers targeting the same physical device or RPC endpoint must
         // not interleave protocol streams. Record every execution resource
-        // touched by each logical stage and lock shared resources in a stable
-        // order during stage advancement.
+        // touched by each logical stage and the sidecar, then lock shared
+        // resources in a stable order during concurrent advancement.
         std::map<std::string, size_t> resource_ids;
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const int32_t layer_begin = (int32_t) stage*layers_per_stage;
@@ -272,6 +280,19 @@ struct common_spd_pipeline::impl {
             }
             std::sort(stage_resources[stage].begin(), stage_resources[stage].end());
         }
+        for (int32_t layer = 0; layer < llama_model_n_layer(model_spd); ++layer) {
+            const std::string key = execution_resource_key(
+                    llama_model_layer_device(model_spd, layer));
+            auto [it, inserted] = resource_ids.emplace(key, resource_ids.size());
+            if (inserted) {
+                resource_mutexes.push_back(std::make_unique<std::mutex>());
+            }
+            if (std::find(sidecar_resources.begin(), sidecar_resources.end(), it->second) ==
+                sidecar_resources.end()) {
+                sidecar_resources.push_back(it->second);
+            }
+        }
+        std::sort(sidecar_resources.begin(), sidecar_resources.end());
 
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             llama_context_params cp = make_context_params(params.n_batch);
@@ -447,6 +468,11 @@ struct common_spd_pipeline::impl {
             const std::vector<float> & features,
             const std::vector<llama_pos> & positions,
             llama_token * sampled) {
+        std::vector<std::unique_lock<std::mutex>> resource_locks;
+        resource_locks.reserve(sidecar_resources.size());
+        for (size_t resource : sidecar_resources) {
+            resource_locks.emplace_back(*resource_mutexes[resource]);
+        }
         batch_storage storage(selectors, features, sidecar_n_embd_inp, positions);
         if (llama_decode(sidecar, storage.batch) != 0) {
             fail("SPD sidecar decode failed");
@@ -489,12 +515,12 @@ struct common_spd_pipeline::impl {
         return true;
     }
 
-    bool speculate(
+    bool prepare_speculation(
             const std::vector<entry> & pipeline,
             const std::map<llama_pos, snapshot> & completed,
             const snapshot * prev_evicted,
             llama_pos prev_evicted_pos,
-            llama_token & sampled) {
+            speculation_input & input) {
         if (pipeline.empty()) {
             fail("SPD pipeline is empty before speculation");
             return false;
@@ -512,16 +538,14 @@ struct common_spd_pipeline::impl {
             active[item.pos] = &item.snap;
         }
 
-        std::vector<llama_token> selectors;
-        std::vector<llama_pos> positions;
-        std::vector<float> features;
+        input = {};
         const bool has_evicted = prev_evicted != nullptr;
 
         if (has_evicted) {
             const size_t selector = choose_anchor(*prev_evicted, stage_count);
-            selectors.push_back((llama_token) selector);
-            positions.push_back(prev_evicted_pos);
-            append_feature_row(features, *prev_evicted, selector);
+            input.selectors.push_back((llama_token) selector);
+            input.positions.push_back(prev_evicted_pos);
+            append_feature_row(input.features, *prev_evicted, selector);
         }
 
         for (llama_pos pos = oldest_needed; pos <= newest_pos; ++pos) {
@@ -541,17 +565,32 @@ struct common_spd_pipeline::impl {
             const int32_t nominal_depth = newest_pos - pos;
             const int32_t search_hi = nominal_depth == 0 ? 0 : has_evicted ? stage_count - 1 : stage_count;
             const size_t selector = choose_anchor(*snap, search_hi);
-            selectors.push_back((llama_token) selector);
-            positions.push_back(pos);
-            append_feature_row(features, *snap, selector);
+            input.selectors.push_back((llama_token) selector);
+            input.positions.push_back(pos);
+            append_feature_row(input.features, *snap, selector);
         }
 
-        const llama_pos min_pos = positions.front();
-        if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, min_pos, -1)) {
-            fail("failed to crop SPD sidecar cache at position " + std::to_string(min_pos));
+        input.min_pos = input.positions.front();
+        return true;
+    }
+
+    bool run_speculation(const speculation_input & input, llama_token & sampled) {
+        if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, input.min_pos, -1)) {
+            fail("failed to crop SPD sidecar cache at position " + std::to_string(input.min_pos));
             return false;
         }
-        return sidecar_decode(selectors, features, positions, &sampled);
+        return sidecar_decode(input.selectors, input.features, input.positions, &sampled);
+    }
+
+    bool speculate(
+            const std::vector<entry> & pipeline,
+            const std::map<llama_pos, snapshot> & completed,
+            const snapshot * prev_evicted,
+            llama_pos prev_evicted_pos,
+            llama_token & sampled) {
+        speculation_input input;
+        return prepare_speculation(pipeline, completed, prev_evicted, prev_evicted_pos, input) &&
+                run_speculation(input, sampled);
     }
 
     bool rollback(llama_pos target_pos) {
@@ -595,34 +634,70 @@ struct common_spd_pipeline::impl {
             std::vector<std::vector<float>> & anchor_data) {
         const int32_t n_prompt = (int32_t) prompt.size();
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
+        const int32_t n_chunks = (n_prompt + chunk_size - 1)/chunk_size;
         hidden.resize((size_t) n_prompt*n_embd);
         anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_prompt*n_embd));
 
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            for (int32_t begin = 0; begin < n_prompt; begin += chunk_size) {
-                const int32_t count = std::min(chunk_size, n_prompt - begin);
-                std::vector<float> chunk_output;
-                std::vector<std::vector<float>> chunk_anchors(anchors.size());
-                std::vector<std::pair<size_t, std::vector<float> *>> wanted;
-                for (size_t ai = 0; ai < anchors.size(); ++ai) {
-                    if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
-                        wanted.push_back({ ai, &chunk_anchors[ai] });
-                    }
+        struct prefill_task_result {
+            bool ok;
+            std::string error;
+        };
+
+        // A target-prefill task depends on both the previous stage for the
+        // same chunk and the previous chunk for the same stage. Execute the
+        // stage/chunk grid by antidiagonals so both dependencies have finished
+        // while distinct stages can keep distinct accelerators busy together.
+        for (int32_t wave = 0; wave < n_chunks + (int32_t) stage_count - 1; ++wave) {
+            std::vector<std::future<prefill_task_result>> work;
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                const int32_t chunk = wave - (int32_t) stage;
+                if (chunk < 0 || chunk >= n_chunks) {
+                    continue;
                 }
 
-                std::string error;
-                const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
-                const float * embeddings = stage == 0 ? nullptr : hidden.data() + (size_t) begin*n_embd;
-                if (!decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error)) {
-                    fail(std::move(error));
+                work.push_back(std::async(std::launch::async, [&, stage, chunk]() {
+                    std::vector<std::unique_lock<std::mutex>> resource_locks;
+                    resource_locks.reserve(stage_resources[stage].size());
+                    for (size_t resource : stage_resources[stage]) {
+                        resource_locks.emplace_back(*resource_mutexes[resource]);
+                    }
+
+                    const int32_t begin = chunk*chunk_size;
+                    const int32_t count = std::min(chunk_size, n_prompt - begin);
+                    std::vector<float> chunk_output;
+                    std::vector<std::vector<float>> chunk_anchors(anchors.size());
+                    std::vector<std::pair<size_t, std::vector<float> *>> wanted;
+                    for (size_t ai = 0; ai < anchors.size(); ++ai) {
+                        if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
+                            wanted.push_back({ ai, &chunk_anchors[ai] });
+                        }
+                    }
+
+                    std::string error;
+                    const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
+                    const float * embeddings = stage == 0 ? nullptr : hidden.data() + (size_t) begin*n_embd;
+                    if (!decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error)) {
+                        return prefill_task_result { false, std::move(error) };
+                    }
+                    std::copy(chunk_output.begin(), chunk_output.end(), hidden.begin() + (size_t) begin*n_embd);
+                    for (auto & item : wanted) {
+                        std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
+                                anchor_data[item.first].begin() + (size_t) begin*n_embd);
+                    }
+                    return prefill_task_result { true, {} };
+                }));
+            }
+
+            for (auto & task : work) {
+                prefill_task_result task_result = task.get();
+                if (!task_result.ok) {
+                    fail(std::move(task_result.error));
                     return false;
                 }
-                std::copy(chunk_output.begin(), chunk_output.end(), hidden.begin() + (size_t) begin*n_embd);
-                for (auto & item : wanted) {
-                    std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
-                            anchor_data[item.first].begin() + (size_t) begin*n_embd);
-                }
             }
+        }
+
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
             stage_tail_pos[stage] = n_prompt - 1;
         }
         return true;
@@ -761,10 +836,11 @@ struct common_spd_pipeline::impl {
             llama_token pending_draft = LLAMA_TOKEN_NULL;
             const llama_pos oldest_needed = pipeline.front().pos - stage_count + 1;
             bool has_pending_draft = false;
+            speculation_input pending_input;
             if (oldest_needed >= 0) {
-                if (!speculate(pipeline, completed,
+                if (!prepare_speculation(pipeline, completed,
                         has_prev_evicted ? &prev_evicted : nullptr,
-                        prev_evicted_pos, pending_draft)) {
+                        prev_evicted_pos, pending_input)) {
                     return false;
                 }
                 has_pending_draft = true;
@@ -774,6 +850,20 @@ struct common_spd_pipeline::impl {
             std::vector<double> elapsed(active_count, 0.0);
             std::vector<std::string> errors(active_count);
             std::vector<uint8_t> ok(active_count, 0);
+            std::future<bool> speculation_work;
+            bool speculation_ok = true;
+            if (has_pending_draft) {
+                // The features were copied before target stages mutate their
+                // snapshots, so an independently placed sidecar can decode
+                // them while the target pipeline advances.
+                if (params.parallel_stages) {
+                    speculation_work = std::async(std::launch::async, [&]() {
+                        return run_speculation(pending_input, pending_draft);
+                    });
+                } else {
+                    speculation_ok = run_speculation(pending_input, pending_draft);
+                }
+            }
 
             if (params.parallel_stages && active_count > 1) {
                 std::vector<std::future<bool>> work;
@@ -792,12 +882,18 @@ struct common_spd_pipeline::impl {
                 }
             }
 
+            if (speculation_work.valid()) {
+                speculation_ok = speculation_work.get();
+            }
             for (size_t stage = 0; stage < active_count; ++stage) {
                 result.stage_compute_seconds += elapsed[stage];
                 if (!ok[stage]) {
                     fail(errors[stage]);
                     return false;
                 }
+            }
+            if (!speculation_ok) {
+                return false;
             }
 
             if (pipeline.size() >= stage_count) {
