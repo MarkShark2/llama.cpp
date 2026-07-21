@@ -2070,6 +2070,12 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    static const bool graph_trace = [] {
+        const char * value = getenv("GGML_RPC_GRAPH_TRACE");
+        return value && atoi(value) != 0;
+    }();
+    const int64_t t_start = graph_trace ? ggml_time_us() : 0;
+
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -2102,6 +2108,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, uid, n_nodes, n_tensors);
+    const int64_t t_parse = graph_trace ? ggml_time_us() : 0;
 
     stored_graph sg;
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
@@ -2136,7 +2143,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
+    const int64_t t_build = graph_trace ? ggml_time_us() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    const int64_t t_compute = graph_trace ? ggml_time_us() : 0;
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     if (uid != 0) {
         sg.graph = graph;
@@ -2146,6 +2155,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             GGML_LOG_WARN("[%s] device %u holds %zu cached graphs - client eviction may be broken\n",
                     __func__, device, stored_graphs[device].size());
         }
+    }
+    if (graph_trace) {
+        fprintf(stderr,
+                "[rpc graph] dev=%u nodes=%u tensors=%u parse=%.2fms build=%.2fms compute=%.2fms store=%.2fms total=%.2fms\n",
+                device, n_nodes, n_tensors,
+                (t_parse   - t_start)   / 1000.0,
+                (t_build   - t_parse)   / 1000.0,
+                (t_compute - t_build)   / 1000.0,
+                (ggml_time_us() - t_compute) / 1000.0,
+                (ggml_time_us() - t_start)   / 1000.0);
+        fflush(stderr);
     }
     return true;
 }
