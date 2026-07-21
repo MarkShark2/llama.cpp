@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <memory>
 #include <sstream>
@@ -48,8 +49,29 @@ void usage(const char * argv0) {
             "       [--rpc host:port,...] [--rpc-cache] [--device RPC0,...,CUDA0]\n"
             "       [--device-draft CUDA0] [--tensor-split 8,8,8,4,4,0]\n"
             "       [--cache-type-k q8_0] [--cache-type-v q8_0]\n"
-            "       [--flash-attn on|off|auto] [--no-mmap]\n",
+            "       [--flash-attn on|off|auto] [--no-mmap]\n"
+            "       [--prompt-file path] [--duration seconds] [--phase-file path]\n",
             argv0);
+}
+
+std::string read_text_file(const std::string & path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::invalid_argument("failed to open prompt file: " + path);
+    }
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+void phase_marker(const std::string & path, const char * phase, const char * state) {
+    const int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr, "[spd-bench] phase=%s state=%s unix_ms=%lld\n",
+            phase, state, (long long) unix_ms);
+    std::fflush(stderr);
+    if (!path.empty()) {
+        std::ofstream output(path, std::ios::app);
+        output << unix_ms << ',' << phase << ',' << state << '\n';
+    }
 }
 
 std::vector<std::string> split(const std::string & value, char delimiter) {
@@ -269,6 +291,7 @@ int main(int argc, char ** argv) {
     int32_t n_gpu_layers_draft = 99;
     uint32_t n_ctx = 4096;
     uint32_t n_batch = 512;
+    int32_t duration_seconds = 0;
     bool parallel_stages = true;
     bool rpc_cache = false;
     bool use_mmap = true;
@@ -279,6 +302,8 @@ int main(int argc, char ** argv) {
     std::string cache_type_k = "f16";
     std::string cache_type_v = "f16";
     std::string flash_attn = "auto";
+    std::string prompt_file;
+    std::string phase_file;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -317,14 +342,32 @@ int main(int argc, char ** argv) {
             flash_attn = argv[++i];
         } else if (std::strcmp(argv[i], "--no-mmap") == 0) {
             use_mmap = false;
+        } else if (std::strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
+            prompt_file = argv[++i];
+        } else if (std::strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            duration_seconds = std::stoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--phase-file") == 0 && i + 1 < argc) {
+            phase_file = argv[++i];
         } else {
             usage(argv[0]);
             return 1;
         }
     }
 
-    if (target_path.empty() || sidecar_path.empty() || n_predict <= 0 || n_batch == 0) {
+    if (target_path.empty() || sidecar_path.empty() || n_predict <= 0 || n_batch == 0 || duration_seconds < 0) {
         usage(argv[0]);
+        return 1;
+    }
+
+    try {
+        if (!prompt_file.empty()) {
+            prompt = read_text_file(prompt_file);
+        }
+        if (!phase_file.empty()) {
+            std::ofstream(phase_file, std::ios::trunc);
+        }
+    } catch (const std::exception & error) {
+        std::fprintf(stderr, "invalid arguments: %s\n", error.what());
         return 1;
     }
 
@@ -383,12 +426,35 @@ int main(int argc, char ** argv) {
     }
 
     baseline_result baseline;
-    std::fprintf(stderr, "[spd] running full-target greedy baseline\n");
-    if (!run_baseline(target, prompt_tokens, n_predict, n_ctx, n_batch, target_context, baseline)) {
-        std::fprintf(stderr, "baseline generation failed\n");
-        llama_model_free(target);
-        return 1;
-    }
+    double baseline_prefill_seconds = 0.0;
+    double baseline_decode_seconds = 0.0;
+    uint64_t baseline_requests = 0;
+    uint64_t baseline_generated = 0;
+    std::fprintf(stderr, "[spd] running full-target greedy baseline%s\n",
+            duration_seconds > 0 ? " duration benchmark" : "");
+    phase_marker(phase_file, "baseline", "start");
+    const auto baseline_wall_start = clock_type::now();
+    do {
+        baseline_result current;
+        if (!run_baseline(target, prompt_tokens, n_predict, n_ctx, n_batch, target_context, current)) {
+            std::fprintf(stderr, "baseline generation failed\n");
+            llama_model_free(target);
+            return 1;
+        }
+        if (baseline_requests == 0) {
+            baseline = current;
+        } else if (current.tokens != baseline.tokens) {
+            std::fprintf(stderr, "baseline greedy output changed between benchmark iterations\n");
+            llama_model_free(target);
+            return 1;
+        }
+        baseline_prefill_seconds += current.prefill_seconds;
+        baseline_decode_seconds += current.decode_seconds;
+        baseline_generated += current.tokens.size();
+        ++baseline_requests;
+    } while (duration_seconds > 0 && seconds_since(baseline_wall_start) < duration_seconds);
+    const double baseline_wall_seconds = seconds_since(baseline_wall_start);
+    phase_marker(phase_file, "baseline", "end");
 
     llama_model_params sidecar_params = llama_model_default_params();
     sidecar_params.n_gpu_layers = n_gpu_layers_draft;
@@ -419,35 +485,74 @@ int main(int argc, char ** argv) {
     }
 
     common_spd_result actual;
-    std::fprintf(stderr, "[spd] running verified speculative pipeline decoding\n");
-    if (!pipeline->generate(prompt_tokens, n_predict, actual)) {
-        std::fprintf(stderr, "SPD generation failed: %s\n", pipeline->error().c_str());
-        pipeline.reset();
-        llama_model_free(sidecar);
-        llama_model_free(target);
-        return 1;
-    }
+    double spd_prefill_seconds = 0.0;
+    double spd_decode_seconds = 0.0;
+    uint64_t spd_requests = 0;
+    uint64_t spd_generated = 0;
+    uint64_t spd_steps = 0;
+    uint64_t spd_accepted = 0;
+    uint64_t spd_rejected = 0;
+    std::fprintf(stderr, "[spd] running verified speculative pipeline decoding%s\n",
+            duration_seconds > 0 ? " duration benchmark" : "");
+    phase_marker(phase_file, "spd", "start");
+    const auto spd_wall_start = clock_type::now();
+    do {
+        common_spd_result current;
+        if (!pipeline->generate(prompt_tokens, n_predict, current)) {
+            std::fprintf(stderr, "SPD generation failed: %s\n", pipeline->error().c_str());
+            pipeline.reset();
+            llama_model_free(sidecar);
+            llama_model_free(target);
+            return 1;
+        }
+        if (spd_requests == 0) {
+            actual = current;
+        }
+        if (current.tokens != baseline.tokens) {
+            std::fprintf(stderr, "FAIL: verified SPD iteration differs from the full-target greedy baseline\n");
+            pipeline.reset();
+            llama_model_free(sidecar);
+            llama_model_free(target);
+            return 2;
+        }
+        spd_prefill_seconds += current.prefill_seconds;
+        spd_decode_seconds += current.decode_seconds;
+        spd_generated += current.tokens.size();
+        spd_steps += current.decode_steps;
+        spd_accepted += current.n_accepted;
+        spd_rejected += current.n_rejected;
+        ++spd_requests;
+    } while (duration_seconds > 0 && seconds_since(spd_wall_start) < duration_seconds);
+    const double spd_wall_seconds = seconds_since(spd_wall_start);
+    phase_marker(phase_file, "spd", "end");
 
     size_t matched = 0;
     while (matched < baseline.tokens.size() && matched < actual.tokens.size() &&
            baseline.tokens[matched] == actual.tokens[matched]) {
         ++matched;
     }
-    const double baseline_tps = baseline.decode_seconds > 0.0 ? n_predict / baseline.decode_seconds : 0.0;
-    const double spd_tps = actual.decode_seconds > 0.0 ? n_predict / actual.decode_seconds : 0.0;
-    const uint64_t verified_drafts = actual.n_accepted > 0 ? actual.n_accepted - 1 : 0;
-    const uint64_t decisions = verified_drafts + actual.n_rejected;
+    const double baseline_pp = baseline_prefill_seconds > 0.0 ?
+            (double) baseline_requests*prompt_tokens.size()/baseline_prefill_seconds : 0.0;
+    const double spd_pp = spd_prefill_seconds > 0.0 ?
+            (double) spd_requests*prompt_tokens.size()/spd_prefill_seconds : 0.0;
+    const double baseline_tps = baseline_decode_seconds > 0.0 ? baseline_generated/baseline_decode_seconds : 0.0;
+    const double spd_tps = spd_decode_seconds > 0.0 ? spd_generated/spd_decode_seconds : 0.0;
+    const uint64_t verified_drafts = spd_accepted > spd_requests ? spd_accepted - spd_requests : 0;
+    const uint64_t decisions = verified_drafts + spd_rejected;
     const double acceptance = decisions > 0 ? 100.0*verified_drafts/decisions : 100.0;
 
-    std::printf("baseline prefill: %.6f s\n", baseline.prefill_seconds);
-    std::printf("SPD prefill:      %.6f s\n", actual.prefill_seconds);
-    std::printf("baseline decode:  %.3f tok/s\n", baseline_tps);
-    std::printf("SPD decode:       %.3f tok/s\n", spd_tps);
-    std::printf("SPD steps:        %llu\n", (unsigned long long) actual.decode_steps);
+    std::printf("prompt tokens:    %zu\n", prompt_tokens.size());
+    std::printf("baseline window:  %.3f s (%llu requests)\n", baseline_wall_seconds, (unsigned long long) baseline_requests);
+    std::printf("SPD window:       %.3f s (%llu requests)\n", spd_wall_seconds, (unsigned long long) spd_requests);
+    std::printf("baseline PP:      %.3f tok/s\n", baseline_pp);
+    std::printf("SPD PP:           %.3f tok/s\n", spd_pp);
+    std::printf("baseline TG:      %.3f tok/s\n", baseline_tps);
+    std::printf("SPD TG:           %.3f tok/s\n", spd_tps);
+    std::printf("SPD steps:        %llu\n", (unsigned long long) spd_steps);
     std::printf("SPD acceptance:   %.2f%% (%llu accepted, %llu rejected)\n",
             acceptance,
             (unsigned long long) verified_drafts,
-            (unsigned long long) actual.n_rejected);
+            (unsigned long long) spd_rejected);
     std::printf("correctness:      %zu/%d greedy tokens matched\n", matched, n_predict);
     std::printf("baseline ids:     ");
     for (llama_token token : baseline.tokens) {
