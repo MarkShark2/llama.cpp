@@ -477,6 +477,7 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     bool    fit_params_whole_layers = false; // fit using contiguous whole layers only (no tensor overrides)
+    bool    fit_params_fill_rpc_first = false; // fill non-primary devices with whole layers first, spill MoE experts of the remainder on device 0 to CPU
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:

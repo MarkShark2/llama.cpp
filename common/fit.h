@@ -25,6 +25,8 @@ common_params_fit_status common_fit_params(
                               size_t * margins,               // margins of memory to leave per device in bytes
                             uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                                 bool   whole_layers,          // place only complete layers; never create tensor overrides
+                                bool   fill_rpc_first,        // fill non-primary devices with whole layers first; the primary device
+                                                              // takes every remaining layer, spilling MoE experts to system memory
                       ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
 // print estimated memory to stdout
