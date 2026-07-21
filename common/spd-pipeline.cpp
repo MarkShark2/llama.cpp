@@ -9,6 +9,7 @@
 #include <cstring>
 #include <future>
 #include <map>
+#include <mutex>
 #include <utility>
 
 namespace {
@@ -127,12 +128,15 @@ struct common_spd_pipeline::impl {
     std::array<llama_context *, SPD_STAGE_COUNT> stages = {};
     std::array<std::array<llama_pos, SPD_ROLLBACK_TOKENS>, SPD_STAGE_COUNT> checkpoint_pos = {};
     std::array<llama_pos, SPD_STAGE_COUNT> stage_tail_pos = {};
+    std::array<std::vector<size_t>, SPD_STAGE_COUNT> stage_resources;
+    std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
     llama_context * head = nullptr;
     llama_context * embed = nullptr;
     llama_context * sidecar = nullptr;
 
     std::string last_error;
     bool ready = false;
+    bool used = false;
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params)
         : model_target(model_target), model_spd(model_spd), params(params) {
@@ -152,6 +156,22 @@ struct common_spd_pipeline::impl {
         if (last_error.empty()) {
             last_error = std::move(message);
         }
+    }
+
+    std::string execution_resource_key(ggml_backend_dev_t dev) const {
+        if (dev == nullptr) {
+            return "cpu";
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg != nullptr) {
+            using endpoint_fn = const char * (*)(ggml_backend_dev_t);
+            auto endpoint = (endpoint_fn) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_rpc_device_endpoint");
+            if (endpoint != nullptr) {
+                return std::string("rpc:") + endpoint(dev);
+            }
+        }
+        return "device:" + std::to_string((uintptr_t) dev);
     }
 
     llama_context_params make_context_params(uint32_t n_batch, bool is_sidecar = false) const {
@@ -217,6 +237,30 @@ struct common_spd_pipeline::impl {
         if (llama_vocab_n_tokens(llama_model_get_vocab(model_spd)) != n_vocab) {
             fail("SPD target and sidecar vocabularies have different sizes");
             return;
+        }
+
+        // Independent schedulers may overlap across distinct machines, but
+        // schedulers targeting the same physical device or RPC endpoint must
+        // not interleave protocol streams. Record every execution resource
+        // touched by each logical stage and lock shared resources in a stable
+        // order during stage advancement.
+        std::map<std::string, size_t> resource_ids;
+        for (uint32_t stage = 0; stage < SPD_STAGE_COUNT; ++stage) {
+            const int32_t layer_begin = (int32_t) stage*layers_per_stage;
+            const int32_t layer_end = layer_begin + layers_per_stage;
+            for (int32_t layer = layer_begin; layer < layer_end; ++layer) {
+                const std::string key = execution_resource_key(
+                        llama_model_layer_device(model_target, layer));
+                auto [it, inserted] = resource_ids.emplace(key, resource_ids.size());
+                if (inserted) {
+                    resource_mutexes.push_back(std::make_unique<std::mutex>());
+                }
+                if (std::find(stage_resources[stage].begin(), stage_resources[stage].end(), it->second) ==
+                    stage_resources[stage].end()) {
+                    stage_resources[stage].push_back(it->second);
+                }
+            }
+            std::sort(stage_resources[stage].begin(), stage_resources[stage].end());
         }
 
         for (uint32_t stage = 0; stage < SPD_STAGE_COUNT; ++stage) {
@@ -596,6 +640,11 @@ struct common_spd_pipeline::impl {
     }
 
     bool advance_entry(uint32_t stage, entry & item, double & elapsed, std::string & error) {
+        std::vector<std::unique_lock<std::mutex>> resource_locks;
+        resource_locks.reserve(stage_resources[stage].size());
+        for (size_t resource : stage_resources[stage]) {
+            resource_locks.emplace_back(*resource_mutexes[resource]);
+        }
         const auto start = clock_type::now();
 
         const uint32_t checkpoint_slot = (uint32_t) (item.pos % SPD_ROLLBACK_TOKENS);
@@ -625,6 +674,15 @@ struct common_spd_pipeline::impl {
         }
         elapsed = seconds_since(start);
         return true;
+    }
+
+    void synchronize_all() {
+        for (llama_context * ctx : stages) {
+            llama_synchronize(ctx);
+        }
+        llama_synchronize(head);
+        llama_synchronize(embed);
+        llama_synchronize(sidecar);
     }
 
     bool generate(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result) {
@@ -837,5 +895,22 @@ bool common_spd_pipeline::generate(
     if (!pimpl->ready) {
         return false;
     }
+    if (pimpl->used) {
+        // Hybrid recurrent rollback aliases are deliberately short-lived.
+        // Recreate only the contexts between requests while retaining both
+        // loaded model objects and their weight buffers. This avoids carrying
+        // backend cache/alias state across requests, which is unsafe for the
+        // staged RPC schedulers and previously caused repeat-request crashes.
+        pimpl->synchronize_all();
+        llama_model * model_target = pimpl->model_target;
+        llama_model * model_spd = pimpl->model_spd;
+        common_spd_params params = pimpl->params;
+        pimpl = std::make_unique<impl>(model_target, model_spd, params);
+        if (!pimpl->ready) {
+            return false;
+        }
+    }
+
+    pimpl->used = true;
     return pimpl->generate(prompt, n_predict, result);
 }
