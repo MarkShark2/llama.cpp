@@ -2064,6 +2064,10 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD) {
+        return nullptr;
+    }
+
     llama_memory_i * res;
 
     switch (arch) {
@@ -2150,10 +2154,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
                         filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                            const bool in_spd_stage = params.ctx_type != LLAMA_CONTEXT_TYPE_SPD_STAGE ||
+                                    (il >= cparams.spd_layer_start && il < cparams.spd_layer_end);
+                            return il < hparams.n_layer() && in_spd_stage && !hparams.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                            const bool in_spd_stage = params.ctx_type != LLAMA_CONTEXT_TYPE_SPD_STAGE ||
+                                    (il >= cparams.spd_layer_start && il < cparams.spd_layer_end);
+                            return il < hparams.n_layer() && in_spd_stage && hparams.is_recr(il);
                         };
                     }
 

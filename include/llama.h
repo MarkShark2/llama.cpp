@@ -205,6 +205,8 @@ extern "C" {
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
+        LLAMA_CONTEXT_TYPE_SPD_STAGE = 2,
+        LLAMA_CONTEXT_TYPE_SPD_HEAD  = 3,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
@@ -349,6 +351,8 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
+        uint32_t spd_stage;         // zero-based logical stage for LLAMA_CONTEXT_TYPE_SPD_STAGE [EXPERIMENTAL]
+        uint32_t spd_stage_count;   // total logical stages for LLAMA_CONTEXT_TYPE_SPD_STAGE [EXPERIMENTAL]
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
