@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-constexpr uint32_t COMMON_SPD_STAGE_COUNT = 8;
+constexpr uint32_t COMMON_SPD_MAX_STAGE_COUNT = 8;
 
 struct common_spd_params {
     uint32_t n_ctx = 4096;
@@ -38,7 +38,8 @@ struct common_spd_result {
 
 // Single-sequence, greedy Speculative Pipeline Decoding (SPD) controller.
 //
-// The target model is executed as eight independently cached stages. The SPD
+// The target model is executed as independently cached stages. Their count is
+// read from the sidecar GGUF metadata (currently four or eight). The SPD
 // sidecar consumes the trained staircase snapshots and proposes one token per
 // pipeline step. Completed target tokens verify those proposals; a rejection
 // rewinds both attention and recurrent target state before restarting the
@@ -53,6 +54,7 @@ public:
 
     bool valid() const;
     const std::string & error() const;
+    uint32_t stage_count() const;
 
     bool generate(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result);
 

@@ -1441,7 +1441,8 @@ private:
                 return false;
             }
             spd_mode = true;
-            SRV_INF("%s", "initialized eight-stage SPD pipeline (single-slot, greedy)\n");
+            SRV_INF("initialized %u-stage SPD pipeline (single-slot, greedy)\n",
+                    spd_pipeline->stage_count());
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2982,22 +2983,23 @@ private:
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
             const llama_tokens prompt = slot.task->tokens.get_text_tokens();
+            const uint32_t spd_stage_count = spd_pipeline->stage_count();
             if (prompt.empty()) {
                 send_error(slot, "SPD prompt must not be empty", ERROR_TYPE_INVALID_REQUEST);
                 slot.release();
                 return;
             }
-            if (prompt.size() < COMMON_SPD_STAGE_COUNT) {
+            if (prompt.size() < spd_stage_count) {
                 send_error(slot,
                         string_format("SPD requires a prompt of at least %u tokens; received %zu",
-                                COMMON_SPD_STAGE_COUNT, prompt.size()),
+                                spd_stage_count, prompt.size()),
                         ERROR_TYPE_INVALID_REQUEST);
                 slot.release();
                 return;
             }
 
             const int32_t n_available = slot.n_ctx - (int32_t) prompt.size() -
-                (int32_t) COMMON_SPD_STAGE_COUNT - 1;
+                (int32_t) spd_stage_count - 1;
             if (n_available <= 0) {
                 send_error(slot,
                         string_format("SPD prompt (%zu tokens) leaves no decode space in the %d-token context",

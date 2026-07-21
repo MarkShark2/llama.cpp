@@ -2243,7 +2243,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_SPD:
-                // SPD owns its eight-stage pipeline and does not add draft
+                // SPD owns its staged pipeline and does not add draft
                 // logits to the ordinary server decode batch.
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
