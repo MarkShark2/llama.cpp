@@ -50,7 +50,8 @@ void usage(const char * argv0) {
             "       [--device-draft CUDA0] [--tensor-split 8,8,8,4,4,0]\n"
             "       [--cache-type-k q8_0] [--cache-type-v q8_0]\n"
             "       [--flash-attn on|off|auto] [--no-mmap]\n"
-            "       [--prompt-file path] [--duration seconds] [--phase-file path]\n",
+            "       [--prompt-file path] [--duration seconds] [--phase-file path]\n"
+            "       [--arm both|baseline|spd]\n",
             argv0);
 }
 
@@ -304,6 +305,7 @@ int main(int argc, char ** argv) {
     std::string flash_attn = "auto";
     std::string prompt_file;
     std::string phase_file;
+    std::string arm = "both";
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -348,13 +350,18 @@ int main(int argc, char ** argv) {
             duration_seconds = std::stoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--phase-file") == 0 && i + 1 < argc) {
             phase_file = argv[++i];
+        } else if (std::strcmp(argv[i], "--arm") == 0 && i + 1 < argc) {
+            arm = argv[++i];
         } else {
             usage(argv[0]);
             return 1;
         }
     }
 
-    if (target_path.empty() || sidecar_path.empty() || n_predict <= 0 || n_batch == 0 || duration_seconds < 0) {
+    const bool run_baseline_arm = arm == "both" || arm == "baseline";
+    const bool run_spd_arm = arm == "both" || arm == "spd";
+    if (target_path.empty() || (run_spd_arm && sidecar_path.empty()) ||
+        (!run_baseline_arm && !run_spd_arm) || n_predict <= 0 || n_batch == 0 || duration_seconds < 0) {
         usage(argv[0]);
         return 1;
     }
@@ -430,9 +437,11 @@ int main(int argc, char ** argv) {
     double baseline_decode_seconds = 0.0;
     uint64_t baseline_requests = 0;
     uint64_t baseline_generated = 0;
-    std::fprintf(stderr, "[spd] running full-target greedy baseline%s\n",
-            duration_seconds > 0 ? " duration benchmark" : "");
-    phase_marker(phase_file, "baseline", "start");
+    const int32_t baseline_duration_seconds = run_baseline_arm ? duration_seconds : 0;
+    const char * baseline_phase = run_baseline_arm ? "baseline" : "reference";
+    std::fprintf(stderr, "[spd] running full-target greedy %s%s\n",
+            baseline_phase, baseline_duration_seconds > 0 ? " duration benchmark" : "");
+    phase_marker(phase_file, baseline_phase, "start");
     const auto baseline_wall_start = clock_type::now();
     do {
         baseline_result current;
@@ -452,9 +461,29 @@ int main(int argc, char ** argv) {
         baseline_decode_seconds += current.decode_seconds;
         baseline_generated += current.tokens.size();
         ++baseline_requests;
-    } while (duration_seconds > 0 && seconds_since(baseline_wall_start) < duration_seconds);
+    } while (baseline_duration_seconds > 0 && seconds_since(baseline_wall_start) < baseline_duration_seconds);
     const double baseline_wall_seconds = seconds_since(baseline_wall_start);
-    phase_marker(phase_file, "baseline", "end");
+    phase_marker(phase_file, baseline_phase, "end");
+
+    const double baseline_pp = baseline_prefill_seconds > 0.0 ?
+            (double) baseline_requests*prompt_tokens.size()/baseline_prefill_seconds : 0.0;
+    const double baseline_tps = baseline_decode_seconds > 0.0 ? baseline_generated/baseline_decode_seconds : 0.0;
+
+    if (!run_spd_arm) {
+        std::printf("prompt tokens:    %zu\n", prompt_tokens.size());
+        std::printf("baseline window:  %.3f s (%llu requests)\n",
+                baseline_wall_seconds, (unsigned long long) baseline_requests);
+        std::printf("baseline PP:      %.3f tok/s\n", baseline_pp);
+        std::printf("baseline TG:      %.3f tok/s\n", baseline_tps);
+        std::printf("baseline ids:     ");
+        for (llama_token token : baseline.tokens) {
+            std::printf("%d ", token);
+        }
+        std::printf("\n\n%s\n", detokenize(vocab, baseline.tokens).c_str());
+        llama_model_free(target);
+        std::printf("PASS: full-target greedy baseline completed\n");
+        return 0;
+    }
 
     llama_model_params sidecar_params = llama_model_default_params();
     sidecar_params.n_gpu_layers = n_gpu_layers_draft;
@@ -531,22 +560,20 @@ int main(int argc, char ** argv) {
            baseline.tokens[matched] == actual.tokens[matched]) {
         ++matched;
     }
-    const double baseline_pp = baseline_prefill_seconds > 0.0 ?
-            (double) baseline_requests*prompt_tokens.size()/baseline_prefill_seconds : 0.0;
     const double spd_pp = spd_prefill_seconds > 0.0 ?
             (double) spd_requests*prompt_tokens.size()/spd_prefill_seconds : 0.0;
-    const double baseline_tps = baseline_decode_seconds > 0.0 ? baseline_generated/baseline_decode_seconds : 0.0;
     const double spd_tps = spd_decode_seconds > 0.0 ? spd_generated/spd_decode_seconds : 0.0;
     const uint64_t verified_drafts = spd_accepted > spd_requests ? spd_accepted - spd_requests : 0;
     const uint64_t decisions = verified_drafts + spd_rejected;
     const double acceptance = decisions > 0 ? 100.0*verified_drafts/decisions : 100.0;
 
     std::printf("prompt tokens:    %zu\n", prompt_tokens.size());
-    std::printf("baseline window:  %.3f s (%llu requests)\n", baseline_wall_seconds, (unsigned long long) baseline_requests);
+    std::printf("%s window: %.3f s (%llu requests)\n", baseline_phase,
+            baseline_wall_seconds, (unsigned long long) baseline_requests);
     std::printf("SPD window:       %.3f s (%llu requests)\n", spd_wall_seconds, (unsigned long long) spd_requests);
-    std::printf("baseline PP:      %.3f tok/s\n", baseline_pp);
+    std::printf("%s PP: %.3f tok/s\n", baseline_phase, baseline_pp);
     std::printf("SPD PP:           %.3f tok/s\n", spd_pp);
-    std::printf("baseline TG:      %.3f tok/s\n", baseline_tps);
+    std::printf("%s TG: %.3f tok/s\n", baseline_phase, baseline_tps);
     std::printf("SPD TG:           %.3f tok/s\n", spd_tps);
     std::printf("SPD steps:        %llu\n", (unsigned long long) spd_steps);
     std::printf("SPD acceptance:   %.2f%% (%llu accepted, %llu rejected)\n",
