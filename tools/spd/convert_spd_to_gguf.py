@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "gguf-py"))
+
+import gguf  # noqa: E402
+
+
+LOGGER = logging.getLogger("convert_spd_to_gguf")
+SPD_ARCH = gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.SPD]
+SUPPORTED_CHECKPOINT_VERSION = 11
+
+
+def field_value(reader: gguf.GGUFReader, key: str) -> Any:
+    field = reader.get_field(key)
+    if field is None:
+        raise ValueError(f"target GGUF is missing required metadata: {key}")
+    return field.contents()
+
+
+def copy_tokenizer_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter) -> None:
+    for key, field in reader.fields.items():
+        if not key.startswith("tokenizer."):
+            continue
+        subtype = field.types[-1] if field.types[0] == gguf.GGUFValueType.ARRAY else None
+        writer.add_key_value(key, field.contents(), field.types[0], subtype)
+
+
+def checkpoint_tensor_name(name: str) -> str:
+    if re.fullmatch(r"aggr_projs\.\d+\.weight", name):
+        raise ValueError("aggregation projections are packed into aggr.weight")
+    if name == "lm_head.weight":
+        return "output.weight"
+
+    match = re.fullmatch(r"spec_layers\.(\d+)\.(.+)", name)
+    if match is None:
+        raise ValueError(f"unrecognized checkpoint tensor: {name}")
+
+    block = match.group(1)
+    suffix = match.group(2)
+    suffix_map = {
+        "input_layernorm.weight":              "attn_norm.weight",
+        "post_attention_layernorm.weight":     "ffn_norm.weight",
+        "self_attn.q_proj.weight":             "attn_q.weight",
+        "self_attn.k_proj.weight":             "attn_k.weight",
+        "self_attn.v_proj.weight":             "attn_v.weight",
+        "self_attn.o_proj.weight":             "attn_output.weight",
+        "self_attn.q_norm.weight":             "attn_q_norm.weight",
+        "self_attn.k_norm.weight":             "attn_k_norm.weight",
+        "mlp.gate_proj.weight":                "ffn_gate.weight",
+        "mlp.up_proj.weight":                  "ffn_up.weight",
+        "mlp.down_proj.weight":                "ffn_down.weight",
+    }
+    if suffix not in suffix_map:
+        raise ValueError(f"unrecognized checkpoint tensor: {name}")
+    return f"blk.{block}.{suffix_map[suffix]}"
+
+
+def to_bf16_bytes(tensor: torch.Tensor) -> np.ndarray[Any, Any]:
+    data = tensor.detach().to(device="cpu", dtype=torch.float32).numpy()
+    return gguf.quantize(data, gguf.GGMLQuantizationType.BF16)
+
+
+def add_checkpoint_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tensor) -> None:
+    if tensor.ndim == 1:
+        writer.add_tensor(name, tensor.detach().to(device="cpu", dtype=torch.float32).numpy())
+        return
+    writer.add_tensor(
+        name,
+        to_bf16_bytes(tensor),
+        raw_dtype=gguf.GGMLQuantizationType.BF16,
+    )
+
+
+def validate_checkpoint(
+    config: dict[str, Any],
+    state_dict: dict[str, torch.Tensor],
+    target: gguf.GGUFReader,
+) -> dict[str, int | float | list[int] | bool | str]:
+    target_arch = str(field_value(target, "general.architecture"))
+    if target_arch != "qwen35":
+        raise ValueError(f"SPD checkpoint requires a qwen35 target GGUF, got {target_arch!r}")
+
+    version = int(config["version"])
+    if version != SUPPORTED_CHECKPOINT_VERSION:
+        raise ValueError(
+            f"unsupported SPD checkpoint version {version}; expected {SUPPORTED_CHECKPOINT_VERSION}"
+        )
+
+    hidden_size = int(config["hidden_size"])
+    target_hidden_size = int(field_value(target, f"{target_arch}.embedding_length"))
+    if hidden_size != target_hidden_size:
+        raise ValueError(
+            f"checkpoint hidden size {hidden_size} does not match target hidden size {target_hidden_size}"
+        )
+
+    target_vocab_size = len(field_value(target, "tokenizer.ggml.tokens"))
+    if int(config["vocab_size"]) != target_vocab_size:
+        raise ValueError(
+            f"checkpoint target vocabulary {config['vocab_size']} does not match target GGUF {target_vocab_size}"
+        )
+
+    draft_token_ids = np.asarray(config["draft_token_ids"], dtype=np.int64)
+    draft_vocab_size = int(config["draft_vocab_size"])
+    if draft_token_ids.ndim != 1 or draft_token_ids.size != draft_vocab_size:
+        raise ValueError("draft_token_ids must be a one-dimensional draft-vocabulary mapping")
+    if np.any((draft_token_ids < 0) | (draft_token_ids >= target_vocab_size)):
+        raise ValueError("draft_token_ids contains a target token outside the target vocabulary")
+    if np.unique(draft_token_ids).size != draft_token_ids.size:
+        raise ValueError("draft_token_ids contains duplicates")
+
+    num_stages = int(config["num_stages"])
+    num_spec_layers = int(config["num_spec_layers"])
+    num_aggr_types = int(config["num_aggr_types"])
+    anchors = [int(value) for value in config["aggr_feature_bound"]]
+    use_deepest = bool(config["trained_with_use_deepest"])
+    if not use_deepest:
+        raise ValueError("only checkpoints trained with deepest available snapshots are supported")
+    if len(anchors) != num_aggr_types:
+        raise ValueError("aggr_feature_bound length does not match num_aggr_types")
+
+    target_blocks = int(field_value(target, f"{target_arch}.block_count"))
+    nextn_field = target.get_field(f"{target_arch}.nextn_predict_layers")
+    nextn_blocks = 0 if nextn_field is None else int(nextn_field.contents())
+    trunk_blocks = target_blocks - nextn_blocks
+    if trunk_blocks <= 0 or trunk_blocks % num_stages != 0:
+        raise ValueError(
+            f"target trunk block count {trunk_blocks} cannot be divided into {num_stages} SPD stages"
+        )
+    if anchors[0] != 0 or anchors[-1] >= trunk_blocks:
+        raise ValueError(f"invalid SPD anchors for {trunk_blocks} target trunk blocks: {anchors}")
+
+    for index in range(num_aggr_types):
+        key = f"aggr_projs.{index}.weight"
+        expected = (hidden_size, hidden_size * (index + 1))
+        if key not in state_dict or tuple(state_dict[key].shape) != expected:
+            actual = None if key not in state_dict else tuple(state_dict[key].shape)
+            raise ValueError(f"{key} has shape {actual}, expected {expected}")
+
+    output_shape = (draft_vocab_size, hidden_size)
+    if "lm_head.weight" not in state_dict or tuple(state_dict["lm_head.weight"].shape) != output_shape:
+        raise ValueError(f"lm_head.weight must have shape {output_shape}")
+
+    layer_ids = {
+        int(match.group(1))
+        for name in state_dict
+        if (match := re.match(r"spec_layers\.(\d+)\.", name)) is not None
+    }
+    if layer_ids != set(range(num_spec_layers)):
+        raise ValueError(
+            f"checkpoint speculative layers are {sorted(layer_ids)}, expected 0..{num_spec_layers - 1}"
+        )
+
+    mapped_names = [
+        checkpoint_tensor_name(name)
+        for name in state_dict
+        if not name.startswith("aggr_projs.")
+    ]
+    if len(mapped_names) != len(set(mapped_names)):
+        raise ValueError("multiple checkpoint tensors map to the same GGUF tensor name")
+
+    return {
+        "target_arch": target_arch,
+        "target_vocab_size": target_vocab_size,
+        "hidden_size": hidden_size,
+        "draft_vocab_size": draft_vocab_size,
+        "num_stages": num_stages,
+        "num_spec_layers": num_spec_layers,
+        "num_aggr_types": num_aggr_types,
+        "anchors": anchors,
+        "use_deepest": use_deepest,
+        "trunk_blocks": trunk_blocks,
+        "stage_blocks": trunk_blocks // num_stages,
+        "version": version,
+    }
+
+
+def convert(checkpoint_path: Path, target_path: Path, output_path: Path) -> None:
+    LOGGER.info("Loading SPD checkpoint: %s", checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict) or set(checkpoint) != {"config", "state_dict"}:
+        raise ValueError("SPD checkpoint must contain exactly config and state_dict")
+    config = checkpoint["config"]
+    state_dict = checkpoint["state_dict"]
+    if not isinstance(config, dict) or not isinstance(state_dict, dict):
+        raise ValueError("invalid SPD checkpoint config or state_dict")
+
+    LOGGER.info("Reading target GGUF metadata: %s", target_path)
+    target = gguf.GGUFReader(target_path)
+    meta = validate_checkpoint(config, state_dict, target)
+
+    LOGGER.info(
+        "Validated SPD v%s: %s stages x %s target blocks, %s speculative layers, %s aggregation types",
+        meta["version"],
+        meta["num_stages"],
+        meta["stage_blocks"],
+        meta["num_spec_layers"],
+        meta["num_aggr_types"],
+    )
+
+    writer = gguf.GGUFWriter(output_path, SPD_ARCH, use_temp_file=True)
+    writer.add_name(f"Qwen3.5 SPD s{meta['num_stages']} l{meta['num_spec_layers']}")
+    writer.add_type(gguf.GGUFType.MODEL)
+    writer.add_file_type(gguf.LlamaFileType.MOSTLY_BF16)
+    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+    writer.add_vocab_size(int(meta["target_vocab_size"]))
+    writer.add_context_length(int(field_value(target, "qwen35.context_length")))
+    writer.add_embedding_length(int(meta["hidden_size"]))
+    writer.add_block_count(int(meta["num_spec_layers"]))
+    writer.add_feed_forward_length(int(field_value(target, "qwen35.feed_forward_length")))
+    writer.add_expert_count(int(meta["num_aggr_types"]))
+    writer.add_expert_used_count(1)
+    writer.add_head_count(int(field_value(target, "qwen35.attention.head_count")))
+    writer.add_head_count_kv(int(field_value(target, "qwen35.attention.head_count_kv")))
+    writer.add_key_length(int(field_value(target, "qwen35.attention.key_length")))
+    writer.add_value_length(int(field_value(target, "qwen35.attention.value_length")))
+    writer.add_layer_norm_rms_eps(float(field_value(target, "qwen35.attention.layer_norm_rms_epsilon")))
+    writer.add_rope_dimension_count(int(field_value(target, "qwen35.rope.dimension_count")))
+    writer.add_rope_dimension_sections(
+        [int(value) for value in field_value(target, "qwen35.rope.dimension_sections")]
+    )
+    writer.add_rope_freq_base(float(field_value(target, "qwen35.rope.freq_base")))
+    writer.add_target_layers(meta["anchors"])  # type: ignore[arg-type]
+    writer.add_target_hidden_size(int(meta["hidden_size"]))
+    writer.add_spd_checkpoint_version(int(meta["version"]))
+    writer.add_spd_stage_count(int(meta["num_stages"]))
+    writer.add_spd_use_deepest(bool(meta["use_deepest"]))
+    copy_tokenizer_metadata(target, writer)
+
+    num_aggr_types = int(meta["num_aggr_types"])
+    hidden_size = int(meta["hidden_size"])
+    aggr = torch.zeros(
+        (num_aggr_types, hidden_size, num_aggr_types * hidden_size),
+        dtype=torch.float32,
+    )
+    for index in range(num_aggr_types):
+        source = state_dict[f"aggr_projs.{index}.weight"]
+        aggr[index, :, : source.shape[1]] = source.to(dtype=torch.float32)
+    LOGGER.info("%-64s -> %s", "aggr_projs.*.weight", "aggr.weight")
+    writer.add_tensor(
+        "aggr.weight",
+        gguf.quantize(aggr.numpy(), gguf.GGMLQuantizationType.BF16),
+        raw_dtype=gguf.GGMLQuantizationType.BF16,
+    )
+    del aggr
+
+    for source_name, tensor in state_dict.items():
+        if source_name.startswith("aggr_projs."):
+            continue
+        output_name = checkpoint_tensor_name(source_name)
+        LOGGER.info("%-64s -> %s", source_name, output_name)
+        add_checkpoint_tensor(writer, output_name, tensor)
+
+    draft_token_ids = np.asarray(config["draft_token_ids"], dtype=np.int64)
+    writer.add_tensor("d2t", draft_token_ids, raw_dtype=gguf.GGMLQuantizationType.I64)
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=True)
+    writer.close()
+    LOGGER.info("Wrote %s", output_path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Convert an SPD v11 PyTorch sidecar checkpoint to BF16 GGUF")
+    parser.add_argument("checkpoint", type=Path, help="Qwen3.5 SPD .pt checkpoint")
+    parser.add_argument("target_gguf", type=Path, help="matching Qwen3.5 target GGUF")
+    parser.add_argument("--outfile", type=Path, help="output GGUF path")
+    parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    checkpoint = args.checkpoint.resolve()
+    target = args.target_gguf.resolve()
+    output = (
+        args.outfile.resolve()
+        if args.outfile is not None
+        else checkpoint.with_name(f"{checkpoint.stem}-BF16.gguf")
+    )
+
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    if not target.is_file():
+        raise FileNotFoundError(target)
+    if output.exists() and not args.overwrite:
+        raise FileExistsError(f"output already exists: {output}; pass --overwrite to replace it")
+
+    convert(checkpoint, target, output)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    main()

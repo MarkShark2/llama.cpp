@@ -961,6 +961,15 @@ class GGUFWriter:
     def add_norm_before_residual(self, value: bool) -> None:
         self.add_bool(Keys.LLM.NORM_BEFORE_RESIDUAL.format(arch=self.arch), value)
 
+    def add_spd_checkpoint_version(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.SPD_CHECKPOINT_VERSION.format(arch=self.arch), value)
+
+    def add_spd_stage_count(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.SPD_STAGE_COUNT.format(arch=self.arch), value)
+
+    def add_spd_use_deepest(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.SPD_USE_DEEPEST.format(arch=self.arch), value)
+
     def add_attention_output_group_count(self, count: int) -> None:
         self.add_uint32(Keys.Attention.OUTPUT_GROUP_COUNT.format(arch=self.arch), count)
 

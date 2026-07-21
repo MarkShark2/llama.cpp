@@ -31,6 +31,9 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
+        case LLAMA_CONTEXT_TYPE_SPD_STAGE: return LLM_GRAPH_TYPE_SPD_STAGE;
+        case LLAMA_CONTEXT_TYPE_SPD_HEAD : return LLM_GRAPH_TYPE_SPD_HEAD;
+        case LLAMA_CONTEXT_TYPE_SPD_EMBED: return LLM_GRAPH_TYPE_SPD_EMBED;
     }
     throw std::runtime_error("Unsupported ctx type");
 }
@@ -129,6 +132,23 @@ llama_context::llama_context(
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
+
+    cparams.spd_stage       = params.spd_stage;
+    cparams.spd_stage_count = params.spd_stage_count;
+    cparams.spd_layer_start = 0;
+    cparams.spd_layer_end   = hparams.n_layer();
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+        if (cparams.spd_stage_count == 0 || cparams.spd_stage >= cparams.spd_stage_count) {
+            throw std::runtime_error("invalid SPD stage index/count");
+        }
+        if (hparams.n_layer() % cparams.spd_stage_count != 0) {
+            throw std::runtime_error("target layer count must divide evenly into SPD stages");
+        }
+
+        const uint32_t layers_per_stage = hparams.n_layer() / cparams.spd_stage_count;
+        cparams.spd_layer_start = cparams.spd_stage * layers_per_stage;
+        cparams.spd_layer_end   = cparams.spd_layer_start + layers_per_stage;
+    }
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -315,6 +335,11 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+        LLAMA_LOG_INFO("%s: SPD stage     = %u/%u, layers [%u, %u)\n", __func__,
+                cparams.spd_stage, cparams.spd_stage_count,
+                cparams.spd_layer_start, cparams.spd_layer_end);
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -1593,14 +1618,21 @@ int llama_context::encode(const llama_batch & batch_inp) {
     n_outputs = n_tokens;
 
     const auto causal_attn_org = cparams.causal_attn;
+    const bool is_spd_head  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD;
+    const bool is_spd_embed = cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED;
+    const bool is_spd_stateless = is_spd_head || is_spd_embed;
 
     // always use non-causal attention for encoder graphs
     // TODO: this is a tmp solution until we have a proper way to support enc-dec models
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
-    cparams.causal_attn = false;
+    if (!is_spd_stateless) {
+        cparams.causal_attn = false;
+    }
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const auto * res = process_ubatch(ubatch,
+            is_spd_head  ? LLM_GRAPH_TYPE_SPD_HEAD  :
+            is_spd_embed ? LLM_GRAPH_TYPE_SPD_EMBED : LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -3897,6 +3929,8 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
+        /*.spd_stage                   =*/ 0,
+        /*.spd_stage_count             =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -4003,6 +4037,14 @@ llama_context * llama_init_from_model(
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
         model->hparams.n_layer_nextn == 0) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        return nullptr;
+    }
+
+    if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
+         params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
+         params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
+        model->arch != LLM_ARCH_QWEN35) {
+        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 model\n", __func__);
         return nullptr;
     }
 

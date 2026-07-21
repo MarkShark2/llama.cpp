@@ -297,6 +297,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
+        case LLM_ARCH_SPD:
+            return new llama_model_spd(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
@@ -1332,8 +1334,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 (int) hparams.n_layer(), n_layer_all - 1, ggml_backend_dev_name(mtp_dev));
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // When the MTP/output override is active, normalize the ordinary layer
+    // split over the target transformer layers only. The overridden trailing
+    // MTP blocks and output head must not consume fractions of the target
+    // split (e.g. an 8/8/8/4/4 SPD layout).
+    const int n_split_layers = mtp_dev != nullptr ? (int) hparams.n_layer() : n_layer_all + 1;
+    const int i_gpu_start = std::max(n_split_layers - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_split_layers);
     auto get_layer_buft_list = [&, mtp_dev](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (mtp_dev != nullptr && il >= (int) hparams.n_layer()) {
@@ -2073,6 +2080,11 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD ||
+        params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) {
+        return nullptr;
+    }
+
     llama_memory_i * res;
 
     switch (arch) {
@@ -2159,10 +2171,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
                         filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                            const bool in_spd_stage = params.ctx_type != LLAMA_CONTEXT_TYPE_SPD_STAGE ||
+                                    (il >= cparams.spd_layer_start && il < cparams.spd_layer_end);
+                            return il < hparams.n_layer() && in_spd_stage && !hparams.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                            const bool in_spd_stage = params.ctx_type != LLAMA_CONTEXT_TYPE_SPD_STAGE ||
+                                    (il >= cparams.spd_layer_start && il < cparams.spd_layer_end);
+                            return il < hparams.n_layer() && in_spd_stage && hparams.is_recr(il);
                         };
                     }
 
@@ -2621,6 +2637,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_SPD:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         case LLM_ARCH_GLM4:
@@ -2778,6 +2795,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
+}
+
+int32_t llama_model_n_pos_per_embd(const struct llama_model * model) {
+    return (int32_t) model->hparams.n_pos_per_embd();
 }
 
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
