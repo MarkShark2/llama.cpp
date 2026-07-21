@@ -18,6 +18,22 @@ Measured on Step-3.7-Flash IQ3_XXS (45 layers, 288-expert MoE), ~9.8k-token prom
 | pipelined, both fixes, warm | **306** |
 | pipelined, both fixes, first request per process | ~127 |
 
+A follow-up min-max run used a dedicated text-only profile: no mmproj or draft model,
+8,448 context, one slot, Q8 KV, batch 8,192, and a six-stage whole-layer split. The
+RTX 3080 Ti is intentionally excluded (`CUDA_VISIBLE_DEVICES=0`; local `CUDA0` is the
+RTX 3090). Exact 8,192-token prompts produced these warm results:
+
+| layer split / ubatch | warm samples (t/s) | mean (t/s) |
+|---|---:|---:|
+| default free-memory split / 512 | 415.6, 483.2, 377.7 | 425.5 |
+| `16,7,7,7,4,5` / 256 | 432.8, 512.9, 373.7 | 439.8 |
+| `16,7,7,7,4,5` / 512 | 474.7, 529.4, 436.1 | **480.0** |
+| `16,7,7,7,4,5` / 1024 | 434.5, 463.6, 408.3 | 435.5 |
+
+The explicit split moves one layer off each BC-250: 16 layers run on the RTX 3090,
+7 on each BC-250, 4 on the first GTX 1080, and 4 plus the output layer on the second.
+That improved the matched warm mean by 12.8% while retaining the configured fit margins.
+
 ## Fix 1 — INPUT copies drained the pipeline (`ggml-backend.cpp`)
 
 With `n_copies > 1` the scheduler's INPUT branch copied host-side inputs (`kq_mask`,
@@ -58,17 +74,21 @@ Fixed-length chunks (an SPD data-collection loop) only pay this once.
 - `GGML_SCHED_SUBMIT_TRACE=1` — raw-stderr `[submit]`/`[pu]`/`[pu-alloc]`/`[sched-alloc]`
   per-graph phase timing plus a REALLOC-drain marker; `GGML_SCHED_TIMING=1` — per-backend
   per-split table, now mirrored to stderr (the server log filter hides lib INFO lines).
+- `GGML_RPC_GRAPH_TRACE=1` — RPC-daemon raw-stderr timing for graph parse, build,
+  compute, and cache-store phases. Keep this off outside diagnostics.
 - The `pipeline_parallel=` decision is printed unconditionally on stderr at context
   creation for the same reason.
 
 ## Findings / limits
 
-- Per-stage cost for a 512-token graph: CUDA0 ~350 ms, each BC-250 ~1000–1030 ms,
-  shredder ~255 + ~230 ms. Sum ≈ 3.85 s → **ceiling ≈ 500 t/s** with perfect overlap;
-  306 t/s means the BC-250s are already near-saturated. The residual per-endpoint serial
-  cost is server-side per-graph deserialize/build on the BC-250 CPUs — graphs differ
-  every ubatch (n_kv grows) so the proto-v5 graph cache never hits. An n_kv-tolerant
-  server-side graph cache is the next lever and needs a daemon redeploy.
+- The original free-memory split put 8 layers on every BC-250. Tracing showed those
+  stages dominating the pipeline while the two GTX 1080 stages were much shorter. The
+  `16,7,7,7,4,5` split reduced steady-state BC-250 compute to roughly 0.7–0.8 s per
+  512-token graph and raised the warm mean to 480.0 t/s.
+- RPC server graph construction is not the residual bottleneck. With
+  `GGML_RPC_GRAPH_TRACE=1`, parse rounded to 0.00 ms and graph build was generally
+  0.2–0.6 ms, versus roughly 0.6–0.8 s of BC-250 compute. An n_kv-tolerant graph cache
+  would save well under 1% here, so the proposed protocol/cache change was rejected.
 - Deeper pipelines don't help: depth 8 ≈ depth 4. The bottleneck is per-endpoint serial
   work, not in-flight slots.
 - **Decode under this mode is unusable** (~0.2 t/s): per-token graphs rebuild and
