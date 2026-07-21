@@ -141,6 +141,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     const bool is_spd_stage = params.gtype == LLM_GRAPH_TYPE_SPD_STAGE;
     const bool is_spd_head  = params.gtype == LLM_GRAPH_TYPE_SPD_HEAD;
+    const bool is_spd_embed = params.gtype == LLM_GRAPH_TYPE_SPD_EMBED;
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -151,6 +152,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
+
+    if (is_spd_embed) {
+        res->t_embd = inpL;
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
 
     if (is_spd_head) {
         cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);

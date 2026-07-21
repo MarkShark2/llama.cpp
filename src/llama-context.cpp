@@ -29,6 +29,7 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
         case LLAMA_CONTEXT_TYPE_SPD_STAGE: return LLM_GRAPH_TYPE_SPD_STAGE;
         case LLAMA_CONTEXT_TYPE_SPD_HEAD : return LLM_GRAPH_TYPE_SPD_HEAD;
+        case LLAMA_CONTEXT_TYPE_SPD_EMBED: return LLM_GRAPH_TYPE_SPD_EMBED;
     }
     throw std::runtime_error("Unsupported ctx type");
 }
@@ -1492,18 +1493,21 @@ int llama_context::encode(const llama_batch & batch_inp) {
     n_outputs = n_tokens;
 
     const auto causal_attn_org = cparams.causal_attn;
-    const bool is_spd_head = cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD;
+    const bool is_spd_head  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD;
+    const bool is_spd_embed = cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED;
+    const bool is_spd_stateless = is_spd_head || is_spd_embed;
 
     // always use non-causal attention for encoder graphs
     // TODO: this is a tmp solution until we have a proper way to support enc-dec models
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
-    if (!is_spd_head) {
+    if (!is_spd_stateless) {
         cparams.causal_attn = false;
     }
 
     ggml_status status;
     const auto * res = process_ubatch(ubatch,
-            is_spd_head ? LLM_GRAPH_TYPE_SPD_HEAD : LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+            is_spd_head  ? LLM_GRAPH_TYPE_SPD_HEAD  :
+            is_spd_embed ? LLM_GRAPH_TYPE_SPD_EMBED : LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -3636,7 +3640,8 @@ llama_context * llama_init_from_model(
     }
 
     if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
-         params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD) &&
+         params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
+         params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
         model->arch != LLM_ARCH_QWEN35) {
         LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 model\n", __func__);
         return nullptr;

@@ -2064,7 +2064,8 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD) {
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD ||
+        params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) {
         return nullptr;
     }
 
@@ -2778,6 +2779,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
+}
+
+int32_t llama_model_n_pos_per_embd(const struct llama_model * model) {
+    return (int32_t) model->hparams.n_pos_per_embd();
 }
 
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {

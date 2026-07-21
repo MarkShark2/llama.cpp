@@ -38,6 +38,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DECODER_MTP,
     LLM_GRAPH_TYPE_SPD_STAGE,
     LLM_GRAPH_TYPE_SPD_HEAD,
+    LLM_GRAPH_TYPE_SPD_EMBED,
 };
 
 enum llm_fused_op {

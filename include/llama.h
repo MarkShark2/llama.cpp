@@ -207,6 +207,7 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
         LLAMA_CONTEXT_TYPE_SPD_STAGE = 2,
         LLAMA_CONTEXT_TYPE_SPD_HEAD  = 3,
+        LLAMA_CONTEXT_TYPE_SPD_EMBED = 4,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
