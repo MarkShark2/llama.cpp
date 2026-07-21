@@ -6,13 +6,13 @@ IMPORTANT: Ensure you've thoroughly reviewed the [AGENTS.md](AGENTS.md) file bef
 
 This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) maintained to run large MoE models across a small heterogeneous cluster. This section documents the fork; everything above/around it is upstream.
 
-## Hardware & topology (current, pre-networking)
+## Hardware & topology
 
-- **Desktop (this machine, Windows 11):** RTX 3090 + RTX 3080 Ti — both `sm_86` (Ampere). This is the build host and will be the main `llama-server` / RPC client. Source lives at `llama_loader\llamacpp-src`.
-- **Cluster:** 3× Fedora nodes on BC-250 AMD APUs. These are **UMA** — system RAM is shared with the GPU, so host memory is scarce and precious. SSH aliases `fedora` / `fedora2` / `fedora3`; scripts under `/home/mark/llama-scripts`; Vulkan backend. Reached today over ordinary **1 GbE**.
-- **Coming (not yet wired):** a **10 GbE ring network** — every NIC has two DAC ports, so the desktop + 3 nodes form a ring. The desktop's ring NIC is **not installed yet**, so **RPC cannot be exercised from this machine yet.** All RPC load-speed and topology numbers below are pending that hardware.
+- **Desktop (this machine, Windows 11):** RTX 3090 (`sm_86`). Build host and the `llama-server` RPC client for "The House". Source lives at `llama_loader\llamacpp-src`.
+- **Cluster:** 3× Fedora nodes on BC-250 AMD APUs (**UMA** — system RAM shared with the GPU, host memory scarce). SSH aliases `fedora` / `fedora2` / `fedora3`; scripts under `/home/mark/llama-scripts`; Vulkan backend. Wired into a bridged **10 GbE fabric** (`10.10.10.1/.2/.3`, MTU 9000; ~5–6.4 Gbit/s usable — the BC-250 PCIe 2.0 x2 link is the ceiling). RPC daemons at `10.10.10.1:50052`, `.2:50053`, `.3:50054`.
+- **shredder:** Ubuntu box, 2× GTX 1080 (`sm_61`, Pascal), CUDA-in-docker builds; RPC daemon at `192.168.4.60:50052` (~4.5 Gbit/s link).
 
-**Target workload:** a ~75B MoE model with ~9B active experts (~40 GB) split across the 3090 + the three nodes over RPC.
+**Current workload ("The House"):** one big MoE model (e.g. Step-3.7-Flash IQ3_XXS ~68.5 GB, or Hy3 295B ternary) layer-split across 3090 + the 3 BC-250s + shredder over RPC, launched by the Llama Loader app. See `llama_loader\CLAUDE.md` for the cluster/network details.
 
 ## Git branch strategy
 
@@ -28,6 +28,12 @@ Goal: stay easy to merge against fast-moving upstream, keep each feature isolate
   - **`feat/rpc-robust`** — survive transient RPC connect failures instead of crashing. Root cause of "the C5 bug" (llama-server dies with 0xC0000005 / `GGML_ASSERT(buft)` at ggml-backend.cpp:39 mid-load): the rpc-server serves **one client at a time** and its listen backlog was **1**, so concurrent connects (the app's fabric probes + a multi-endpoint `--fit` client) get refused; `get_socket` returned null, `ggml_backend_rpc_buffer_type` returned a null buft, and the loader asserted or AV'd. Changes: (a) `get_socket` retries connect+HELLO up to 5× with 250 ms-step backoff, logging every attempt; (b) a failed HELLO handshake returns false (retryable) instead of `GGML_ABORT`; (c) server listen backlog 1 → 16 (**server-side — daemons only pick this up when their binaries are redeployed and restarted**); (d) `make_gpu_buft_list` throws a clean "RPC endpoint unreachable?" error on a null device buft instead of asserting deep in the loader. Upstreamable.
   - **`feat/hy3-port`** — Hy3 / Hunyuan 3 (`hy_v3`) support (299B MoE, 17B active, 192 experts, MTP head), tracked from [satindergrewal/llama.cpp `hy3-mtp`](https://github.com/satindergrewal/llama.cpp/tree/hy3-mtp) (upstream PR #25395); refresh by fetching that branch. Runs `satgeze/Hy3-1M-GGUF` (`hy3-1M-MTP-IQ2_M.gguf`, 93 GB) — this is "The House" model, split across the 3090 + BC-250 cluster + shredder over RPC. No ggml/backend changes, so RPC workers don't need new kernels — only the client needs the arch. Merge note: on `integration` the branch's `hy-v3.cpp` needed adapting to puzzle-port's per-layer `n_ff_exp(il)` accessor (upstream has a plain `n_ff_exp` field). The GGUF's MTP head loads; the model card recommends `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75` (the p-min gate matters: without it acceptance is ~39% and MTP is a net slowdown) — untested here, off by default.
   - **`feat/rpc-cache`** — per-model control of the rpc-server tensor cache + LRU size cap. Client: `--rpc-cache` on llama-server (env `LLAMA_ARG_RPC_CACHE`) opts the process in; only then are large tensors offered via SET_TENSOR_HASH, and the server only writes cache entries for uploads offered as a hash first (no wire-format change — old/new client/server mixes stay compatible; cache *reads* work for everyone). Server: `ggml-rpc-server --cache-limit SIZE` (plain MiB or K/M/G/T) evicts least-recently-used entries at startup and after each write; cache hits bump the entry mtime as the LRU clock. Deployed with daemon args in `serve.rpc-cluster.json` (`"cache-limit": "80G"`) and `serve.rpc-shredder.json` (`"25G"`); the loader's House configs opt in per-RunConfig with a `"rpc-cache": true` extra-arg line. Upstreamable.
+  - **`feat/rpc-socket-lifetime`**, **`feat/rpc-graph-fixes`** — RPC hardening follow-ups (endpoint socket retention + connect-failure logging; clean rejection of bad graph views + iterative graph serialization). The RPC branches form one linear chain: `feat/rpc-robust` → `feat/rpc-socket-lifetime` → `feat/rpc-graph-fixes` → `feat/rpc-cache` → `feat/rpc-cache-preflight`, and `feat/rpc-async` continues it.
+  - **`feat/rpc-async`** — async RPC streams/events/caps (`GGML_RPC_ASYNC=1`), non-blocking sched walk, ordered synchronous commands, quiescent-stream sync skip, and the proto-v5 multi-slot graph cache. Extracted from `feat/pipedec` (July 2026) because it is shared infrastructure: pipeline prefill sits on it today and SPD will next. Based on `feat/rpc-cache-preflight`.
+  - **`feat/pipeline-prefill`** — pipelined chunked prefill over RPC: async INPUT staging with `n_copies > 1`, client-side GET_ALLOC_SIZE shape cache, runtime `GGML_SCHED_COPIES` depth, submit-trace diagnostics. 306 t/s warm vs 123 t/s sequential on the 6-stage House. Stacked on `feat/rpc-async`; see `docs/pipeline-prefill.md`.
+  - **`feat/fit-modes`** — `--fit-whole-layers` (complete layers only, no tensor overrides) and `--fit-fill-rpc-first` (fill non-primary devices with whole layers, confine MoE CPU-spill to the primary device).
+  - **`feat/pipedec`** — PipeDec speculative decoding (stage-2 token-body lanes, deferred verify group, sibling probe, streamed draft lanes; `docs/pipedec.md`). Production House decode path (~23.5–25 t/s vs 9.7 stock on Step-3.7). After the July 2026 extraction it is the only branch that still owns decode machinery; the plan is to **drop it from `integration` once SPD (speculative pipeline decoding) replaces it** — the extracted `feat/rpc-async` / `feat/pipeline-prefill` / `feat/fit-modes` branches carry everything worth keeping. Note: `feat/pipedec` history currently interleaves with the `integration` spine (they shared a head before the extraction), so rebuilding a pipedec-free integration means re-merging `master` + the other `feat/*` branches fresh rather than reverting.
+  - Model/tool ports, each on its own branch: **`feat/step37`** (StepFun Step-3.7), **`feat/mtp-device`** (pin embedded-MTP layers + output head to the draft device), **`feat/q2_0-gpu`**, **`feat/qwen3-tts`**, **`feat/s2`**, **`feat/voxcpm2`**, **`fix/mmproj-fit-target-index`**.
   - **`feat/rpc-cache-preflight`** - skips local GGUF payload reads on warm RPC-cache hits and loads independent RPC endpoints concurrently. The first opted-in load records each large tensor's full FNV hash in a small `<shard>.rpc-cache-manifest` sidecar, validated by GGUF file size and mtime. Later loads query each endpoint before reading the tensor; hits are loaded from the node's cache while one worker per RPC device runs in parallel with local CUDA loading. Tensors at or below the 10 MiB threshold still upload directly. Logs use aggregate summaries rather than per-tensor hit messages. The Step 3.7 House load measured 8m55s before this change, 3m06s while learning manifests in parallel, and 1m52s manifest-warm.
 - **`integration`** — the build/deploy branch: latest `master` + every `feat/*` merged in + this `CLAUDE.md`. **This is the branch we compile and run.** Refresh it by: ff `master` to upstream, then (re)merge each `feat/*` into `integration`, then build.
 
@@ -60,27 +66,18 @@ Goal: stay easy to merge against fast-moving upstream, keep each feature isolate
 
 ## Building on this machine (Windows, CUDA)
 
-Toolchain is already installed **system-wide** — nothing to download: VS2022 Build Tools (MSVC 14.4x), CUDA 12.6 / 12.9, CMake 4.x. Both local GPUs are `sm_86`, so we compile a single CUDA arch to keep the build short.
+**Run `..\build-llama.cmd` — do not hand-roll cmake.** It sets up vcvars64 + Ninja, configures the persistent `build-ninja\` dir (CUDA `sm_86`, `GGML_RPC=ON`, shared libs, Web UI off, `GGML_SCHED_MAX_COPIES=8`), builds `llama-server`, and deploys the exe + DLLs to `llama_loader\dist\llama-cpp\` (refusing while llama-server.exe is running). **Never use the old Visual Studio generator/`build\` dir** — MSBuild compiles the ~100 CUDA template `.cu` files serially (hours); Ninja + ccache is ~15 min full, seconds incremental. Never set `CL=/MP` (nvcc host-compiler invocations inherit `CL` and every `.cu` fails).
 
-```powershell
-# from llama_loader\llamacpp-src, on the `integration` branch
-$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T cuda=12.9 `
-      -DGGML_CUDA=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release `
-      -DCUDAToolkit_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9"
-cmake --build build --config Release -j
-```
-
-The VS generator lets MSBuild drive the CUDA integration, so no `vcvars` shell is needed; `-T cuda=12.9` pins the CUDA toolset. This machine also has CUDA 13.3 installed, and CMake's `FindCUDAToolkit` will happily pick up its headers even though `-T` pinned the compiler to 12.9 — that mismatch is a hard compiler error (`C1189`), so **both** `CUDA_PATH` and `-DCUDAToolkit_ROOT` must explicitly point at the same 12.9 install. `-DGGML_RPC=ON` is required for cluster work: without it, neither the `--rpc` client flag in `llama-server` nor the RPC server binary get built.
-
-Binaries land in `build\bin\Release\`. Note the RPC server binary is named **`ggml-rpc-server.exe`**, not `rpc-server.exe` (despite the source living at `tools/rpc/rpc-server.cpp` and most upstream docs calling it `rpc-server`).
+Note the RPC server binary is named **`ggml-rpc-server.exe`**, not `rpc-server.exe` (despite the source living at `tools/rpc/rpc-server.cpp` and most upstream docs calling it `rpc-server`).
 
 ## Building on shredder (Ubuntu 26.04, 2× GTX 1080, CUDA-in-docker)
 
 Shredder has no root-usable CUDA toolchain: host GCC 15 is too new for nvcc, and Pascal (`sm_61`) needs CUDA ≤ 12.x anyway. The build therefore runs inside `nvidia/cuda:12.9.1-devel-ubuntu24.04` (mark is in the `docker` group) and the resulting binaries run on the host (driver 580). The whole flow is scripted:
 
 ```bash
-ssh shredder '~/llama-scripts/build-fork.sh'   # clone/fetch fork integration → docker build → chown
+ssh shredder './llama-scripts/build-llama.sh'   # sync fork/integration → docker build → deploy to ~/llama-scripts/llama-cpp/
 ```
+
+(The same script runs on fedora, where it does a Vulkan build and auto-disperses binaries to fedora2/3. `build-fork.sh.bak` is the retired predecessor. It never restarts running daemons — live rpc-servers keep their old binaries until restarted.)
 
 Key flags: `-DCMAKE_CUDA_ARCHITECTURES=61 -DGGML_CUDA_NO_VMM=ON -DLLAMA_CURL=OFF`. `NO_VMM` is required — the container only has the libcuda *stub*, and the VMM pool needs driver-API symbols at executable link time. Deploy = copy `build/bin/.` plus the container's CUDA runtime libs (`libcudart`, `libcublas`, `libcublasLt`, **`libnccl.so.2`** — the devel image links it in) into `~/llama-scripts/llama-cpp/`; `serve_llama.py` sets `LD_LIBRARY_PATH` to that dir. The old upstream build is parked at `~/llama-scripts/llama-cpp.bak-upstream-b0151`.

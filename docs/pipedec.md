@@ -1,5 +1,12 @@
 # PipeDec on llama.cpp RPC — design notes (branch `feat/pipedec`)
 
+> **Status (July 2026): maintenance mode.** PipeDec is the production House decode path
+> (~23.5–25 t/s Stage2+Defer vs 9.7 stock on Step-3.7) but is slated to be replaced by
+> SPD (speculative pipeline decoding, arXiv 2605.30852). The reusable infrastructure
+> described in Phase 1 below was extracted to `feat/rpc-async`, pipelined prefill lives
+> on `feat/pipeline-prefill` (see `docs/pipeline-prefill.md`), and the fit modes on
+> `feat/fit-modes`; only the decode machinery remains unique to this branch.
+
 Goal: fill the pipeline bubble when a model is layer-split across RPC nodes ("The House"),
 adapting PipeDec (arXiv 2504.04104). Measured baseline (Step-3.7-Flash, 5-stage House,
 MTP n_max=3): decode ~9 t/s, of which the **verify pass is ~294 ms (87%) and runs strictly
