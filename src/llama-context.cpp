@@ -449,6 +449,12 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // [fork] unconditional, unbuffered: the server's log filter hides lib
+        // INFO/WARN lines at default verbosity, and RPC pipeline-prefill
+        // diagnosis needs this decision visible in a redirected log.
+        fprintf(stderr, "[sched] pipeline_parallel=%d\n", pipeline_parallel ? 1 : 0);
+        fflush(stderr);
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -615,6 +621,8 @@ void llama_context::sched_reserve() {
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                fprintf(stderr, "[sched] compute buffer allocation failed -> pipeline parallelism disabled\n");
+                fflush(stderr);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
@@ -1303,6 +1311,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [fork] GGML_SCHED_SUBMIT_TRACE=1: per-phase stderr timing (see ggml-backend.cpp)
+    static const int pu_trace = [] {
+        const char * e = getenv("GGML_SCHED_SUBMIT_TRACE");
+        return e ? atoi(e) : 0;
+    }();
+    const int64_t pu_t0 = pu_trace ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1333,7 +1348,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const int64_t pu_tb0 = pu_trace ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
 
@@ -1345,12 +1360,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const int64_t pu_tb1 = pu_trace ? ggml_time_us() : 0;
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        if (pu_trace) {
+            const int64_t pu_tb2 = ggml_time_us();
+            if (pu_tb2 - pu_t0 > 300*1000) {
+                fprintf(stderr, "[pu-alloc] apply+pre=%.1fms build=%.1fms sched_alloc=%.1fms\n",
+                        (pu_tb0 - pu_t0) / 1000.0, (pu_tb1 - pu_tb0) / 1000.0, (pu_tb2 - pu_tb1) / 1000.0);
+                fflush(stderr);
+            }
+        }
     }
+
+    const int64_t pu_t1 = pu_trace ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1362,7 +1390,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t pu_t2 = pu_trace ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (pu_trace) {
+        const int64_t pu_t3 = ggml_time_us();
+        if (pu_t3 - pu_t0 > 300*1000) {
+            fprintf(stderr, "[pu] n_tok=%d apply+build+alloc=%.1fms set_inputs=%.1fms compute_submit=%.1fms\n",
+                    (int) ubatch.n_tokens, (pu_t1 - pu_t0) / 1000.0, (pu_t2 - pu_t1) / 1000.0, (pu_t3 - pu_t2) / 1000.0);
+            fflush(stderr);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
