@@ -757,6 +757,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    ggml_backend_sched_set_stable_host_inputs(sched.get(), stable_host_inputs);
 }
 
 void llama_context::synchronize() {
@@ -1271,6 +1273,15 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_graph_reuse(bool value) {
+    graph_reuse_disable = !value;
+}
+
+void llama_context::set_stable_host_inputs(bool value) {
+    stable_host_inputs = value;
+    ggml_backend_sched_set_stable_host_inputs(sched.get(), value);
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1300,7 +1311,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft);
+        if (!sampler->iface->backend_init(sampler, buft)) {
+            LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d is not supported by the output backend\n",
+                    __func__, llama_sampler_name(sampler), seq_id);
+            if (sampling.samplers.erase(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            return false;
+        }
 
         sampling.samplers[seq_id] = sampler;
 
@@ -1563,6 +1581,31 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     return res;
 }
 
+static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(
+        const llama_ubatch & ubatch, uint32_t row_offset);
+static void copy_tensor_async_ints(
+        const std::map<llama_seq_id, ggml_tensor *> & tensor_map,
+        const buffer_view<llama_token> & sampled,
+        const std::map<llama_seq_id, uint32_t> & seq_to_row,
+        ggml_backend_sched_t sched);
+static void copy_tensor_async_floats(
+        const std::map<llama_seq_id, ggml_tensor *> & tensor_map,
+        const buffer_view<float> & dst,
+        size_t stride,
+        std::vector<uint32_t> & counts,
+        const std::map<llama_seq_id, uint32_t> & seq_to_row,
+        ggml_backend_sched_t sched);
+static void copy_tensor_async_candidates(
+        const std::map<llama_seq_id, ggml_tensor *> & tensor_map,
+        const buffer_view<llama_token> & dst,
+        size_t stride,
+        std::vector<uint32_t> & counts,
+        const std::map<llama_seq_id, uint32_t> & seq_to_row,
+        ggml_backend_sched_t sched);
+static bool needs_raw_logits(
+        const llama_ubatch & ubatch,
+        const std::map<llama_seq_id, llama_sampler *> & samplers);
+
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1650,12 +1693,30 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
     // extract logits
-    if (logits.data && t_logits) {
+    const bool use_backend_sampling = is_spd_head && !sampling.samplers.empty();
+    if (logits.data && t_logits &&
+        (!use_backend_sampling || needs_raw_logits(ubatch, sampling.samplers))) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+    }
+
+    if (use_backend_sampling &&
+        (!res->t_sampled.empty() || !res->t_sampled_probs.empty() ||
+         !res->t_sampled_logits.empty() || !res->t_candidates.empty())) {
+        const auto seq_to_output_row = build_seq_to_output_row(ubatch, 0);
+        copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
+        copy_tensor_async_floats(
+                res->t_sampled_logits, sampling.logits, n_vocab,
+                sampling.logits_count, seq_to_output_row, sched.get());
+        copy_tensor_async_floats(
+                res->t_sampled_probs, sampling.probs, n_vocab,
+                sampling.probs_count, seq_to_output_row, sched.get());
+        copy_tensor_async_candidates(
+                res->t_candidates, sampling.candidates, n_vocab,
+                sampling.candidates_count, seq_to_output_row, sched.get());
     }
 
     // extract embeddings
@@ -4138,6 +4199,14 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_graph_reuse(llama_context * ctx, bool value) {
+    ctx->set_graph_reuse(value);
+}
+
+void llama_set_stable_host_inputs(llama_context * ctx, bool value) {
+    ctx->set_stable_host_inputs(value);
 }
 
 void llama_synchronize(llama_context * ctx) {

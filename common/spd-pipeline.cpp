@@ -6,10 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -40,6 +44,8 @@ struct batch_storage {
     std::vector<llama_pos> positions;
     std::vector<int8_t> logits;
 
+    batch_storage() = default;
+
     batch_storage(
             int32_t n_tokens,
             const llama_token * token_data,
@@ -48,8 +54,22 @@ struct batch_storage {
             int32_t n_pos_per_embd,
             llama_pos first_pos,
             bool output_all) {
+        set(n_tokens, token_data, embedding_data, n_embd, n_pos_per_embd, first_pos, output_all);
+    }
+
+    void set(
+            int32_t n_tokens,
+            const llama_token * token_data,
+            const float * embedding_data,
+            int32_t n_embd,
+            int32_t n_pos_per_embd,
+            llama_pos first_pos,
+            bool output_all) {
+        batch = {};
         batch.n_tokens = n_tokens;
 
+        tokens.clear();
+        embeddings.clear();
         if (token_data != nullptr) {
             tokens.assign(token_data, token_data + n_tokens);
             batch.token = tokens.data();
@@ -61,6 +81,7 @@ struct batch_storage {
 
         positions.resize((size_t) n_tokens*(embedding_data != nullptr ? n_pos_per_embd : 1));
         logits.resize(n_tokens, 0);
+        std::fill(logits.begin(), logits.end(), 0);
         for (int32_t p = 0; p < (embedding_data != nullptr ? n_pos_per_embd : 1); ++p) {
             for (int32_t i = 0; i < n_tokens; ++i) {
                 positions[(size_t) p*n_tokens + i] = first_pos + i;
@@ -78,11 +99,21 @@ struct batch_storage {
             const std::vector<float> & features,
             int32_t n_embd,
             const std::vector<llama_pos> & pos) {
+        set(selectors, features, n_embd, pos);
+    }
+
+    void set(
+            const std::vector<llama_token> & selectors,
+            const std::vector<float> & features,
+            int32_t n_embd,
+            const std::vector<llama_pos> & pos) {
+        batch = {};
         batch.n_tokens = (int32_t) selectors.size();
         tokens = selectors;
         embeddings = features;
         positions = pos;
         logits.resize(selectors.size(), 0);
+        std::fill(logits.begin(), logits.end(), 0);
         if (!logits.empty()) {
             logits.back() = 1;
         }
@@ -94,6 +125,85 @@ struct batch_storage {
         GGML_ASSERT(features.size() == selectors.size()*(size_t) n_embd);
         GGML_ASSERT(pos.size() == selectors.size());
     }
+};
+
+class fixed_worker {
+public:
+    using task_fn = void (*)(void *);
+
+    fixed_worker() : worker([this]() { run(); }) {}
+
+    ~fixed_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        ready.notify_one();
+        worker.join();
+    }
+
+    void submit(task_fn fn, void * data) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(fn != nullptr);
+            GGML_ASSERT(!pending && !running);
+            task = fn;
+            task_data = data;
+            failure = nullptr;
+            pending = true;
+        }
+        ready.notify_one();
+    }
+
+    std::exception_ptr wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        finished.wait(lock, [this]() { return !pending && !running; });
+        return failure;
+    }
+
+private:
+    void run() {
+        while (true) {
+            task_fn fn = nullptr;
+            void * data = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait(lock, [this]() { return pending || stopping; });
+                if (!pending && stopping) {
+                    return;
+                }
+                fn = task;
+                data = task_data;
+                pending = false;
+                running = true;
+            }
+
+            std::exception_ptr current_failure;
+            try {
+                fn(data);
+            } catch (...) {
+                current_failure = std::current_exception();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                failure = current_failure;
+                running = false;
+            }
+            finished.notify_one();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable finished;
+    std::thread worker;
+    task_fn task = nullptr;
+    void * task_data = nullptr;
+    std::exception_ptr failure;
+    bool pending = false;
+    bool running = false;
+    bool stopping = false;
 };
 
 } // namespace
@@ -120,6 +230,22 @@ struct common_spd_pipeline::impl {
         llama_pos min_pos = -1;
     };
 
+    struct stage_decode_job {
+        impl * owner;
+        uint32_t stage;
+        entry * item;
+        double * elapsed;
+        std::string * error;
+        uint8_t * ok;
+    };
+
+    struct speculation_job {
+        impl * owner;
+        const speculation_input * input;
+        llama_token * sampled;
+        bool * ok;
+    };
+
     llama_model * model_target;
     llama_model * model_spd;
     common_spd_params params;
@@ -140,31 +266,79 @@ struct common_spd_pipeline::impl {
     std::array<std::vector<size_t>, SPD_MAX_STAGE_COUNT> stage_resources;
     std::vector<size_t> sidecar_resources;
     std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
+    std::array<batch_storage, SPD_MAX_STAGE_COUNT> stage_decode_batches;
+    std::array<std::vector<float>, SPD_MAX_STAGE_COUNT> stage_decode_outputs;
+    batch_storage head_decode_batch;
+    batch_storage embed_decode_batch;
+    batch_storage sidecar_decode_batch;
+    speculation_input decode_speculation_input;
+    std::array<std::unique_ptr<fixed_worker>, SPD_MAX_STAGE_COUNT> stage_workers;
+    std::unique_ptr<fixed_worker> sidecar_worker;
     llama_context * head = nullptr;
     llama_context * embed = nullptr;
     llama_context * sidecar = nullptr;
+    llama_sampler * head_sampler = nullptr;
+    llama_sampler * sidecar_sampler = nullptr;
+    bool head_backend_sampling = false;
+    bool sidecar_backend_sampling = false;
 
     std::string last_error;
     bool ready = false;
     bool used = false;
+    bool static_decode_fast_path = true;
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params)
         : model_target(model_target), model_spd(model_spd), params(params) {
+        if (const char * value = std::getenv("LLAMA_SPD_STATIC_DECODE")) {
+            static_decode_fast_path = std::atoi(value) != 0;
+        }
         initialize();
     }
 
     ~impl() {
+        sidecar_worker.reset();
+        for (auto & worker : stage_workers) {
+            worker.reset();
+        }
         llama_free(sidecar);
         llama_free(embed);
         llama_free(head);
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             llama_free(stages[stage]);
         }
+        llama_sampler_free(sidecar_sampler);
+        llama_sampler_free(head_sampler);
+    }
+
+    static void execute_stage_decode_job(void * data) {
+        auto & job = *static_cast<stage_decode_job *>(data);
+        *job.ok = job.owner->advance_entry(job.stage, *job.item, *job.elapsed, *job.error);
+    }
+
+    static void execute_speculation_job(void * data) {
+        auto & job = *static_cast<speculation_job *>(data);
+        *job.ok = job.owner->run_speculation(*job.input, *job.sampled);
     }
 
     void fail(std::string message) {
         if (last_error.empty()) {
             last_error = std::move(message);
+        }
+    }
+
+    llama_sampler * make_greedy_sampler() const {
+        llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        return sampler;
+    }
+
+    void configure_static_context(llama_context * ctx, bool stable_inputs) const {
+        if (!static_decode_fast_path || ctx == nullptr) {
+            return;
+        }
+        llama_set_graph_reuse(ctx, true);
+        if (stable_inputs) {
+            llama_set_stable_host_inputs(ctx, true);
         }
     }
 
@@ -231,6 +405,12 @@ struct common_spd_pipeline::impl {
         layers_per_stage = n_layers / (int32_t) stage_count;
         target_n_pos_per_embd = llama_model_n_pos_per_embd(model_target);
         sidecar_n_embd_inp = llama_model_n_embd_inp(model_spd);
+
+        if (static_decode_fast_path) {
+            decode_speculation_input.selectors.reserve(stage_count + 1);
+            decode_speculation_input.positions.reserve(stage_count + 1);
+            decode_speculation_input.features.reserve((size_t) (stage_count + 1)*sidecar_n_embd_inp);
+        }
 
         const uint32_t n_anchor = llama_model_target_layer_ids_n(model_spd);
         const int32_t * anchor_data = llama_model_target_layer_ids(model_spd);
@@ -318,6 +498,7 @@ struct common_spd_pipeline::impl {
                 fail("failed to initialize target SPD stage " + std::to_string(stage));
                 return;
             }
+            configure_static_context(stages[stage], true);
         }
 
         for (int32_t anchor : anchors) {
@@ -332,6 +513,15 @@ struct common_spd_pipeline::impl {
             fail("failed to initialize the target SPD head");
             return;
         }
+        if (static_decode_fast_path) {
+            head_sampler = make_greedy_sampler();
+            head_backend_sampling = llama_set_sampler(head, 0, head_sampler);
+            if (!head_backend_sampling) {
+                llama_sampler_free(head_sampler);
+                head_sampler = nullptr;
+            }
+        }
+        configure_static_context(head, true);
 
         llama_context_params ep = make_context_params(1);
         ep.ctx_type = LLAMA_CONTEXT_TYPE_SPD_EMBED;
@@ -341,6 +531,7 @@ struct common_spd_pipeline::impl {
             fail("failed to initialize the target token-embedding context");
             return;
         }
+        configure_static_context(embed, true);
 
         llama_context_params sp = make_context_params(
                 std::max<uint32_t>(params.n_batch, stage_count + 1), true);
@@ -348,6 +539,22 @@ struct common_spd_pipeline::impl {
         if (sidecar == nullptr) {
             fail("failed to initialize the SPD sidecar context");
             return;
+        }
+        if (static_decode_fast_path) {
+            sidecar_sampler = make_greedy_sampler();
+            sidecar_backend_sampling = llama_set_sampler(sidecar, 0, sidecar_sampler);
+            if (!sidecar_backend_sampling) {
+                llama_sampler_free(sidecar_sampler);
+                sidecar_sampler = nullptr;
+            }
+        }
+        configure_static_context(sidecar, false);
+
+        if (static_decode_fast_path && params.parallel_stages) {
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                stage_workers[stage] = std::make_unique<fixed_worker>();
+            }
+            sidecar_worker = std::make_unique<fixed_worker>();
         }
         ready = true;
     }
@@ -370,9 +577,12 @@ struct common_spd_pipeline::impl {
             int32_t n_tokens,
             llama_pos first_pos,
             std::vector<float> & output,
-            std::vector<std::pair<size_t, std::vector<float> *>> anchor_outputs,
-            std::string & error) {
-        batch_storage storage(n_tokens, tokens, embeddings, n_embd, target_n_pos_per_embd, first_pos, true);
+            const std::vector<std::pair<size_t, std::vector<float> *>> & anchor_outputs,
+            std::string & error,
+            batch_storage * reusable_storage = nullptr) {
+        batch_storage local_storage;
+        batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
+        storage.set(n_tokens, tokens, embeddings, n_embd, target_n_pos_per_embd, first_pos, true);
         if (llama_decode(stages[stage], storage.batch) != 0) {
             error = "target SPD stage " + std::to_string(stage) + " decode failed";
             return false;
@@ -399,7 +609,9 @@ struct common_spd_pipeline::impl {
     }
 
     bool embed_token(llama_token token, std::vector<float> & output) {
-        batch_storage storage(1, &token, nullptr, 0, target_n_pos_per_embd, 0, true);
+        batch_storage local_storage;
+        batch_storage & storage = static_decode_fast_path ? embed_decode_batch : local_storage;
+        storage.set(1, &token, nullptr, 0, target_n_pos_per_embd, 0, true);
         if (llama_decode(embed, storage.batch) != 0) {
             fail("target token embedding decode failed");
             return false;
@@ -414,10 +626,20 @@ struct common_spd_pipeline::impl {
     }
 
     bool target_head(const std::vector<float> & hidden, llama_token & token) {
-        batch_storage storage(1, nullptr, hidden.data(), n_embd, target_n_pos_per_embd, 0, true);
+        batch_storage local_storage;
+        batch_storage & storage = static_decode_fast_path ? head_decode_batch : local_storage;
+        storage.set(1, nullptr, hidden.data(), n_embd, target_n_pos_per_embd, 0, true);
         if (llama_decode(head, storage.batch) != 0) {
             fail("target SPD head decode failed");
             return false;
+        }
+        if (head_backend_sampling) {
+            token = llama_get_sampled_token_ith(head, -1);
+            if (token == LLAMA_TOKEN_NULL) {
+                fail("target SPD head produced no sampled token");
+                return false;
+            }
+            return true;
         }
         const float * logits = llama_get_logits_ith(head, -1);
         if (logits == nullptr) {
@@ -467,18 +689,29 @@ struct common_spd_pipeline::impl {
             const std::vector<llama_token> & selectors,
             const std::vector<float> & features,
             const std::vector<llama_pos> & positions,
-            llama_token * sampled) {
+            llama_token * sampled,
+            batch_storage * reusable_storage = nullptr) {
         std::vector<std::unique_lock<std::mutex>> resource_locks;
         resource_locks.reserve(sidecar_resources.size());
         for (size_t resource : sidecar_resources) {
             resource_locks.emplace_back(*resource_mutexes[resource]);
         }
-        batch_storage storage(selectors, features, sidecar_n_embd_inp, positions);
+        batch_storage local_storage;
+        batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
+        storage.set(selectors, features, sidecar_n_embd_inp, positions);
         if (llama_decode(sidecar, storage.batch) != 0) {
             fail("SPD sidecar decode failed");
             return false;
         }
         if (sampled != nullptr) {
+            if (sidecar_backend_sampling) {
+                *sampled = llama_get_sampled_token_ith(sidecar, -1);
+                if (*sampled == LLAMA_TOKEN_NULL) {
+                    fail("SPD sidecar produced no sampled token");
+                    return false;
+                }
+                return true;
+            }
             const float * logits = llama_get_logits_ith(sidecar, -1);
             if (logits == nullptr) {
                 fail("SPD sidecar produced no logits");
@@ -533,12 +766,10 @@ struct common_spd_pipeline::impl {
             return false;
         }
 
-        std::map<llama_pos, const snapshot *> active;
-        for (const entry & item : pipeline) {
-            active[item.pos] = &item.snap;
-        }
-
-        input = {};
+        input.selectors.clear();
+        input.positions.clear();
+        input.features.clear();
+        input.min_pos = -1;
         const bool has_evicted = prev_evicted != nullptr;
 
         if (has_evicted) {
@@ -550,10 +781,13 @@ struct common_spd_pipeline::impl {
 
         for (llama_pos pos = oldest_needed; pos <= newest_pos; ++pos) {
             const snapshot * snap = nullptr;
-            auto active_it = active.find(pos);
-            if (active_it != active.end()) {
-                snap = active_it->second;
-            } else {
+            for (const entry & item : pipeline) {
+                if (item.pos == pos) {
+                    snap = &item.snap;
+                    break;
+                }
+            }
+            if (snap == nullptr) {
                 auto complete_it = completed.find(pos);
                 if (complete_it == completed.end()) {
                     fail("missing completed SPD snapshot at position " + std::to_string(pos));
@@ -579,7 +813,8 @@ struct common_spd_pipeline::impl {
             fail("failed to crop SPD sidecar cache at position " + std::to_string(input.min_pos));
             return false;
         }
-        return sidecar_decode(input.selectors, input.features, input.positions, &sampled);
+        return sidecar_decode(input.selectors, input.features, input.positions, &sampled,
+                static_decode_fast_path ? &sidecar_decode_batch : nullptr);
     }
 
     bool speculate(
@@ -737,7 +972,10 @@ struct common_spd_pipeline::impl {
         llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
         checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
 
-        std::vector<float> output;
+        std::vector<float> local_output;
+        std::vector<float> & output = static_decode_fast_path
+                ? stage_decode_outputs[stage]
+                : local_output;
         std::vector<std::vector<float>> captured(anchors.size());
         std::vector<std::pair<size_t, std::vector<float> *>> wanted;
         for (size_t ai = 0; ai < anchors.size(); ++ai) {
@@ -748,10 +986,15 @@ struct common_spd_pipeline::impl {
 
         const llama_token * token = stage == 0 ? &item.token : nullptr;
         const float * embd = stage == 0 ? nullptr : item.hidden.data();
-        if (!decode_stage(stage, token, embd, 1, item.pos, output, wanted, error)) {
+        if (!decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
+                static_decode_fast_path ? &stage_decode_batches[stage] : nullptr)) {
             return false;
         }
-        item.hidden = std::move(output);
+        if (static_decode_fast_path) {
+            item.hidden.swap(output);
+        } else {
+            item.hidden = std::move(output);
+        }
         stage_tail_pos[stage] = item.pos;
         for (auto & captured_item : wanted) {
             item.snap.values[captured_item.first] = std::move(captured[captured_item.first]);
@@ -796,6 +1039,10 @@ struct common_spd_pipeline::impl {
             !prefill_sidecar(prompt_anchors, n_prompt)) {
             return false;
         }
+        if (static_decode_fast_path) {
+            llama_synchronize(sidecar);
+            llama_set_stable_host_inputs(sidecar, true);
+        }
 
         std::map<llama_pos, snapshot> completed;
         const int32_t retained_begin = std::max(0, n_prompt - (int32_t) stage_count + 1);
@@ -836,7 +1083,10 @@ struct common_spd_pipeline::impl {
             llama_token pending_draft = LLAMA_TOKEN_NULL;
             const llama_pos oldest_needed = pipeline.front().pos - stage_count + 1;
             bool has_pending_draft = false;
-            speculation_input pending_input;
+            speculation_input local_pending_input;
+            speculation_input & pending_input = static_decode_fast_path
+                    ? decode_speculation_input
+                    : local_pending_input;
             if (oldest_needed >= 0) {
                 if (!prepare_speculation(pipeline, completed,
                         has_prev_evicted ? &prev_evicted : nullptr,
@@ -847,16 +1097,24 @@ struct common_spd_pipeline::impl {
             }
 
             const size_t active_count = pipeline.size();
-            std::vector<double> elapsed(active_count, 0.0);
-            std::vector<std::string> errors(active_count);
-            std::vector<uint8_t> ok(active_count, 0);
+            std::array<double, SPD_MAX_STAGE_COUNT> elapsed = {};
+            std::array<std::string, SPD_MAX_STAGE_COUNT> errors;
+            std::array<uint8_t, SPD_MAX_STAGE_COUNT> ok = {};
+            std::array<stage_decode_job, SPD_MAX_STAGE_COUNT> stage_jobs = {};
             std::future<bool> speculation_work;
+            speculation_job sidecar_job = {};
             bool speculation_ok = true;
+            bool sidecar_job_submitted = false;
+            std::exception_ptr worker_failure;
             if (has_pending_draft) {
                 // The features were copied before target stages mutate their
                 // snapshots, so an independently placed sidecar can decode
                 // them while the target pipeline advances.
-                if (params.parallel_stages) {
+                if (static_decode_fast_path && params.parallel_stages) {
+                    sidecar_job = { this, &pending_input, &pending_draft, &speculation_ok };
+                    sidecar_worker->submit(execute_speculation_job, &sidecar_job);
+                    sidecar_job_submitted = true;
+                } else if (params.parallel_stages) {
                     speculation_work = std::async(std::launch::async, [&]() {
                         return run_speculation(pending_input, pending_draft);
                     });
@@ -865,7 +1123,25 @@ struct common_spd_pipeline::impl {
                 }
             }
 
-            if (params.parallel_stages && active_count > 1) {
+            if (static_decode_fast_path && params.parallel_stages && active_count > 1) {
+                for (size_t stage = 0; stage < active_count; ++stage) {
+                    stage_jobs[stage] = {
+                        this,
+                        (uint32_t) stage,
+                        &pipeline[stage],
+                        &elapsed[stage],
+                        &errors[stage],
+                        &ok[stage],
+                    };
+                    stage_workers[stage]->submit(execute_stage_decode_job, &stage_jobs[stage]);
+                }
+                for (size_t stage = 0; stage < active_count; ++stage) {
+                    std::exception_ptr failure = stage_workers[stage]->wait();
+                    if (worker_failure == nullptr && failure != nullptr) {
+                        worker_failure = failure;
+                    }
+                }
+            } else if (params.parallel_stages && active_count > 1) {
                 std::vector<std::future<bool>> work;
                 work.reserve(active_count);
                 for (size_t stage = 0; stage < active_count; ++stage) {
@@ -882,8 +1158,24 @@ struct common_spd_pipeline::impl {
                 }
             }
 
+            if (sidecar_job_submitted) {
+                std::exception_ptr failure = sidecar_worker->wait();
+                if (worker_failure == nullptr && failure != nullptr) {
+                    worker_failure = failure;
+                }
+            }
             if (speculation_work.valid()) {
                 speculation_ok = speculation_work.get();
+            }
+            if (worker_failure != nullptr) {
+                try {
+                    std::rethrow_exception(worker_failure);
+                } catch (const std::exception & error) {
+                    fail(std::string("SPD decode worker failed: ") + error.what());
+                } catch (...) {
+                    fail("SPD decode worker failed");
+                }
+                return false;
             }
             for (size_t stage = 0; stage < active_count; ++stage) {
                 result.stage_compute_seconds += elapsed[stage];

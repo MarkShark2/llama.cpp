@@ -118,6 +118,11 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Allow callers with stable, reusable input storage to opt a context back into
+// graph reuse and asynchronous host input staging.
+LLAMA_API void llama_set_graph_reuse(struct llama_context * ctx, bool value);
+LLAMA_API void llama_set_stable_host_inputs(struct llama_context * ctx, bool value);
+
 // [PipeDec] deferred verify group (requires GGML_PIPEDEC_STAGE2 eligibility):
 // llama_pipedec_defer marks the NEXT llama_decode as a deferred group member -
 // its stage-2 token lanes are submitted but no head runs and no logits are
