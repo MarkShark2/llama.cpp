@@ -38,6 +38,14 @@ void llama_model_hy_v3::load_arch_tensors(llama_model_loader & ml) {
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+    // duplicate of output_norm kept with the last trunk layer: with mtp_dev pinning
+    // the output head (and output_norm) to the draft device, norming h_nextn there
+    // would pull the full-width hidden rows through a synchronous RPC -> local copy
+    // on every prefill ubatch, serializing the pipeline. Norming on the last trunk
+    // stage keeps t_h_nextn local to it and the extraction uses the async RPC GET.
+    output_norm_trunk = n_layer > 0
+            ? create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1)
+            : nullptr;
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
@@ -212,7 +220,10 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
         inpL = cur;
     }
 
-    cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    // use the last-trunk-stage copy of output_norm when present (see load_arch_tensors)
+    const auto & model_hy3 = static_cast<const llama_model_hy_v3 &>(model);
+    ggml_tensor * output_norm_w = model_hy3.output_norm_trunk ? model_hy3.output_norm_trunk : model.output_norm;
+    cur = build_norm(inpL, output_norm_w, nullptr, LLM_NORM_RMS, -1);
 
     // Post-final-norm hidden state: what the MTP draft head's hnorm consumes.
     // vLLM feeds the target model's normed output states, and the MTP layer

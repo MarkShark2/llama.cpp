@@ -1701,6 +1701,13 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         tn, ne, flags);
 }
 
+ggml_tensor * llama_model_base::create_tensor_on_layer(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags, int il) {
+    buft_list_t * buft_list = pimpl->dev_layer.at(il).buft_list;
+    return ml.create_tensor(
+        hparams, &pimpl->cpu_buft_list, buft_list, buft_list, buft_list,
+        tn, ne, flags);
+}
+
 std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
