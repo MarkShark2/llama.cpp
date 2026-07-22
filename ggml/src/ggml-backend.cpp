@@ -1590,6 +1590,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            // [fork] empty inputs (e.g. output rows pruned to zero during prompt
+            // processing) carry no data: skip the copy, and in particular the
+            // synchronous fallback below, which would drain the source backend
+            // (a full pipeline stall per ubatch when the source is the last RPC stage)
+            if (ggml_nbytes(input) == 0) {
+                continue;
+            }
+
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 const int64_t pd_t = pd_trace ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
