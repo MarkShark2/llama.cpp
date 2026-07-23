@@ -89,17 +89,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    if (use_gqa_opt && gqa_ratio > 4) {
+    // Pick the GQA head-packing factor (ncols2) by divisibility, not threshold:
+    // packing more query heads per KV head than actually share one gives wrong
+    // KV indexing when the GQA optimization is active (e.g. gqa_ratio = 9 must
+    // NOT use ncols2 = 8). Matches the Volta branch above.
+    if (use_gqa_opt && gqa_ratio % 8 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
     }
 
-    if (use_gqa_opt && gqa_ratio > 2) {
+    if (use_gqa_opt && gqa_ratio % 4 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
         return;
     }
 
-    if (use_gqa_opt && gqa_ratio > 1) {
+    if (use_gqa_opt && gqa_ratio % 2 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
         return;
     }
