@@ -1960,7 +1960,7 @@ static bool pipedec_stage2_eligible(
         }
     }
 
-    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4) ||
+    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_LAGUNA) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||
@@ -1976,11 +1976,9 @@ static bool pipedec_stage2_eligible(
         return false;
     }
 
-    for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled) {
-            return false;
-        }
-    }
+    // Enabled per-layer input taps (DFlash feature extraction) are handled by
+    // the stage-2 path itself: each body lane async-GETs its rows into the
+    // per-group buffers, published to embd_layer_inp at group close.
 
     const llama_seq_id seq_id = batch.seq_id[0][0];
     const llama_pos    pos_0  = batch.pos[0];
@@ -2337,7 +2335,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        if (pipedec_stage2) {
+            // [fork, PipeDec] single-token body lane: route enabled layer-input
+            // taps into the stable group buffers (a shared embd_layer_inp write
+            // would be overwritten by the next lane while GETs are in flight)
+            extract_layer_inputs_pipedec(res, sched_pipedec_body[pipedec_lane].get(), pipedec_lane);
+        } else {
+            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2418,6 +2423,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const uint32_t n_embd = hparams.n_embd_out();
             GGML_ASSERT((size_t) pipedec_total * n_embd <= embd_nextn.size);
             std::memcpy(embd_nextn.data, pipedec_group_h.data(), (size_t) pipedec_total * n_embd * sizeof(float));
+        }
+
+        // publish the group's per-layer DFlash feature taps to embd_layer_inp so
+        // llama_get_embeddings_layer_inp sees the same row layout as a batched
+        // (non-stage-2) verify would have produced
+        for (uint32_t il = 0; il < (uint32_t) cparams.embeddings_layer_inp.size(); ++il) {
+            if (!cparams.embeddings_layer_inp[il]) {
+                continue;
+            }
+            if (il >= pipedec_group_layer_inp.size() || pipedec_group_layer_inp[il].empty() ||
+                !embd_layer_inp[il].has_data()) {
+                continue;
+            }
+            const uint32_t n_embd_inp = model.hparams.n_embd;
+            GGML_ASSERT((size_t) pipedec_total * n_embd_inp <= embd_layer_inp[il].size);
+            std::memcpy(embd_layer_inp[il].data, pipedec_group_layer_inp[il].data(),
+                    (size_t) pipedec_total * n_embd_inp * sizeof(float));
         }
 
         llama_ubatch head_ubatch = {};
@@ -2777,6 +2799,32 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
+void llama_context::extract_layer_inputs_pipedec(const llm_graph_result * res, ggml_backend_sched_t lane_sched, uint32_t lane) {
+    if (pipedec_group_layer_inp.size() < cparams.embeddings_layer_inp.size()) {
+        pipedec_group_layer_inp.resize(cparams.embeddings_layer_inp.size());
+    }
+    const uint32_t n_embd = model.hparams.n_embd;
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+        ggml_tensor * t = res->get_layer_inp((int) il);
+        if (!t) {
+            GGML_ABORT("PipeDec stage 2: layer input tensor %u not found in body lane", il);
+        }
+        auto & buf = pipedec_group_layer_inp[il];
+        if (buf.empty()) {
+            buf.resize((size_t) PIPEDEC_STAGE2_MAX_LANES * n_embd);
+        }
+        const size_t nbytes = ggml_nbytes(t);
+        GGML_ASSERT(nbytes == (size_t) n_embd * sizeof(float) && "stage-2 body lanes are single-token");
+        GGML_ASSERT((size_t) (lane + 1) * n_embd <= buf.size());
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(lane_sched, t);
+        GGML_ASSERT(backend != nullptr);
+        ggml_backend_tensor_get_async(backend, t, buf.data() + (size_t) lane * n_embd, 0, nbytes);
     }
 }
 

@@ -3379,8 +3379,15 @@ private:
             // draft runs. A draft whose cache shares the target's cells
             // (gemma4-assistant) then sees that position occupied and rejects its
             // own batch, so every draft fails. Keep defer off for shared-cell drafts.
+            // dflash/eagle3 drafts also set ctx_other, but only to borrow
+            // tok_embd/lm_head -- they keep their own kv cache, so defer stays on.
             if (defer_ok && ctx_dft != nullptr && llama_get_ctx_other(ctx_dft) == ctx_tgt) {
-                defer_ok = false;
+                char arch_buf[64] = {};
+                llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch_buf, sizeof(arch_buf));
+                const bool own_cache = strcmp(arch_buf, "dflash") == 0 || strcmp(arch_buf, "eagle3") == 0;
+                if (!own_cache) {
+                    defer_ok = false;
+                }
             }
 
             if (defer_ok) {

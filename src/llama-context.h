@@ -256,6 +256,11 @@ private:
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // [fork, PipeDec] stage-2 variant: async-GET each enabled layer-input row of a
+    // single-token body lane into the stable per-group buffers (published to
+    // embd_layer_inp at group close, mirroring pipedec_group_h -> embd_nextn).
+    void extract_layer_inputs_pipedec(const llm_graph_result * res, ggml_backend_sched_t lane_sched, uint32_t lane);
+
     //
     // graph
     //
@@ -386,6 +391,11 @@ private:
     bool               pipedec_defer_next   = false;
     uint32_t           pipedec_group_tokens = 0;
     std::vector<float> pipedec_group_h;
+
+    // [fork, PipeDec] per-layer DFlash feature taps for the deferred group, one
+    // fixed lane-indexed buffer per enabled layer (same stability contract as
+    // pipedec_group_h). Indexed by layer id; unused layers stay empty.
+    std::vector<std::vector<float>> pipedec_group_layer_inp;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
