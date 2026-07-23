@@ -1957,6 +1957,17 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        // shared caches alias the source cache's cells and tensors, so their state is
+        // fully covered by the source checkpoint. Still emit a valid empty record:
+        // a zero-byte sequence state reads back as nread == 0, which the file loader
+        // treats as corruption and aborts on.
+        io.write(&n_stream, sizeof(n_stream));
+
+        const uint32_t cell_count = 0;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            io.write(&cell_count, sizeof(cell_count));
+        }
+
         return;
     }
 
@@ -2027,6 +2038,21 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        // consume the empty record written by state_write for shared caches
+        uint32_t n_stream_cur;
+        io.read(&n_stream_cur, sizeof(n_stream_cur));
+        if (n_stream_cur != n_stream) {
+            throw std::runtime_error("n_stream mismatch");
+        }
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            uint32_t cell_count;
+            io.read(&cell_count, sizeof(cell_count));
+            if (cell_count != 0) {
+                throw std::runtime_error("shared kv cache expects an empty sequence state");
+            }
+        }
+
         return;
     }
 
