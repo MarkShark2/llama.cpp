@@ -1572,7 +1572,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         const bool spec_spd = std::find(params.speculative.types.begin(),
                                         params.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_SPD) != params.speculative.types.end();
-        if (((spec_mtp && !params.speculative.has_dft()) || spec_spd) &&
+        // DFlash drafts share the target's tok_embd/lm_head via ctx_other and run on
+        // the draft device; without the pin the fit/split puts output.weight on the
+        // last RPC device, which the draft's scheduler cannot use (hard abort in
+        // ggml-backend: "pre-allocated tensor in a buffer that cannot run the
+        // operation") -- and even for the target alone the logits matmul would sit
+        // behind the full pipeline split.
+        const bool spec_dflash = std::find(params.speculative.types.begin(),
+                                           params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+        if (((spec_mtp && !params.speculative.has_dft()) || spec_spd || spec_dflash) &&
             !params.speculative.draft.devices.empty()) {
             mparams.mtp_dev = params.speculative.draft.devices[0];
         }
