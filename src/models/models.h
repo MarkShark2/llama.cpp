@@ -818,6 +818,10 @@ struct llama_model_gemma4 : public llama_model_base {
         ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
     };
 
+    struct graph_pipedec_head : public llm_graph_context {
+        graph_pipedec_head(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
