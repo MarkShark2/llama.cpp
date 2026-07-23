@@ -3123,6 +3123,15 @@ private:
             // (otherwise a prompt chunk could join the closing decode and break
             // stage-2 eligibility with a group in flight)
             bool defer_ok = defer_enabled && drafting.size() == 1 && generating.size() == 1;
+
+            // [fork] a deferred lane inserts the sampled token's kv cell before the
+            // draft runs. A draft whose cache shares the target's cells
+            // (gemma4-assistant) then sees that position occupied and rejects its
+            // own batch, so every draft fails. Keep defer off for shared-cell drafts.
+            if (defer_ok && ctx_dft != nullptr && llama_get_ctx_other(ctx_dft) == ctx_tgt) {
+                defer_ok = false;
+            }
+
             if (defer_ok) {
                 for (auto & s : slots) {
                     if (&s != drafting.front() && s.state != SLOT_STATE_IDLE) {
