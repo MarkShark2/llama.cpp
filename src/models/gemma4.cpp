@@ -132,6 +132,9 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_gemma4::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
+        return std::make_unique<graph_pipedec_head>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -188,7 +191,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // TODO: is causal == true correct? might need some changes
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // The PipeDec body returns every unmasked hidden row directly and never
+    // gathers output rows. Do not register an unused out_ids input: unused
+    // graph inputs are intentionally not allocated, but set_inputs() would
+    // still attempt to populate one if it were registered here.
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+            ? nullptr
+            : build_inp_out_ids();
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -413,6 +422,15 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    // Stage 2 PipeDec queues token-sized trunk graphs across the layer devices.
+    // The body ends at the post-output-norm hidden state (h_nextn); the rows are
+    // copied out and fed to one batched graph_pipedec_head (lm_head only — the
+    // final norm is already applied here) after the body pipeline drains.
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -432,6 +450,45 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // apply logits bias if needed (e.g. for gemma4_unified patch)
     // this is to mirror the suppress_tokens patch on transformers, to avoid model from outputing <image|> and <audio|> tokens (which is a known issue related to the checkpoint)
     // TODO: maybe handle this inside the sampling system in the future
+    if (!model.vocab.get_suppress_tokens().empty()) {
+        auto inp_bias = std::make_unique<llm_graph_input_logits_bias>(model.vocab);
+        inp_bias->logits_bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, inp_bias->arr.size());
+        cur = ggml_add(ctx0, cur, inp_bias->logits_bias);
+        res->add_input(std::move(inp_bias));
+    }
+
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// Deferred LM head for a group of completed PipeDec body rows. The body already
+// applies the final output norm (h_nextn is post-norm for Gemma 4), so this is
+// the lm_head (+ softcap / logit bias) only.
+llama_model_gemma4::graph_pipedec_head::graph_pipedec_head(
+        const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    cb(inp->embd, "pipedec_h_input", -1);
+
+    ggml_tensor * cur = inp->embd;
+    res->add_input(std::move(inp));
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_lora_mm(model.output, cur, model.output_s);
+
+    if (hparams.f_final_logit_softcapping) {
+        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+        cur = ggml_tanh(ctx0, cur);
+        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+    }
+
     if (!model.vocab.get_suppress_tokens().empty()) {
         auto inp_bias = std::make_unique<llm_graph_input_logits_bias>(model.vocab);
         inp_bias->logits_bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, inp_bias->arr.size());
