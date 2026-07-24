@@ -278,10 +278,17 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
-    cparams.fused_dsv4_hc_pre  = true;
-    cparams.fused_dsv4_hc_comb = true;
-    cparams.fused_dsv4_hc_post = true;
-    cparams.auto_fhc           = true;
+    // The fused DSV4 hyper-connection ops exist only for CPU and CUDA. The
+    // auto-probe below cannot see that a Vulkan RPC endpoint lacks them,
+    // because the RPC backend's supports_op is a `return true` stub -- so the
+    // ops get scheduled onto the remote node and abort its rpc-server. Set
+    // LLAMA_FUSED_DSV4_HC=0 to force the primitive-op path everywhere, which is
+    // what a House split over the BC-250 Vulkan boards needs.
+    const bool fused_hc = !getenv("LLAMA_FUSED_DSV4_HC") || atoi(getenv("LLAMA_FUSED_DSV4_HC")) != 0;
+    cparams.fused_dsv4_hc_pre  = fused_hc;
+    cparams.fused_dsv4_hc_comb = fused_hc;
+    cparams.fused_dsv4_hc_post = fused_hc;
+    cparams.auto_fhc           = fused_hc;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
