@@ -1961,7 +1961,8 @@ static bool pipedec_stage2_eligible(
         }
     }
 
-    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_LAGUNA) ||
+    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
+         model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||

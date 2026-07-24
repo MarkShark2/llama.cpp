@@ -147,7 +147,36 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
+        return std::make_unique<graph_pipedec_head>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
+}
+
+// Deferred PipeDec verification head: the body lanes stop at the collapsed
+// pre-final-norm state, so all that is left here is the output norm + lm_head
+// over the batched rows gathered from every lane in the group.
+llama_model_deepseek4::graph_pipedec_head::graph_pipedec_head(
+        const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    cb(inp->embd, "pipedec_h_input", -1);
+
+    ggml_tensor * cur = inp->embd;
+    res->add_input(std::move(inp));
+
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
 }
 
 static size_t dsv4_elem_offset(const ggml_tensor * t, int64_t i) {
@@ -1156,7 +1185,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // PipeDec body lanes are single-token and keep every row (the deferred head
+    // consumes the raw h_nextn rows), so no out_ids gather is built for them.
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+            ? nullptr : build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
@@ -1264,6 +1296,19 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
     cb(cur, "hc_head", -1);
+
+    // Stage 2 PipeDec queues token-sized trunk graphs across the layer devices.
+    // The body ends at the collapsed pre-final-norm hidden state; those rows are
+    // copied out and fed to one batched graph_pipedec_head (output norm + lm_head)
+    // after the body pipeline drains. The HC collapse stays in the body so the
+    // carried state is [n_embd, n_tokens] like every other arch.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
