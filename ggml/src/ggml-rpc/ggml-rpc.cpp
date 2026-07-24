@@ -823,11 +823,26 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     RPC_STATUS_ASSERT(status);
 }
 
+static void ggml_backend_rpc_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    // RPC has no dedicated memset command; emulate it by writing a host buffer of
+    // the fill value through the normal SET_TENSOR path. Without this the buffer
+    // iface's memset slot is NULL and ggml_backend_tensor_memset() aborts on any
+    // tensor that lives on a board — e.g. DeepSeek-V4's DSA KV cache zeroing a
+    // per-stream slice on sequence clear (llama-kv-cache-dsv4.cpp). memset happens
+    // on cache clears, not per token, so the extra transfer is negligible; bypass
+    // the hash cache (a plain fill is not worth a dedup round-trip).
+    if (size == 0) {
+        return;
+    }
+    std::vector<uint8_t> tmp(size, value);
+    RPC_STATUS_ASSERT(rpc_buffer_set_tensor_raw(buffer, tensor, tmp.data(), offset, size));
+}
+
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_rpc_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_rpc_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_rpc_buffer_init_tensor,
-    /* .memset_tensor   = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_rpc_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_rpc_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_rpc_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
@@ -1057,12 +1072,100 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
     }
 }
 
-static void serialize_graph(uint32_t device, uint64_t uid, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
-    uint32_t n_nodes = cgraph->n_nodes;
+// Diagnostic: flag any leaf in a subgraph bound for `endpoint` whose data lives
+// in an RPC buffer owned by a DIFFERENT endpoint. The server rejects such a
+// tensor with "[create_node] invalid data ptr" (buffer==null && data!=null)
+// because RPC is star-only: there is no remote<->remote path, so a board can
+// never dereference another board's buffer. Gated by LLAMA_RPC_TRACE_XDEV.
+static const char * rpc_xdev_ep(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_rpc(t->buffer)) {
+        return nullptr;
+    }
+    auto * bctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
+    return bctx ? bctx->endpoint.c_str() : nullptr;
+}
+
+static void rpc_trace_xdev(const std::string & endpoint, const ggml_cgraph * cgraph) {
+    static const bool on = getenv("LLAMA_RPC_TRACE_XDEV") != nullptr;
+    if (!on) {
+        return;
+    }
+    // The nodes in cgraph->nodes[] are exactly what serialize_graph ships to the
+    // server. A node (or any of its srcs) whose buffer belongs to a different RPC
+    // endpoint is what the server rejects as "invalid data ptr". Report each with
+    // its view_src root so we can see whether it is a foreign VIEW, a foreign real
+    // src, or an orphan foreign node with no in-graph consumer.
+    std::unordered_set<const ggml_tensor *> consumed; // referenced as some node's src
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (n->src[j]) consumed.insert(n->src[j]);
+        }
+    }
+    auto root_of = [](const ggml_tensor * t) {
+        while (t->view_src) t = t->view_src;
+        return t;
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        const char * nep = rpc_xdev_ep(n);
+        if (nep && endpoint != nep) {
+            const ggml_tensor * r = root_of(n);
+            GGML_LOG_ERROR("[rpc xdev] target=%s node[%d] '%s' (op=%s) FOREIGN@%s%s"
+                           " view_root='%s'@%s ne=[%lld,%lld]\n",
+                endpoint.c_str(), i, n->name, ggml_op_name(n->op), nep,
+                consumed.count(n) ? "" : " ORPHAN(no-consumer)",
+                r->name, rpc_xdev_ep(r) ? rpc_xdev_ep(r) : "local",
+                (long long)n->ne[0], (long long)n->ne[1]);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = n->src[j];
+            const char * sep = rpc_xdev_ep(s);
+            if (sep && endpoint != sep) {
+                const ggml_tensor * r = root_of(s);
+                GGML_LOG_ERROR("[rpc xdev] target=%s node[%d] '%s' (op=%s) has FOREIGN src[%d] '%s'"
+                               " (op=%s)@%s view_root='%s'@%s\n",
+                    endpoint.c_str(), i, n->name, ggml_op_name(n->op), j, s->name,
+                    ggml_op_name(s->op), sep, r->name, rpc_xdev_ep(r) ? rpc_xdev_ep(r) : "local");
+            }
+        }
+    }
+}
+
+// True when the tensor's data lives in an RPC buffer owned by a DIFFERENT
+// endpoint than the one we are serializing this subgraph for.
+static bool rpc_node_is_foreign(const ggml_tensor * t, const std::string & endpoint) {
+    const char * ep = rpc_xdev_ep(t);
+    return ep != nullptr && endpoint != ep;
+}
+
+static void serialize_graph(uint32_t device, uint64_t uid, const std::string & endpoint,
+                            const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+    // Drop nodes whose data lives on a different RPC endpoint before shipping the
+    // subgraph. RPC is star-only — there is no remote<->remote memory path — so a
+    // board can never dereference another board's buffer; serializing such a node
+    // makes the server reject it ("[create_node] invalid data ptr": data!=0,
+    // buffer==null) and abort. These nodes are always dead here: the backend
+    // scheduler (ggml_backend_sched pass 5) already rewired every LIVE consumer to
+    // a host-routed cross-backend copy, leaving only orphaned view nodes — e.g.
+    // DeepSeek-V4's per-stream HC residual slices (build_hc_pre/post view the
+    // previous board's l_out) that fall inside this board's contiguous split range.
+    // Skipping them is loss-free (nothing kept references them) and keeps the graph
+    // uid -> filtered-node-set mapping deterministic, so the server's graph cache
+    // stays consistent across recompute.
+    std::vector<ggml_tensor *> nodes;
+    nodes.reserve(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (rpc_node_is_foreign(cgraph->nodes[i], endpoint)) {
+            continue;
+        }
+        nodes.push_back(cgraph->nodes[i]);
+    }
+    uint32_t n_nodes = nodes.size();
     std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
     for (uint32_t i = 0; i < n_nodes; i++) {
-        add_tensor(cgraph->nodes[i], tensors, visited);
+        add_tensor(nodes[i], tensors, visited);
     }
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -1077,7 +1180,7 @@ static void serialize_graph(uint32_t device, uint64_t uid, const ggml_cgraph * c
     memcpy(dest, &n_nodes, sizeof(n_nodes));
     dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        memcpy(dest + i * sizeof(uint64_t), &cgraph->nodes[i], sizeof(uint64_t));
+        memcpy(dest + i * sizeof(uint64_t), &nodes[i], sizeof(uint64_t));
     }
     dest += n_nodes * sizeof(uint64_t);
     memcpy(dest, &n_tensors, sizeof(n_tensors));
@@ -1139,8 +1242,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
+        rpc_trace_xdev(endpoint, cgraph);
         std::vector<uint8_t> input;
-        serialize_graph(device, cgraph->uid, cgraph, input);
+        serialize_graph(device, cgraph->uid, endpoint, cgraph, input);
         rpc_msg_graph_forget_req forget = { device, evicted_uid };
         if (async) {
             auto in = std::make_shared<std::vector<uint8_t>>(std::move(input));

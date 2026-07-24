@@ -749,6 +749,11 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // like fit_params_fill_rpc_first, but overflow the primary device cannot hold
+    // falls fully to the CPU instead of aborting (RPC-safe). Kept at the end of the
+    // struct so adding it never shifts the offset of any pre-existing field.
+    bool fit_params_cpu_moe = false;
 };
 
 // call once at the start of a program if it uses libcommon

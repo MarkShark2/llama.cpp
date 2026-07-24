@@ -1230,6 +1230,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             params.fit_params_whole_layers,
             params.fit_params_fill_rpc_first,
+            params.fit_params_cpu_moe,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 

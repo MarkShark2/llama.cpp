@@ -35,6 +35,7 @@ int llama_fit_params(int argc, char ** argv) {
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
                 params.fit_params_whole_layers,
                 params.fit_params_fill_rpc_first,
+                params.fit_params_cpu_moe,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);

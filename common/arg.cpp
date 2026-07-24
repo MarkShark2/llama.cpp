@@ -2739,6 +2739,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_FILL_RPC_FIRST"));
     add_opt(common_arg(
+        { "--fit-cpu-moe" },
+        "with --fit on MoE models: like --fit-fill-rpc-first (whole layers on non-primary/RPC devices, MoE experts of the "
+        "remainder streamed from host RAM on the primary device), but any layer that still does not fit the primary device "
+        "runs entirely on the CPU instead of aborting. RPC-safe: a remote device never references host memory",
+        [](common_params & params) {
+            params.fit_params_cpu_moe = true;
+        }
+    ).set_env("LLAMA_ARG_FIT_CPU_MOE"));
+    add_opt(common_arg(
         { "-fitp", "--fit-print" }, "[on|off]",
         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
         [](common_params & params, const std::string & value) {

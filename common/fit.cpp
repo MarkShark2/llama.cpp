@@ -176,13 +176,21 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, bool whole_layers, bool fill_rpc_first, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, bool whole_layers, bool fill_rpc_first, bool cpu_moe,
+        enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
-    if (fill_rpc_first && whole_layers) {
-        throw common_params_fit_exception("--fit-whole-layers and --fit-fill-rpc-first are mutually exclusive, abort");
+    if ((fill_rpc_first || cpu_moe) && whole_layers) {
+        throw common_params_fit_exception("--fit-whole-layers is mutually exclusive with --fit-fill-rpc-first / --fit-cpu-moe, abort");
     }
+    if (fill_rpc_first && cpu_moe) {
+        throw common_params_fit_exception("--fit-fill-rpc-first and --fit-cpu-moe are mutually exclusive, abort");
+    }
+    // both modes share the "whole layers on non-primary devices, MoE experts of the
+    // remainder streamed from host RAM on the primary device" placement; they differ
+    // only in what happens to overflow the primary device cannot hold (abort vs CPU).
+    const bool primary_moe_base = fill_rpc_first || cpu_moe;
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -198,9 +206,14 @@ static void common_params_fit_impl(
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
 
-    if (fill_rpc_first && (hp_nex == 0 || nd < 2)) {
-        LOG_WRN("%s: --fit-fill-rpc-first requires a MoE model and at least 2 devices, ignoring\n", __func__);
-        fill_rpc_first = false;
+    // primary_moe: whole layers on non-primary devices + primary-only MoE CPU spill.
+    // cpu_moe_overflow: within that mode, let overflow fall to CPU instead of aborting.
+    bool primary_moe      = primary_moe_base;
+    bool cpu_moe_overflow = cpu_moe;
+    if (primary_moe && (hp_nex == 0 || nd < 2)) {
+        LOG_WRN("%s: --fit-fill-rpc-first / --fit-cpu-moe require a MoE model and at least 2 devices, ignoring\n", __func__);
+        primary_moe      = false;
+        cpu_moe_overflow = false;
     }
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
@@ -534,7 +547,7 @@ static void common_params_fit_impl(
     };
 
     int64_t global_surplus_cpu_moe = 0;
-    if (hp_nex > 0 && !whole_layers && !fill_rpc_first) {
+    if (hp_nex > 0 && !whole_layers && !primary_moe) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
@@ -584,7 +597,7 @@ static void common_params_fit_impl(
     //   many of their MoE expert tensors to system memory as needed to meet the primary's target.
     //   Non-primary devices never hold partial layers and nothing overflows across devices, so
     //   expert tensors in system memory only ever belong to layers whose attention runs on device 0.
-    if (fill_rpc_first) {
+    if (primary_moe) {
         LOG_TRC("%s: fill-rpc-first: filling non-primary devices back-to-front with whole layers:\n", __func__);
         for (int id = nd - 1; id >= 1; id--) {
             uint32_t n_unassigned = hp_ngl + 1;
@@ -643,9 +656,31 @@ static void common_params_fit_impl(
             ngl_lo[0].n_part  = n_unassigned;
             std::vector<int64_t> mem_lo = get_memory_for_layers(__func__, ngl_lo, overflow_bufts);
             if (mem_lo[0] > targets[0]) {
-                throw common_params_fit_exception(
-                    "fill-rpc-first: even with all MoE experts in system memory the dense parts of the "
-                    + std::to_string(n_unassigned) + " remaining layers exceed the primary device's target, abort");
+                if (!cpu_moe_overflow) {
+                    throw common_params_fit_exception(
+                        "fill-rpc-first: even with all MoE experts in system memory the dense parts of the "
+                        + std::to_string(n_unassigned) + " remaining layers exceed the primary device's target, abort");
+                }
+                // --fit-cpu-moe: the primary device cannot hold every remaining layer even
+                // as dense-only. Binary-search the largest count k of dense-only layers that
+                // fits its target; the other (n_unassigned - k) layers stay unassigned and so
+                // run entirely on the client CPU backend. This is RPC-safe: nothing on a remote
+                // device references host memory, and the CPU layers keep the model loadable.
+                uint32_t klo = 0, khi = n_unassigned; // largest k with k dense-only layers fitting device 0
+                while (khi - klo > 1) {
+                    uint32_t kmid = klo + (khi - klo) / 2;
+                    std::vector<ngl_t> ngl_try = ngl_per_device;
+                    ngl_try[0].n_layer = kmid;
+                    ngl_try[0].n_part  = kmid;
+                    const std::vector<int64_t> mem_try = get_memory_for_layers(__func__, ngl_try, overflow_bufts);
+                    if (mem_try[0] <= targets[0]) { klo = kmid; } else { khi = kmid; }
+                }
+                LOG_WRN("%s: --fit-cpu-moe: primary device holds %" PRIu32 " layer(s) with MoE experts streamed from host RAM; "
+                        "%" PRIu32 " overflow layer(s) run entirely on the CPU\n", __func__, klo, n_unassigned - klo);
+                ngl_lo = ngl_per_device;
+                ngl_lo[0].n_layer = klo;
+                ngl_lo[0].n_part  = klo;
+                mem_lo = get_memory_for_layers(__func__, ngl_lo, overflow_bufts);
             }
 
             // upper bound: every remaining layer fully on the primary device
@@ -917,11 +952,12 @@ enum common_params_fit_status common_fit_params(
         uint32_t n_ctx_min,
         bool whole_layers,
         bool fill_rpc_first,
+        bool cpu_moe,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, whole_layers, fill_rpc_first, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, whole_layers, fill_rpc_first, cpu_moe, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

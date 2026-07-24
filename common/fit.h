@@ -27,6 +27,8 @@ common_params_fit_status common_fit_params(
                                 bool   whole_layers,          // place only complete layers; never create tensor overrides
                                 bool   fill_rpc_first,        // fill non-primary devices with whole layers first; the primary device
                                                               // takes every remaining layer, spilling MoE experts to system memory
+                                bool   cpu_moe,               // like fill_rpc_first, but overflow the primary device cannot hold
+                                                              // stays fully on the CPU instead of aborting (RPC-safe)
                       ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
 // print estimated memory to stdout

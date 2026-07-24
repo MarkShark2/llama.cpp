@@ -1288,7 +1288,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     capture_layer_inp(n_layer, inpL);
 
-    if (inp_out_ids) {
+    // Masked nextn (plain decode / PipeDec): gather to the output rows BEFORE the
+    // HC-head collapse so t_h_nextn carries exactly the output positions (the
+    // masked readback takes the first n_outputs rows). Unmasked nextn (the
+    // DFlash/DSpark drafter's per-token feature extraction) needs every token's
+    // collapsed state, so keep the tap full and gather the logits AFTER it — same
+    // split Laguna uses (laguna.cpp). Gathering before vs after the per-token
+    // HC head yields identical output rows.
+    if (inp_out_ids && cparams.embeddings_nextn_masked) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
@@ -1308,6 +1315,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
         ggml_build_forward_expand(gf, cur);
         return;
+    }
+
+    // Unmasked nextn: the tap kept every token; select the output rows now.
+    if (inp_out_ids && !cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

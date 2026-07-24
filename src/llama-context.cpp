@@ -1516,8 +1516,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+// [fork, PipeDec diag] flush-immediate step trace. LLAMA_LOG lines are buffered
+// and lost when a stage-2 verify AVs mid-orchestration; this writes straight to
+// stderr with an explicit flush so the LAST printed step localizes the fault.
+// Gated by GGML_PIPEDEC_STEP_TRACE.
+static bool pipedec_step_trace() {
+    static const bool on = getenv("GGML_PIPEDEC_STEP_TRACE") != nullptr;
+    return on;
+}
+#define PIPEDEC_STEP(...) do { \
+        if (pipedec_step_trace()) { fprintf(stderr, "[pipedec-step] " __VA_ARGS__); fflush(stderr); } \
+    } while (0)
+
 llm_graph_result * llama_context::process_ubatch_pipedec_body(
         const llama_ubatch & ubatch, llama_memory_context_i * mctx, uint32_t lane, ggml_status & ret) {
+    PIPEDEC_STEP("body lane=%u enter\n", lane);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1560,11 +1573,13 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        PIPEDEC_STEP("body lane=%u built (n_nodes=%d)\n", lane, ggml_graph_n_nodes(gf));
         if (!ggml_backend_sched_alloc_graph(lane_sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        PIPEDEC_STEP("body lane=%u alloced\n", lane);
 
         LLAMA_LOG_INFO("%s: initialized token-body lane %u\n", __func__, lane);
         if (lane == 0) {
@@ -1578,13 +1593,16 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
         }
     }
 
+    PIPEDEC_STEP("body lane=%u set_inputs\n", lane);
     res->set_inputs(&ubatch);
 
+    PIPEDEC_STEP("body lane=%u compute_async\n", lane);
     ret = ggml_backend_sched_graph_compute_async(lane_sched.get(), res->get_gf());
     if (ret != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, status: %d\n", __func__, (int) ret);
         return nullptr;
     }
+    PIPEDEC_STEP("body lane=%u submitted status=%d\n", lane, (int) ret);
 
     return res;
 }
@@ -2221,9 +2239,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const uint32_t pipedec_lane = pipedec_group_tokens + n_tokens_prev;
+        if (pipedec_stage2) { PIPEDEC_STEP("loop: dispatch body lane=%u n_tokens=%u\n", pipedec_lane, ubatch.n_tokens); }
         const auto * res = pipedec_stage2
                 ? process_ubatch_pipedec_body(ubatch, mctx.get(), pipedec_lane, status)
                 : process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (pipedec_stage2) { PIPEDEC_STEP("loop: body lane=%u returned res=%p status=%d\n", pipedec_lane, (void*) res, (int) status); }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2348,7 +2368,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // [fork, PipeDec] single-token body lane: route enabled layer-input
             // taps into the stable group buffers (a shared embd_layer_inp write
             // would be overwritten by the next lane while GETs are in flight)
+            PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u begin\n", pipedec_lane);
             extract_layer_inputs_pipedec(res, sched_pipedec_body[pipedec_lane].get(), pipedec_lane);
+            PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u end\n", pipedec_lane);
         } else {
             extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
         }
@@ -2380,6 +2402,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 } else {
                     GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 }
+                if (pipedec_stage2) { PIPEDEC_STEP("nextn GET lane=%u backend=%s n_rows=%lld\n", pipedec_lane, ggml_backend_name(backend_h), (long long) n_rows); }
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
             }
         }
@@ -2418,10 +2441,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // The hidden-state GETs above are ordered after their body graphs. Drain
         // once after all bodies have been submitted, then reuse those host rows
         // as the input to a single output norm/LM-head graph on CUDA0.
+        PIPEDEC_STEP("group-close: drain %u lanes\n", pipedec_total);
         for (uint32_t lane = 0; lane < pipedec_total; ++lane) {
             GGML_ASSERT(sched_pipedec_body[lane]);
+            PIPEDEC_STEP("group-close: sync lane=%u\n", lane);
             ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
         }
+        PIPEDEC_STEP("group-close: drained\n");
         const int64_t body_drain_us = ggml_time_us() - body_drain_t0;
 
         // group rows are all accounted for from here on
@@ -2431,6 +2457,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (embd_nextn.data) {
             const uint32_t n_embd = hparams.n_embd_out();
             GGML_ASSERT((size_t) pipedec_total * n_embd <= embd_nextn.size);
+            PIPEDEC_STEP("group-close: memcpy nextn total=%u n_embd=%u\n", pipedec_total, n_embd);
             std::memcpy(embd_nextn.data, pipedec_group_h.data(), (size_t) pipedec_total * n_embd * sizeof(float));
         }
 
@@ -2447,6 +2474,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
             const uint32_t n_embd_inp = model.hparams.n_embd;
             GGML_ASSERT((size_t) pipedec_total * n_embd_inp <= embd_layer_inp[il].size);
+            PIPEDEC_STEP("group-close: memcpy layer_inp il=%u src_sz=%zu\n", il, pipedec_group_layer_inp[il].size());
             std::memcpy(embd_layer_inp[il].data, pipedec_group_layer_inp[il].data(),
                     (size_t) pipedec_total * n_embd_inp * sizeof(float));
         }
@@ -2486,6 +2514,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_sched_set_eval_callback(
                     sched_pipedec_head.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+            PIPEDEC_STEP("head: build_graph total=%u\n", pipedec_total);
             head_gf = model.build_graph(head_params);
             if (!head_gf) {
                 LLAMA_LOG_ERROR("%s: failed to initialize PipeDec deferred head graph\n", __func__);
@@ -2493,6 +2522,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 memory->seq_rm(batch.seq_id[0][0], batch.pos[0], -1);
                 return -3;
             }
+            PIPEDEC_STEP("head: built (n_nodes=%d), alloc\n", ggml_graph_n_nodes(head_gf));
             if (!ggml_backend_sched_alloc_graph(sched_pipedec_head.get(), head_gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate PipeDec deferred head graph\n", __func__);
                 const auto & batch = balloc->get_batch();
@@ -2501,9 +2531,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        PIPEDEC_STEP("head: set_inputs + compute_async\n");
         head_res->set_inputs(&head_ubatch);
         const ggml_status head_status = ggml_backend_sched_graph_compute_async(
                 sched_pipedec_head.get(), head_res->get_gf());
+        PIPEDEC_STEP("head: submitted status=%d\n", (int) head_status);
 
         if (head_status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: failed to compute PipeDec deferred head graph, status: %d\n",
@@ -2530,12 +2562,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT((int64_t) pipedec_total*n_vocab <= (int64_t) logits.size);
         GGML_ASSERT(ggml_nelements(t_logits) == (int64_t) pipedec_total*n_vocab);
+        PIPEDEC_STEP("head: logits GET backend=%s total=%u\n", ggml_backend_name(backend_res), pipedec_total);
         ggml_backend_tensor_get_async(
                 backend_res, t_logits, logits.data, 0, (size_t) pipedec_total*n_vocab*sizeof(float));
 
         const int64_t head_submit_us = ggml_time_us() - head_t0;
         const int64_t head_drain_t0  = ggml_time_us();
+        PIPEDEC_STEP("head: synchronize\n");
         ggml_backend_sched_synchronize(sched_pipedec_head.get());
+        PIPEDEC_STEP("head: done\n");
         const int64_t head_drain_us = ggml_time_us() - head_drain_t0;
 
         if (pipedec_trace) {
@@ -2833,6 +2868,7 @@ void llama_context::extract_layer_inputs_pipedec(const llm_graph_result * res, g
         GGML_ASSERT((size_t) (lane + 1) * n_embd <= buf.size());
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(lane_sched, t);
         GGML_ASSERT(backend != nullptr);
+        PIPEDEC_STEP("  extract il=%u tap='%s' backend=%s nbytes=%zu\n", il, t->name, ggml_backend_name(backend), nbytes);
         ggml_backend_tensor_get_async(backend, t, buf.data() + (size_t) lane * n_embd, 0, nbytes);
     }
 }
