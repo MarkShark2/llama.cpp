@@ -1095,9 +1095,12 @@ struct llama_model_deepseek32 : public llama_model_base {
 struct llm_graph_context_dsv4_mla : public llm_graph_context {
     llm_graph_context_dsv4_mla(const llm_graph_params & params) : llm_graph_context(params) {}
 
+    // il >= 0 allows the fused DSV4 HC-pre kernel; pass -1 (the head collapse)
+    // to force the primitive-op path
     ggml_tensor * build_hc_weighted_sum(
             ggml_tensor * x,
-            ggml_tensor * weights) const;
+            ggml_tensor * weights,
+            int           il) const;
 
     ggml_tensor * build_hc_sinkhorn(
             ggml_tensor * comb,

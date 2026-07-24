@@ -315,7 +315,7 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_pre(
     }
     cb(*comb, "hc_comb", il);
 
-    ggml_tensor * result = build_hc_pre(x, pre, il);
+    ggml_tensor * result = build_hc_weighted_sum(x, pre, il);
     return result;
 }
 
@@ -375,7 +375,7 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_head(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_head_pre", -1);
 
-    return build_hc_pre(x, pre, -1);
+    return build_hc_weighted_sum(x, pre, -1);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
