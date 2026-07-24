@@ -1577,10 +1577,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         // last RPC device, which the draft's scheduler cannot use (hard abort in
         // ggml-backend: "pre-allocated tensor in a buffer that cannot run the
         // operation") -- and even for the target alone the logits matmul would sit
-        // behind the full pipeline split.
+        // behind the full pipeline split. DSpark is a DFlash drafter with a Markov
+        // head bolted on and borrows the same tensors, so it needs the same pin.
         const bool spec_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
-                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()
+                              || std::find(params.speculative.types.begin(),
+                                           params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
         if (((spec_mtp && !params.speculative.has_dft()) || spec_spd || spec_dflash) &&
             !params.speculative.draft.devices.empty()) {
             mparams.mtp_dev = params.speculative.draft.devices[0];

@@ -931,7 +931,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
-    int32_t         n_layer_tgt        = 0;       // extract id == n_layer_tgt -> pre-final-norm state (nextn)
+    int32_t         n_layer_tgt        = 0;       // extract id == n_layer_tgt -> "after the last layer"
+    bool            last_tap_nextn     = true;    // ...taken from the nextn tap rather than t_layer_inp[n_layer]
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -993,16 +994,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // turn on extraction of the target layers' input embeddings; an id equal
-        // to the target's layer count means the pre-final-norm hidden state,
-        // which is captured through the unmasked nextn path instead
+        // turn on extraction of the target layers' input embeddings. an id equal
+        // to the target's layer count means "after the last layer", which the
+        // archs publish in one of two ways:
+        //  - deepseek4 captures it as t_layer_inp[n_layer], the mean over the
+        //    hyper-connection streams, exactly as the DSpark reference does
+        //    (h.mean(dim=2) after the layer loop, before the hc_head collapse);
+        //  - laguna has no such capture, so the closest equivalent is the
+        //    pre-final-norm hidden state on the unmasked nextn path.
+        // Picking the wrong one silently feeds the drafter a differently
+        // collapsed residual, so gate on the target arch rather than guessing.
         n_layer_tgt = llama_model_n_layer(model_tgt);
+        {
+            char arch[64] = {};
+            if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) >= 0) {
+                last_tap_nextn = strcmp(arch, "deepseek4") != 0;
+            }
+        }
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             if (target_layer_ids[k] == n_layer_tgt) {
+                // keep the nextn tap on regardless: it is also what PipeDec
+                // stage 2 carries from the body lanes to the deferred head
                 llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-            } else {
-                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+                if (last_tap_nextn) {
+                    continue;
+                }
             }
+            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1091,7 +1109,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = target_layer_ids[k] == n_layer_tgt
+                    const float * layer = (target_layer_ids[k] == n_layer_tgt && last_tap_nextn)
                         ? llama_get_embeddings_nextn(ctx_tgt)
                         : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
