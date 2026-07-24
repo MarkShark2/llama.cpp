@@ -1010,6 +1010,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_lightning_indexer_f32;
+    vk_pipeline pipeline_lightning_indexer_f16;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1733,6 +1735,15 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_lightning_indexer_push_constants {
+    uint32_t n_embd, n_head, n_kv, nem3;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk2, nbk3;
+    uint32_t nbw1, nbw3;
+    uint32_t nbm1, nbm3;
+    uint32_t nb1, nb3;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -5666,6 +5677,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32, "lightning_indexer_f32", lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {128, 1, 1}, {128}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16, "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {128, 1, 1}, {128}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11348,6 +11362,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_LIGHTNING_INDEXER:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            switch (src1->type) {
+                case GGML_TYPE_F32: return ctx->device->pipeline_lightning_indexer_f32;
+                case GGML_TYPE_F16: return ctx->device->pipeline_lightning_indexer_f16;
+                default:            return nullptr;
+            }
+        }
+        return nullptr;
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
@@ -12465,6 +12488,68 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
     });
+}
+
+static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2]; // weights
+    const ggml_tensor * m = dst->src[3]; // mask
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+    GGML_ASSERT(  w->type == GGML_TYPE_F32);
+    GGML_ASSERT(  m->type == GGML_TYPE_F16);
+    GGML_ASSERT(  k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+
+    // input tensor rows must be contiguous
+    GGML_ASSERT(  q->nb[0] == ggml_type_size(q->type));
+    GGML_ASSERT(  k->nb[0] == ggml_type_size(k->type));
+    GGML_ASSERT(  w->nb[0] == ggml_type_size(w->type));
+    GGML_ASSERT(  m->nb[0] == ggml_type_size(m->type));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t n_embd   = q->ne[0];
+    const uint32_t n_head   = q->ne[1];
+    const uint32_t n_tokens = q->ne[2];
+    const uint32_t n_stream = q->ne[3];
+    const uint32_t n_kv     = k->ne[2];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, w, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const size_t ts_q = ggml_type_size(q->type);
+    const size_t ts_k = ggml_type_size(k->type);
+    const size_t ts_w = ggml_type_size(w->type);
+    const size_t ts_m = ggml_type_size(m->type);
+    const size_t ts_d = ggml_type_size(dst->type);
+
+    // strides in elements
+    const vk_op_lightning_indexer_push_constants pc = {
+        n_embd, n_head, n_kv, (uint32_t)m->ne[3],
+        (uint32_t)(q->nb[1]/ts_q), (uint32_t)(q->nb[2]/ts_q), (uint32_t)(q->nb[3]/ts_q),
+        (uint32_t)(k->nb[2]/ts_k), (uint32_t)(k->nb[3]/ts_k),
+        (uint32_t)(w->nb[1]/ts_w), (uint32_t)(w->nb[3]/ts_w),
+        (uint32_t)(m->nb[1]/ts_m), (uint32_t)(m->nb[3]/ts_m),
+        (uint32_t)(dst->nb[1]/ts_d), (uint32_t)(dst->nb[3]/ts_d),
+    };
+
+    vk_subbuffer   q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer   k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer   w_buf = ggml_vk_tensor_subbuffer(ctx, w);
+    vk_subbuffer   m_buf = ggml_vk_tensor_subbuffer(ctx, m);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // elements are divided by the pipeline wg_denoms ({BLOCK_SIZE, 1, 1})
+    std::array<uint32_t, 3> elements = { n_kv, n_tokens, n_stream };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {q_buf, k_buf, w_buf, m_buf, dst_buf},
+        pc, elements);
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -15286,6 +15371,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_LIGHTNING_INDEXER:
+        ggml_vk_lightning_indexer(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
 
@@ -18034,6 +18124,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_LIGHTNING_INDEXER:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F16 &&
+                   // rows must be contiguous
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:
@@ -18959,6 +19058,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6]);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
+            tensor_clone = ggml_lightning_indexer(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_ROLL) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

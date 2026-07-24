@@ -9659,7 +9659,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // lightning_indexer
-    for (int kv : { 256 }) {
+    for (int kv : { 33, 256 }) {
         for (int bs : { 1, 512 }) {
             for (int nh : { 32, 64 }) {
                 for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {

@@ -1,0 +1,66 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// naive-but-correct implementation of GGML_OP_LIGHTNING_INDEXER
+// (see ggml_compute_forward_lightning_indexer in ggml-cpu/ops.cpp)
+//
+// per (stream s, token t, kv row ik):
+//   dst[ik] = sum_h( max(dot(q[:,h,t,s], k[:,0,ik,s]), 0) * w[h,t,s] ) + mask[ik,t,s%nem3]
+//
+// one invocation per kv row; workgroups tile (kv, token, stream)
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q { float     data_q[]; };
+layout(binding = 1) readonly buffer K { K_TYPE    data_k[]; };
+layout(binding = 2) readonly buffer W { float     data_w[]; };
+layout(binding = 3) readonly buffer M { float16_t data_m[]; };
+layout(binding = 4) writeonly buffer D { float    data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;    // q->ne[0]
+    uint n_head;    // q->ne[1]
+    uint n_kv;      // k->ne[2]
+    uint nem3;      // m->ne[3] (mask stream broadcast: s % nem3)
+    uint nbq1; uint nbq2; uint nbq3;    // q strides in elements
+    uint nbk2; uint nbk3;               // k strides in elements
+    uint nbw1; uint nbw3;               // w strides in elements
+    uint nbm1; uint nbm3;               // m strides in elements
+    uint nb1;  uint nb3;                // dst strides in elements
+};
+
+void main() {
+    const uint i_kv = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    const uint i_t  = gl_WorkGroupID.y; // token
+    const uint i_s  = gl_WorkGroupID.z; // stream
+
+    if (i_kv >= n_kv) {
+        return;
+    }
+
+    const uint k_base = i_kv * nbk2 + i_s * nbk3;
+    const uint w_base = i_t * nbw1 + i_s * nbw3;
+    const uint m_base = i_t * nbm1 + (i_s % nem3) * nbm3;
+
+    float score = 0.0f;
+
+    for (uint h = 0; h < n_head; ++h) {
+        const uint q_base = h * nbq1 + i_t * nbq2 + i_s * nbq3;
+
+        // dot product of q and k for head h
+        float qk = 0.0f;
+        for (uint e = 0; e < n_embd; ++e) {
+            qk += data_q[q_base + e] * float(data_k[k_base + e]);
+        }
+
+        // ReLU and weights (prescaled)
+        score += max(qk, 0.0f) * data_w[w_base + h];
+    }
+
+    // apply mask
+    data_d[i_t * nb1 + i_s * nb3 + i_kv] = score + float(data_m[m_base + i_kv]);
+}

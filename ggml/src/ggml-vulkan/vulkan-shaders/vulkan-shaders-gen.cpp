@@ -1136,6 +1136,9 @@ void process_shaders() {
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
 
+    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", {{"K_TYPE", "float"}});
+    string_to_spv("lightning_indexer_f16", "lightning_indexer.comp", {{"K_TYPE", "float16_t"}});
+
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
     for (auto &c : compiles) {
