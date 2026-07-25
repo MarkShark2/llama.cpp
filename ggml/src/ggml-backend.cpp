@@ -1608,7 +1608,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if ((sched->n_copies > 1 || (ggml_sched_pipedec_enabled() && sched->n_copies == 1)) &&
                     ggml_backend_buffer_is_host(input->buffer) &&
-                    split_backend->iface.set_tensor_async != NULL) {
+                    split_backend->iface.set_tensor_async != NULL &&
+                    strncmp(ggml_backend_name(split_backend), "RPC", 3) == 0) {
                     // [fork, PipeDec] an async set copies/stages the payload at call time
                     // (snapshot semantics) and is ordered behind the backend's previous
                     // graph on its stream, so no host-side synchronize is needed.
@@ -1617,6 +1618,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // lands on the dst stream behind the graph that last read that slot,
                     // so the event_synchronize + blocking copy below (which serialized
                     // the whole RPC pipeline per ubatch) is unnecessary.
+                    // RPC ONLY: the RPC async set snapshots the payload at enqueue.
+                    // CUDA's cudaMemcpyAsync from a pinned host buffer reads the
+                    // source when the DMA engine gets to it - by then the next
+                    // ubatch's set_inputs has rewritten the host tensor, poisoning
+                    // this ubatch's positions/masks (measured: warm pipelined
+                    // prefill was nondeterministic per request and diverged from
+                    // the sequential reference; local-backend inputs must take the
+                    // synchronized path below).
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
