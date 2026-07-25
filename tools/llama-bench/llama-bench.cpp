@@ -2273,8 +2273,9 @@ int llama_bench(int argc, char ** argv) {
                 fit_overrides.data(),
                 margins.data(),
                 inst.fit_min_ctx,
-                false,
-                false,
+                false,  // whole_layers
+                false,  // fill_rpc_first
+                false,  // cpu_moe
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
        }
 
