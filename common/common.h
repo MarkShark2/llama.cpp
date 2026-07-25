@@ -636,6 +636,12 @@ struct common_params {
     std::string cache_disk;              // directory to stream prompt-cache states and context checkpoints to (empty = keep them in RAM)
     int32_t cache_disk_limit_mib = 0;    // on-disk prompt cache size limit in MiB, 0 = no limit
 
+    // [fork, SPD] training-data collection: dump tapped per-layer hidden states
+    // of collect-enabled requests into shard files for offline SPD training
+    std::vector<int32_t> spd_collect_layers;      // layer-input taps (0 = embedding output, n_layer = pre-output-norm)
+    std::string          spd_collect_dir;         // spool directory for shard files (empty = collection disabled)
+    int32_t              spd_collect_shard_tokens = 131072; // rotate shards after this many collected tokens
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

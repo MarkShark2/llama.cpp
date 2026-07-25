@@ -82,6 +82,40 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         }));
 
 
+    // [fork, SPD] training-data collection opt-in
+    add((new field_bool("spd_collect", params.spd_collect))
+        ->set_desc("Collect this request's tapped prompt hidden states into the SPD training spool (requires --spd-collect-dir)"));
+
+    add((new field_str("spd_collect_id"))
+        ->set_desc("Sequence tag recorded in the SPD shard index for this request")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.spd_collect_id = data.at("spd_collect_id").get<std::string>();
+        }));
+
+    add((new field_json("spd_collect_labels"))
+        ->set_desc("Array of [start,end) prompt-token ranges that carry training loss (empty = all tokens)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.spd_collect_label_ranges.clear();
+            const auto it = data.find("spd_collect_labels");
+            if (it == data.end() || it->is_null()) {
+                return;
+            }
+            if (!it->is_array()) {
+                throw std::runtime_error("spd_collect_labels must be an array of [start, end) pairs");
+            }
+            for (const auto & range : *it) {
+                if (!range.is_array() || range.size() != 2) {
+                    throw std::runtime_error("spd_collect_labels entries must be [start, end) pairs");
+                }
+                const int32_t lo = range[0].get<int32_t>();
+                const int32_t hi = range[1].get<int32_t>();
+                if (lo < 0 || hi < lo) {
+                    throw std::runtime_error("spd_collect_labels entries must satisfy 0 <= start <= end");
+                }
+                ctx.params.spd_collect_label_ranges.emplace_back(lo, hi);
+            }
+        }));
+
     //
     // Sampling params
     //

@@ -1589,6 +1589,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--spd-collect-layers"}, "L0,L1,...",
+        "[fork, SPD] comma-separated layer-input taps to collect for SPD training "
+        "(0 = embedding output, n_layer = pre-output-norm trunk output)",
+        [](common_params & params, const std::string & value) {
+            params.spd_collect_layers.clear();
+            for (const auto & part : string_split<std::string>(value, ',')) {
+                params.spd_collect_layers.push_back(std::stoi(part));
+            }
+        }
+    ).set_env("LLAMA_ARG_SPD_COLLECT_LAYERS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spd-collect-dir"}, "DIR",
+        "[fork, SPD] spool directory for collected SPD training shards (empty = collection disabled)",
+        [](common_params & params, const std::string & value) {
+            params.spd_collect_dir = value;
+        }
+    ).set_env("LLAMA_ARG_SPD_COLLECT_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spd-collect-shard-tokens"}, "N",
+        string_format("[fork, SPD] rotate collection shards after N tokens (default: %d)", params.spd_collect_shard_tokens),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("spd-collect-shard-tokens must be positive");
+            }
+            params.spd_collect_shard_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SPD_COLLECT_SHARD_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
