@@ -2179,6 +2179,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         return value && atoi(value) != 0;
     }();
     const int64_t t_start = graph_trace ? ggml_time_us() : 0;
+    // [fork] idle accounting: how long this device sat with nothing to compute
+    // since the previous graph returned. With an absolute (epoch) stamp on
+    // every line, traces from several daemons can be merged to see whether the
+    // pipeline stages actually overlap or run one after another.
+    static int64_t t_prev_end = 0;
+    const double   t_wait_ms  = (graph_trace && t_prev_end) ? (t_start - t_prev_end) / 1000.0 : 0.0;
 
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -2261,15 +2267,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
     }
     if (graph_trace) {
+        const int64_t t_end = ggml_time_us();
+        const double  epoch = std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
         fprintf(stderr,
-                "[rpc graph] dev=%u nodes=%u tensors=%u parse=%.2fms build=%.2fms compute=%.2fms store=%.2fms total=%.2fms\n",
-                device, n_nodes, n_tensors,
+                "[rpc graph] t=%.3f dev=%u nodes=%u tensors=%u wait=%.2fms parse=%.2fms build=%.2fms compute=%.2fms store=%.2fms total=%.2fms\n",
+                epoch, device, n_nodes, n_tensors, t_wait_ms,
                 (t_parse   - t_start)   / 1000.0,
                 (t_build   - t_parse)   / 1000.0,
                 (t_compute - t_build)   / 1000.0,
-                (ggml_time_us() - t_compute) / 1000.0,
-                (ggml_time_us() - t_start)   / 1000.0);
+                (t_end     - t_compute) / 1000.0,
+                (t_end     - t_start)   / 1000.0);
         fflush(stderr);
+        t_prev_end = ggml_time_us();
     }
     return true;
 }
