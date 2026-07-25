@@ -14,6 +14,7 @@
 #include "../../src/llama-ext.h" // [fork, PipeDec] llama_pipedec_defer/abort
 #include "log.h"
 #include "sampling.h"
+#include "server-spd-collect.h"
 #include "spd-pipeline.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -188,6 +189,11 @@ struct server_slot {
     // deferred group from inside the draft loop (on_draft_token); the closing
     // decode carries only spec_draft[spec_deferred_drafts..]
     int32_t   spec_deferred_drafts = 0;
+
+    // [fork, SPD] training-data collection state for the current task
+    std::shared_ptr<server_spd_seq>          spd_seq;    // in-flight sequence (null = not collecting)
+    std::vector<llama_token>                 spd_tokens; // text prompt tokens for the shard record
+    std::vector<std::pair<int32_t, int32_t>> spd_rows;   // (global batch index, prompt pos) added this batch
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -371,6 +377,12 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // [fork, SPD] drop any incomplete collection sequence (a complete one
+        // was already handed to the collector and this pointer cleared)
+        spd_seq.reset();
+        spd_tokens.clear();
+        spd_rows.clear();
     }
 
     void init_sampler() const {
@@ -992,6 +1004,9 @@ private:
     bool spd_mode = false;
     std::unique_ptr<common_spd_pipeline> spd_pipeline;
 
+    // [fork, SPD] hidden-state collection for offline SPD training
+    std::unique_ptr<server_spd_collector> spd_collector;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1282,6 +1297,41 @@ private:
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        // [fork, SPD] hidden-state collection for offline SPD training
+        if (!params_base.spd_collect_dir.empty()) {
+            if (params_base.spd_collect_layers.empty()) {
+                SRV_ERR("%s", "--spd-collect-dir requires --spd-collect-layers\n");
+                return false;
+            }
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("%s", "SPD collection requires --parallel 1 (tap rows are batch-ordered)\n");
+                return false;
+            }
+            const int32_t n_layer = llama_model_n_layer(model_tgt);
+
+            std::vector<int32_t> taps = params_base.spd_collect_layers;
+            std::sort(taps.begin(), taps.end());
+            taps.erase(std::unique(taps.begin(), taps.end()), taps.end());
+            for (const int32_t tap : taps) {
+                if (tap < 0 || tap > n_layer) {
+                    SRV_ERR("invalid --spd-collect-layers entry %d (valid: 0..%d)\n", tap, n_layer);
+                    return false;
+                }
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) tap, true);
+            }
+
+            spd_collector = std::make_unique<server_spd_collector>(
+                    params_base.spd_collect_dir,
+                    taps,
+                    (uint32_t) llama_model_n_embd(model_tgt),
+                    (uint32_t) n_layer,
+                    params_base.model.path,
+                    params_base.spd_collect_shard_tokens);
+
+            SRV_INF("SPD collection enabled: %zu taps -> %s, shard rotation at %d tokens\n",
+                    taps.size(), params_base.spd_collect_dir.c_str(), params_base.spd_collect_shard_tokens);
+        }
 
         if (has_spec) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
@@ -1873,6 +1923,40 @@ private:
                 send_error(task, "SPD does not currently support LoRA adapters", ERROR_TYPE_NOT_SUPPORTED);
                 return false;
             }
+        }
+
+        // [fork, SPD] set up hidden-state collection for this request
+        if (task.params.spd_collect) {
+            if (!spd_collector) {
+                send_error(task, "SPD collection is not enabled on this server (--spd-collect-dir)", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (task.tokens.has_mtmd) {
+                send_error(task, "SPD collection does not support multimodal prompts", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (task.is_parent() || task.is_child()) {
+                send_error(task, "SPD collection supports one completion per request", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (task.tokens.empty()) {
+                send_error(task, "SPD collection requires a non-empty prompt", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            // every prompt token must be recomputed for its taps to exist
+            task.params.cache_prompt = false;
+
+            slot.spd_tokens = task.tokens.get_text_tokens();
+            slot.spd_seq    = spd_collector->begin_seq(
+                    task.params.spd_collect_id,
+                    (int32_t) slot.spd_tokens.size(),
+                    task.params.spd_collect_label_ranges);
+            slot.spd_rows.clear();
+        } else {
+            slot.spd_seq.reset();
+            slot.spd_tokens.clear();
+            slot.spd_rows.clear();
         }
 
         // process per-request lora adapters
@@ -3285,6 +3369,13 @@ private:
         // start populating the batch for this iteration
         batch.clear();
 
+        // [fork, SPD] row mappings refer to the batch being populated
+        if (spd_collector) {
+            iterate(slots, [](server_slot & slot) {
+                slot.spd_rows.clear();
+            });
+        }
+
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
@@ -3930,6 +4021,12 @@ private:
                             break;
                         }
 
+                        // [fork, SPD] remember which batch row carries which
+                        // prompt position for tap harvesting after the decode
+                        if (slot.spd_seq) {
+                            slot.spd_rows.emplace_back((int32_t) batch.size(), slot.prompt.n_tokens());
+                        }
+
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
@@ -4037,6 +4134,57 @@ private:
         }
     }
 
+    // [fork, SPD] copy this decode window's tap rows into the collecting
+    // slots' sequence buffers, then hand completed sequences to the shard
+    // writer. llama_get_embeddings_layer_inp synchronizes once per window -
+    // free here, since the pipeline cannot span llama_decode calls anyway.
+    void spd_harvest(int32_t off, int32_t n_view) {
+        if (!spd_collector) {
+            return;
+        }
+        const auto & taps = spd_collector->taps();
+        const size_t n_embd = (size_t) llama_model_n_embd(model_tgt);
+
+        for (auto & slot : slots) {
+            if (!slot.spd_seq || slot.spd_rows.empty()) {
+                continue;
+            }
+            const auto & rows = slot.spd_rows;
+
+            for (size_t t = 0; t < taps.size(); ++t) {
+                const float * base = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) taps[t]);
+                if (base == nullptr) {
+                    continue;
+                }
+                // harvest contiguous (batch row, prompt pos) runs inside this window
+                size_t i = 0;
+                while (i < rows.size()) {
+                    if (rows[i].first < off || rows[i].first >= off + n_view) {
+                        i++;
+                        continue;
+                    }
+                    size_t j = i + 1;
+                    while (j < rows.size() &&
+                           rows[j].first  == rows[j - 1].first  + 1 &&
+                           rows[j].second == rows[j - 1].second + 1 &&
+                           rows[j].first  <  off + n_view) {
+                        j++;
+                    }
+                    spd_collector->harvest(*slot.spd_seq, t,
+                            base + (size_t) (rows[i].first - off) * n_embd,
+                            rows[i].second, (int32_t) (j - i));
+                    i = j;
+                }
+            }
+
+            if (slot.spd_seq->complete()) {
+                spd_collector->end_seq(std::move(slot.spd_seq), std::move(slot.spd_tokens));
+                slot.spd_seq.reset();
+                slot.spd_tokens.clear();
+            }
+        }
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -4118,6 +4266,9 @@ private:
 
             return false; // retry with the updated n_batch
         }
+
+        // [fork, SPD] harvest hidden-state taps of this window's prompt rows
+        spd_harvest(off, batch_view.n_tokens);
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity

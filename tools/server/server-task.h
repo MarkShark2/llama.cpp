@@ -97,6 +97,11 @@ struct task_params {
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
+    // [fork, SPD] training-data collection (requires server --spd-collect-dir)
+    bool        spd_collect = false;
+    std::string spd_collect_id;                                        // sequence tag written to the shard index
+    std::vector<std::pair<int32_t, int32_t>> spd_collect_label_ranges; // [start,end) prompt-token ranges that carry loss (empty = all)
+
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;
 };

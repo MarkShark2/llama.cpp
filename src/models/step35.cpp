@@ -208,6 +208,10 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
+        // [fork, SPD] expose per-layer inputs so anchor hidden states can be
+        // captured via llama_set_embeddings_layer_inp (training collection)
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         const uint32_t n_head_l    = hparams.n_head(il);
@@ -294,7 +298,11 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        // [fork, SPD] when the final trunk hidden state is tapped for every
+        // token (embeddings_layer_inp[n_layer]), the last layer must keep all
+        // rows - skip the early output-row selection.
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked &&
+            !cparams.embeddings_layer_inp[n_layer]) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -352,6 +360,10 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     cur = inpL;
+
+    // [fork, SPD] index n_layer = pre-output-norm trunk output ("input to the
+    // output head"), tapped as the teacher feature for SPD training collection
+    res->t_layer_inp[n_layer] = cur;
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
