@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1224,6 +1226,63 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+// n_kv bucketing (LLAMA_KV_BUCKET), off by default.
+//
+// The default padding (256) makes n_kv step once per ubatch during chunked prefill, so
+// every ubatch produces a distinct graph shape: the client re-splits/re-allocates, the
+// gallocr compute buffer keeps growing (each growth drains a pipelined schedule), the
+// GET_ALLOC_SIZE shape cache misses, and the RPC servers' graph cache can never hit.
+// Bucketing coarsens n_kv so a whole prompt sweeps only a handful of shapes (or one).
+// The extra cells are masked out by set_input_kq_mask exactly like the existing padding,
+// so results are unchanged; the cost is attention work over the padded region.
+//
+//   unset / 0 / "off"  - upstream behaviour
+//   "pow2"             - round up to the next power of two
+//   "max" / "full"     - always the full cache size (single graph shape)
+//   <N>                - round up to a multiple of N
+enum class llama_kv_bucket_mode { OFF, POW2, FULL, MULTIPLE };
+
+struct llama_kv_bucket_cfg {
+    llama_kv_bucket_mode mode = llama_kv_bucket_mode::OFF;
+    uint32_t             step = 0;
+};
+
+static llama_kv_bucket_cfg llama_kv_bucket_get_cfg() {
+    static const llama_kv_bucket_cfg cfg = []() {
+        llama_kv_bucket_cfg c;
+
+        const char * env = getenv("LLAMA_KV_BUCKET");
+        if (env == nullptr || env[0] == '\0') {
+            return c;
+        }
+
+        const std::string v = env;
+
+        if (v == "0" || v == "off") {
+            // leave OFF
+        } else if (v == "pow2") {
+            c.mode = llama_kv_bucket_mode::POW2;
+        } else if (v == "max" || v == "full") {
+            c.mode = llama_kv_bucket_mode::FULL;
+        } else {
+            const long n = strtol(env, nullptr, 10);
+            if (n > 0) {
+                c.mode = llama_kv_bucket_mode::MULTIPLE;
+                c.step = (uint32_t) n;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring unrecognized LLAMA_KV_BUCKET='%s'\n", __func__, env);
+                return c;
+            }
+        }
+
+        LLAMA_LOG_WARN("%s: n_kv bucketing enabled (LLAMA_KV_BUCKET=%s)\n", __func__, env);
+
+        return c;
+    }();
+
+    return cfg;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -1231,10 +1290,42 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
+    const auto bucket = llama_kv_bucket_get_cfg();
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        uint32_t cur = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur));
+
+        switch (bucket.mode) {
+            case llama_kv_bucket_mode::OFF:
+                break;
+            case llama_kv_bucket_mode::FULL:
+                cur = (uint32_t) cells.size();
+                break;
+            case llama_kv_bucket_mode::POW2:
+                {
+                    uint32_t p = n_pad_cur;
+                    while (p < cur && p < (uint32_t) cells.size()) {
+                        p *= 2;
+                    }
+                    cur = p;
+                }
+                break;
+            case llama_kv_bucket_mode::MULTIPLE:
+                {
+                    // the bucket step must still respect the backend padding requirement
+                    const uint32_t step = std::max(bucket.step, n_pad_cur);
+                    cur = std::max(step, GGML_PAD(cur, step));
+                }
+                break;
+        }
+
+        // never exceed the cache size, and never drop below what the batch actually needs
+        cur = std::min((uint32_t) cells.size(), cur);
+        cur = std::max(cur, std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur)));
+
+        result = std::max(std::min((uint32_t) cells.size(), cur), result);
     }
 
     return result;
