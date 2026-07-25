@@ -1438,19 +1438,26 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
             send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, msg->data(), msg->size());
         });
     } else {
-        // host-visible source (CUDA/CPU): its async compute may still be running, so
-        // record an event on the source backend NOW (submission order) and have the
-        // dst stream wait for it before reading - the scheduler thread never blocks
+        // host-visible source (CUDA/CPU): the payload must be read on the SOURCE
+        // backend's ordered timeline. Reading it later (from the dst stream's
+        // thread, gated only on a completion event) is racy whenever another
+        // graph is submitted to the source backend in the meantime: under
+        // pipelined prefill (n_copies > 1) the next ubatch's graph reuses the
+        // same compute-buffer address and overwrites the boundary tensor,
+        // tearing the copy mid-payload (measured: warm pipelined prefill
+        // nondeterminism with a CUDA first stage). Enqueue the D2H on the
+        // source stream NOW - submission order puts it before any later
+        // graph's kernels - then let the dst stream wait until the source has
+        // actually produced it before shipping.
+        ggml_backend_tensor_get_async(backend_src, src, msg->data() + RPC_SET_TENSOR_HDR, 0, size);
         ggml_backend_event_t ev = rpc_src_event_record(backend_src);
-        ggml_tensor src_snap = *src; // struct snapshot; data/buffer stay valid on device
-        dst_stream->enqueue([dst_endpoint, msg, src_snap, size, ev, backend_src]() mutable {
+        dst_stream->enqueue([dst_endpoint, msg, ev, backend_src]() {
             if (ev != nullptr) {
                 ggml_backend_event_synchronize(ev);
                 rpc_src_event_release(ev);
             } else if (backend_src->iface.synchronize != nullptr) {
                 ggml_backend_synchronize(backend_src);
             }
-            ggml_backend_tensor_get(&src_snap, msg->data() + RPC_SET_TENSOR_HDR, 0, size);
             auto sock = get_socket(dst_endpoint);
             if (sock == nullptr) {
                 GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", dst_endpoint.c_str());
