@@ -162,14 +162,17 @@ public:
     }
 
     // hand a fully harvested sequence to the background writer.
-    // blocks briefly if the writer is more than a few sequences behind.
+    // blocks briefly if the writer is behind. queue depth 1: each queued seq
+    // holds n_tokens*n_taps*n_embd fp16 in host RAM (~830 MB at 15k-token
+    // packs), which a UMA collection head (BC-250) cannot spare 4x of; the
+    // writer outpaces collection anyway, so depth only bounds the worst case.
     void end_seq(std::shared_ptr<server_spd_seq> seq, std::vector<llama_token> tokens) {
         GGML_ASSERT(seq->complete());
         GGML_ASSERT((int32_t) tokens.size() == seq->n_tokens);
         seq->tokens = std::move(tokens);
 
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_room_.wait(lock, [this]() { return queue_.size() < 4 || stop_; });
+        cv_room_.wait(lock, [this]() { return queue_.size() < 1 || stop_; });
         if (stop_) {
             return;
         }
