@@ -2615,8 +2615,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
-    inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
-    inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+    // prefer the cache-resident rotation tensors; the input-tensor fallback is
+    // only used when the cache could not pre-allocate them (no_alloc/shared)
+    inp->self_k_rot = mctx_cur->has_dev_rot() ? nullptr : mctx_cur->build_input_k_rot(ctx0);
+    inp->self_v_rot = mctx_cur->has_dev_rot() ? nullptr : mctx_cur->build_input_v_rot(ctx0);
 
     return inp;
 }
@@ -2644,13 +2646,16 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    ggml_tensor * k_rot = inp->self_k_rot ? inp->self_k_rot : inp->mctx->dev_k_rot(il);
+    ggml_tensor * v_rot = inp->self_v_rot ? inp->self_v_rot : inp->mctx->dev_v_rot(il);
+
+    if (k_rot) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
     }
 
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    if (v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2680,8 +2685,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
@@ -2885,6 +2890,18 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
+    // fall back to the cache-resident rotation tensors when the inputs were
+    // skipped at graph-build time (see llama_kv_cache::dev_k_rot)
+    if (k_rot == nullptr || v_rot == nullptr) {
+        const auto * mctx_rot = is_swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+        if (k_rot == nullptr) {
+            k_rot = mctx_rot->dev_k_rot(il);
+        }
+        if (v_rot == nullptr) {
+            v_rot = mctx_rot->dev_v_rot(il);
+        }
+    }
+
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
@@ -3067,11 +3084,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
     }
 
-    inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
-    inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
+    // prefer the cache-resident rotation tensors (see llama_kv_cache::dev_k_rot)
+    inp->self_k_rot = mctx_cur->get_base()->has_dev_rot() ? nullptr : mctx_cur->get_base()->build_input_k_rot(ctx0);
+    inp->self_v_rot = mctx_cur->get_base()->has_dev_rot() ? nullptr : mctx_cur->get_base()->build_input_v_rot(ctx0);
 
-    inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
-    inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+    inp->self_k_rot_swa = mctx_cur->get_swa()->has_dev_rot() ? nullptr : mctx_cur->get_swa()->build_input_k_rot(ctx0);
+    inp->self_v_rot_swa = mctx_cur->get_swa()->has_dev_rot() ? nullptr : mctx_cur->get_swa()->build_input_v_rot(ctx0);
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
