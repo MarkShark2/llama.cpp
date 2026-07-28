@@ -206,6 +206,16 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // pre-allocated per-buffer-type hadamard rotation tensors, written once at
+    // construction. Graph builders reference these like weights, so the
+    // constant matrices are not treated as volatile graph inputs (which the
+    // scheduler re-uploads to RPC backends on every decode - 1.3 MB/step/board).
+    // Returns null when unavailable (rot disabled, shared-cell cache, no_alloc
+    // estimation, or layer not covered) - callers fall back to the input path.
+    ggml_tensor * dev_k_rot(int32_t il) const;
+    ggml_tensor * dev_v_rot(int32_t il) const;
+    bool has_dev_rot() const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -255,6 +265,14 @@ private:
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // per-buffer-type device-resident hadamard tensors (see dev_k_rot/dev_v_rot)
+    std::unordered_map<ggml_backend_buffer_type_t, ggml_tensor *> dev_rot_k_map;
+    std::unordered_map<ggml_backend_buffer_type_t, ggml_tensor *> dev_rot_v_map;
+    bool dev_rot_ready = false;
+
+    int64_t attn_rot_nrot_k() const;
+    int64_t attn_rot_nrot_v() const;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -388,6 +406,11 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // device-resident constant rotation tensors (see llama_kv_cache::dev_k_rot)
+    ggml_tensor * dev_k_rot(int32_t il) const;
+    ggml_tensor * dev_v_rot(int32_t il) const;
+    bool has_dev_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
