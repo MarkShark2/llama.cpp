@@ -80,6 +80,11 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_GRAPH_FORGET,
+    // bf16 wire compression for f32 activations (GGML_RPC_WIRE_BF16=1):
+    // same semantics as SET_TENSOR / GET_TENSOR but the wire payload is bf16
+    // (half the bytes); the server expands/truncates at the buffer edge.
+    RPC_CMD_SET_TENSOR_BF16,
+    RPC_CMD_GET_TENSOR_BF16,
     RPC_CMD_COUNT,
 };
 
@@ -1343,6 +1348,42 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor(
     return msg;
 }
 
+// bf16 wire compression (GGML_RPC_WIRE_BF16=1): halves the wire bytes of
+// ASYNC f32 tensor traffic - pipeline stage-boundary activations, INPUT
+// staging (KQ masks), and deferred tap/embedding reads. Load-time weight
+// uploads go through the synchronous buffer interface and are never
+// compressed. bf16 keeps the f32 exponent (8 mantissa bits), so large
+// activations can never overflow the way IEEE f16 would.
+static bool rpc_wire_bf16_enabled() {
+    static const bool on = []() {
+        const char * e = std::getenv("GGML_RPC_WIRE_BF16");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
+static bool rpc_wire_bf16_ok(const ggml_tensor * tensor, uint64_t offset, size_t size) {
+    return rpc_wire_bf16_enabled()
+        && tensor->type == GGML_TYPE_F32
+        && offset % sizeof(float) == 0
+        && size   % sizeof(float) == 0
+        && size >= 4096; // tiny messages are latency-bound, not bandwidth-bound
+}
+
+static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
+        const ggml_tensor * tensor, const void * data, uint64_t offset, size_t size) {
+    rpc_tensor rt = serialize_tensor(tensor);
+    auto msg = std::make_shared<std::vector<uint8_t>>(RPC_SET_TENSOR_HDR + size / 2);
+    memcpy(msg->data(), &rt, sizeof(rt));
+    memcpy(msg->data() + sizeof(rt), &offset, sizeof(offset));
+    if (data != nullptr) {
+        ggml_fp32_to_bf16_row((const float *) data,
+                              (ggml_bf16_t *) (msg->data() + RPC_SET_TENSOR_HDR),
+                              size / sizeof(float));
+    }
+    return msg;
+}
+
 // pool of events recorded on a source backend at enqueue time (i.e. in submission
 // order, right after that backend's graph_compute was submitted) so a stream worker
 // can wait for the source's async compute to finish before reading its output buffer.
@@ -1397,15 +1438,18 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     // snapshot the full wire message now: the caller may reuse `data` (and the graph
     // may rewrite `tensor`) once we return
-    auto msg = rpc_prepare_set_tensor(tensor, data, offset, size);
+    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
+    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(tensor, data, offset, size)
+                         : rpc_prepare_set_tensor(tensor, data, offset, size);
     const std::string endpoint = rpc_ctx->endpoint;
-    get_stream(endpoint)->enqueue([endpoint, msg]{
+    get_stream(endpoint)->enqueue([endpoint, msg, wire_bf16]{
         auto sock = get_socket(endpoint);
         if (sock == nullptr) {
             GGML_LOG_ERROR("[rpc set_tensor_async] lost connection to %s\n", endpoint.c_str());
             return;
         }
-        send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, msg->data(), msg->size());
+        send_rpc_cmd(sock, wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR,
+                     msg->data(), msg->size());
     });
 }
 
@@ -1428,6 +1472,22 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     request.offset = offset;
     request.size   = size;
     const std::string endpoint = rpc_ctx->endpoint;
+    if (rpc_wire_bf16_ok(tensor, offset, size)) {
+        get_stream(endpoint)->enqueue([endpoint, request, data, size]{
+            auto sock = get_socket(endpoint);
+            if (sock == nullptr) {
+                GGML_LOG_ERROR("[rpc get_tensor_async] lost connection to %s\n", endpoint.c_str());
+                return;
+            }
+            std::vector<uint8_t> wire(size / 2);
+            if (send_rpc_cmd(sock, RPC_CMD_GET_TENSOR_BF16, &request, sizeof(request),
+                             wire.data(), wire.size())) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
+                                      (float *) data, size / sizeof(float));
+            }
+        });
+        return;
+    }
     get_stream(endpoint)->enqueue([endpoint, request, data, size]{
         auto sock = get_socket(endpoint);
         if (sock != nullptr) {
@@ -1449,8 +1509,13 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     const size_t size = ggml_nbytes(src);
     rpc_stream * dst_stream = get_stream(dst_ctx->endpoint);
     const std::string dst_endpoint = dst_ctx->endpoint;
+    // bf16 wire: the boundary payload stays 2-byte end-to-end through the
+    // star hairpin (GET_BF16 from the source lands directly in the SET_BF16
+    // message) - both legs halve with no client-side conversion at all
+    const bool wire_bf16 = rpc_wire_bf16_ok(src, 0, size) && dst->type == GGML_TYPE_F32;
     // snapshot the SET message header now; the payload is filled in by the tasks below
-    auto msg = rpc_prepare_set_tensor(dst, nullptr, 0, size);
+    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(dst, nullptr, 0, size)
+                         : rpc_prepare_set_tensor(dst, nullptr, 0, size);
 
     if (ggml_backend_buffer_is_rpc(src->buffer)) {
         // RPC -> RPC (star topology): read on the source stream (the server's FIFO
@@ -1464,23 +1529,51 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         get_req.offset = 0;
         get_req.size   = size;
         auto gate = std::make_shared<rpc_gate>();
-        src_stream->enqueue([src_endpoint, get_req, msg, size, gate]{
+        src_stream->enqueue([src_endpoint, get_req, msg, size, gate, wire_bf16]{
             auto sock = get_socket(src_endpoint);
             if (sock != nullptr) {
-                send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &get_req, sizeof(get_req), msg->data() + RPC_SET_TENSOR_HDR, size);
+                if (wire_bf16) {
+                    send_rpc_cmd(sock, RPC_CMD_GET_TENSOR_BF16, &get_req, sizeof(get_req), msg->data() + RPC_SET_TENSOR_HDR, size / 2);
+                } else {
+                    send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &get_req, sizeof(get_req), msg->data() + RPC_SET_TENSOR_HDR, size);
+                }
             } else {
                 GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", src_endpoint.c_str());
             }
             gate->set();
         });
-        dst_stream->enqueue([dst_endpoint, msg, gate]{
+        dst_stream->enqueue([dst_endpoint, msg, gate, wire_bf16]{
             gate->wait();
             auto sock = get_socket(dst_endpoint);
             if (sock == nullptr) {
                 GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", dst_endpoint.c_str());
                 return;
             }
-            send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, msg->data(), msg->size());
+            send_rpc_cmd(sock, wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR,
+                         msg->data(), msg->size());
+        });
+    } else if (wire_bf16) {
+        // host-visible source with bf16 wire: stage the f32 read separately,
+        // truncate to bf16 on the dst stream after the source compute is done
+        auto staging = std::make_shared<std::vector<uint8_t>>(size);
+        ggml_backend_tensor_get_async(backend_src, src, staging->data(), 0, size);
+        ggml_backend_event_t ev = rpc_src_event_record(backend_src);
+        dst_stream->enqueue([dst_endpoint, msg, staging, size, ev, backend_src]() {
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize(ev);
+                rpc_src_event_release(ev);
+            } else if (backend_src->iface.synchronize != nullptr) {
+                ggml_backend_synchronize(backend_src);
+            }
+            ggml_fp32_to_bf16_row((const float *) staging->data(),
+                                  (ggml_bf16_t *) (msg->data() + RPC_SET_TENSOR_HDR),
+                                  size / sizeof(float));
+            auto sock = get_socket(dst_endpoint);
+            if (sock == nullptr) {
+                GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", dst_endpoint.c_str());
+                return;
+            }
+            send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_BF16, msg->data(), msg->size());
         });
     } else {
         // host-visible source (CUDA/CPU): the payload must be read on the SOURCE
@@ -1689,8 +1782,10 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_bf16(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+    bool get_tensor_bf16(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -2003,6 +2098,98 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     ifs.read((char *)data.data(), size);
     // bump the mtime so LRU eviction sees this entry as recently used
     fs::last_write_time(cache_file, fs::file_time_type::clock::now(), ec);
+    return true;
+}
+
+bool rpc_server::set_tensor_bf16(const std::vector<uint8_t> & input) {
+    // serialization format: | rpc_tensor | offset (8 bytes) | bf16 data (size/2 bytes) |
+    // expands to f32 at the buffer edge; never used for weight loads (async-only)
+    cache_pending = false; // activations are never cache candidates
+    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    uint64_t offset;
+    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
+    const size_t wire_size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    const size_t size = wire_size * 2; // f32 bytes written to the tensor
+
+    if (in_tensor->type != GGML_TYPE_F32 || wire_size % sizeof(ggml_bf16_t) != 0) {
+        GGML_LOG_ERROR("[%s] bf16 wire payload for non-f32 tensor or odd size\n", __func__);
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    // sanitize tensor->data
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor->data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
+    const ggml_bf16_t * data = (const ggml_bf16_t *)(input.data() + sizeof(rpc_tensor) + sizeof(offset));
+    std::vector<float> tmp(wire_size / sizeof(ggml_bf16_t));
+    ggml_bf16_to_fp32_row(data, tmp.data(), (int64_t) tmp.size());
+    ggml_backend_tensor_set(tensor, tmp.data(), offset, size);
+    return true;
+}
+
+bool rpc_server::get_tensor_bf16(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+    // request offset/size describe the f32 region; the response is bf16 (size/2)
+    if (request.tensor.type != GGML_TYPE_F32 || request.size % sizeof(float) != 0) {
+        GGML_LOG_ERROR("[%s] bf16 wire read of non-f32 tensor or odd size\n", __func__);
+        return false;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    // sanitize tensor->data
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (request.tensor.data + request.offset < p0 ||
+            request.tensor.data + request.offset >= p1 ||
+            request.size > (p1 - request.tensor.data - request.offset)) {
+                GGML_LOG_ERROR("[%s] requested tensor region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
+                               __func__, request.tensor.data, request.offset, request.size, p0, p1);
+                return false;
+        }
+    }
+
+    std::vector<float> tmp(request.size / sizeof(float));
+    ggml_backend_tensor_get(tensor, tmp.data(), request.offset, request.size);
+    response.resize(request.size / 2);
+    ggml_fp32_to_bf16_row(tmp.data(), (ggml_bf16_t *) response.data(), (int64_t) tmp.size());
     return true;
 }
 
@@ -2552,6 +2739,30 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_BF16: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_bf16(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_TENSOR_BF16: {
+                rpc_msg_get_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.get_tensor_bf16(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
