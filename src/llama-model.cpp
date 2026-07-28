@@ -2249,6 +2249,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+                        // each SPD stage context caches only its own target layers
+                        filter = [start = cparams.spd_layer_start,
+                                  end   = cparams.spd_layer_end](uint32_t il) {
+                            return il >= start && il < end;
+                        };
+                    }
+
                     if (mtp_on_hybrid_qwen35) {
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
@@ -2653,8 +2661,12 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
-        case LLM_ARCH_SPD:
             return LLAMA_ROPE_TYPE_IMROPE;
+
+        case LLM_ARCH_SPD:
+            // qwen35-style sidecars carry rope dimension sections; sidecars
+            // trained against standard-rope targets (gemma4) omit them
+            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_IMROPE : LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_GLM4:
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;

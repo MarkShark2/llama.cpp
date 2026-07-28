@@ -179,11 +179,49 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const bool is_spd_stage = params.gtype == LLM_GRAPH_TYPE_SPD_STAGE;
+    const bool is_spd_head  = params.gtype == LLM_GRAPH_TYPE_SPD_HEAD;
+    const bool is_spd_embed = params.gtype == LLM_GRAPH_TYPE_SPD_EMBED;
+
     inpL = build_inp_embd(model.tok_embd);
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
     inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
     cb(inpL, "inp_scaled", -1);
+
+    if (is_spd_embed) {
+        // SPD anchor 0 is the layer-0 input, i.e. the scaled token embedding
+        res->t_embd = inpL;
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
+
+    if (is_spd_head) {
+        // pre-output-norm trunk hidden -> final norm -> lm_head (+ softcap/bias)
+        cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur, model.output_s);
+
+        if (hparams.f_final_logit_softcapping) {
+            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+            cur = ggml_tanh(ctx0, cur);
+            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        }
+
+        if (!model.vocab.get_suppress_tokens().empty()) {
+            auto inp_bias = std::make_unique<llm_graph_input_logits_bias>(model.vocab);
+            inp_bias->logits_bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, inp_bias->arr.size());
+            cur = ggml_add(ctx0, cur, inp_bias->logits_bias);
+            res->add_input(std::move(inp_bias));
+        }
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -195,12 +233,16 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // gathers output rows. Do not register an unused out_ids input: unused
     // graph inputs are intentionally not allocated, but set_inputs() would
     // still attempt to populate one if it were registered here.
-    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+    ggml_tensor * inp_out_ids = (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY || is_spd_stage)
             ? nullptr
             : build_inp_out_ids();
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
+        // per-layer token embeddings need token ids at every layer, but SPD
+        // stage contexts past stage 0 receive hidden states instead - the
+        // E2B/E4B variants that carry them cannot be staged
+        GGML_ASSERT(!is_spd_stage && "SPD stages are unsupported with per-layer token embeddings");
         inp_per_layer = build_inp_per_layer();
         ggml_build_forward_expand(gf, inp_per_layer);
 
@@ -208,7 +250,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
-    for (int il = 0; il < n_layer; ++il) {
+    const int layer_start = is_spd_stage ? cparams.spd_layer_start : 0;
+    const int layer_end   = is_spd_stage ? cparams.spd_layer_end   : n_layer;
+
+    for (int il = layer_start; il < layer_end; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
 
@@ -410,6 +455,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    if (is_spd_stage) {
+        cb(cur, "spd_stage_output", -1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    // [fork, SPD] index n_layer = pre-output-norm trunk output ("input to the
+    // output head"), tapped as the teacher feature for SPD training collection
+    res->t_layer_inp[n_layer] = cur;
 
     cur = build_norm(cur,
             model.output_norm, nullptr,

@@ -4198,8 +4198,8 @@ llama_context * llama_init_from_model(
     if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
-        model->arch != LLM_ARCH_QWEN35) {
-        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 model\n", __func__);
+        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_GEMMA4) {
+        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 or Gemma 4 model\n", __func__);
         return nullptr;
     }
 

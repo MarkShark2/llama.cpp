@@ -53,7 +53,10 @@ private:
 
 void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
+    // qwen35-style sidecars carry rope sections (IMROPE); gemma4-style
+    // sidecars use standard NEOX rope and omit them
+    hparams.rope_sections.fill(0);
+    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
     ml.get_key(LLM_KV_SPD_CHECKPOINT_VERSION, checkpoint_version);
     ml.get_key(LLM_KV_SPD_STAGE_COUNT, stage_count);
     ml.get_key(LLM_KV_SPD_USE_DEEPEST, use_deepest);
@@ -163,12 +166,21 @@ llama_model_spd::graph::graph(const llama_model & model, const llm_graph_params 
 
         Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-        Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
-        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
+        if (hparams.use_mrope()) {
+            Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+        } else {
+            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+        }
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);

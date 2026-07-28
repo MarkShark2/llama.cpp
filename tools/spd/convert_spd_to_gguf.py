@@ -84,14 +84,18 @@ def add_checkpoint_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tens
     )
 
 
+SUPPORTED_TARGET_ARCHS = ("qwen35", "gemma4")
+
+
 def validate_checkpoint(
     config: dict[str, Any],
     state_dict: dict[str, torch.Tensor],
     target: gguf.GGUFReader,
 ) -> dict[str, int | float | list[int] | bool | str]:
     target_arch = str(field_value(target, "general.architecture"))
-    if target_arch != "qwen35":
-        raise ValueError(f"SPD checkpoint requires a qwen35 target GGUF, got {target_arch!r}")
+    if target_arch not in SUPPORTED_TARGET_ARCHS:
+        raise ValueError(
+            f"SPD checkpoint requires a target GGUF with one of {SUPPORTED_TARGET_ARCHS}, got {target_arch!r}")
 
     version = int(config["version"])
     if version != SUPPORTED_CHECKPOINT_VERSION:
@@ -142,6 +146,22 @@ def validate_checkpoint(
     if anchors[0] != 0 or anchors[-1] >= trunk_blocks:
         raise ValueError(f"invalid SPD anchors for {trunk_blocks} target trunk blocks: {anchors}")
 
+    stage_layers = config.get("stage_layers")
+    if stage_layers is not None:
+        stage_layers = [int(x) for x in stage_layers]
+        if sum(stage_layers) != trunk_blocks:
+            raise ValueError(
+                f"checkpoint stage_layers {stage_layers} do not sum to the target trunk ({trunk_blocks})")
+        if len(set(stage_layers)) != 1:
+            raise ValueError(
+                f"the fork SPD decode path requires uniform stages, got stage_layers {stage_layers}")
+        bounds = [0]
+        for count in stage_layers[:-1]:
+            bounds.append(bounds[-1] + count)
+        if anchors != bounds[: len(anchors)]:
+            raise ValueError(
+                f"aggr_feature_bound {anchors} does not match stage boundaries {bounds}")
+
     for index in range(num_aggr_types):
         key = f"aggr_projs.{index}.weight"
         expected = (hidden_size, hidden_size * (index + 1))
@@ -187,7 +207,8 @@ def validate_checkpoint(
     }
 
 
-def convert(checkpoint_path: Path, target_path: Path, output_path: Path) -> None:
+def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
+            assets_path: Path | None = None) -> None:
     LOGGER.info("Loading SPD checkpoint: %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict) or set(checkpoint) != {"config", "state_dict"}:
@@ -201,6 +222,22 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path) -> None
     target = gguf.GGUFReader(target_path)
     meta = validate_checkpoint(config, state_dict, target)
 
+    if assets_path is not None:
+        # Training computes spec logits as lm_head(target_final_norm(g0)); the
+        # fork sidecar graph has no norm before its output head. RMS norm's
+        # per-row 1/rms scalar cannot change the argmax, but the elementwise
+        # norm weight can - fold it into the output weight so greedy drafts
+        # match training exactly.
+        assets = torch.load(assets_path, map_location="cpu", weights_only=False)
+        norm_w = assets["final_norm.weight"].to(torch.float32)
+        head_w = state_dict["lm_head.weight"]
+        if norm_w.ndim != 1 or norm_w.shape[0] != head_w.shape[1]:
+            raise ValueError(
+                f"assets final_norm.weight shape {tuple(norm_w.shape)} does not match "
+                f"lm_head.weight {tuple(head_w.shape)}")
+        state_dict["lm_head.weight"] = head_w.to(torch.float32) * norm_w.unsqueeze(0)
+        LOGGER.info("folded the target final-norm weight into output.weight (argmax-preserving)")
+
     LOGGER.info(
         "Validated SPD v%s: %s stages x %s target blocks, %s speculative layers, %s aggregation types",
         meta["version"],
@@ -210,28 +247,45 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path) -> None
         meta["num_aggr_types"],
     )
 
+    target_arch = str(meta["target_arch"])
+    spec_attn = config.get("spec_attn")
+
     writer = gguf.GGUFWriter(output_path, SPD_ARCH, use_temp_file=True)
-    writer.add_name(f"Qwen3.5 SPD s{meta['num_stages']} l{meta['num_spec_layers']}")
+    writer.add_name(f"{target_arch} SPD s{meta['num_stages']} l{meta['num_spec_layers']}")
     writer.add_type(gguf.GGUFType.MODEL)
     writer.add_file_type(gguf.LlamaFileType.MOSTLY_BF16)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
     writer.add_vocab_size(int(meta["target_vocab_size"]))
-    writer.add_context_length(int(field_value(target, "qwen35.context_length")))
+    writer.add_context_length(int(field_value(target, f"{target_arch}.context_length")))
     writer.add_embedding_length(int(meta["hidden_size"]))
     writer.add_block_count(int(meta["num_spec_layers"]))
-    writer.add_feed_forward_length(int(field_value(target, "qwen35.feed_forward_length")))
     writer.add_expert_count(int(meta["num_aggr_types"]))
     writer.add_expert_used_count(1)
-    writer.add_head_count(int(field_value(target, "qwen35.attention.head_count")))
-    writer.add_head_count_kv(int(field_value(target, "qwen35.attention.head_count_kv")))
-    writer.add_key_length(int(field_value(target, "qwen35.attention.key_length")))
-    writer.add_value_length(int(field_value(target, "qwen35.attention.value_length")))
-    writer.add_layer_norm_rms_eps(float(field_value(target, "qwen35.attention.layer_norm_rms_epsilon")))
-    writer.add_rope_dimension_count(int(field_value(target, "qwen35.rope.dimension_count")))
-    writer.add_rope_dimension_sections(
-        [int(value) for value in field_value(target, "qwen35.rope.dimension_sections")]
-    )
-    writer.add_rope_freq_base(float(field_value(target, "qwen35.rope.freq_base")))
+    if spec_attn is not None:
+        # spd-train checkpoints carry the speculation module's own attention
+        # geometry (independent of the target's); standard NEOX rope, no
+        # dimension sections
+        writer.add_feed_forward_length(int(spec_attn["intermediate_size"]))
+        writer.add_head_count(int(spec_attn["num_heads"]))
+        writer.add_head_count_kv(int(spec_attn["num_kv_heads"]))
+        writer.add_key_length(int(spec_attn["head_dim"]))
+        writer.add_value_length(int(spec_attn["head_dim"]))
+        writer.add_layer_norm_rms_eps(float(spec_attn["rms_norm_eps"]))
+        writer.add_rope_dimension_count(int(spec_attn["head_dim"]))
+        writer.add_rope_freq_base(float(spec_attn["rope_theta"]))
+    else:
+        # reference qwen35 checkpoints mirror the target's attention geometry
+        writer.add_feed_forward_length(int(field_value(target, f"{target_arch}.feed_forward_length")))
+        writer.add_head_count(int(field_value(target, f"{target_arch}.attention.head_count")))
+        writer.add_head_count_kv(int(field_value(target, f"{target_arch}.attention.head_count_kv")))
+        writer.add_key_length(int(field_value(target, f"{target_arch}.attention.key_length")))
+        writer.add_value_length(int(field_value(target, f"{target_arch}.attention.value_length")))
+        writer.add_layer_norm_rms_eps(float(field_value(target, f"{target_arch}.attention.layer_norm_rms_epsilon")))
+        writer.add_rope_dimension_count(int(field_value(target, f"{target_arch}.rope.dimension_count")))
+        writer.add_rope_dimension_sections(
+            [int(value) for value in field_value(target, f"{target_arch}.rope.dimension_sections")]
+        )
+        writer.add_rope_freq_base(float(field_value(target, f"{target_arch}.rope.freq_base")))
     writer.add_target_layers(meta["anchors"])  # type: ignore[arg-type]
     writer.add_target_hidden_size(int(meta["hidden_size"]))
     writer.add_spd_checkpoint_version(int(meta["version"]))
@@ -275,10 +329,13 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path) -> None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert an SPD v11 PyTorch sidecar checkpoint to BF16 GGUF")
-    parser.add_argument("checkpoint", type=Path, help="Qwen3.5 SPD .pt checkpoint")
-    parser.add_argument("target_gguf", type=Path, help="matching Qwen3.5 target GGUF")
+    parser.add_argument("checkpoint", type=Path, help="SPD speculation-head .pt checkpoint")
+    parser.add_argument("target_gguf", type=Path, help="matching target GGUF")
     parser.add_argument("--outfile", type=Path, help="output GGUF path")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
+    parser.add_argument("--assets", type=Path, default=None,
+                        help="spd-train assets .pt; folds the target final-norm weight "
+                             "into output.weight (required for spd-train checkpoints)")
     return parser.parse_args()
 
 
@@ -298,8 +355,10 @@ def main() -> None:
         raise FileNotFoundError(target)
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"output already exists: {output}; pass --overwrite to replace it")
+    if args.assets is not None and not args.assets.is_file():
+        raise FileNotFoundError(args.assets)
 
-    convert(checkpoint, target, output)
+    convert(checkpoint, target, output, assets_path=args.assets)
 
 
 if __name__ == "__main__":
