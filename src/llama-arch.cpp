@@ -868,7 +868,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
-    {LLM_TENSOR_SPD_AGGR,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT_ID}},
+    // the stacked per-pattern FC bank is the bulk of an SPD sidecar and runs
+    // mul_mat_id every speculation step - it must live on the output device,
+    // not in the host input-layer buffer (24 ms/step on CPU vs ~1 ms on GPU)
+    {LLM_TENSOR_SPD_AGGR,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT_ID}},
     // dspark
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},

@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -26,6 +28,14 @@ using clock_type = std::chrono::steady_clock;
 double seconds_since(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
 }
+
+struct scope_timer {
+    double & total;
+    clock_type::time_point start;
+
+    explicit scope_timer(double & total) : total(total), start(clock_type::now()) {}
+    ~scope_timer() { total += seconds_since(start); }
+};
 
 int32_t argmax(const float * logits, int32_t n_vocab) {
     int32_t result = 0;
@@ -286,11 +296,40 @@ struct common_spd_pipeline::impl {
     bool ready = false;
     bool used = false;
     bool static_decode_fast_path = true;
+    bool light_rollback = false;
+    bool timing_enabled = false;
+
+    struct phase_timing {
+        double prepare = 0.0;
+        double stage_wall = 0.0;
+        double sidecar_extra = 0.0;
+        double head = 0.0;
+        double embed = 0.0;
+        double rollback = 0.0;
+        double step_total = 0.0;
+        double sidecar_run = 0.0;
+        uint64_t head_calls = 0;
+        uint64_t embed_calls = 0;
+        uint64_t sidecar_calls = 0;
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_busy = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_lock = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_decode = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_read = {};
+        std::array<uint64_t, SPD_MAX_STAGE_COUNT> stage_calls = {};
+        // busy time and call count bucketed by how many stages ran in the step
+        std::array<std::array<double, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> busy_by_active = {};
+        std::array<std::array<uint64_t, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> calls_by_active = {};
+    };
+    phase_timing timing;
+    size_t timing_active_count = 0;
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params)
         : model_target(model_target), model_spd(model_spd), params(params) {
         if (const char * value = std::getenv("LLAMA_SPD_STATIC_DECODE")) {
             static_decode_fast_path = std::atoi(value) != 0;
+        }
+        if (const char * value = std::getenv("LLAMA_SPD_TIMING")) {
+            timing_enabled = std::atoi(value) != 0;
         }
         initialize();
     }
@@ -399,6 +438,18 @@ struct common_spd_pipeline::impl {
             return;
         }
 
+        // Attention KV entries are position-addressed, so a rejection can rewind
+        // a stage with llama_memory_seq_rm alone (rollback depth is at most
+        // stage_count - 1 and the iswa cache keeps n_ubatch slack past the SWA
+        // window). Recurrent/hybrid targets mutate state in place and still need
+        // the cross-stream checkpoint copies.
+        light_rollback = !llama_model_is_recurrent(model_target) && !llama_model_is_hybrid(model_target);
+        if (const char * value = std::getenv("LLAMA_SPD_SEQCP_ROLLBACK")) {
+            if (std::atoi(value) != 0) {
+                light_rollback = false;
+            }
+        }
+
         n_embd = llama_model_n_embd(model_target);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_target));
         n_layers = llama_model_n_layer(model_target);
@@ -479,13 +530,15 @@ struct common_spd_pipeline::impl {
             cp.ctx_type = LLAMA_CONTEXT_TYPE_SPD_STAGE;
             cp.spd_stage = stage;
             cp.spd_stage_count = stage_count;
-            cp.n_seq_max = stage_count;
-            // llama_context derives n_ctx_seq by dividing total n_ctx by
-            // n_seq_max. SPD uses the extra sequence IDs as rollback aliases,
-            // but seq 0 must still retain the caller-requested context length.
-            // Without this expansion an 8192-token SPD context silently became
-            // an effective 1024-token context and diverged on longer prompts.
-            cp.n_ctx = params.n_ctx*stage_count;
+            if (!light_rollback) {
+                cp.n_seq_max = stage_count;
+                // llama_context derives n_ctx_seq by dividing total n_ctx by
+                // n_seq_max. SPD uses the extra sequence IDs as rollback aliases,
+                // but seq 0 must still retain the caller-requested context length.
+                // Without this expansion an 8192-token SPD context silently became
+                // an effective 1024-token context and diverged on longer prompts.
+                cp.n_ctx = params.n_ctx*stage_count;
+            }
             // Keep seq 0 on the same per-sequence KV layout as an ordinary
             // target context. Rollback snapshots use seq_cp aliases and do not
             // require a unified cache; forcing one changes long-context target
@@ -579,13 +632,20 @@ struct common_spd_pipeline::impl {
             std::vector<float> & output,
             const std::vector<std::pair<size_t, std::vector<float> *>> & anchor_outputs,
             std::string & error,
-            batch_storage * reusable_storage = nullptr) {
+            batch_storage * reusable_storage = nullptr,
+            double * t_decode = nullptr,
+            double * t_read = nullptr) {
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
         storage.set(n_tokens, tokens, embeddings, n_embd, target_n_pos_per_embd, first_pos, true);
+        const auto decode_start = clock_type::now();
         if (llama_decode(stages[stage], storage.batch) != 0) {
             error = "target SPD stage " + std::to_string(stage) + " decode failed";
             return false;
+        }
+        const auto read_start = clock_type::now();
+        if (t_decode != nullptr) {
+            *t_decode += std::chrono::duration<double>(read_start - decode_start).count();
         }
 
         const float * result = llama_get_embeddings(stages[stage]);
@@ -605,10 +665,14 @@ struct common_spd_pipeline::impl {
             }
             item.second->assign(data, data + (size_t) n_tokens*n_embd);
         }
+        if (t_read != nullptr) {
+            *t_read += seconds_since(read_start);
+        }
         return true;
     }
 
     bool embed_token(llama_token token, std::vector<float> & output) {
+        const auto start = clock_type::now();
         batch_storage local_storage;
         batch_storage & storage = static_decode_fast_path ? embed_decode_batch : local_storage;
         storage.set(1, &token, nullptr, 0, target_n_pos_per_embd, 0, true);
@@ -622,10 +686,14 @@ struct common_spd_pipeline::impl {
             return false;
         }
         output.assign(data, data + n_embd);
+        timing.embed += seconds_since(start);
+        ++timing.embed_calls;
         return true;
     }
 
     bool target_head(const std::vector<float> & hidden, llama_token & token) {
+        scope_timer head_timer(timing.head);
+        ++timing.head_calls;
         batch_storage local_storage;
         batch_storage & storage = static_decode_fast_path ? head_decode_batch : local_storage;
         storage.set(1, nullptr, hidden.data(), n_embd, target_n_pos_per_embd, 0, true);
@@ -809,6 +877,8 @@ struct common_spd_pipeline::impl {
     }
 
     bool run_speculation(const speculation_input & input, llama_token & sampled) {
+        scope_timer sidecar_timer(timing.sidecar_run);
+        ++timing.sidecar_calls;
         if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, input.min_pos, -1)) {
             fail("failed to crop SPD sidecar cache at position " + std::to_string(input.min_pos));
             return false;
@@ -832,6 +902,18 @@ struct common_spd_pipeline::impl {
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const llama_pos restore_pos = target_pos - 1;
             if (stage_tail_pos[stage] == restore_pos) {
+                continue;
+            }
+
+            if (light_rollback) {
+                // Position-addressed attention cache: dropping every cell at or
+                // past the rejected position restores the checkpoint exactly.
+                if (!llama_memory_seq_rm(llama_get_memory(stages[stage]), 0, target_pos, -1)) {
+                    fail("failed to rewind target SPD stage " + std::to_string(stage) +
+                            " to position " + std::to_string(restore_pos));
+                    return false;
+                }
+                stage_tail_pos[stage] = restore_pos;
                 continue;
             }
 
@@ -960,17 +1042,22 @@ struct common_spd_pipeline::impl {
     }
 
     bool advance_entry(uint32_t stage, entry & item, double & elapsed, std::string & error) {
+        const auto lock_start = clock_type::now();
         std::vector<std::unique_lock<std::mutex>> resource_locks;
         resource_locks.reserve(stage_resources[stage].size());
         for (size_t resource : stage_resources[stage]) {
             resource_locks.emplace_back(*resource_mutexes[resource]);
         }
         const auto start = clock_type::now();
+        timing.stage_lock[stage] += std::chrono::duration<double>(start - lock_start).count();
+        ++timing.stage_calls[stage];
 
-        const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
-        const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
-        llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
-        checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
+        if (!light_rollback) {
+            const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
+            const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
+            llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
+            checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
+        }
 
         std::vector<float> local_output;
         std::vector<float> & output = static_decode_fast_path
@@ -987,7 +1074,8 @@ struct common_spd_pipeline::impl {
         const llama_token * token = stage == 0 ? &item.token : nullptr;
         const float * embd = stage == 0 ? nullptr : item.hidden.data();
         if (!decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
-                static_decode_fast_path ? &stage_decode_batches[stage] : nullptr)) {
+                static_decode_fast_path ? &stage_decode_batches[stage] : nullptr,
+                &timing.stage_decode[stage], &timing.stage_read[stage])) {
             return false;
         }
         if (static_decode_fast_path) {
@@ -1001,6 +1089,11 @@ struct common_spd_pipeline::impl {
             item.snap.present[captured_item.first] = true;
         }
         elapsed = seconds_since(start);
+        timing.stage_busy[stage] += elapsed;
+        if (timing_active_count <= SPD_MAX_STAGE_COUNT) {
+            timing.busy_by_active[stage][timing_active_count] += elapsed;
+            ++timing.calls_by_active[stage][timing_active_count];
+        }
         return true;
     }
 
@@ -1016,6 +1109,7 @@ struct common_spd_pipeline::impl {
     bool generate(const std::vector<llama_token> & prompt, int32_t n_predict, common_spd_result & result) {
         result = {};
         last_error.clear();
+        timing = {};
         if (prompt.empty()) {
             fail("SPD prompt must not be empty");
             return false;
@@ -1078,6 +1172,7 @@ struct common_spd_pipeline::impl {
 
         const auto decode_start = clock_type::now();
         while (verified_up_to - n_prompt < n_predict) {
+            scope_timer step_timer(timing.step_total);
             ++result.decode_steps;
 
             llama_token pending_draft = LLAMA_TOKEN_NULL;
@@ -1088,6 +1183,7 @@ struct common_spd_pipeline::impl {
                     ? decode_speculation_input
                     : local_pending_input;
             if (oldest_needed >= 0) {
+                scope_timer prepare_timer(timing.prepare);
                 if (!prepare_speculation(pipeline, completed,
                         has_prev_evicted ? &prev_evicted : nullptr,
                         prev_evicted_pos, pending_input)) {
@@ -1097,6 +1193,7 @@ struct common_spd_pipeline::impl {
             }
 
             const size_t active_count = pipeline.size();
+            timing_active_count = active_count;
             std::array<double, SPD_MAX_STAGE_COUNT> elapsed = {};
             std::array<std::string, SPD_MAX_STAGE_COUNT> errors;
             std::array<uint8_t, SPD_MAX_STAGE_COUNT> ok = {};
@@ -1123,6 +1220,7 @@ struct common_spd_pipeline::impl {
                 }
             }
 
+            const auto stage_phase_start = clock_type::now();
             if (static_decode_fast_path && params.parallel_stages && active_count > 1) {
                 for (size_t stage = 0; stage < active_count; ++stage) {
                     stage_jobs[stage] = {
@@ -1157,15 +1255,19 @@ struct common_spd_pipeline::impl {
                     ok[stage] = advance_entry((uint32_t) stage, pipeline[stage], elapsed[stage], errors[stage]);
                 }
             }
+            timing.stage_wall += seconds_since(stage_phase_start);
 
-            if (sidecar_job_submitted) {
-                std::exception_ptr failure = sidecar_worker->wait();
-                if (worker_failure == nullptr && failure != nullptr) {
-                    worker_failure = failure;
+            {
+                scope_timer sidecar_wait_timer(timing.sidecar_extra);
+                if (sidecar_job_submitted) {
+                    std::exception_ptr failure = sidecar_worker->wait();
+                    if (worker_failure == nullptr && failure != nullptr) {
+                        worker_failure = failure;
+                    }
                 }
-            }
-            if (speculation_work.valid()) {
-                speculation_ok = speculation_work.get();
+                if (speculation_work.valid()) {
+                    speculation_ok = speculation_work.get();
+                }
             }
             if (worker_failure != nullptr) {
                 try {
@@ -1207,8 +1309,11 @@ struct common_spd_pipeline::impl {
                         result.accepted.push_back(false);
                         ++result.n_rejected;
 
-                        if (!rollback(target_pos)) {
-                            return false;
+                        {
+                            scope_timer rollback_timer(timing.rollback);
+                            if (!rollback(target_pos)) {
+                                return false;
+                            }
                         }
                         for (auto it = completed.lower_bound(target_pos); it != completed.end();) {
                             it = completed.erase(it);
@@ -1264,6 +1369,55 @@ struct common_spd_pipeline::impl {
         }
 
         result.decode_seconds = seconds_since(decode_start);
+        if (timing_enabled && result.decode_steps > 0) {
+            const double other = timing.step_total - timing.prepare - timing.stage_wall -
+                    timing.sidecar_extra - timing.head - timing.embed - timing.rollback;
+            fprintf(stderr,
+                    "SPD timing: steps=%" PRIu64 " decode=%.2fs (%.1f ms/step) rollback_mode=%s | "
+                    "prepare %.2fs | stages(wall) %.2fs | sidecar-extra %.2fs | head %.2fs/%" PRIu64 " | "
+                    "embed %.2fs/%" PRIu64 " | rollback %.2fs/%" PRIu64 " | other %.2fs\n",
+                    result.decode_steps, result.decode_seconds,
+                    1e3*result.decode_seconds/(double) result.decode_steps,
+                    light_rollback ? "seq_rm" : "seq_cp",
+                    timing.prepare, timing.stage_wall, timing.sidecar_extra,
+                    timing.head, timing.head_calls,
+                    timing.embed, timing.embed_calls,
+                    timing.rollback, result.n_rejected,
+                    other);
+            fprintf(stderr, "SPD timing: sidecar_run %.2fs/%" PRIu64 " calls (%.1f ms/call)\n",
+                    timing.sidecar_run, timing.sidecar_calls,
+                    timing.sidecar_calls > 0 ? 1e3*timing.sidecar_run/(double) timing.sidecar_calls : 0.0);
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                if (timing.stage_calls[stage] == 0) {
+                    continue;
+                }
+                fprintf(stderr,
+                        "SPD timing: stage %u: busy %.2fs/%" PRIu64 " calls (%.1f ms/call) | "
+                        "decode %.2fs | read %.2fs | lock-wait %.2fs | graphs_reused %d\n",
+                        stage, timing.stage_busy[stage], timing.stage_calls[stage],
+                        1e3*timing.stage_busy[stage]/(double) timing.stage_calls[stage],
+                        timing.stage_decode[stage], timing.stage_read[stage], timing.stage_lock[stage],
+                        llama_perf_context(stages[stage]).n_reused);
+            }
+            fprintf(stderr, "SPD timing: graphs_reused sidecar %d | head %d | embed %d\n",
+                    llama_perf_context(sidecar).n_reused,
+                    llama_perf_context(head).n_reused,
+                    llama_perf_context(embed).n_reused);
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                char row[512];
+                size_t off = (size_t) snprintf(row, sizeof(row), "SPD timing: stage %u ms/call by active:", stage);
+                for (uint32_t a = 1; a <= stage_count && off < sizeof(row) - 32; ++a) {
+                    const uint64_t n = timing.calls_by_active[stage][a];
+                    if (n == 0) {
+                        off += (size_t) snprintf(row + off, sizeof(row) - off, " a%u=-", a);
+                    } else {
+                        off += (size_t) snprintf(row + off, sizeof(row) - off, " a%u=%.1f/%" PRIu64,
+                                a, 1e3*timing.busy_by_active[stage][a]/(double) n, n);
+                    }
+                }
+                fprintf(stderr, "%s\n", row);
+            }
+        }
         result.tokens.resize(n_predict);
         result.accepted.resize(n_predict);
         return true;
