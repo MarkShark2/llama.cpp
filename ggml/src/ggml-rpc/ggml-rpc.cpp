@@ -312,9 +312,44 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
+// per-command wire accounting (client-side), enabled with GGML_RPC_CMD_STATS=1;
+// printed every ~5s from whichever thread sends next
+static void rpc_cmd_stats_add(enum rpc_cmd cmd, size_t bytes) {
+    static const bool enabled = []{
+        const char * e = std::getenv("GGML_RPC_CMD_STATS");
+        return e && atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::atomic<uint64_t> counts[RPC_CMD_COUNT] = {};
+    static std::atomic<uint64_t> sizes[RPC_CMD_COUNT] = {};
+    static std::atomic<int64_t> t_print{0};
+    counts[cmd] += 1;
+    sizes[cmd] += bytes;
+    const int64_t now = ggml_time_us();
+    int64_t prev = t_print.load();
+    if (now - prev > 5*1000*1000 && t_print.compare_exchange_strong(prev, now)) {
+        char buf[1024];
+        size_t off = 0;
+        for (int i = 0; i < RPC_CMD_COUNT && off < sizeof(buf) - 64; i++) {
+            const uint64_t n = counts[i].exchange(0);
+            const uint64_t s = sizes[i].exchange(0);
+            if (n == 0) {
+                continue;
+            }
+            off += (size_t) snprintf(buf + off, sizeof(buf) - off, " cmd%d n=%llu %.1fMB",
+                    i, (unsigned long long) n, (double) s/1e6);
+        }
+        fprintf(stderr, "[rpc cmd stats]%s\n", buf);
+        fflush(stderr);
+    }
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    rpc_cmd_stats_add(cmd, input_size);
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -735,6 +770,16 @@ static bool rpc_buffer_set_tensor_raw(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    {
+        static const int stats_level = []{
+            const char * e = std::getenv("GGML_RPC_CMD_STATS");
+            return e ? atoi(e) : 0;
+        }();
+        if (stats_level >= 2 && size >= 32*1024) {
+            fprintf(stderr, "[rpc set_tensor] %s type=%s size=%zu\n",
+                    tensor->name, ggml_type_name(tensor->type), size);
+        }
+    }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
