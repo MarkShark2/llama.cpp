@@ -448,7 +448,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params target_params = llama_model_default_params();
     target_params.n_gpu_layers = n_gpu_layers;
-    target_params.use_mmap = use_mmap;
+    target_params.load_mode = use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
     target_params.devices = target_devices.empty() ? nullptr : target_devices.data();
     target_params.tensor_split = tensor_split_arg.empty() ? nullptr : tensor_split.data();
     if (!draft_devices.empty()) {
@@ -525,7 +525,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params sidecar_params = llama_model_default_params();
     sidecar_params.n_gpu_layers = n_gpu_layers_draft;
-    sidecar_params.use_mmap = use_mmap;
+    sidecar_params.load_mode = use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
     sidecar_params.devices = draft_devices.empty() ? nullptr : draft_devices.data();
     llama_model * sidecar = llama_model_load_from_file(sidecar_path.c_str(), sidecar_params);
     if (sidecar == nullptr) {
