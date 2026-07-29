@@ -76,9 +76,6 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
 
     __shared__ half2 Kt[TILE][DK/2];       // staged K/V rows (V = DV-prefix)
     __shared__ float Pt[HCHUNK][TILE];     // per-tile exp'd scores
-    __shared__ float Mh[HCHUNK];           // running max
-    __shared__ float Lh[HCHUNK];           // running sum
-    __shared__ float MSh[HCHUNK];          // per-tile rescale factor
     __shared__ unsigned char row_ok[TILE]; // gathered-row validity
 
     // Q slice for this (head, lane) in registers, pre-scaled
@@ -102,11 +99,11 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
         Or[i] = 0.0f;
     }
 
-    if (tid < HCHUNK) {
-        Mh[tid] = FATTN_SPARSE_M_INIT;
-        Lh[tid] = 0.0f;
-    }
-    __syncthreads();
+    // Running softmax state. All TPH lanes of a head derive these from the same
+    // cross-lane reductions, so they stay identical and live in registers.
+    float M_run   = FATTN_SPARSE_M_INIT;
+    float L_run   = 0.0f;
+    float m_scale = 1.0f;
 
     const half  * mask_row = p.mask ? (const half *) (p.mask + t*p.nbm1 + s*p.nbm3) : nullptr;
     const int   * idx_row  = (const int *) (p.idx + t*p.nbi1 + s*p.nbi3);
@@ -140,15 +137,12 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
                     src = p.k + (size_t) (base + r)*p.nbk1 + s*p.nbk3;
                 }
             }
-            if (tid < TILE) {
-                // filled below for our own row; write a default first
-                row_ok[tid] = 0;
+            // one leader per row writes the flag unconditionally, so no
+            // zero-init pass (and no extra __syncthreads) is needed
+            if (c0 == 0) {
+                row_ok[r] = ok ? 1 : 0;
             }
-            __syncthreads();
             if (ok) {
-                if (c0 == 0) {
-                    row_ok[r] = 1;
-                }
                 const int4 * src4 = (const int4 *) src;
                 int4 * dst4 = (int4 *) &Kt[r][0];
 #pragma unroll
@@ -191,33 +185,44 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
         }
         __syncthreads();
 
-        // per-head online softmax update (one thread per head)
-        if (tid < HCHUNK) {
-            const int hh = tid;
+        // per-head online softmax update — the TPH lanes of a head split the
+        // TILE rows, so every thread works (doing this on tid < HCHUNK left
+        // 15/16 of the block stalled at the following barrier)
+        {
             float tmax = FATTN_SPARSE_M_INIT;
 #pragma unroll
-            for (int j = 0; j < TILE; ++j) {
-                tmax = fmaxf(tmax, Pt[hh][j]);
+            for (int j = lane; j < TILE; j += TPH) {
+                tmax = fmaxf(tmax, Pt[hl][j]);
             }
-            const float Mold = Mh[hh];
-            const float Mnew = fmaxf(Mold, tmax);
-            const float ms   = expf(Mold - Mnew);
+#pragma unroll
+            for (int off = TPH/2; off > 0; off >>= 1) {
+                tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off, TPH));
+            }
+
+            const float Mnew = fmaxf(M_run, tmax);
+            const float ms   = expf(M_run - Mnew);
+
             float l_add = 0.0f;
 #pragma unroll
-            for (int j = 0; j < TILE; ++j) {
-                const float pv = expf(Pt[hh][j] - Mnew);
-                Pt[hh][j] = pv;
+            for (int j = lane; j < TILE; j += TPH) {
+                const float pv = expf(Pt[hl][j] - Mnew);
+                Pt[hl][j] = pv;
                 l_add += pv;
             }
-            Mh[hh]  = Mnew;
-            Lh[hh]  = Lh[hh]*ms + l_add;
-            MSh[hh] = ms;
+#pragma unroll
+            for (int off = TPH/2; off > 0; off >>= 1) {
+                l_add += __shfl_xor_sync(0xffffffff, l_add, off, TPH);
+            }
+
+            M_run   = Mnew;
+            L_run   = L_run*ms + l_add;
+            m_scale = ms;
         }
         __syncthreads();
 
         // accumulate O — each thread owns a VPT-dim slice of one head
         {
-            const float ms = MSh[hl];
+            const float ms = m_scale;
             if (ms != 1.0f) {
 #pragma unroll
                 for (int i = 0; i < VPT; ++i) {
@@ -241,33 +246,20 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
         __syncthreads();
     }
 
-    // sinks
-    if (p.sinks && tid < HCHUNK) {
-        const int hh = tid;
-        const int hg = hc*HCHUNK + hh;
-        if (hg < p.n_head) {
-            const float sk   = ((const float *) p.sinks)[hg];
-            const float Mold = Mh[hh];
-            const float Mnew = fmaxf(Mold, sk);
-            const float ms   = expf(Mold - Mnew);
-            Mh[hh]  = Mnew;
-            Lh[hh]  = Lh[hh]*ms + expf(sk - Mnew);
-            MSh[hh] = ms;
-        } else {
-            MSh[hh] = 1.0f;
-        }
-    } else if (tid < HCHUNK) {
-        MSh[tid] = 1.0f;
-    }
-    __syncthreads();
-
     if (!h_ok) {
         return;
     }
 
-    const float ms_f = MSh[hl];
-    const float L    = Lh[hl];
-    const float li   = L == 0.0f ? 0.0f : 1.0f/L;
+    // sinks — every lane of the head already holds the same running state
+    float ms_f = 1.0f;
+    if (p.sinks) {
+        const float sk   = ((const float *) p.sinks)[h];
+        const float Mnew = fmaxf(M_run, sk);
+        ms_f  = expf(M_run - Mnew);
+        L_run = L_run*ms_f + expf(sk - Mnew);
+    }
+
+    const float li = L_run == 0.0f ? 0.0f : 1.0f/L_run;
 
     // dst is contiguous [DV, H, T, ns]
     float * out = p.dst + (size_t) DV*(h + (size_t) p.n_head*(t + (size_t) gridDim.x*s));

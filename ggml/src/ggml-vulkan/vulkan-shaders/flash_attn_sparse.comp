@@ -64,9 +64,6 @@ layout (push_constant) uniform parameter {
 
 shared f16vec4 Kt[TILE][D4];
 shared float   Pt[HCHUNK][TILE];
-shared float   Mh[HCHUNK];
-shared float   Lh[HCHUNK];
-shared float   MSh[HCHUNK];
 shared uint    row_ok[TILE];
 
 void main() {
@@ -102,11 +99,12 @@ void main() {
         Or[i] = 0.0;
     }
 
-    if (tid < HCHUNK) {
-        Mh[tid] = float(M_INIT);
-        Lh[tid] = 0.0;
-    }
-    barrier();
+    // running softmax state. Every lane of a head derives these from the same
+    // cross-lane reductions, so they stay identical across the head's TPH lanes
+    // and can live in registers instead of shared memory.
+    float M_run   = float(M_INIT);
+    float L_run   = 0.0;
+    float m_scale = 1.0;   // exp(M_old - M_new) for the current tile
 
     const uint m_base = t*p.m_s1 + s*p.m_s3;
     const uint i_base = t*p.i_s1 + s*p.i_s3;
@@ -127,11 +125,6 @@ void main() {
             const uint r   = tid / TPR;
             const uint c0  = tid % TPR;
 
-            if (tid < TILE) {
-                row_ok[tid] = 0u;
-            }
-            barrier();
-
             bool ok = base + r < limit;
             uint src4 = 0u;
             if (ok) {
@@ -145,10 +138,12 @@ void main() {
                     src4 = ((base + r)*p.k_s1 + s*p.k_s3)/4u;
                 }
             }
+            // one leader per row writes the flag unconditionally, so no
+            // zero-init pass (and no extra barrier) is needed
+            if (c0 == 0u) {
+                row_ok[r] = ok ? 1u : 0u;
+            }
             if (ok) {
-                if (c0 == 0u) {
-                    row_ok[r] = 1u;
-                }
                 [[unroll]] for (uint c = c0; c < D4; c += TPR) {
                     Kt[r][c] = gather ? data_kc4[src4 + c] : data_k4[src4 + c];
                 }
@@ -183,31 +178,42 @@ void main() {
         }
         barrier();
 
-        // per-head online softmax update
-        if (tid < HCHUNK) {
-            const uint hh = tid;
+        // per-head online softmax update — the TPH lanes of a head split the
+        // TILE rows between them, so every thread works (doing this on
+        // thread<HCHUNK left 15/16 of the workgroup stalled at the barrier)
+        {
             float tmax = float(M_INIT);
-            [[unroll]] for (uint j = 0; j < TILE; ++j) {
-                tmax = max(tmax, Pt[hh][j]);
+            [[unroll]] for (uint j = lane; j < TILE; j += TPH) {
+                tmax = max(tmax, Pt[hl][j]);
             }
-            const float Mold = Mh[hh];
-            const float Mnew = max(Mold, tmax);
-            const float ms   = exp(Mold - Mnew);
+            tmax = max(tmax, subgroupShuffleXor(tmax, 8u));
+            tmax = max(tmax, subgroupShuffleXor(tmax, 4u));
+            tmax = max(tmax, subgroupShuffleXor(tmax, 2u));
+            tmax = max(tmax, subgroupShuffleXor(tmax, 1u));
+
+            const float Mnew = max(M_run, tmax);
+            const float ms   = exp(M_run - Mnew);
+
             float l_add = 0.0;
-            [[unroll]] for (uint j = 0; j < TILE; ++j) {
-                const float pv = exp(Pt[hh][j] - Mnew);
-                Pt[hh][j] = pv;
+            [[unroll]] for (uint j = lane; j < TILE; j += TPH) {
+                const float pv = exp(Pt[hl][j] - Mnew);
+                Pt[hl][j] = pv;
                 l_add += pv;
             }
-            Mh[hh]  = Mnew;
-            Lh[hh]  = Lh[hh]*ms + l_add;
-            MSh[hh] = ms;
+            l_add += subgroupShuffleXor(l_add, 8u);
+            l_add += subgroupShuffleXor(l_add, 4u);
+            l_add += subgroupShuffleXor(l_add, 2u);
+            l_add += subgroupShuffleXor(l_add, 1u);
+
+            M_run = Mnew;
+            L_run = L_run*ms + l_add;
+            m_scale = ms;
         }
         barrier();
 
         // accumulate O — each thread owns a VPT-dim slice of one head
         {
-            const float ms = MSh[hl];
+            const float ms = m_scale;
             if (ms != 1.0) {
                 [[unroll]] for (uint i = 0; i < VPT; ++i) {
                     Or[i] *= ms;
@@ -230,31 +236,20 @@ void main() {
         barrier();
     }
 
-    // sinks
-    if (tid < HCHUNK) {
-        const uint hh = tid;
-        const uint hg = hc*HCHUNK + hh;
-        if (has_sinks && hg < p.n_head) {
-            const float sk   = data_s[hg];
-            const float Mold = Mh[hh];
-            const float Mnew = max(Mold, sk);
-            const float ms   = exp(Mold - Mnew);
-            Mh[hh]  = Mnew;
-            Lh[hh]  = Lh[hh]*ms + exp(sk - Mnew);
-            MSh[hh] = ms;
-        } else {
-            MSh[hh] = 1.0;
-        }
-    }
-    barrier();
-
     if (!h_ok) {
         return;
     }
 
-    const float ms_f = MSh[hl];
-    const float L    = Lh[hl];
-    const float li   = L == 0.0 ? 0.0 : 1.0/L;
+    // sinks — every lane of the head holds the same running state already
+    float ms_f = 1.0;
+    if (has_sinks) {
+        const float sk   = data_s[h];
+        const float Mnew = max(M_run, sk);
+        ms_f  = exp(M_run - Mnew);
+        L_run = L_run*ms_f + exp(sk - Mnew);
+    }
+
+    const float li = L_run == 0.0 ? 0.0 : 1.0/L_run;
 
     // dst is contiguous f32 [DV, n_head, T, ns]
     const uint o_base = DV*(h + p.n_head*(t + T*s)) + lane*VPT;
