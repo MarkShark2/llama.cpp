@@ -2032,7 +2032,10 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         rpc_ep_lanes * dep = sep == nullptr ? nullptr : rpc_lanes_get_active(dst_endpoint);
         if (dep != nullptr && rpc_peer_route_ready(src_endpoint, dst_endpoint, dep->session_id)) {
             rpc_msg_push_tensor_req req = {};
-            memcpy(req.endpoint, dst_endpoint.c_str(), dst_endpoint.size());
+            // must be the address peer_open registered the link under, i.e. the
+            // mapped one -- it is the key into the producer's link table
+            const std::string & via = rpc_peer_addr(dst_endpoint);
+            memcpy(req.endpoint, via.c_str(), via.size());
             req.src        = serialize_tensor(src);
             req.dst        = serialize_tensor(dst);
             req.src_offset = 0;
