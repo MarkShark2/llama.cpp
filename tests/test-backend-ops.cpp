@@ -10134,6 +10134,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // [fork] DSV4-Flash DSA selection: top-512 over the per-token indexer
+    // scores, one of these per CSA layer per ubatch
+    for (int n_cells : { 4096, 16384 }) {
+        for (int nb : { 1, 512 }) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_cells, nb, 1, 1}, 512));
+        }
+    }
+
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
