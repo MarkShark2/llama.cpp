@@ -1138,6 +1138,8 @@ void process_shaders() {
 
     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", {{"K_TYPE", "float"}});
     string_to_spv("lightning_indexer_f16", "lightning_indexer.comp", {{"K_TYPE", "float16_t"}});
+    // [fork] specialized to n_embd == 128 / n_head <= 64 / f16 K (DSA indexer shape)
+    string_to_spv("lightning_indexer_fast_f16", "lightning_indexer_fast.comp", {{"D4", "32"}, {"HCHUNK", "16"}});
 
     // [fork] DSA sparse flash attention
     string_to_spv("flash_attn_sparse_f16", "flash_attn_sparse.comp", {});

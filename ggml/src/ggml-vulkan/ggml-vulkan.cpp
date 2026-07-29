@@ -1012,6 +1012,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_lightning_indexer_f32;
     vk_pipeline pipeline_lightning_indexer_f16;
+    vk_pipeline pipeline_lightning_indexer_fast_f16;
 
     // [fork] DSA sparse flash attention
     vk_pipeline pipeline_flash_attn_sparse;
@@ -5698,6 +5699,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32, "lightning_indexer_f32", lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {128, 1, 1}, {128}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16, "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {128, 1, 1}, {128}, 1);
+
+    // [fork] fast indexer, specialized to n_embd==128 / n_head<=64 / f16 K.
+    // 256 threads, one kv row each; 8.25 KB of shared memory for the Q head-chunk.
+    if (device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_fast_f16, "lightning_indexer_fast_f16", lightning_indexer_fast_f16_len, lightning_indexer_fast_f16_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {256, 1, 1}, {256}, 1);
+    }
 
     // [fork] DSA sparse flash attention: fixed 256-thread workgroup, one
     // workgroup per (query token, 16-head chunk, stream) — no wg_denoms scaling
@@ -11506,7 +11513,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             switch (src1->type) {
                 case GGML_TYPE_F32: return ctx->device->pipeline_lightning_indexer_f32;
-                case GGML_TYPE_F16: return ctx->device->pipeline_lightning_indexer_f16;
+                case GGML_TYPE_F16:
+                    // [fork] the fast shader is compiled for n_embd==128 / n_head<=64
+                    if (src0->ne[0] == 128 && src0->ne[1] <= 64 &&
+                        ctx->device->pipeline_lightning_indexer_fast_f16) {
+                        return ctx->device->pipeline_lightning_indexer_fast_f16;
+                    }
+                    return ctx->device->pipeline_lightning_indexer_f16;
                 default:            return nullptr;
             }
         }

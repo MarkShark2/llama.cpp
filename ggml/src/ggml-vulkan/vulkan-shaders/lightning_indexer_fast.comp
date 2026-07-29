@@ -1,0 +1,103 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// [fork] fast path for GGML_OP_LIGHTNING_INDEXER, specialized to
+// n_embd == 4*D4 and n_head <= NH_MAX with an f16 K cache.
+//
+// per (stream s, token t, kv row ik):
+//   dst[ik] = sum_h( max(dot(q[:,h,t,s], k[:,0,ik,s]), 0) * w[h,t,s] ) + mask[ik,t,s%nem3]
+//
+// The generic variant (lightning_indexer.comp) walks the whole Q slice
+// (n_head*n_embd floats = 32 KB at 64x128) *and* re-reads the same K row once
+// per head, straight from global memory, for every single kv row - ~48 KB of
+// loads per (token, kv) pair, all scalar. At kv=4096/nb=512/nh=64 that measures
+// 1.02 s per call on a BC-250 (34 GFLOPS).
+//
+// Here each invocation owns one kv row and loads it once into registers, while
+// the workgroup stages the token's Q slice a head-chunk at a time in shared
+// memory. The inner loop is then a pure LDS-broadcast + FMA sequence: every
+// invocation in the workgroup reads the *same* q_lds element, which is a
+// broadcast rather than a banked access. Mixed f16xf32 products accumulate in
+// f32 (v_fma_mix on RDNA), so results are bit-identical to the generic shader.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Q { float     data_q[]; };
+layout(binding = 1) readonly  buffer K { float16_t data_k[]; };
+layout(binding = 2) readonly  buffer W { float     data_w[]; };
+layout(binding = 3) readonly  buffer M { float16_t data_m[]; };
+layout(binding = 4) writeonly buffer D { float     data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;    // q->ne[0]   (== 4*D4)
+    uint n_head;    // q->ne[1]   (<= NH_MAX)
+    uint n_kv;      // k->ne[2]
+    uint nem3;      // m->ne[3] (mask stream broadcast: s % nem3)
+    uint nbq1; uint nbq2; uint nbq3;    // q strides in elements
+    uint nbk2; uint nbk3;               // k strides in elements
+    uint nbw1; uint nbw3;               // w strides in elements
+    uint nbm1; uint nbm3;               // m strides in elements
+    uint nb1;  uint nb3;                // dst strides in elements
+};
+
+shared vec4  q_lds[HCHUNK * D4];
+shared float w_lds[HCHUNK];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint i_kv = gl_WorkGroupID.x * BLOCK_SIZE + tid;
+    const uint i_t  = gl_WorkGroupID.y; // token
+    const uint i_s  = gl_WorkGroupID.z; // stream
+
+    const uint q_base = i_t * nbq2 + i_s * nbq3;
+    const uint w_base = i_t * nbw1 + i_s * nbw3;
+
+    // Clamp instead of branching: rows past the end compute a junk score that is
+    // never stored, but they still take part in every barrier below.
+    const uint k_base = min(i_kv, n_kv - 1) * nbk2 + i_s * nbk3;
+
+    f16vec4 kr[D4];
+    [[unroll]] for (uint e = 0; e < D4; ++e) {
+        kr[e] = f16vec4(data_k[k_base + 4*e + 0], data_k[k_base + 4*e + 1],
+                        data_k[k_base + 4*e + 2], data_k[k_base + 4*e + 3]);
+    }
+
+    float score = 0.0f;
+
+    for (uint h0 = 0; h0 < n_head; h0 += HCHUNK) {
+        const uint nh = min(HCHUNK, n_head - h0);
+
+        // wait for the previous chunk to be fully consumed before overwriting
+        barrier();
+
+        for (uint i = tid; i < nh * D4; i += BLOCK_SIZE) {
+            const uint h = i / D4;
+            const uint e = i - h * D4;
+            const uint o = q_base + (h0 + h) * nbq1 + 4*e;
+            q_lds[i] = vec4(data_q[o + 0], data_q[o + 1], data_q[o + 2], data_q[o + 3]);
+        }
+        if (tid < nh) {
+            w_lds[tid] = data_w[w_base + h0 + tid];
+        }
+
+        barrier();
+
+        for (uint h = 0; h < nh; ++h) {
+            const uint qo = h * D4;
+            float qk = 0.0f;
+            [[unroll]] for (uint e = 0; e < D4; ++e) {
+                qk += dot(q_lds[qo + e], vec4(kr[e]));
+            }
+            score += max(qk, 0.0f) * w_lds[h];
+        }
+    }
+
+    if (i_kv < n_kv) {
+        const uint m_base = i_t * nbm1 + (i_s % nem3) * nbm3;
+        data_d[i_t * nb1 + i_s * nb3 + i_kv] = score + float(data_m[m_base + i_kv]);
+    }
+}

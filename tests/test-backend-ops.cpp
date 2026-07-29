@@ -6938,6 +6938,12 @@ struct test_flash_attn_ext_sparse : public test_case {
         return 5e-4;
     }
 
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // QK + VKQ over the dense window plus the gathered top-k rows
+        return 4 * hs * (kv_dense + n_topk) * nh * nb;
+    }
+
     test_flash_attn_ext_sparse(int64_t hs = 512, int64_t nh = 64, int64_t kv_dense = 256,
                                int64_t n_cells = 1024, int64_t n_topk = 512, int64_t nb = 8, bool sinks = false)
         : hs(hs), nh(nh), kv_dense(kv_dense), n_cells(n_cells), n_topk(n_topk), nb(nb), sinks(sinks) {}
@@ -10111,6 +10117,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // [fork] DSA sparse flash attention, at the DSV4-Flash decode/prefill shapes
+    for (int nb : { 1, 512 }) {
+        for (int n_cells : { 4096, 16384 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(512, 64, 256, n_cells, 512, nb, false));
+        }
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
