@@ -92,16 +92,28 @@ enum rpc_cmd {
     RPC_CMD_SESSION_INFO,
     RPC_CMD_LANE_ATTACH,
     RPC_CMD_LANE_FENCE,
+    // direct remote->remote activation transfer (GGML_RPC_PEER=1) [fork]:
+    // PEER_OPEN tells a server to attach a peer lane to another server's
+    // session; PUSH_TENSOR then makes it read one of its own tensors and ship
+    // it straight down that lane, so a stage boundary never touches the client.
+    RPC_CMD_PEER_OPEN,
+    RPC_CMD_PUSH_TENSOR,
     RPC_CMD_COUNT,
 };
 
 // minimum server RPC_PROTO_PATCH_VERSION that understands the lane commands
 #define GGML_RPC_FDX_MIN_PATCH 1
+// ...and the peer (remote->remote) commands
+#define GGML_RPC_PEER_MIN_PATCH 2
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
     RPC_LANE_GET = 1,   // client <- server bulk reads (request/response)
+    RPC_LANE_PEER = 2,  // another server -> server bulk uploads (fire-and-forget)
 };
+
+// endpoint strings ("host:port") as carried on the wire
+#define RPC_ENDPOINT_MAX 128
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
@@ -243,6 +255,37 @@ struct rpc_msg_lane_attach_rsp {
 struct rpc_msg_lane_fence_req {
     uint64_t wait_set;
     uint64_t wait_get;
+};
+
+// ask a server to open a peer lane into another server's session
+struct rpc_msg_peer_open_req {
+    uint64_t session_id;                  // the DESTINATION server's session id
+    char     endpoint[RPC_ENDPOINT_MAX];  // "host:port" of the destination
+};
+
+struct rpc_msg_peer_open_rsp {
+    uint8_t ok;
+};
+
+// read `src` locally and ship it to `endpoint` as a SET_TENSOR for `dst`.
+// The dst tensor is serialized by the *client* and relayed verbatim, so the
+// source server never has to reason about the destination's address space.
+// wait_main / wait_get are the destination's lane fence targets, chosen by the
+// client exactly as if it were sending this SET on the destination's SET lane.
+struct rpc_msg_push_tensor_req {
+    char       endpoint[RPC_ENDPOINT_MAX];
+    rpc_tensor src;
+    rpc_tensor dst;
+    uint64_t   src_offset;
+    uint64_t   dst_offset;
+    uint64_t   size;        // bytes to read from src (pre-bf16 size)
+    uint64_t   wait_main;   // destination-side fence targets
+    uint64_t   wait_get;
+    uint8_t    bf16;        // truncate to bf16 on the peer wire
+};
+
+struct rpc_msg_push_tensor_rsp {
+    uint8_t ok;
 };
 
 #pragma pack(pop)
@@ -908,6 +951,82 @@ static rpc_ep_lanes * rpc_lanes_get_active(const std::string & endpoint) {
     }
     GGML_LOG_INFO("[rpc fdx] %s: transfer lanes active (session %" PRIu64 ")\n", endpoint.c_str(), info.session_id);
     return ep;
+}
+
+// ---------------------------------------------------------------------------
+// Direct remote->remote transfer (GGML_RPC_PEER=1)  [fork]
+//
+// In the RPC star every stage boundary hairpins through the client: GET the
+// tensor off the producer, SET it onto the consumer. Both legs cross the
+// client's single NIC, which is what makes long-prompt prefill on a multi-node
+// split transport-bound rather than compute-bound.
+//
+// With a peer route the producer ships the payload itself, over whatever link
+// the two nodes share, and the client sends only a small PUSH_TENSOR. The
+// ordering story is unchanged: the push is issued on the producer's GET lane
+// (so it lands after that node's compute, exactly like the GET it replaces),
+// and it carries the consumer's SET-lane fence targets, so the consumer's
+// executor applies it in the same position the client's own SET would have
+// taken. Both endpoints therefore need active lanes; without them there is no
+// ordering domain to slot into and we stay on the hairpin.
+// ---------------------------------------------------------------------------
+static bool rpc_peer_enabled() {
+    static const bool on = []() {
+        const char * e = std::getenv("GGML_RPC_PEER");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
+static std::mutex g_peer_route_m;
+static std::unordered_map<std::string, bool> g_peer_routes;   // "src>dst" -> usable
+
+// Ask `src_endpoint` to open a peer lane into `dst_endpoint`'s session. Tried
+// once per ordered pair; a failure is remembered so the pair quietly keeps
+// using the hairpin (routing is per-pair, so a fabric that only connects some
+// of the nodes still gets the benefit on the pairs that do).
+static bool rpc_peer_route_ready(const std::string & src_endpoint,
+                                 const std::string & dst_endpoint,
+                                 uint64_t dst_session_id) {
+    const std::string key = src_endpoint + ">" + dst_endpoint;
+    {
+        std::lock_guard<std::mutex> l(g_peer_route_m);
+        auto it = g_peer_routes.find(key);
+        if (it != g_peer_routes.end()) {
+            return it->second;
+        }
+    }
+    bool ok = false;
+    if (dst_endpoint.size() >= RPC_ENDPOINT_MAX) {
+        GGML_LOG_WARN("[rpc peer] endpoint '%s' too long to route\n", dst_endpoint.c_str());
+    } else if (rpc_server_patch(src_endpoint) < GGML_RPC_PEER_MIN_PATCH ||
+               rpc_server_patch(dst_endpoint) < GGML_RPC_PEER_MIN_PATCH) {
+        GGML_LOG_WARN("[rpc peer] %s -> %s: server too old for peer transfer\n",
+                      src_endpoint.c_str(), dst_endpoint.c_str());
+    } else {
+        rpc_msg_peer_open_req req = {};
+        req.session_id = dst_session_id;
+        memcpy(req.endpoint, dst_endpoint.c_str(), dst_endpoint.size());
+        rpc_msg_peer_open_rsp rsp = { 0 };
+        auto sock = get_socket(src_endpoint);
+        if (sock != nullptr) {
+            const bool sent = rpc_main_call_counted(src_endpoint, get_stream(src_endpoint),
+                                                    [&sock, &req, &rsp] {
+                return send_rpc_cmd(sock, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
+            });
+            ok = sent && rsp.ok != 0;
+        }
+        if (ok) {
+            GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer\n",
+                          src_endpoint.c_str(), dst_endpoint.c_str());
+        } else {
+            GGML_LOG_WARN("[rpc peer] %s -> %s: peer lane refused, using the client hairpin\n",
+                          src_endpoint.c_str(), dst_endpoint.c_str());
+        }
+    }
+    std::lock_guard<std::mutex> l(g_peer_route_m);
+    g_peer_routes[key] = ok;
+    return ok;
 }
 
 static bool send_rpc_cmd_ordered(
@@ -1865,6 +1984,54 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
     const size_t size = ggml_nbytes(src);
     const std::string dst_endpoint = dst_ctx->endpoint;
+
+    // [fork] direct remote->remote: hand the whole transfer to the producing
+    // node so the payload never crosses the client's NIC at all
+    if (rpc_peer_enabled() && ggml_backend_buffer_is_rpc(src->buffer)) {
+        ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
+        const std::string src_endpoint = src_ctx->endpoint;
+        rpc_ep_lanes * sep = src_endpoint == dst_endpoint ? nullptr : rpc_lanes_get_active(src_endpoint);
+        rpc_ep_lanes * dep = sep == nullptr ? nullptr : rpc_lanes_get_active(dst_endpoint);
+        if (dep != nullptr && rpc_peer_route_ready(src_endpoint, dst_endpoint, dep->session_id)) {
+            rpc_msg_push_tensor_req req = {};
+            memcpy(req.endpoint, dst_endpoint.c_str(), dst_endpoint.size());
+            req.src        = serialize_tensor(src);
+            req.dst        = serialize_tensor(dst);
+            req.src_offset = 0;
+            req.dst_offset = 0;
+            req.size       = size;
+            req.bf16       = (rpc_wire_bf16_ok(src, 0, size) && dst->type == GGML_TYPE_F32) ? 1 : 0;
+            // take the destination's SET slot: the peer's message applies in
+            // the same ordered position a client-side SET would have
+            {
+                std::lock_guard<std::mutex> l(dep->m);
+                req.wait_main = dep->main_enq;
+                req.wait_get  = dep->get_enq;
+                dep->set_enq++;
+            }
+            // ...and issue the read on the source's GET lane, after its compute
+            std::lock_guard<std::mutex> l(sep->m);
+            const uint64_t wait_main = sep->main_enq;
+            const uint64_t wait_set  = sep->set_enq;
+            sep->get_enq++;
+            socket_ptr lane = sep->get_sock;
+            sep->get_stream->enqueue([src_endpoint, dst_endpoint, lane, req, wait_main, wait_set]{
+                rpc_msg_push_tensor_rsp rsp = { 0 };
+                const bool ok = send_lane_cmd(lane, RPC_CMD_PUSH_TENSOR, wait_main, wait_set,
+                                              &req, sizeof(req))
+                             && recv_msg(lane, &rsp, sizeof(rsp));
+                if (!ok) {
+                    GGML_ABORT("[rpc peer] GET lane to %s lost during a push", src_endpoint.c_str());
+                }
+                if (!rsp.ok) {
+                    GGML_ABORT("[rpc peer] %s could not deliver a push to %s",
+                               src_endpoint.c_str(), dst_endpoint.c_str());
+                }
+            });
+            return true;
+        }
+    }
+
     // bf16 wire: the boundary payload stays 2-byte end-to-end through the
     // star hairpin (GET_BF16 from the source lands directly in the SET_BF16
     // message) - both legs halve with no client-side conversion at all
@@ -2148,6 +2315,51 @@ static void rpc_cache_enforce_limit(const char * cache_dir, size_t limit) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// peer links (direct remote->remote transfer) [fork]
+//
+// A stage boundary in the RPC star normally hairpins: the client GETs the
+// boundary tensor off the producing node and SETs it onto the consuming one,
+// so every activation crosses the client's NIC twice. With a peer link the
+// producing server holds its own connection to the consumer -- attached as a
+// RPC_LANE_PEER lane on the consumer's session, so it feeds the very same
+// ordered SET queue the client's own SET lane feeds -- and the client only
+// sends a ~300 byte PUSH_TENSOR instead of the payload.
+//
+// One link per destination endpoint, shared by every push to it; the mutex
+// serializes whole messages onto the socket.
+// ---------------------------------------------------------------------------
+struct rpc_peer_link {
+    std::mutex m;
+    socket_ptr sock;
+};
+
+static std::mutex g_peer_mutex;
+static std::unordered_map<std::string, std::shared_ptr<rpc_peer_link>> g_peer_links;
+
+static std::shared_ptr<rpc_peer_link> rpc_peer_link_find(const std::string & endpoint) {
+    std::lock_guard<std::mutex> l(g_peer_mutex);
+    auto it = g_peer_links.find(endpoint);
+    return it == g_peer_links.end() ? nullptr : it->second;
+}
+
+// close every peer link; called when the session that created them ends so a
+// later client does not inherit sockets into a stale peer session
+static void rpc_peer_links_close() {
+    std::unordered_map<std::string, std::shared_ptr<rpc_peer_link>> links;
+    {
+        std::lock_guard<std::mutex> l(g_peer_mutex);
+        links.swap(g_peer_links);
+    }
+    for (auto & kv : links) {
+        std::lock_guard<std::mutex> l(kv.second->m);
+        if (kv.second->sock != nullptr) {
+            kv.second->sock->shutdown_rw();
+            kv.second->sock = nullptr;
+        }
+    }
+}
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, size_t cache_limit)
@@ -2178,6 +2390,9 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    // [fork] direct remote->remote transfer
+    bool peer_open(const rpc_msg_peer_open_req & request, rpc_msg_peer_open_rsp & response);
+    bool push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -2599,6 +2814,134 @@ bool rpc_server::get_tensor_bf16(const rpc_msg_get_tensor_req & request, std::ve
     return true;
 }
 
+// [fork] Attach a peer lane into another server's live session. Idempotent:
+// a link that already exists for this endpoint is reused, so the client can
+// call this once per (src,dst) pair without tracking server state.
+bool rpc_server::peer_open(const rpc_msg_peer_open_req & request, rpc_msg_peer_open_rsp & response) {
+    response.ok = 0;
+    char ep[RPC_ENDPOINT_MAX];
+    memcpy(ep, request.endpoint, sizeof(ep));
+    ep[sizeof(ep) - 1] = '\0';
+    const std::string endpoint(ep);
+    if (endpoint.empty()) {
+        GGML_LOG_ERROR("[%s] empty peer endpoint\n", __func__);
+        return true;
+    }
+    std::shared_ptr<rpc_peer_link> link;
+    {
+        std::lock_guard<std::mutex> l(g_peer_mutex);
+        auto it = g_peer_links.find(endpoint);
+        if (it != g_peer_links.end() && it->second->sock != nullptr) {
+            response.ok = 1;
+            return true;
+        }
+        if (it != g_peer_links.end()) {
+            link = it->second;
+        } else {
+            link = std::make_shared<rpc_peer_link>();
+            g_peer_links[endpoint] = link;
+        }
+    }
+    // connect outside the map lock: this dials another host and can block
+    socket_ptr sock = rpc_lane_connect(endpoint, request.session_id, RPC_LANE_PEER);
+    if (sock == nullptr) {
+        GGML_LOG_WARN("[rpc peer] could not attach a peer lane to %s (session %" PRIu64 ")\n",
+                      endpoint.c_str(), request.session_id);
+        return true;   // reported as ok=0; the client falls back to the hairpin
+    }
+    {
+        std::lock_guard<std::mutex> l(link->m);
+        link->sock = sock;
+    }
+    GGML_LOG_INFO("[rpc peer] peer lane open to %s (session %" PRIu64 ")\n",
+                  endpoint.c_str(), request.session_id);
+    response.ok = 1;
+    return true;
+}
+
+// [fork] Read one of our own tensors and ship it straight to a peer server as
+// a SET_TENSOR, bypassing the client entirely. Returns false only on a
+// protocol-level error (the caller then drops the connection); a transfer that
+// could not be delivered reports ok=0 so the client can fail loudly.
+bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response) {
+    response.ok = 0;
+    char ep[RPC_ENDPOINT_MAX];
+    memcpy(ep, request.endpoint, sizeof(ep));
+    ep[sizeof(ep) - 1] = '\0';
+    auto link = rpc_peer_link_find(ep);
+    if (link == nullptr) {
+        GGML_LOG_ERROR("[rpc peer] push to %s with no peer lane open\n", ep);
+        return true;
+    }
+    const bool bf16 = request.bf16 != 0;
+    if (bf16 && (request.src.type != GGML_TYPE_F32 || request.size % sizeof(float) != 0)) {
+        GGML_LOG_ERROR("[rpc peer] bf16 push of a non-f32 tensor or odd size\n");
+        return true;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * src = deserialize_tensor(ctx, &request.src);
+    if (src == nullptr || src->buffer == nullptr) {
+        GGML_LOG_ERROR("[rpc peer] error deserializing the source tensor\n");
+        return true;
+    }
+
+    // sanitize src->data exactly as GET_TENSOR does
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(src->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(src->buffer);
+
+        if (request.src.data + request.src_offset < p0 ||
+            request.src.data + request.src_offset >= p1 ||
+            request.size > (p1 - request.src.data - request.src_offset)) {
+                GGML_LOG_ERROR("[rpc peer] source region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
+                               request.src.data, request.src_offset, request.size, p0, p1);
+                return true;
+        }
+    }
+
+    // build the SET message the peer's lane reader expects, reading the payload
+    // straight into it (no staging copy in the f32 case)
+    const size_t wire_size = bf16 ? request.size / 2 : request.size;
+    std::vector<uint8_t> payload(RPC_SET_TENSOR_HDR + wire_size);
+    memcpy(payload.data(), &request.dst, sizeof(request.dst));
+    memcpy(payload.data() + sizeof(request.dst), &request.dst_offset, sizeof(request.dst_offset));
+    if (bf16) {
+        std::vector<float> tmp(request.size / sizeof(float));
+        ggml_backend_tensor_get(src, tmp.data(), request.src_offset, request.size);
+        ggml_fp32_to_bf16_row(tmp.data(),
+                              (ggml_bf16_t *) (payload.data() + RPC_SET_TENSOR_HDR),
+                              (int64_t) tmp.size());
+    } else {
+        ggml_backend_tensor_get(src, payload.data() + RPC_SET_TENSOR_HDR,
+                                request.src_offset, request.size);
+    }
+
+    const enum rpc_cmd set_cmd = bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
+    {
+        std::lock_guard<std::mutex> l(link->m);
+        if (link->sock == nullptr ||
+            !send_lane_cmd(link->sock, set_cmd, request.wait_main, request.wait_get,
+                           payload.data(), payload.size())) {
+            GGML_LOG_ERROR("[rpc peer] lost the peer lane to %s mid-push\n", ep);
+            if (link->sock != nullptr) {
+                link->sock->shutdown_rw();
+                link->sock = nullptr;
+            }
+            return true;
+        }
+    }
+    response.ok = 1;
+    return true;
+}
+
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     cache_pending = false;
@@ -3015,6 +3358,12 @@ struct rpc_active_session {
     bool        closing = false;
     socket_ptr  set_sock, get_sock;
     std::thread set_reader_th, set_exec_th, get_th;
+    // [fork] peer lanes: other servers pushing activations straight to us.
+    // They feed the same queue as the client's SET lane, so one executor keeps
+    // every upload -- client or peer -- in a single ordered domain.
+    std::vector<socket_ptr>  peer_socks;
+    std::vector<std::thread> peer_ths;
+    bool                     set_exec_started = false;
 
     // SET lane reader -> executor queue (bounded by bytes)
     std::mutex              q_m;
@@ -3066,15 +3415,16 @@ static size_t rpc_lane_queue_cap() {
     return cap;
 }
 
-static void rpc_lane_set_reader(rpc_active_session * s) {
-    socket_ptr sock = s->set_sock;
+// Reads SET messages off `sock` into the session's ordered apply queue. Used
+// for the client's SET lane and, with is_peer, for each peer lane [fork].
+static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is_peer) {
     for (;;) {
         uint8_t cmd;
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
         if (cmd != RPC_CMD_SET_TENSOR && cmd != RPC_CMD_SET_TENSOR_BF16) {
-            GGML_LOG_ERROR("[rpc fdx] unexpected command %d on SET lane\n", cmd);
+            GGML_LOG_ERROR("[rpc fdx] unexpected command %d on %s lane\n", cmd, is_peer ? "peer" : "SET");
             break;
         }
         uint64_t size;
@@ -3110,7 +3460,15 @@ static void rpc_lane_set_reader(rpc_active_session * s) {
         s->q_cv.notify_all();
     }
     // socket error or client teardown: fail the session so fence waiters and
-    // the executor cannot hang on commands that will never arrive
+    // the executor cannot hang on commands that will never arrive. A peer that
+    // hangs up while we are already closing is just the far end tearing down
+    // its own session, so do not turn that into an error.
+    if (is_peer) {
+        std::lock_guard<std::mutex> l(s->lane_m);
+        if (s->closing) {
+            return;
+        }
+    }
     s->fail();
 }
 
@@ -3150,7 +3508,11 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
-        if (cmd != RPC_CMD_GET_TENSOR && cmd != RPC_CMD_GET_TENSOR_BF16) {
+        // PUSH_TENSOR rides the GET lane because it is a local read like the
+        // others -- the only difference is where the bytes go afterwards, so it
+        // wants exactly the same ordering against this node's compute [fork]
+        const bool is_push = cmd == RPC_CMD_PUSH_TENSOR;
+        if (cmd != RPC_CMD_GET_TENSOR && cmd != RPC_CMD_GET_TENSOR_BF16 && !is_push) {
             GGML_LOG_ERROR("[rpc fdx] unexpected command %d on GET lane\n", cmd);
             break;
         }
@@ -3158,30 +3520,42 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
         if (!sock->recv_data(&size, sizeof(size))) {
             break;
         }
-        if (size != 2*sizeof(uint64_t) + sizeof(rpc_msg_get_tensor_req)) {
+        const size_t expect = is_push ? sizeof(rpc_msg_push_tensor_req) : sizeof(rpc_msg_get_tensor_req);
+        if (size != 2*sizeof(uint64_t) + expect) {
             GGML_LOG_ERROR("[rpc fdx] bad GET lane message size %" PRIu64 "\n", size);
             break;
         }
         uint64_t wait_main, wait_set;
-        rpc_msg_get_tensor_req req;
         if (!sock->recv_data(&wait_main, sizeof(wait_main))) {
             break;
         }
         if (!sock->recv_data(&wait_set, sizeof(wait_set))) {
             break;
         }
-        if (!sock->recv_data(&req, sizeof(req))) {
+        rpc_msg_get_tensor_req  req;
+        rpc_msg_push_tensor_req push_req;
+        if (!sock->recv_data(is_push ? (void *) &push_req : (void *) &req, expect)) {
             break;
         }
         if (!s->wait_counts(wait_main, wait_set, 0)) {
             return;
         }
         std::vector<uint8_t> response;
-        const bool ok = cmd == RPC_CMD_GET_TENSOR
-            ? s->server->get_tensor(req, response)
-            : s->server->get_tensor_bf16(req, response);
+        bool ok;
+        if (is_push) {
+            // the whole payload leaves for the peer here; the client gets a
+            // one-byte ack so the lane stays request/response framed
+            rpc_msg_push_tensor_rsp push_rsp;
+            ok = s->server->push_tensor(push_req, push_rsp);
+            response.assign((const uint8_t *) &push_rsp,
+                            (const uint8_t *) &push_rsp + sizeof(push_rsp));
+        } else {
+            ok = cmd == RPC_CMD_GET_TENSOR
+                ? s->server->get_tensor(req, response)
+                : s->server->get_tensor_bf16(req, response);
+        }
         if (!ok) {
-            GGML_LOG_ERROR("[rpc fdx] GET lane read failed\n");
+            GGML_LOG_ERROR("[rpc fdx] GET lane %s failed\n", is_push ? "push" : "read");
             break;
         }
         // advance the counter BEFORE streaming the response out: the read into
@@ -3210,15 +3584,29 @@ static bool rpc_session_attach_lane(uint64_t session_id, uint8_t lane, socket_pt
     if (s->closing) {
         return false;
     }
+    // the SET lane and every peer lane share one executor over one queue
+    auto ensure_exec = [s]{
+        if (!s->set_exec_started) {
+            s->set_exec_started = true;
+            s->set_exec_th = std::thread(rpc_lane_set_exec, s);
+        }
+    };
     if (lane == RPC_LANE_SET && s->set_sock == nullptr) {
         s->set_sock      = sock;
-        s->set_reader_th = std::thread(rpc_lane_set_reader, s);
-        s->set_exec_th   = std::thread(rpc_lane_set_exec, s);
+        s->set_reader_th = std::thread(rpc_lane_set_reader, s, sock, /*is_peer =*/ false);
+        ensure_exec();
         return true;
     }
     if (lane == RPC_LANE_GET && s->get_sock == nullptr) {
         s->get_sock = sock;
         s->get_th   = std::thread(rpc_lane_get_serve, s);
+        return true;
+    }
+    if (lane == RPC_LANE_PEER) {
+        s->peer_socks.push_back(sock);
+        s->peer_ths.emplace_back(rpc_lane_set_reader, s, sock, /*is_peer =*/ true);
+        ensure_exec();
+        GGML_LOG_INFO("[rpc peer] peer lane attached to session %" PRIu64 "\n", session_id);
         return true;
     }
     return false;
@@ -3234,10 +3622,20 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
         if (s.get_sock != nullptr) {
             s.get_sock->shutdown_rw();
         }
+        for (auto & p : s.peer_socks) {
+            if (p != nullptr) {
+                p->shutdown_rw();
+            }
+        }
     }
     s.fail();   // wake any fence/queue waiter
     if (s.set_reader_th.joinable()) {
         s.set_reader_th.join();
+    }
+    for (auto & t : s.peer_ths) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
     if (s.set_exec_th.joinable()) {
         s.set_exec_th.join();
@@ -3245,6 +3643,8 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
     if (s.get_th.joinable()) {
         s.get_th.join();
     }
+    // drop our outgoing links too: they belong to the session that opened them
+    rpc_peer_links_close();
 }
 
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
@@ -3528,6 +3928,27 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
             case RPC_CMD_LANE_ATTACH: {
                 // only valid as the first command of a dedicated lane connection
                 GGML_LOG_ERROR("LANE_ATTACH on the main connection\n");
+                return;
+            }
+            case RPC_CMD_PEER_OPEN: {
+                rpc_msg_peer_open_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_peer_open_rsp response;
+                if (!server.peer_open(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PUSH_TENSOR: {
+                // pushes are routed on the GET lane so they order against this
+                // node's compute; on the main connection they would serialize
+                // behind graph traffic for no benefit
+                GGML_LOG_ERROR("PUSH_TENSOR on the main connection\n");
                 return;
             }
             default: {

@@ -9,10 +9,12 @@ extern "C" {
 #define RPC_PROTO_MAJOR_VERSION    5
 #define RPC_PROTO_MINOR_VERSION    0
 // patch 1: full-duplex transfer lanes (SESSION_INFO / LANE_ATTACH / LANE_FENCE).
+// patch 2: direct remote->remote transfer (PEER_OPEN / PUSH_TENSOR).
 // The patch level is not checked by the HELLO handshake, so old clients keep
 // working against new servers; new clients only attach lanes when the server
-// reports patch >= 1 (see GGML_RPC_FDX_MIN_PATCH).
-#define RPC_PROTO_PATCH_VERSION    1
+// reports patch >= 1 (see GGML_RPC_FDX_MIN_PATCH) and only route peer traffic
+// when both endpoints report patch >= 2 (GGML_RPC_PEER_MIN_PATCH).
+#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
