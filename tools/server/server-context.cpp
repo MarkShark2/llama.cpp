@@ -3488,15 +3488,29 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
+                        //  - 4 + n_ubatch   [fork: off by default, see below]
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        //
+                        // [fork] each break ends the prompt batch, and a decode boundary drains the
+                        // whole pipeline -- expensive in proportion to the stage count on a
+                        // multi-stage RPC split. Measured on DSV4 across 10 stages: the deep break
+                        // costs 15.0 s and the shallow one 10.3 s of an 85 s request. The deep break
+                        // only buys a fallback checkpoint n_ubatch tokens further back; per-turn
+                        // restores come from the user-message-boundary rule above and end-of-prompt
+                        // continuation from the shallow break, so it is off by default here.
+                        // LLAMA_CKPT_DEEP_BREAK=1 restores upstream's pair.
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            static const bool deep_break = [] {
+                                const char * e = getenv("LLAMA_CKPT_DEEP_BREAK");
+                                return e && atoi(e) != 0;
+                            }();
+
+                            const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
+                            for (int i = deep_break ? 0 : 1; i < 2; ++i) {
+                                const int n_last = std::min(n_batch, checkpoint_offsets[i]);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;
