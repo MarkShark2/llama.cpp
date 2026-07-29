@@ -1005,11 +1005,26 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// [fork] GGML_ALLOC_TRACE_REALLOC=1: name the tensor that forces a graph
+// reallocation on stderr — over deep RPC pipelines each realloc costs a full
+// drain, so per-ubatch-growing shapes must be found and bucketed
+static bool ggml_gallocr_realloc_trace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char * e = getenv("GGML_ALLOC_TRACE_REALLOC");
+        trace = e ? atoi(e) : 0;
+    }
+    return trace > 0;
+}
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
+        if (ggml_gallocr_realloc_trace()) {
+            fprintf(stderr, "[galloc] realloc: n_nodes %d -> %d\n", galloc->n_nodes, graph->n_nodes);
+        }
         return true;
     }
 
@@ -1017,6 +1032,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        if (ggml_gallocr_realloc_trace()) {
+            fprintf(stderr, "[galloc] realloc: n_leafs %d -> %d\n", galloc->n_leafs, graph->n_leafs);
+        }
         return true;
     }
 
@@ -1028,6 +1046,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
+            if (ggml_gallocr_realloc_trace()) {
+                fprintf(stderr, "[galloc] realloc: node %s (%s) needs %zu, fits %zu\n",
+                        node->name, ggml_op_desc(node), ggml_nbytes(node), node_alloc->dst.size_max);
+            }
             return true;
         }
 
@@ -1040,6 +1062,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
+                if (ggml_gallocr_realloc_trace()) {
+                    fprintf(stderr, "[galloc] realloc: src %d (%s, %s) of node %s needs %zu, fits %zu\n",
+                            j, src->name, ggml_op_desc(src), node->name, ggml_nbytes(src), node_alloc->src[j].size_max);
+                }
                 return true;
             }
         }

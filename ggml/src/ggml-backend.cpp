@@ -21,6 +21,8 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -754,7 +756,11 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 30
+// [fork] 30 -> 64: DSV4's hyper-connection boundaries stage ~25 per-stream
+// l_last view inputs + ~15 state/mask inputs per pipeline stage; the old cap
+// forced a second split per RPC device (18 splits instead of 9 on the
+// 8-board House), doubling stage-boundary hairpins per ubatch.
+#define GGML_SCHED_MAX_SPLIT_INPUTS 64
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
@@ -1266,6 +1272,47 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // [fork] GGML_SCHED_DEDUP_VIEWS: when several distinct views of one parent
+    // tensor cross the same backend boundary, copying each view duplicates the
+    // parent's bytes on the wire (DSV4 hyper-connections stage ~9 overlapping
+    // l_last stream/reshape views per RPC crossing — ~2-6x the parent's size).
+    // Mark parents whose distinct crossing views sum to more than the parent
+    // itself; pass 5 then transfers the parent once and rebinds those views to
+    // local views of that single copy.
+    static const bool dedup_views = getenv("GGML_SCHED_DEDUP_VIEWS") && atoi(getenv("GGML_SCHED_DEDUP_VIEWS"));
+    std::unordered_map<uint64_t, size_t> dedup_view_bytes; // (parent, dst backend) -> distinct crossing view bytes
+    auto dedup_key = [](const struct ggml_tensor * t, int backend_id) {
+        return ((uint64_t)(uintptr_t) t << 5) | (uint64_t) backend_id;
+    };
+    if (dedup_views) {
+        std::unordered_set<uint64_t> seen; // (view, dst backend)
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            const int node_backend_id = tensor_backend_id(node);
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (src == NULL || src->view_src == NULL || (src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    continue;
+                }
+                struct ggml_tensor * base = src->view_src;
+                if (src->type != base->type || !ggml_is_contiguous(base)) {
+                    continue;
+                }
+                if (tensor_backend_id(src) == node_backend_id ||
+                    ggml_backend_sched_buffer_supported(sched, src, node_backend_id)) {
+                    continue;
+                }
+                if (!seen.insert(dedup_key(src, node_backend_id)).second) {
+                    continue;
+                }
+                dedup_view_bytes[dedup_key(base, node_backend_id)] += ggml_nbytes(src);
+            }
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
@@ -1374,6 +1421,47 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    // [fork] dedup marked views: transfer the parent once, rebind the view
+                    // to a local view of the parent's copy (no wire copy for the view)
+                    struct ggml_tensor * base = src->view_src;
+                    if (dedup_views && base != NULL && !(src->flags & GGML_TENSOR_FLAG_INPUT) &&
+                        src->type == base->type && ggml_is_contiguous(base)) {
+                        auto it = dedup_view_bytes.find(dedup_key(base, cur_backend_id));
+                        if (it != dedup_view_bytes.end() && it->second > ggml_nbytes(base)) {
+                            const size_t base_id = hash_id(base);
+                            if (tensor_id_copy(base_id, cur_backend_id, 0) == NULL) {
+                                ggml_backend_t backend = sched->backends[cur_backend_id];
+                                for (int c = 0; c < sched->n_copies; c++) {
+                                    struct ggml_tensor * base_copy = ggml_dup_tensor_layout(sched->ctx, base);
+                                    ggml_format_name(base_copy, "%s#%s#%d", ggml_backend_name(backend), base->name, c);
+                                    if (sched->n_copies > 1) {
+                                        ggml_set_input(base_copy);
+                                        ggml_set_output(base_copy); // prevent ggml-alloc from overwriting the tensor
+                                    }
+                                    tensor_id_copy(base_id, cur_backend_id, c) = base_copy;
+                                    SET_CAUSE(base_copy, "5.dvp");
+                                }
+                                int n_inputs = split->n_inputs++;
+                                GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                                split->inputs[n_inputs] = base;
+                            }
+                            if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                                for (int c = 0; c < sched->n_copies; c++) {
+                                    struct ggml_tensor * base_copy = tensor_id_copy(base_id, cur_backend_id, c);
+                                    struct ggml_tensor * view_copy = ggml_view_4d(sched->ctx, base_copy,
+                                            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                                            src->nb[1], src->nb[2], src->nb[3], src->view_offs);
+                                    view_copy->nb[0] = src->nb[0];
+                                    ggml_format_name(view_copy, "%s#%s#%d",
+                                            ggml_backend_name(sched->backends[cur_backend_id]), src->name, c);
+                                    tensor_id_copy(src_id, cur_backend_id, c) = view_copy;
+                                    SET_CAUSE(view_copy, "5.dvv");
+                                }
+                            }
+                            node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                            continue;
+                        }
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1553,14 +1641,34 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             fprintf(stderr, "[sched] REALLOC drain (backend_ids_changed or galloc alloc failed)\n");
             fflush(stderr);
         }
+        const bool realloc_trace = getenv("GGML_SCHED_SUBMIT_TRACE") && atoi(getenv("GGML_SCHED_SUBMIT_TRACE"));
         for (int i = 0; i < sched->n_backends; i++) {
+            const int64_t ts0 = ggml_time_us();
             ggml_backend_synchronize(sched->backends[i]);
+            if (realloc_trace) {
+                const int64_t ts1 = ggml_time_us();
+                if (ts1 - ts0 > 500*1000) {
+                    fprintf(stderr, "[sched] REALLOC sync %s = %.1fms\n",
+                            ggml_backend_name(sched->backends[i]), (ts1 - ts0) / 1000.0);
+                    fflush(stderr);
+                }
+            }
         }
 
+        const int64_t tr0 = ggml_time_us();
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        const int64_t tr1 = ggml_time_us();
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
+        }
+        if (realloc_trace) {
+            const int64_t tr2 = ggml_time_us();
+            if (tr2 - tr0 > 500*1000) {
+                fprintf(stderr, "[sched] REALLOC reserve=%.1fms alloc=%.1fms\n",
+                        (tr1 - tr0) / 1000.0, (tr2 - tr1) / 1000.0);
+                fflush(stderr);
+            }
         }
     }
 

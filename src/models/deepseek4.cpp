@@ -226,6 +226,24 @@ static ggml_tensor * dsv4_hc_affine(
     return x;
 }
 
+ggml_tensor * llm_graph_context_dsv4_mla::build_hc_stream_view(ggml_tensor * parent, int64_t ih) const {
+    const int64_t hc = hparams.dsv4_hc_mult;
+    GGML_ASSERT(hc <= (int64_t) (sizeof(hc_stream_views)/sizeof(hc_stream_views[0])));
+    GGML_ASSERT(ih >= 0 && ih < hc);
+    GGML_ASSERT(parent->ne[0] == n_embd && parent->ne[1] == hc);
+
+    if (hc_stream_parent != parent) {
+        hc_stream_parent = parent;
+        for (int64_t i = 0; i < hc; ++i) {
+            hc_stream_views[i] = nullptr;
+        }
+    }
+    if (hc_stream_views[ih] == nullptr) {
+        hc_stream_views[ih] = ggml_view_2d(ctx0, parent, n_embd, parent->ne[2], parent->nb[2], ih*parent->nb[1]);
+    }
+    return hc_stream_views[ih];
+}
+
 ggml_tensor * llm_graph_context_dsv4_mla::build_hc_weighted_sum(
         ggml_tensor * x,
         ggml_tensor * weights,
@@ -244,7 +262,7 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_weighted_sum(
 
     ggml_tensor * result = nullptr;
     for (int64_t ih = 0; ih < hc; ++ih) {
-        ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], ih*x->nb[1]);
+        ggml_tensor * xh = build_hc_stream_view(x, ih);
         ggml_tensor * wh = ggml_view_2d(ctx0, weights, 1, nt, weights->nb[1], ih*weights->nb[0]);
         ggml_tensor * cur = ggml_mul(ctx0, xh, wh);
         result = result ? ggml_add(ctx0, result, cur) : cur;
@@ -372,7 +390,7 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_post(
         ggml_tensor * cur = ggml_mul(ctx0, x, post_dst);
 
         for (int64_t src = 0; src < hc; ++src) {
-            ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
+            ggml_tensor * res_src = build_hc_stream_view(residual, src);
             ggml_tensor * comb_src_dst = ggml_view_2d(ctx0, comb, 1, nt, comb->nb[2],
                     dst*comb->nb[0] + src*comb->nb[1]);
             cur = ggml_add(ctx0, cur, ggml_mul(ctx0, res_src, comb_src_dst));

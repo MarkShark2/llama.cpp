@@ -1436,6 +1436,43 @@ static llama_kv_bucket_cfg llama_kv_bucket_get_cfg() {
     return cfg;
 }
 
+// [fork] shared bucket rounding for auxiliary caches (the DSV4 compressed/lid
+// plans pad to 256 only, so their kq masks step every couple of ubatches and
+// each step forces a galloc realloc = full pipeline drain over RPC). step_div
+// scales the configured step into the cache's position space: a ratio-R
+// compressed cache advances one cell per R raw positions.
+uint32_t llama_kv_bucket_pad(uint32_t cur, uint32_t cells_size, uint32_t n_pad, uint32_t step_div) {
+    cur = std::max(n_pad, GGML_PAD(cur, n_pad));
+
+    const auto bucket = llama_kv_bucket_get_cfg();
+
+    uint32_t out = cur;
+    switch (bucket.mode) {
+        case llama_kv_bucket_mode::OFF:
+            break;
+        case llama_kv_bucket_mode::FULL:
+            out = cells_size;
+            break;
+        case llama_kv_bucket_mode::POW2:
+            {
+                uint32_t p = n_pad;
+                while (p < cur && p < cells_size) {
+                    p *= 2;
+                }
+                out = p;
+            }
+            break;
+        case llama_kv_bucket_mode::MULTIPLE:
+            {
+                const uint32_t step = std::max(std::max(1u, bucket.step/std::max(1u, step_div)), n_pad);
+                out = std::max(step, GGML_PAD(cur, step));
+            }
+            break;
+    }
+
+    return std::min(cells_size, std::max(out, cur));
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

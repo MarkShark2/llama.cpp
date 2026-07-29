@@ -571,7 +571,24 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 overlap_cur_reads.begin(), overlap_cur_reads.end());
     }
 
-    plan.n_kv = GGML_PAD(plan.n_kv, 256u);
+    // [fork] LLAMA_KV_BUCKET_COMP=<cells>: bucket the compressed n_kv — a
+    // 256-padded comp mask changes shape every couple of ubatches, and each
+    // change is a galloc realloc that drains the whole RPC pipeline (~16 s
+    // over 9 stages). Off by default: Vulkan FA does NOT skip fully-masked
+    // tiles, so padded comp cells cost real attention time every ubatch
+    // (measured 2026-07-28: comp padded to cache size halved warm prefill).
+    // Use a moderate step to trade a few one-time reallocs for small padding.
+    {
+        static const uint32_t comp_step = []() {
+            const char * e = getenv("LLAMA_KV_BUCKET_COMP");
+            return e ? (uint32_t) std::max(0L, strtol(e, nullptr, 10)) : 0u;
+        }();
+        if (comp_step > 0) {
+            plan.n_kv = std::min<int64_t>(kv_size, std::max<int64_t>(comp_step, GGML_PAD(plan.n_kv, (int64_t) comp_step)));
+        } else {
+            plan.n_kv = GGML_PAD(plan.n_kv, 256u);
+        }
+    }
 
     std::sort(persist_rows.begin(), persist_rows.end(),
             [](const persist_row & a, const persist_row & b) {

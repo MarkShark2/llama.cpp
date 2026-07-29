@@ -1118,6 +1118,16 @@ struct llm_graph_context_dsv4_mla : public llm_graph_context {
             ggml_tensor * weights,
             int           il) const;
 
+    // Memoized per-stream view of an [n_embd, hc, nt] residual. hc_weighted_sum and
+    // hc_post consume per-stream views of the same layer input, and each *distinct*
+    // view tensor of an off-device parent becomes its own split-input copy at an RPC
+    // stage boundary — the hc*hc-per-post duplicates cost ~40 MB per boundary crossing
+    // at ubatch 256. Sharing one set per parent keeps a crossing at hc stream views.
+    ggml_tensor * build_hc_stream_view(ggml_tensor * parent, int64_t ih) const;
+
+    mutable ggml_tensor * hc_stream_parent   = nullptr;
+    mutable ggml_tensor * hc_stream_views[8] = {};
+
     ggml_tensor * build_hc_sinkhorn(
             ggml_tensor * comb,
             int il) const;

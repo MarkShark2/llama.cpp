@@ -13,6 +13,11 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// [fork] LLAMA_KV_BUCKET rounding for auxiliary caches (DSV4 compressed/lid
+// plans); step_div scales the configured step into a ratio-R cache's position
+// space. Returns cur padded to n_pad and the bucket policy, clamped to cells_size.
+uint32_t llama_kv_bucket_pad(uint32_t cur, uint32_t cells_size, uint32_t n_pad, uint32_t step_div);
+
 //
 // llama_kv_cache
 //
