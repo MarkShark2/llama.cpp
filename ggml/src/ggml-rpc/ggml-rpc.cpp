@@ -978,6 +978,43 @@ static bool rpc_peer_enabled() {
     return on;
 }
 
+// GGML_RPC_PEER_MAP="<client endpoint>=<peer endpoint>,..." rewrites the
+// address a producer dials for a destination. The client reaches the nodes on
+// whatever network it shares with them, which is not necessarily the fastest
+// link *between* them: here the boards sit on a 10 GbE fabric the Windows head
+// is not even attached to, so without this the peer traffic would take the
+// management LAN. Unmapped endpoints are dialed exactly as the client has them.
+static const std::string & rpc_peer_addr(const std::string & endpoint) {
+    static const std::unordered_map<std::string, std::string> map = []{
+        std::unordered_map<std::string, std::string> m;
+        const char * e = std::getenv("GGML_RPC_PEER_MAP");
+        if (e == nullptr) {
+            return m;
+        }
+        std::string spec(e);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t comma = spec.find(',', pos);
+            if (comma == std::string::npos) {
+                comma = spec.size();
+            }
+            const std::string entry = spec.substr(pos, comma - pos);
+            const size_t eq = entry.find('=');
+            if (eq != std::string::npos && eq > 0 && eq + 1 < entry.size()) {
+                m[entry.substr(0, eq)] = entry.substr(eq + 1);
+                GGML_LOG_INFO("[rpc peer] route %s via %s\n",
+                              entry.substr(0, eq).c_str(), entry.substr(eq + 1).c_str());
+            } else if (!entry.empty()) {
+                GGML_LOG_WARN("[rpc peer] ignoring malformed GGML_RPC_PEER_MAP entry '%s'\n", entry.c_str());
+            }
+            pos = comma + 1;
+        }
+        return m;
+    }();
+    auto it = map.find(endpoint);
+    return it == map.end() ? endpoint : it->second;
+}
+
 static std::mutex g_peer_route_m;
 static std::unordered_map<std::string, bool> g_peer_routes;   // "src>dst" -> usable
 
@@ -996,9 +1033,10 @@ static bool rpc_peer_route_ready(const std::string & src_endpoint,
             return it->second;
         }
     }
+    const std::string & via = rpc_peer_addr(dst_endpoint);
     bool ok = false;
-    if (dst_endpoint.size() >= RPC_ENDPOINT_MAX) {
-        GGML_LOG_WARN("[rpc peer] endpoint '%s' too long to route\n", dst_endpoint.c_str());
+    if (via.size() >= RPC_ENDPOINT_MAX) {
+        GGML_LOG_WARN("[rpc peer] endpoint '%s' too long to route\n", via.c_str());
     } else if (rpc_server_patch(src_endpoint) < GGML_RPC_PEER_MIN_PATCH ||
                rpc_server_patch(dst_endpoint) < GGML_RPC_PEER_MIN_PATCH) {
         GGML_LOG_WARN("[rpc peer] %s -> %s: server too old for peer transfer\n",
@@ -1006,7 +1044,7 @@ static bool rpc_peer_route_ready(const std::string & src_endpoint,
     } else {
         rpc_msg_peer_open_req req = {};
         req.session_id = dst_session_id;
-        memcpy(req.endpoint, dst_endpoint.c_str(), dst_endpoint.size());
+        memcpy(req.endpoint, via.c_str(), via.size());
         rpc_msg_peer_open_rsp rsp = { 0 };
         auto sock = get_socket(src_endpoint);
         if (sock != nullptr) {
@@ -2329,10 +2367,44 @@ static void rpc_cache_enforce_limit(const char * cache_dir, size_t limit) {
 // One link per destination endpoint, shared by every push to it; the mutex
 // serializes whole messages onto the socket.
 // ---------------------------------------------------------------------------
+// A push is handed to a per-link sender thread and acknowledged immediately.
+// It must NEVER block on the wire: the push arrives on the producer's GET
+// lane, so blocking there stalls the client too, and the consumer often cannot
+// accept the payload until the client has advanced it -- the client waits on
+// the producer, the producer waits on the consumer, the consumer waits on the
+// client. That three-way cycle deadlocked the whole fleet on the first try
+// (81 MB stuck unread in one peer socket, every board's set-executor parked in
+// wait_counts). Handing the bytes to a private thread breaks it: client
+// progress no longer depends on peer progress, so the consumer always reaches
+// the fence that lets it drain.
+//
+// The queue is therefore a SOFT cap -- over it we warn, never block. Depth is
+// bounded in practice by the scheduler's in-flight copies (GGML_SCHED_COPIES).
 struct rpc_peer_link {
-    std::mutex m;
-    socket_ptr sock;
+    std::mutex  m;          // guards sock during connect/teardown
+    socket_ptr  sock;
+
+    std::mutex                        q_m;
+    std::condition_variable           q_cv;
+    std::deque<std::vector<uint8_t>>  q;      // pre-framed lane messages, FIFO
+    size_t      q_bytes = 0;
+    bool        closing = false;
+    bool        failed  = false;
+    bool        warned  = false;
+    std::thread sender;
 };
+
+static size_t rpc_peer_queue_soft_cap() {
+    static const size_t cap = []{
+        const char * e = std::getenv("GGML_RPC_PEER_QUEUE_MB");
+        long mb = e ? strtol(e, nullptr, 10) : 0;
+        if (mb <= 0) {
+            mb = 512;
+        }
+        return (size_t) mb * 1024 * 1024;
+    }();
+    return cap;
+}
 
 static std::mutex g_peer_mutex;
 static std::unordered_map<std::string, std::shared_ptr<rpc_peer_link>> g_peer_links;
@@ -2341,6 +2413,35 @@ static std::shared_ptr<rpc_peer_link> rpc_peer_link_find(const std::string & end
     std::lock_guard<std::mutex> l(g_peer_mutex);
     auto it = g_peer_links.find(endpoint);
     return it == g_peer_links.end() ? nullptr : it->second;
+}
+
+// drains the link's queue onto the socket in FIFO order
+static void rpc_peer_sender(rpc_peer_link * link, std::string endpoint) {
+    for (;;) {
+        std::vector<uint8_t> msg;
+        {
+            std::unique_lock<std::mutex> l(link->q_m);
+            link->q_cv.wait(l, [&]{ return !link->q.empty() || link->closing; });
+            if (link->q.empty()) {
+                return;   // closing and drained
+            }
+            msg = std::move(link->q.front());
+            link->q.pop_front();
+            link->q_bytes -= msg.size();
+        }
+        link->q_cv.notify_all();
+        socket_ptr sock;
+        {
+            std::lock_guard<std::mutex> l(link->m);
+            sock = link->sock;
+        }
+        if (sock == nullptr || !sock->send_data(msg.data(), msg.size())) {
+            GGML_LOG_ERROR("[rpc peer] lost the peer lane to %s mid-push\n", endpoint.c_str());
+            std::lock_guard<std::mutex> l(link->q_m);
+            link->failed = true;
+            return;
+        }
+    }
 }
 
 // close every peer link; called when the session that created them ends so a
@@ -2352,6 +2453,14 @@ static void rpc_peer_links_close() {
         links.swap(g_peer_links);
     }
     for (auto & kv : links) {
+        {
+            std::lock_guard<std::mutex> l(kv.second->q_m);
+            kv.second->closing = true;
+        }
+        kv.second->q_cv.notify_all();
+        if (kv.second->sender.joinable()) {
+            kv.second->sender.join();
+        }
         std::lock_guard<std::mutex> l(kv.second->m);
         if (kv.second->sock != nullptr) {
             kv.second->sock->shutdown_rw();
@@ -2853,6 +2962,23 @@ bool rpc_server::peer_open(const rpc_msg_peer_open_req & request, rpc_msg_peer_o
         std::lock_guard<std::mutex> l(link->m);
         link->sock = sock;
     }
+    // a previous sender for this link may have exited on a broken socket; its
+    // thread object is still joinable and assigning over it would terminate()
+    if (link->sender.joinable()) {
+        {
+            std::lock_guard<std::mutex> l(link->q_m);
+            link->closing = true;
+        }
+        link->q_cv.notify_all();
+        link->sender.join();
+        std::lock_guard<std::mutex> l(link->q_m);
+        link->closing = false;
+        link->failed  = false;
+        link->warned  = false;
+        link->q.clear();
+        link->q_bytes = 0;
+    }
+    link->sender = std::thread(rpc_peer_sender, link.get(), endpoint);
     GGML_LOG_INFO("[rpc peer] peer lane open to %s (session %" PRIu64 ")\n",
                   endpoint.c_str(), request.session_id);
     response.ok = 1;
@@ -2907,37 +3033,46 @@ bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_pu
         }
     }
 
-    // build the SET message the peer's lane reader expects, reading the payload
-    // straight into it (no staging copy in the f32 case)
-    const size_t wire_size = bf16 ? request.size / 2 : request.size;
-    std::vector<uint8_t> payload(RPC_SET_TENSOR_HDR + wire_size);
-    memcpy(payload.data(), &request.dst, sizeof(request.dst));
-    memcpy(payload.data() + sizeof(request.dst), &request.dst_offset, sizeof(request.dst_offset));
+    // Frame the whole lane message up front -- | cmd | total | wait_main |
+    // wait_get | rpc_tensor(dst) | dst_offset | data | -- reading the payload
+    // straight into its final position (no staging copy in the f32 case) so
+    // the sender thread can hand one contiguous buffer to the socket.
+    const size_t   wire_size = bf16 ? request.size / 2 : request.size;
+    const size_t   lane_hdr  = 1 + 3*sizeof(uint64_t);
+    const uint64_t total     = 2*sizeof(uint64_t) + RPC_SET_TENSOR_HDR + wire_size;
+    std::vector<uint8_t> msg(lane_hdr + RPC_SET_TENSOR_HDR + wire_size);
+    msg[0] = (uint8_t) (bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR);
+    memcpy(msg.data() + 1,                     &total,             sizeof(total));
+    memcpy(msg.data() + 1 + sizeof(uint64_t),  &request.wait_main, sizeof(request.wait_main));
+    memcpy(msg.data() + 1 + 2*sizeof(uint64_t),&request.wait_get,  sizeof(request.wait_get));
+    uint8_t * body = msg.data() + lane_hdr;
+    memcpy(body,                          &request.dst,        sizeof(request.dst));
+    memcpy(body + sizeof(request.dst),    &request.dst_offset, sizeof(request.dst_offset));
     if (bf16) {
         std::vector<float> tmp(request.size / sizeof(float));
         ggml_backend_tensor_get(src, tmp.data(), request.src_offset, request.size);
-        ggml_fp32_to_bf16_row(tmp.data(),
-                              (ggml_bf16_t *) (payload.data() + RPC_SET_TENSOR_HDR),
+        ggml_fp32_to_bf16_row(tmp.data(), (ggml_bf16_t *) (body + RPC_SET_TENSOR_HDR),
                               (int64_t) tmp.size());
     } else {
-        ggml_backend_tensor_get(src, payload.data() + RPC_SET_TENSOR_HDR,
-                                request.src_offset, request.size);
+        ggml_backend_tensor_get(src, body + RPC_SET_TENSOR_HDR, request.src_offset, request.size);
     }
-
-    const enum rpc_cmd set_cmd = bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
+    // hand off and acknowledge; never wait for the wire (see rpc_peer_link)
     {
-        std::lock_guard<std::mutex> l(link->m);
-        if (link->sock == nullptr ||
-            !send_lane_cmd(link->sock, set_cmd, request.wait_main, request.wait_get,
-                           payload.data(), payload.size())) {
-            GGML_LOG_ERROR("[rpc peer] lost the peer lane to %s mid-push\n", ep);
-            if (link->sock != nullptr) {
-                link->sock->shutdown_rw();
-                link->sock = nullptr;
-            }
+        std::lock_guard<std::mutex> l(link->q_m);
+        if (link->failed) {
+            GGML_LOG_ERROR("[rpc peer] peer lane to %s already failed\n", ep);
             return true;
         }
+        const size_t bytes = msg.size();
+        link->q.push_back(std::move(msg));
+        link->q_bytes += bytes;
+        if (link->q_bytes > rpc_peer_queue_soft_cap() && !link->warned) {
+            link->warned = true;
+            GGML_LOG_WARN("[rpc peer] %s is backing up (%zu MB queued); the link is slower than the pipeline\n",
+                          ep, link->q_bytes / (1024*1024));
+        }
     }
+    link->q_cv.notify_all();
     response.ok = 1;
     return true;
 }
