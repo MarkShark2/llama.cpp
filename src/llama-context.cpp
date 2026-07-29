@@ -278,12 +278,12 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
-    // The fused DSV4 hyper-connection ops exist only for CPU and CUDA. The
-    // auto-probe below cannot see that a Vulkan RPC endpoint lacks them,
-    // because the RPC backend's supports_op is a `return true` stub -- so the
-    // ops get scheduled onto the remote node and abort its rpc-server. Set
-    // LLAMA_FUSED_DSV4_HC=0 to force the primitive-op path everywhere, which is
-    // what a House split over the BC-250 Vulkan boards needs.
+    // The fused DSV4 hyper-connection ops now exist for CPU, CUDA and Vulkan,
+    // so a House split over the BC-250 boards can leave this on. Note that the
+    // auto-probe below still cannot see a backend that lacks them, because the
+    // RPC backend's supports_op is a `return true` stub -- on any *other*
+    // remote backend the ops would be scheduled out and abort its rpc-server.
+    // Set LLAMA_FUSED_DSV4_HC=0 to force the primitive-op path everywhere.
     const bool fused_hc = !getenv("LLAMA_FUSED_DSV4_HC") || atoi(getenv("LLAMA_FUSED_DSV4_HC")) != 0;
     cparams.fused_dsv4_hc_pre  = fused_hc;
     cparams.fused_dsv4_hc_comb = fused_hc;
