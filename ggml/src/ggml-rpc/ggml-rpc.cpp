@@ -3494,11 +3494,9 @@ struct rpc_active_session {
     socket_ptr  set_sock, get_sock;
     std::thread set_reader_th, set_exec_th, get_th;
     // [fork] peer lanes: other servers pushing activations straight to us.
-    // They feed the same queue as the client's SET lane, so one executor keeps
-    // every upload -- client or peer -- in a single ordered domain.
+    // Each gets its own reader/applier thread (see rpc_lane_peer_serve).
     std::vector<socket_ptr>  peer_socks;
     std::vector<std::thread> peer_ths;
-    bool                     set_exec_started = false;
 
     // SET lane reader -> executor queue (bounded by bytes)
     std::mutex              q_m;
@@ -3550,8 +3548,7 @@ static size_t rpc_lane_queue_cap() {
     return cap;
 }
 
-// Reads SET messages off `sock` into the session's ordered apply queue. Used
-// for the client's SET lane and, with is_peer, for each peer lane [fork].
+// Reads SET messages off `sock` into the session's ordered apply queue.
 static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is_peer) {
     for (;;) {
         uint8_t cmd;
@@ -3704,6 +3701,74 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
     s->fail();
 }
 
+// [fork] One thread per peer lane: read a SET message, wait for this node's
+// ordering counters, apply it, bump set_done.
+//
+// Deliberately NOT sharing the client SET lane's queue and executor. A peer
+// message arrives decoupled from the client's stream order -- the producer
+// ships it as soon as its own compute is done, which can be long before the
+// client has sent us the commands its fence targets refer to. On the shared
+// queue such a message parks at the head and blocks every client upload behind
+// it, including the ones that would advance the very counters it waits for
+// (measured: 256 MB queued on one board, both readers and the executor stuck).
+// With a private thread per link a not-yet-satisfiable push only stalls its own
+// producer, via ordinary TCP backpressure.
+//
+// set_done is a count of applied SET-domain operations, so LANE_FENCE keeps
+// working across the client lane and every peer lane; the boundary tensors
+// these carry are distinct, so applying them out of order relative to each
+// other is not observable.
+static void rpc_lane_peer_serve(rpc_active_session * s, socket_ptr sock) {
+    for (;;) {
+        uint8_t cmd;
+        if (!sock->recv_data(&cmd, 1)) {
+            break;
+        }
+        if (cmd != RPC_CMD_SET_TENSOR && cmd != RPC_CMD_SET_TENSOR_BF16) {
+            GGML_LOG_ERROR("[rpc peer] unexpected command %d on a peer lane\n", cmd);
+            break;
+        }
+        uint64_t size;
+        if (!sock->recv_data(&size, sizeof(size))) {
+            break;
+        }
+        if (size < 2*sizeof(uint64_t) || size > MAX_CHUNK_SIZE) {
+            GGML_LOG_ERROR("[rpc peer] bad peer lane message size %" PRIu64 "\n", size);
+            break;
+        }
+        uint64_t wait_main, wait_get;
+        if (!sock->recv_data(&wait_main, sizeof(wait_main)) ||
+            !sock->recv_data(&wait_get,  sizeof(wait_get))) {
+            break;
+        }
+        std::vector<uint8_t> payload(size - 2*sizeof(uint64_t));
+        if (!sock->recv_data(payload.data(), payload.size())) {
+            break;
+        }
+        if (!s->wait_counts(wait_main, 0, wait_get)) {
+            return;
+        }
+        const bool ok = cmd == RPC_CMD_SET_TENSOR
+            ? s->server->set_tensor(payload, /*allow_cache =*/ false)
+            : s->server->set_tensor_bf16(payload, /*allow_cache =*/ false);
+        if (!ok) {
+            GGML_LOG_ERROR("[rpc peer] peer lane apply failed\n");
+            s->fail();
+            return;
+        }
+        s->bump(s->set_done);
+    }
+    // a peer hanging up while we are already closing is just the far end
+    // tearing down its own session, not an error
+    {
+        std::lock_guard<std::mutex> l(s->lane_m);
+        if (s->closing) {
+            return;
+        }
+    }
+    s->fail();
+}
+
 // registry so lane connections (classified on the acceptor's dispatch threads)
 // can find the live session
 static std::mutex g_session_mutex;
@@ -3719,17 +3784,10 @@ static bool rpc_session_attach_lane(uint64_t session_id, uint8_t lane, socket_pt
     if (s->closing) {
         return false;
     }
-    // the SET lane and every peer lane share one executor over one queue
-    auto ensure_exec = [s]{
-        if (!s->set_exec_started) {
-            s->set_exec_started = true;
-            s->set_exec_th = std::thread(rpc_lane_set_exec, s);
-        }
-    };
     if (lane == RPC_LANE_SET && s->set_sock == nullptr) {
         s->set_sock      = sock;
         s->set_reader_th = std::thread(rpc_lane_set_reader, s, sock, /*is_peer =*/ false);
-        ensure_exec();
+        s->set_exec_th   = std::thread(rpc_lane_set_exec, s);
         return true;
     }
     if (lane == RPC_LANE_GET && s->get_sock == nullptr) {
@@ -3739,8 +3797,7 @@ static bool rpc_session_attach_lane(uint64_t session_id, uint8_t lane, socket_pt
     }
     if (lane == RPC_LANE_PEER) {
         s->peer_socks.push_back(sock);
-        s->peer_ths.emplace_back(rpc_lane_set_reader, s, sock, /*is_peer =*/ true);
-        ensure_exec();
+        s->peer_ths.emplace_back(rpc_lane_peer_serve, s, sock);
         GGML_LOG_INFO("[rpc peer] peer lane attached to session %" PRIu64 "\n", session_id);
         return true;
     }
