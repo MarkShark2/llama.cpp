@@ -273,10 +273,14 @@ llama_context::llama_context(
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
-        graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
+        const int level = LLAMA_GRAPH_REUSE_DISABLE ? atoi(LLAMA_GRAPH_REUSE_DISABLE) : (graph_reuse_disable ? 1 : 0);
+
+        graph_reuse_disable     = level != 0;
+        graph_reuse_disable_all = level >= 2;
 
         if (graph_reuse_disable) {
-            LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: graph reuse disabled for %s\n", __func__,
+                    graph_reuse_disable_all ? "all graphs" : "full-ubatch graphs only (token generation still reuses)");
         }
     }
 
@@ -1328,7 +1332,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

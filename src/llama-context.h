@@ -375,8 +375,24 @@ private:
 
     bool has_evaluated_once = false;
 
-    // env: LLAMA_GRAPH_REUSE_DISABLE
-    bool graph_reuse_disable = false;
+    // env: LLAMA_GRAPH_REUSE_DISABLE (1 = batch graphs only, 2 = every graph)
+    bool graph_reuse_disable     = false;
+    bool graph_reuse_disable_all = false;
+
+    // disabling graph reuse is a pipelined-*prefill* knob: rebuilding per ubatch is what keeps a
+    // multi-backend pipeline full, because the reuse path has to drain it before set_inputs. Graphs
+    // that carry fewer tokens than a full ubatch are token generation (or a single-ubatch prompt) --
+    // there is nothing to overlap and a rebuild per token is catastrophic -- so they keep reusing
+    // unless LLAMA_GRAPH_REUSE_DISABLE=2 asks for the old behaviour.
+    bool graph_reuse_allowed(const llama_ubatch & ubatch) const {
+        if (!graph_reuse_disable) {
+            return true;
+        }
+        if (graph_reuse_disable_all) {
+            return false;
+        }
+        return ubatch.n_tokens < cparams.n_ubatch;
+    }
 
     // perf
     mutable int64_t t_start_us  = 0;
