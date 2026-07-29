@@ -1,0 +1,111 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_DSV4_HC_COMB — per-token hyper-connection mixing matrix: softmax
+// over the source axis, then Sinkhorn-style alternating row/column
+// normalisation (see ggml_compute_forward_dsv4_hc_comb in ggml-cpu/ops.cpp
+// and dsv4_hc_comb_f32 in ggml-cuda/dsv4-hc.cu; keep the three in sync).
+//
+// hc is fixed at 4 by the op, so the whole 4x4 matrix lives in registers and
+// one invocation owns one token.
+
+#define HC 4
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer M { float data_m[]; };
+layout(binding = 1) readonly  buffer S { float data_s[]; };
+layout(binding = 2) readonly  buffer B { float data_b[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  n_tokens; // mixes->ne[1]
+    uint  nbm0; uint nbm1;              // mixes strides in elements
+    uint  nbs0;                         // scale stride in elements
+    uint  nbb0;                         // base stride in elements
+    uint  nbd0; uint nbd1; uint nbd2;   // dst strides in elements
+    float eps;
+    int   n_iter;
+};
+
+void main() {
+    const uint it = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+
+    if (it >= n_tokens) {
+        return;
+    }
+
+    // the comb block sits after the pre/post weights in the mix vector
+    const uint comb_offset = 2u * HC;
+
+    const float scale_comb = data_s[2u * nbs0];
+
+    float comb[HC * HC];
+
+    [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+        float mx = -1.0 / 0.0;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            const uint  idx = idst + HC * isrc;
+            const float v   = data_m[(comb_offset + idx) * nbm0 + it * nbm1] * scale_comb
+                            + data_b[(comb_offset + idx) * nbb0];
+            comb[idx] = v;
+            mx = max(mx, v);
+        }
+
+        float sum = 0.0f;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            const uint  idx = idst + HC * isrc;
+            const float v   = exp(comb[idx] - mx);
+            comb[idx] = v;
+            sum += v;
+        }
+
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            comb[idst + HC * isrc] = comb[idst + HC * isrc] * inv_sum + eps;
+        }
+    }
+
+    // normalise columns, then alternate rows/columns for the remaining iters
+    [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+        float sum = eps;
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            sum += comb[idst + HC * isrc];
+        }
+        const float inv_sum = 1.0f / sum;
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            comb[idst + HC * isrc] *= inv_sum;
+        }
+    }
+
+    for (int i = 1; i < n_iter; ++i) {
+        [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+            float sum = eps;
+            [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+                sum += comb[idst + HC * isrc];
+            }
+            const float inv_sum = 1.0f / sum;
+            [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+                comb[idst + HC * isrc] *= inv_sum;
+            }
+        }
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            float sum = eps;
+            [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+                sum += comb[idst + HC * isrc];
+            }
+            const float inv_sum = 1.0f / sum;
+            [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+                comb[idst + HC * isrc] *= inv_sum;
+            }
+        }
+    }
+
+    [[unroll]] for (uint isrc = 0; isrc < HC; ++isrc) {
+        [[unroll]] for (uint idst = 0; idst < HC; ++idst) {
+            data_d[idst * nbd0 + isrc * nbd1 + it * nbd2] = comb[idst + HC * isrc];
+        }
+    }
+}

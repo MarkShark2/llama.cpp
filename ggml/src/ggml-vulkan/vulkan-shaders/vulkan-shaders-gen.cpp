@@ -1144,6 +1144,11 @@ void process_shaders() {
     // [fork] DSA sparse flash attention
     string_to_spv("flash_attn_sparse_f16", "flash_attn_sparse.comp", {});
 
+    // [fork] fused DSV4 hyper-connection ops
+    string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
+    string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+    string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
     for (auto &c : compiles) {

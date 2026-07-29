@@ -1,0 +1,46 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_DSV4_HC_PRE — collapse the hyper-connection streams to one residual
+// (see ggml_compute_forward_dsv4_hc_pre in ggml-cpu/ops.cpp and
+// dsv4_hc_pre_f32 in ggml-cuda/dsv4-hc.cu; keep the three in sync).
+//
+//   dst[i0, it] = sum_ih( x[i0, ih, it] * weights[ih, it] )
+//
+// one invocation per (n_embd, token) element.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer X { float data_x[]; };
+layout(binding = 1) readonly  buffer W { float data_w[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;    // x->ne[0]
+    uint hc;        // x->ne[1]
+    uint n_tokens;  // x->ne[2]
+    uint nbx0; uint nbx1; uint nbx2;    // x strides in elements
+    uint nbw0; uint nbw1;               // weights strides in elements
+    uint nbd0; uint nbd1;               // dst strides in elements
+};
+
+void main() {
+    const uint i0 = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    const uint it = gl_WorkGroupID.y;
+
+    if (i0 >= n_embd) {
+        return;
+    }
+
+    const uint x_base = i0 * nbx0 + it * nbx2;
+    const uint w_base = it * nbw1;
+
+    float sum = 0.0f;
+    for (uint ih = 0; ih < hc; ++ih) {
+        sum += data_x[x_base + ih * nbx1] * data_w[w_base + ih * nbw0];
+    }
+
+    data_d[i0 * nbd0 + it * nbd1] = sum;
+}

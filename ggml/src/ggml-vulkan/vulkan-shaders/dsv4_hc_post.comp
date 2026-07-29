@@ -1,0 +1,54 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_DSV4_HC_POST — scatter the layer output back across the
+// hyper-connection streams and mix the residuals
+// (see ggml_compute_forward_dsv4_hc_post in ggml-cpu/ops.cpp and
+// dsv4_hc_post_f32 in ggml-cuda/dsv4-hc.cu; keep the three in sync).
+//
+//   dst[i0, idst, it] = x[i0, it]*post[idst, it]
+//                     + sum_isrc( residual[i0, isrc, it] * comb[idst, isrc, it] )
+//
+// one invocation per (n_embd, hc, token) element. hc is 4, so comb/post are
+// read from registers once and reused across the whole n_embd row.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer X { float data_x[]; };
+layout(binding = 1) readonly  buffer R { float data_r[]; };
+layout(binding = 2) readonly  buffer P { float data_p[]; };
+layout(binding = 3) readonly  buffer C { float data_c[]; };
+layout(binding = 4) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;    // x->ne[0]
+    uint hc;        // residual->ne[1]
+    uint n_tokens;  // x->ne[1]
+    uint nbx0; uint nbx1;               // x strides in elements
+    uint nbr0; uint nbr1; uint nbr2;    // residual strides in elements
+    uint nbp0; uint nbp1;               // post strides in elements
+    uint nbc0; uint nbc1; uint nbc2;    // comb strides in elements
+    uint nbd0; uint nbd1; uint nbd2;    // dst strides in elements
+};
+
+void main() {
+    const uint i0   = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    const uint idst = gl_WorkGroupID.y;
+    const uint it   = gl_WorkGroupID.z;
+
+    if (i0 >= n_embd) {
+        return;
+    }
+
+    const uint r_base = i0 * nbr0 + it * nbr2;
+    const uint c_base = idst * nbc0 + it * nbc2;
+
+    float sum = data_x[i0 * nbx0 + it * nbx1] * data_p[idst * nbp0 + it * nbp1];
+    for (uint isrc = 0; isrc < hc; ++isrc) {
+        sum += data_r[r_base + isrc * nbr1] * data_c[c_base + isrc * nbc1];
+    }
+
+    data_d[i0 * nbd0 + idst * nbd1 + it * nbd2] = sum;
+}

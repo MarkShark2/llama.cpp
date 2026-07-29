@@ -1013,6 +1013,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32;
     vk_pipeline pipeline_lightning_indexer_f16;
     vk_pipeline pipeline_lightning_indexer_fast_f16;
+    vk_pipeline pipeline_dsv4_hc_pre_f32;
+    vk_pipeline pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_dsv4_hc_comb_f32;
 
     // [fork] DSA sparse flash attention
     vk_pipeline pipeline_flash_attn_sparse;
@@ -1748,6 +1751,33 @@ struct vk_op_lightning_indexer_push_constants {
     uint32_t nbw1, nbw3;
     uint32_t nbm1, nbm3;
     uint32_t nb1, nb3;
+};
+
+// [fork] fused DSV4 hyper-connection ops (dsv4_hc_{pre,post,comb}.comp)
+struct vk_op_dsv4_hc_pre_push_constants {
+    uint32_t n_embd, hc, n_tokens;
+    uint32_t nbx0, nbx1, nbx2;
+    uint32_t nbw0, nbw1;
+    uint32_t nbd0, nbd1;
+};
+
+struct vk_op_dsv4_hc_post_push_constants {
+    uint32_t n_embd, hc, n_tokens;
+    uint32_t nbx0, nbx1;
+    uint32_t nbr0, nbr1, nbr2;
+    uint32_t nbp0, nbp1;
+    uint32_t nbc0, nbc1, nbc2;
+    uint32_t nbd0, nbd1, nbd2;
+};
+
+struct vk_op_dsv4_hc_comb_push_constants {
+    uint32_t n_tokens;
+    uint32_t nbm0, nbm1;
+    uint32_t nbs0;
+    uint32_t nbb0;
+    uint32_t nbd0, nbd1, nbd2;
+    float    eps;
+    int32_t  n_iter;
 };
 
 // [fork] DSA sparse flash attention (flash_attn_sparse.comp)
@@ -5705,6 +5735,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->fp16) {
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_fast_f16, "lightning_indexer_fast_f16", lightning_indexer_fast_f16_len, lightning_indexer_fast_f16_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {256, 1, 1}, {256}, 1);
     }
+
+    // [fork] fused DSV4 hyper-connection ops. Unfused, the four residual
+    // streams cost ~1000 elementwise MUL/ADD/CONCAT nodes per 5-layer stage
+    // graph; these three collapse them to three nodes per layer.
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,  "dsv4_hc_pre_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {256, 1, 1}, {256}, 1);
 
     // [fork] DSA sparse flash attention: fixed 256-thread workgroup, one
     // workgroup per (query token, 16-head chunk, stream) — no wg_denoms scaling
@@ -9941,10 +9978,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    // [fork] Pick the tile for the rows ONE expert actually receives, not for
+    // the whole token batch. nei1 is every token in the ubatch, but each
+    // expert only sees nei1*nei0/n_as of them -- 512*6/256 = 12 rows on
+    // DeepSeek-V4-Flash -- while the n>64 rule was selecting the 128-wide
+    // tile, so ~90% of every MAC was padding. mul_mm.comp already early-exits
+    // n-tiles past data_expert_count[expert], so a narrower tile costs only a
+    // few extra no-op workgroups. Hot experts still get several tiles.
+    const uint32_t n_per_expert = std::max<uint32_t>(1, (uint32_t) CEIL_DIV(nei1 * nei0, n_as));
+
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, n_per_expert, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, n_per_expert, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -12703,6 +12749,126 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {q_buf, k_buf, w_buf, m_buf, dst_buf},
         pc, elements);
+}
+
+// [fork] fused DSV4 hyper-connection ops — see ggml-cuda/dsv4-hc.cu
+static void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+
+    GGML_ASSERT(  x->type == GGML_TYPE_F32);
+    GGML_ASSERT(  w->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_pre_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_embd   = (uint32_t) x->ne[0];
+    const uint32_t hc       = (uint32_t) x->ne[1];
+    const uint32_t n_tokens = (uint32_t) x->ne[2];
+
+    const size_t ts = sizeof(float);
+    const vk_op_dsv4_hc_pre_push_constants pc = {
+        n_embd, hc, n_tokens,
+        (uint32_t)(  x->nb[0]/ts), (uint32_t)(  x->nb[1]/ts), (uint32_t)(x->nb[2]/ts),
+        (uint32_t)(  w->nb[0]/ts), (uint32_t)(  w->nb[1]/ts),
+        (uint32_t)(dst->nb[0]/ts), (uint32_t)(dst->nb[1]/ts),
+    };
+
+    vk_subbuffer   x_buf = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer   w_buf = ggml_vk_tensor_subbuffer(ctx, w);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // elements are divided by the pipeline wg_denoms ({BLOCK_SIZE, 1, 1})
+    std::array<uint32_t, 3> elements = { n_embd, n_tokens, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {x_buf, w_buf, dst_buf}, pc, elements);
+}
+
+static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * r = dst->src[1];
+    const ggml_tensor * p = dst->src[2];
+    const ggml_tensor * c = dst->src[3];
+
+    GGML_ASSERT(  x->type == GGML_TYPE_F32);
+    GGML_ASSERT(  r->type == GGML_TYPE_F32);
+    GGML_ASSERT(  p->type == GGML_TYPE_F32);
+    GGML_ASSERT(  c->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_embd   = (uint32_t) x->ne[0];
+    const uint32_t n_tokens = (uint32_t) x->ne[1];
+    const uint32_t hc       = (uint32_t) r->ne[1];
+
+    const size_t ts = sizeof(float);
+    const vk_op_dsv4_hc_post_push_constants pc = {
+        n_embd, hc, n_tokens,
+        (uint32_t)(  x->nb[0]/ts), (uint32_t)(  x->nb[1]/ts),
+        (uint32_t)(  r->nb[0]/ts), (uint32_t)(  r->nb[1]/ts), (uint32_t)(r->nb[2]/ts),
+        (uint32_t)(  p->nb[0]/ts), (uint32_t)(  p->nb[1]/ts),
+        (uint32_t)(  c->nb[0]/ts), (uint32_t)(  c->nb[1]/ts), (uint32_t)(c->nb[2]/ts),
+        (uint32_t)(dst->nb[0]/ts), (uint32_t)(dst->nb[1]/ts), (uint32_t)(dst->nb[2]/ts),
+    };
+
+    vk_subbuffer   x_buf = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer   r_buf = ggml_vk_tensor_subbuffer(ctx, r);
+    vk_subbuffer   p_buf = ggml_vk_tensor_subbuffer(ctx, p);
+    vk_subbuffer   c_buf = ggml_vk_tensor_subbuffer(ctx, c);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    std::array<uint32_t, 3> elements = { n_embd, hc, n_tokens };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {x_buf, r_buf, p_buf, c_buf, dst_buf}, pc, elements);
+}
+
+static void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * m = dst->src[0];
+    const ggml_tensor * s = dst->src[1];
+    const ggml_tensor * b = dst->src[2];
+
+    GGML_ASSERT(  m->type == GGML_TYPE_F32);
+    GGML_ASSERT(  s->type == GGML_TYPE_F32);
+    GGML_ASSERT(  b->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(dst->ne[0] == 4 && dst->ne[1] == 4); // the shader hardcodes hc == 4
+
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_comb_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_tokens = (uint32_t) m->ne[1];
+
+    const size_t ts = sizeof(float);
+    const vk_op_dsv4_hc_comb_push_constants pc = {
+        n_tokens,
+        (uint32_t)(  m->nb[0]/ts), (uint32_t)(m->nb[1]/ts),
+        (uint32_t)(  s->nb[0]/ts),
+        (uint32_t)(  b->nb[0]/ts),
+        (uint32_t)(dst->nb[0]/ts), (uint32_t)(dst->nb[1]/ts), (uint32_t)(dst->nb[2]/ts),
+        ggml_get_op_params_f32(dst, 0),
+        ggml_get_op_params_i32(dst, 1),
+    };
+
+    vk_subbuffer   m_buf = ggml_vk_tensor_subbuffer(ctx, m);
+    vk_subbuffer   s_buf = ggml_vk_tensor_subbuffer(ctx, s);
+    vk_subbuffer   b_buf = ggml_vk_tensor_subbuffer(ctx, b);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    std::array<uint32_t, 3> elements = { n_tokens, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {m_buf, s_buf, b_buf, dst_buf}, pc, elements);
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -15529,6 +15695,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_DSV4_HC_PRE:
+        ggml_vk_dsv4_hc_pre(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DSV4_HC_POST:
+        ggml_vk_dsv4_hc_post(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DSV4_HC_COMB:
+        ggml_vk_dsv4_hc_comb(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
 
@@ -18290,6 +18471,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    // rows must be contiguous
                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                    op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   (op->op == GGML_OP_DSV4_HC_PRE ||
+                    (op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32));
+        case GGML_OP_DSV4_HC_COMB:
+            // the shader keeps the whole mixing matrix in registers at hc == 4,
+            // which ggml_dsv4_hc_comb already asserts
+            return op->type == GGML_TYPE_F32 &&
+                   op->ne[0] == 4 && op->ne[1] == 4 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:
