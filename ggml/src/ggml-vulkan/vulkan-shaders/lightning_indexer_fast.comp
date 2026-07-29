@@ -46,6 +46,7 @@ layout(push_constant) uniform PushConstants {
 
 shared vec4  q_lds[HCHUNK * D4];
 shared float w_lds[HCHUNK];
+shared uint  wg_live;
 
 void main() {
     const uint tid  = gl_LocalInvocationID.x;
@@ -55,6 +56,36 @@ void main() {
 
     const uint q_base = i_t * nbq2 + i_s * nbq3;
     const uint w_base = i_t * nbw1 + i_s * nbw3;
+    const uint m_base = i_t * nbm1 + (i_s % nem3) * nbm3;
+
+    // A row masked to -inf ends up as dst = score + (-inf) = -inf whatever the
+    // score is, so its 64x128 dot product is pure waste. That matters because
+    // padding the compressed KV up to a bucket boundary (LLAMA_KV_BUCKET_COMP,
+    // which is what stops the comp mask changing shape - and forcing a galloc
+    // realloc that drains the whole RPC pipeline - every couple of ubatches)
+    // makes the entire tail of every dispatch look exactly like this.
+    // Only true -inf is skipped, so the stored value stays bit-identical.
+    const float mask_v = (i_kv < n_kv) ? float(data_m[m_base + i_kv]) : 0.0f;
+    const bool  dead   = (i_kv >= n_kv) || isinf(mask_v);
+
+    // Padded cells are a contiguous tail, so whole workgroups go dead together.
+    // The check is workgroup-uniform, so the early return can't strand anyone
+    // on a barrier below.
+    if (tid == 0) {
+        wg_live = 0u;
+    }
+    barrier();
+    if (!dead) {
+        atomicOr(wg_live, 1u);
+    }
+    barrier();
+
+    if (wg_live == 0u) {
+        if (i_kv < n_kv) {
+            data_d[i_t * nb1 + i_s * nb3 + i_kv] = mask_v;
+        }
+        return;
+    }
 
     // Clamp instead of branching: rows past the end compute a junk score that is
     // never stored, but they still take part in every barrier below.
@@ -86,18 +117,19 @@ void main() {
 
         barrier();
 
-        for (uint h = 0; h < nh; ++h) {
-            const uint qo = h * D4;
-            float qk = 0.0f;
-            [[unroll]] for (uint e = 0; e < D4; ++e) {
-                qk += dot(q_lds[qo + e], vec4(kr[e]));
+        if (!dead) {
+            for (uint h = 0; h < nh; ++h) {
+                const uint qo = h * D4;
+                float qk = 0.0f;
+                [[unroll]] for (uint e = 0; e < D4; ++e) {
+                    qk += dot(q_lds[qo + e], vec4(kr[e]));
+                }
+                score += max(qk, 0.0f) * w_lds[h];
             }
-            score += max(qk, 0.0f) * w_lds[h];
         }
     }
 
     if (i_kv < n_kv) {
-        const uint m_base = i_t * nbm1 + (i_s % nem3) * nbm3;
-        data_d[i_t * nb1 + i_s * nb3 + i_kv] = score + float(data_m[m_base + i_kv]);
+        data_d[i_t * nb1 + i_s * nb3 + i_kv] = dead ? mask_v : (score + mask_v);
     }
 }
