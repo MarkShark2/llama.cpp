@@ -10118,6 +10118,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
+    // [fork] the mask-dense CSA attention that DSA sparse attention replaces:
+    // DSV4-Flash MLA shape (DK == DV == 512, MQA 64:1), for a like-for-like
+    // comparison against the FLASH_ATTN_EXT sparse cases below
+    for (int kv : { 4096, 16384 }) {
+        for (int nb : { 1, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // [fork] DSA sparse flash attention, at the DSV4-Flash decode/prefill shapes
     for (int nb : { 1, 512 }) {
         for (int n_cells : { 4096, 16384 }) {
