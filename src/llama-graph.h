@@ -520,6 +520,10 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
+        // [fork] per-token count of visible compressed cells; feeds the sparse
+        // (gathered) attention path as the top-k validity bound (csa group only)
+        ggml_tensor * n_vis      = nullptr; // I32 [n_batch/n_stream, 1, 1, n_stream]
+
         ggml_tensor * k_rot      = nullptr;
     };
 

@@ -5479,6 +5479,68 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// [fork] DSA sparse attention extension to flash_attn_ext.
+//
+// Adds an optional gathered KV segment that shares the online softmax with
+// the regular (dense, masked) K/V of the op:
+//
+//   src[5] = kc   [DK, n_cells, 1, ns]  gather source (K rows; V = first DV
+//                                       elements of the same row, so DV <= DK)
+//   src[6] = idx  [n_idx, n_tokens, 1, ns]  I32 row indices into kc
+//   src[7] = nvis [n_tokens, 1, 1, ns]      I32 per-token validity bound:
+//                                            idx[j,t] contributes iff
+//                                            0 <= idx[j,t] < nvis[t]
+//
+// The selection indices come from a top-k over indexer scores; entries that
+// won a slot without being visible (score was -inf, index arbitrary) are
+// rejected by the nvis bound, which replaces the dense [n_cells, n_tokens]
+// -inf mask the mask-dense formulation uploads and walks.
+//
+// No public header changes (fork rule): consumers declare these extern "C".
+// The flag lives in op_params[4] (0..2 = floats, 3 = prec) so backends can
+// cheaply distinguish sparse FA nodes.
+
+#define GGML_FA_SPARSE_MAGIC 0x53504131 // 'SPA1'
+
+GGML_API void ggml_flash_attn_ext_set_sparse(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kc,
+        struct ggml_tensor * idx,
+        struct ggml_tensor * nvis) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(kc && idx && nvis);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && a->src[7] == NULL);
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    GGML_ASSERT(kc->ne[0] == k->ne[0]);          // same head width as dense K
+    GGML_ASSERT(kc->ne[0] >= v->ne[0]);          // V rows are a prefix of kc rows
+    GGML_ASSERT(kc->ne[2] == 1);                 // single KV head (MQA/MLA)
+    GGML_ASSERT(kc->ne[3] == q->ne[3]);
+    GGML_ASSERT(kc->nb[0] == ggml_type_size(kc->type)); // contiguous rows
+
+    GGML_ASSERT(idx->type  == GGML_TYPE_I32);
+    GGML_ASSERT(idx->ne[1] == q->ne[1]);         // one index list per query token
+    GGML_ASSERT(idx->ne[3] == q->ne[3]);
+
+    GGML_ASSERT(nvis->type  == GGML_TYPE_I32);
+    GGML_ASSERT(nvis->ne[0] == q->ne[1]);
+    GGML_ASSERT(nvis->ne[3] == q->ne[3]);
+
+    a->src[5] = kc;
+    a->src[6] = idx;
+    a->src[7] = nvis;
+
+    ggml_set_op_params_i32(a, 4, GGML_FA_SPARSE_MAGIC);
+}
+
+GGML_API bool ggml_flash_attn_ext_is_sparse(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[5] != NULL &&
+           ggml_get_op_params_i32(a, 4) == GGML_FA_SPARSE_MAGIC;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-sparse.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -546,6 +547,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+    // [fork] sparse FA requires f16 K/V/kc already (no conversion scratch)
+    if (ggml_cuda_fattn_sparse_is_sparse_node(dst)) {
+        const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra_sparse =
+            ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, false, false);
+        return f16_extra_sparse.end - (uintptr_t) dst->data;
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -573,6 +581,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // [fork] DSA sparse FA extension (src[5..7] gathered segment)
+    if (ggml_cuda_fattn_sparse_is_sparse_node(dst)) {
+        ggml_cuda_flash_attn_ext_sparse(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -589,5 +602,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    // [fork] DSA sparse FA extension: dedicated kernel with its own constraints
+    if (ggml_cuda_fattn_sparse_is_sparse_node(dst)) {
+        return ggml_cuda_fattn_sparse_supported(dst);
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

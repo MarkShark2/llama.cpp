@@ -1012,6 +1012,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_lightning_indexer_f32;
     vk_pipeline pipeline_lightning_indexer_f16;
+
+    // [fork] DSA sparse flash attention
+    vk_pipeline pipeline_flash_attn_sparse;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1744,6 +1747,21 @@ struct vk_op_lightning_indexer_push_constants {
     uint32_t nbw1, nbw3;
     uint32_t nbm1, nbm3;
     uint32_t nb1, nb3;
+};
+
+// [fork] DSA sparse flash attention (flash_attn_sparse.comp)
+struct vk_op_flash_attn_sparse_push_constants {
+    float    scale;
+    uint32_t ne_dense;
+    uint32_t n_idx;
+    uint32_t n_head;
+    uint32_t q_s1, q_s2, q_s3;
+    uint32_t k_s1, k_s3;
+    uint32_t m_s1, m_s3;
+    uint32_t c_s1, c_s3;
+    uint32_t i_s1, i_s3;
+    uint32_t n_s3;
+    uint32_t flags;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -5680,6 +5698,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32, "lightning_indexer_f32", lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {128, 1, 1}, {128}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16, "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {128, 1, 1}, {128}, 1);
+
+    // [fork] DSA sparse flash attention: fixed 256-thread workgroup, one
+    // workgroup per (query token, 16-head chunk, stream) — no wg_denoms scaling
+    if (device->fp16 && device->subgroup_shuffle) {
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sparse, "flash_attn_sparse_f16", flash_attn_sparse_f16_len, flash_attn_sparse_f16_data, "main", 8, sizeof(vk_op_flash_attn_sparse_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -10496,7 +10520,123 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// [fork] DSA sparse FA extension — declared in ggml.c, not in public headers
+extern "C" bool ggml_flash_attn_ext_is_sparse(const struct ggml_tensor * a);
+
+static bool ggml_vk_fattn_sparse_supported(const vk_device_struct * device, const ggml_tensor * op) {
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    const ggml_tensor * kc   = op->src[5];
+    const ggml_tensor * idx  = op->src[6];
+    const ggml_tensor * nvis = op->src[7];
+
+    if (!device->fp16 || !device->subgroup_shuffle) {
+        return false;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
+
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || kc->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (mask && mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (idx->type != GGML_TYPE_I32 || nvis->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (k->ne[0] != 512 || v->ne[0] != 512 || kc->ne[0] != 512) {
+        return false; // v1: DK == DV == 512 (DSV4)
+    }
+    if (k->ne[2] != 1 || v->ne[2] != 1 || kc->ne[2] != 1) {
+        return false; // single KV head (MQA)
+    }
+    // V must alias dense K (rows staged once, V read as the DV-prefix);
+    // matches the CUDA gate — during no-alloc probes both data pointers are
+    // null, which passes, and the stride check still holds
+    if (v->data != k->data || v->nb[1] != k->nb[1]) {
+        return false;
+    }
+    // rows must be f16vec4-addressable
+    if (k->nb[1] % 8 != 0 || kc->nb[1] % 8 != 0) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_flash_attn_sparse(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * kc    = dst->src[5];
+    const ggml_tensor * idx   = dst->src[6];
+    const ggml_tensor * nvis  = dst->src[7];
+
+    GGML_ASSERT(ggml_vk_fattn_sparse_supported(ctx->device.get(), dst));
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_sparse;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t T  = (uint32_t) q->ne[1];
+    const uint32_t H  = (uint32_t) q->ne[2];
+    const uint32_t ns = (uint32_t) q->ne[3];
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const size_t ts_q = ggml_type_size(q->type);
+    const size_t ts_k = ggml_type_size(k->type);
+    const size_t ts_i = ggml_type_size(idx->type);
+
+    const vk_op_flash_attn_sparse_push_constants pc = {
+        scale,
+        (uint32_t) k->ne[1],
+        (uint32_t) idx->ne[0],
+        H,
+        (uint32_t)(q->nb[1]/ts_q), (uint32_t)(q->nb[2]/ts_q), (uint32_t)(q->nb[3]/ts_q),
+        (uint32_t)(k->nb[1]/ts_k), (uint32_t)(k->nb[3]/ts_k),
+        (uint32_t)(mask ? mask->nb[1]/sizeof(ggml_fp16_t) : 0), (uint32_t)(mask ? mask->nb[3]/sizeof(ggml_fp16_t) : 0),
+        (uint32_t)(kc->nb[1]/ts_k), (uint32_t)(kc->nb[3]/ts_k),
+        (uint32_t)(idx->nb[1]/ts_i), (uint32_t)(idx->nb[3]/ts_i),
+        (uint32_t)(nvis->nb[3]/ts_i),
+        (uint32_t)((mask ? 1u : 0u) | (sinks ? 2u : 0u)),
+    };
+
+    vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer m_buf    = mask  ? ggml_vk_tensor_subbuffer(ctx, mask)  : q_buf;
+    vk_subbuffer s_buf    = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    vk_subbuffer kc_buf   = ggml_vk_tensor_subbuffer(ctx, kc);
+    vk_subbuffer idx_buf  = ggml_vk_tensor_subbuffer(ctx, idx);
+    vk_subbuffer nvis_buf = ggml_vk_tensor_subbuffer(ctx, nvis);
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // one workgroup per (query token, 16-head chunk, stream); wg_denoms = {1,1,1}
+    std::array<uint32_t, 3> elements = { T, (H + 15)/16, ns };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {q_buf, k_buf, m_buf, s_buf, kc_buf, idx_buf, nvis_buf, dst_buf},
+        pc, elements);
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    // [fork] DSA sparse FA extension (src[5..7] gathered segment)
+    if (ggml_flash_attn_ext_is_sparse(dst)) {
+        ggml_vk_flash_attn_sparse(ctx, subctx, dst);
+        return;
+    }
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -17723,6 +17863,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // [fork] DSA sparse FA extension: dedicated shader, own constraints
+                if (ggml_flash_attn_ext_is_sparse(op)) {
+                    return ggml_vk_fattn_sparse_supported(device.get(), op);
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];

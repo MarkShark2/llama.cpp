@@ -6914,6 +6914,102 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// [fork] GGML_OP_FLASH_ATTN_EXT + DSA sparse gathered segment (src[5..7])
+extern "C" void ggml_flash_attn_ext_set_sparse(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kc,
+        struct ggml_tensor * idx,
+        struct ggml_tensor * nvis);
+
+struct test_flash_attn_ext_sparse : public test_case {
+    const int64_t hs;       // head size (DK == DV)
+    const int64_t nh;       // query heads
+    const int64_t kv_dense; // dense (raw) KV rows
+    const int64_t n_cells;  // gather-source rows
+    const int64_t n_topk;   // gathered candidates per token
+    const int64_t nb;       // batch (query tokens)
+    const bool    sinks;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, kv_dense, n_cells, n_topk, nb, sinks);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_sparse(int64_t hs = 512, int64_t nh = 64, int64_t kv_dense = 256,
+                               int64_t n_cells = 1024, int64_t n_topk = 512, int64_t nb = 8, bool sinks = false)
+        : hs(hs), nh(nh), kv_dense(kv_dense), n_cells(n_cells), n_topk(n_topk), nb(nb), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv_dense, 1, 1);
+        ggml_set_name(k, "k");
+
+        // V is the DV-prefix view of K (MLA convention; required by the kernels)
+        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv_dense, 1, 1, k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_dense, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * kc = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, n_cells, 1, 1);
+        ggml_set_name(kc, "kc");
+
+        ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_topk, nb, 1, 1);
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * nvis = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nb, 1, 1, 1);
+        ggml_set_name(nvis, "nvis");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_set_prec (out, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_sparse(out, kc, idx, nvis);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                // indices in [-1, n_cells): -1 padding plus some entries that
+                // exceed nvis to exercise the validity bound
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(-1, (int32_t) n_cells - 1);
+                for (auto & x : data) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "nvis") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_cells);
+                for (auto & x : data) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9546,6 +9642,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+
+    // [fork] DSA sparse FA (dense segment + gathered top-k segment)
+    for (int64_t nb : {1, 7, 64}) {
+        for (int64_t n_topk : {64, 100, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(512, 64, 256, 1024, n_topk, nb, false));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(512, 64, 256, 1024, 512, nb, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(512,  8, 256, 1024, 512, nb, false));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

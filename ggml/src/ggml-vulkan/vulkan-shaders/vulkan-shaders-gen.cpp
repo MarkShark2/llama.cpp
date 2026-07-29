@@ -1139,6 +1139,9 @@ void process_shaders() {
     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", {{"K_TYPE", "float"}});
     string_to_spv("lightning_indexer_f16", "lightning_indexer.comp", {{"K_TYPE", "float16_t"}});
 
+    // [fork] DSA sparse flash attention
+    string_to_spv("flash_attn_sparse_f16", "flash_attn_sparse.comp", {});
+
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
     for (auto &c : compiles) {

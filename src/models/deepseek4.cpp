@@ -664,6 +664,28 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     return top_k;
 }
 
+// [fork] declared in ggml.c (no public-header change): attaches a gathered
+// top-k KV segment to a flash_attn_ext node (src[5]=kc, src[6]=idx, src[7]=nvis)
+extern "C" void ggml_flash_attn_ext_set_sparse(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kc,
+        struct ggml_tensor * idx,
+        struct ggml_tensor * nvis);
+
+// [fork] LLAMA_DSV4_SPARSE_ATTN=1: replace the mask-dense CSA attention
+// (dense FA over every compressed cell with a -inf top-k mask) with true
+// sparse attention: dense raw SWA window + gathered top-k compressed rows in
+// one shared online softmax. Requires flash_attn and backend support for the
+// sparse FA extension on every device the CSA layers touch (CPU/CUDA/Vulkan
+// in this fork). Default off until validated per deployment.
+static bool llama_dsv4_sparse_attn() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_DSV4_SPARSE_ATTN");
+        return e && atoi(e) > 0;
+    }();
+    return v;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
         ggml_tensor * kq_mask,
         ggml_tensor * top_k,
@@ -736,16 +758,51 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
-    cb(k_all, "csa_k_all", il);
-
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
-    cb(kq_mask, "csa_lid_kq_mask", il);
+    ggml_tensor * out = nullptr;
 
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    if (llama_dsv4_sparse_attn() && cparams.flash_attn && inp_csa.n_vis) {
+        // true sparse path: no k_all copy, no dense comp mask synthesis, no
+        // [n_csa, n_tokens] mask walk in the attention — the top-k indices
+        // survive into the FA node and only the selected rows are read.
+        const int64_t n_stream = raw_k->ne[3];
+
+        ggml_tensor * qf = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        qf = ggml_permute(ctx0, qf, 0, 2, 1, 3);              // [D, T, H, ns]
+
+        ggml_tensor * kf  = ggml_permute(ctx0, raw_k, 0, 2, 1, 3); // [D, n_raw, 1, ns]
+        ggml_tensor * kcf = ggml_permute(ctx0, csa_k, 0, 2, 1, 3); // [D, n_csa, 1, ns]
+
+        if (kf->type == GGML_TYPE_F32) {
+            kf = ggml_cast(ctx0, kf, GGML_TYPE_F16);
+        }
+        if (kcf->type == GGML_TYPE_F32) {
+            kcf = ggml_cast(ctx0, kcf, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx0, qf, kf, kf, raw_mask, kq_scale,
+                hparams.f_max_alibi_bias, 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il});
+        ggml_flash_attn_ext_add_sinks(fa, sinks);
+        ggml_flash_attn_ext_set_prec (fa, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_sparse(fa, kcf, top_k, inp_csa.n_vis);
+        cb(fa, "csa_sparse_fattn", il);
+
+        out = ggml_reshape_2d(ctx0, fa, fa->ne[0]*fa->ne[1], fa->ne[2]*fa->ne[3]);
+    } else {
+        ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+        cb(k_all, "csa_k_all", il);
+
+        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+
+        ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+        cb(kq_mask, "csa_lid_kq_mask", il);
+
+        out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    }
+
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }

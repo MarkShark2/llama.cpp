@@ -8656,6 +8656,72 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
+        // [fork] sparse gathered segment (DSA): src[5]=kc, src[6]=idx, src[7]=nvis.
+        // Runs once per query row, on the chunk that owns the KV tail, sharing
+        // the online softmax state with the dense loop above.
+        if (dst->src[5] != NULL && ic_end == nek1) {
+            const ggml_tensor * kc   = dst->src[5];
+            const ggml_tensor * kidx = dst->src[6];
+            const ggml_tensor * nvis = dst->src[7];
+
+            const int64_t n_idx = kidx->ne[0];
+
+            const int32_t * idx_row = (const int32_t *) ((const char *) kidx->data + iq1*kidx->nb[1] + iq3*kidx->nb[3]);
+            const int32_t   n_vis   = *(const int32_t *) ((const char *) nvis->data + iq1*nvis->nb[0] + iq3*nvis->nb[3]);
+
+            // kq_vec_dot is bound to k->type and the V accumulate branch to v->type,
+            // and both read kc rows here, so all three types must agree
+            GGML_ASSERT(k->type == kc->type && v->type == kc->type && "fattn sparse: kc/K/V types must match");
+
+            for (int64_t j = 0; j < n_idx; ++j) {
+                const int32_t cell = idx_row[j];
+                if (cell < 0 || cell >= n_vis) {
+                    continue;
+                }
+
+                float s;
+                const char * kc_row = (const char *) kc->data + (size_t) cell*kc->nb[1] + iq3*kc->nb[3];
+                kq_vec_dot(DK, &s, 0, kc_row, 0, Q_q, 0, 1);
+
+                s = s*scale;
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
+                }
+
+                const float Mold = M;
+                float ms = 1.0f;
+                float vs = 1.0f;
+
+                // V rows are the DV-element prefix of the gathered K rows
+                if (v->type == GGML_TYPE_F16) {
+                    if (s > M) {
+                        M = s;
+                        ms = expf(Mold - M);
+                        ggml_vec_scale_f16(DV, VKQ16, ms);
+                    } else {
+                        vs = expf(s - M);
+                    }
+                    ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) kc_row, vs);
+                } else {
+                    if (s > M) {
+                        M = s;
+                        ms = expf(Mold - M);
+                        ggml_vec_scale_f32(DV, VKQ32, ms);
+                    } else {
+                        vs = expf(s - M);
+                    }
+                    if (v_to_float) {
+                        v_to_float(kc_row, V32, DV);
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, (const float *) kc_row, vs);
+                    }
+                }
+
+                S = S*ms + vs;
+            }
+        }
+
         if (v->type == GGML_TYPE_F16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
@@ -9109,7 +9175,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int nth = params->nth;
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
-    const bool use_ref = params->use_ref;
+    // [fork] sparse FA (gathered segment in src[5..7]) only exists in the
+    // one_chunk path, which appends the gathered rows after the dense tail
+    const bool use_ref = params->use_ref || dst->src[5] != NULL;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
