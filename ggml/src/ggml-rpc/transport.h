@@ -17,6 +17,10 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
+    // half-close both directions so a thread blocked in recv_data on this
+    // socket wakes up with an error (the fd itself is closed by the dtor)
+    void shutdown_rw();
+
     socket_ptr accept();
 
     // "ip:port" of the remote end, for logging

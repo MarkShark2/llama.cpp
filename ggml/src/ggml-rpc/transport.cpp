@@ -558,6 +558,18 @@ bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
+void socket_t::shutdown_rw() {
+#ifdef _WIN32
+    if (pimpl->fd != INVALID_SOCKET) {
+        shutdown(pimpl->fd, SD_BOTH);
+    }
+#else
+    if (pimpl->fd >= 0) {
+        shutdown(pimpl->fd, SHUT_RDWR);
+    }
+#endif
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
