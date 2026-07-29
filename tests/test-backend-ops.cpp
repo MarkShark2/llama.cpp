@@ -9965,6 +9965,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // [fork] DeepSeek-V4-Flash MoE expert shapes (256 experts, 6 used): the
+    // gate/up (m=2048,k=4096) and down (m=4096,k=2048) matmuls are ~61% of
+    // BC-250 prefill time. The quant sweep at a fixed shape separates weight
+    // bandwidth (GB/s constant across types) from dequant cost (it isn't).
+    for (int bs : {512}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_K,
+                                 GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
