@@ -1212,6 +1212,13 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // Duplicates of output_norm / output kept with the last transformer layer,
+    // created only when mtp_dev pins dev_output away from it. See
+    // load_arch_tensors for why the trunk graph must not end on another device.
+    // graph_pipedec_head deliberately keeps using the originals.
+    ggml_tensor * output_norm_trunk = nullptr;
+    ggml_tensor * output_trunk      = nullptr;
+
     struct graph : public llm_graph_context_dsv4_mla {
         graph(const llama_model & model, const llm_graph_params & params);
 

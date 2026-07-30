@@ -80,6 +80,37 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
+    // Second copies of the trunk's tail, kept with the last transformer layer.
+    //
+    // --device-draft makes mtp_dev pin dev_output to the local draft GPU, so
+    // output_norm and output.weight live there. The trunk graph then ends with a
+    // split on that GPU whose input is produced by the *last* pipeline stage, and
+    // an RPC -> local copy has no async path (ggml-backend.cpp: the destination
+    // backend's cpy_tensor_async is tried, and CUDA's only accepts CUDA sources),
+    // so the scheduler falls back to ggml_backend_synchronize(input_backend) +
+    // a blocking copy. That drains the endpoint *inside the submission of this
+    // ubatch*, which means ubatch i+1 cannot be submitted until ubatch i has
+    // traversed every stage: the prefill pipeline stops pipelining entirely.
+    // Measured on the 9-stage split as 11.3-47.1 s per fallback for 16 KB
+    // ('pipedec fallback: CUDA0 <- RPC0 norm', GGML_PIPEDEC_TRACE=1).
+    //
+    // Norming and projecting on the last stage keeps the whole trunk graph on the
+    // pipeline, exactly as it is when there is no drafter at all. The cost is one
+    // extra copy of output.weight on that stage. Same fix as hy-v3's
+    // output_norm_trunk; there the crossing was the full-width hidden rows, here
+    // it is only n_outputs rows -- the bytes were never the problem, the
+    // synchronisation is.
+    //
+    // Only the trunk graph switches. graph_pipedec_head runs on the draft GPU by
+    // design (the batched verification head over rows already copied out of the
+    // body lanes) and keeps the originals, so mtp_dev's decode win is unaffected.
+    if (params.mtp_dev != nullptr && n_layer > 0) {
+        output_norm_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        output_trunk      = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+    }
+
     // The hyper-connection collapse is classified LAYER_OUTPUT, so by default it
     // follows dev_output. That is harmless while dev_output == the last layer's
     // device, but --device-draft pins dev_output to the local draft GPU (the DSpark
@@ -1411,11 +1442,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    // Use the last-stage copies of the tail when they exist (see
+    // load_arch_tensors): keeping the norm and lm_head on the pipeline is what
+    // stops every ubatch from ending in a pipeline-draining RPC -> local copy.
+    const auto & model_dsv4 = static_cast<const llama_model_deepseek4 &>(model);
+    ggml_tensor * out_norm_w = model_dsv4.output_norm_trunk ? model_dsv4.output_norm_trunk : model.output_norm;
+    ggml_tensor * out_w      = model_dsv4.output_trunk      ? model_dsv4.output_trunk      : model.output;
+
+    cur = build_norm(cur, out_norm_w, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = ggml_mul_mat(ctx0, out_w, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
