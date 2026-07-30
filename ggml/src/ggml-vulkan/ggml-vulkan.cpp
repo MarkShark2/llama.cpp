@@ -5744,7 +5744,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {256, 1, 1}, {256}, 1);
 
     // [fork] DSA sparse flash attention: fixed 256-thread workgroup, one
-    // workgroup per (query token, 16-head chunk, stream) — no wg_denoms scaling
+    // workgroup per (query token, 32-head chunk, stream) — no wg_denoms scaling
     if (device->fp16 && device->subgroup_shuffle) {
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sparse, "flash_attn_sparse_f16", flash_attn_sparse_f16_len, flash_attn_sparse_f16_data, "main", 8, sizeof(vk_op_flash_attn_sparse_push_constants), {1, 1, 1}, {}, 1);
     }
@@ -10576,6 +10576,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // [fork] DSA sparse FA extension — declared in ggml.c, not in public headers
 extern "C" bool ggml_flash_attn_ext_is_sparse(const struct ggml_tensor * a);
 
+// query heads per workgroup in flash_attn_sparse.comp (HGRP*HPT there)
+#define FA_SPARSE_HCHUNK 32
+
 static bool ggml_vk_fattn_sparse_supported(const vk_device_struct * device, const ggml_tensor * op) {
     const ggml_tensor * q    = op->src[0];
     const ggml_tensor * k    = op->src[1];
@@ -10676,8 +10679,9 @@ static void ggml_vk_flash_attn_sparse(ggml_backend_vk_context * ctx, vk_context&
     vk_subbuffer nvis_buf = ggml_vk_tensor_subbuffer(ctx, nvis);
     vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
 
-    // one workgroup per (query token, 16-head chunk, stream); wg_denoms = {1,1,1}
-    std::array<uint32_t, 3> elements = { T, (H + 15)/16, ns };
+    // one workgroup per (query token, head chunk, stream); wg_denoms = {1,1,1}.
+    // FA_SPARSE_HCHUNK must match HCHUNK in flash_attn_sparse.comp.
+    std::array<uint32_t, 3> elements = { T, (H + FA_SPARSE_HCHUNK - 1)/FA_SPARSE_HCHUNK, ns };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {q_buf, k_buf, m_buf, s_buf, kc_buf, idx_buf, nvis_buf, dst_buf},

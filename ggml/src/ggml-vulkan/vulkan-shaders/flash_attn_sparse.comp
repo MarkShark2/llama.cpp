@@ -13,6 +13,23 @@
 // V is the DV-prefix of the same staged row (MLA: V aliases K).
 //
 // Mirrors ggml-cuda/fattn-sparse.cu; keep the two in sync.
+//
+// Thread mapping, v2 (the v1 mapping ran at 1.36 TFLOPS against the dense FA
+// shader's 4.89 at the same shape):
+//
+//   * lanes walk a K row with stride TPH, never in contiguous blocks. Each
+//     lane reads 8 bytes, so a block mapping put all TPH lanes of a wave on
+//     two LDS bank pairs — an 8-way conflict on every single K access, in
+//     both the score and the accumulate loop. Striding spreads them over all
+//     32 banks.
+//   * each thread carries HPT heads in registers, so one LDS read of K feeds
+//     HPT dot products. At HPT = 1 the kernel needs 1 byte of LDS per FLOP,
+//     which is exactly the per-CU LDS:VALU ratio — i.e. LDS-bound even with
+//     zero conflicts. HPT = 2 halves that and leaves the ALU the limit.
+//   * K staging is a flat strided copy over the whole tile, so consecutive
+//     threads take consecutive f16vec4 of one row: coalesced global reads and
+//     conflict-free LDS writes (the per-row mapping had a 4-way write
+//     conflict and 64-byte global bursts).
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -22,13 +39,16 @@
 
 #define WGS    256
 #define TILE    32
-#define HCHUNK  16
-#define TPH    (WGS/HCHUNK)  // threads per head (16)
+#define TPH     16           // threads cooperating on one head's dot product
+#define HPT      2           // heads carried per thread
+#define HGRP   (WGS/TPH)     // head groups per workgroup (16)
+#define HCHUNK (HGRP*HPT)    // query heads per workgroup (32)
 #define DK     512
 #define DV     512
 #define D4     (DK/4)        // f16vec4 per row
 #define DPT    (DK/TPH)      // dims per thread in the dot product (32)
 #define VPT    (DV/TPH)      // dims per thread in the V accumulate (32)
+#define V4     (DPT/4)       // f16vec4 per thread per row (8)
 #define M_INIT (-1.0e30)
 
 layout(local_size_x = WGS, local_size_y = 1, local_size_z = 1) in;
@@ -65,6 +85,7 @@ layout (push_constant) uniform parameter {
 shared f16vec4 Kt[TILE][D4];
 shared float   Pt[HCHUNK][TILE];
 shared uint    row_ok[TILE];
+shared uint    row_src4[TILE];
 
 void main() {
     const uint t   = gl_WorkGroupID.x;   // query token
@@ -73,38 +94,56 @@ void main() {
     const uint T   = gl_NumWorkGroups.x;
 
     const uint tid  = gl_LocalInvocationID.x;
-    const uint hl   = tid / TPH;
+    const uint hg   = tid / TPH;
     const uint lane = tid % TPH;
-    const uint h    = hc*HCHUNK + hl;
-    const bool h_ok = h < p.n_head;
 
     const bool has_mask  = (p.flags & 1u) != 0u;
     const bool has_sinks = (p.flags & 2u) != 0u;
 
-    // Q slice, pre-scaled
-    float Qr[DPT];
-    if (h_ok) {
-        const uint q_base = t*p.q_s1 + h*p.q_s2 + s*p.q_s3 + lane*DPT;
-        [[unroll]] for (uint i = 0; i < DPT; ++i) {
-            Qr[i] = data_q[q_base + i]*p.scale;
-        }
-    } else {
-        [[unroll]] for (uint i = 0; i < DPT; ++i) {
-            Qr[i] = 0.0;
+    // Q slice, pre-scaled. Lane l owns dims {(i*TPH + l)*4 + 0..3}, matching
+    // the strided LDS walk below — which also makes this global read coalesced.
+    uint  hh  [HPT];
+    bool  h_ok[HPT];
+    float Qr  [HPT][DPT];
+    [[unroll]] for (uint u = 0; u < HPT; ++u) {
+        const uint h = hc*HCHUNK + hg*HPT + u;
+        hh  [u] = h;
+        h_ok[u] = h < p.n_head;
+
+        if (h_ok[u]) {
+            const uint q_base = t*p.q_s1 + h*p.q_s2 + s*p.q_s3;
+            [[unroll]] for (uint i = 0; i < V4; ++i) {
+                const uint d0 = (i*TPH + lane)*4;
+                [[unroll]] for (uint c = 0; c < 4; ++c) {
+                    Qr[u][4*i + c] = data_q[q_base + d0 + c]*p.scale;
+                }
+            }
+        } else {
+            [[unroll]] for (uint i = 0; i < DPT; ++i) {
+                Qr[u][i] = 0.0;
+            }
         }
     }
+    const bool grp_ok = h_ok[0];   // heads are consecutive: slot 0 valid => group has work
 
-    float Or[VPT];
-    [[unroll]] for (uint i = 0; i < VPT; ++i) {
-        Or[i] = 0.0;
+    float Or[HPT][VPT];
+    [[unroll]] for (uint u = 0; u < HPT; ++u) {
+        [[unroll]] for (uint i = 0; i < VPT; ++i) {
+            Or[u][i] = 0.0;
+        }
     }
 
     // running softmax state. Every lane of a head derives these from the same
     // cross-lane reductions, so they stay identical across the head's TPH lanes
     // and can live in registers instead of shared memory.
-    float M_run   = float(M_INIT);
-    float L_run   = 0.0;
-    float m_scale = 1.0;   // exp(M_old - M_new) for the current tile
+    float M_run  [HPT];
+    float L_run  [HPT];
+    float m_scale[HPT];
+    [[unroll]] for (uint u = 0; u < HPT; ++u) {
+        M_run  [u] = float(M_INIT);
+        L_run  [u] = 0.0;
+        m_scale[u] = 1.0;
+    }
 
     const uint m_base = t*p.m_s1 + s*p.m_s3;
     const uint i_base = t*p.i_s1 + s*p.i_s3;
@@ -119,61 +158,72 @@ void main() {
         const uint base   = gather ? (tile - n_tiles_dense)*TILE : tile*TILE;
         const uint limit  = gather ? p.n_idx : p.ne_dense;
 
-        // stage TILE rows into LDS: 8 threads per row, f16vec4 chunks
-        {
-            const uint TPR = WGS/TILE; // threads per row
-            const uint r   = tid / TPR;
-            const uint c0  = tid % TPR;
-
-            bool ok = base + r < limit;
+        // resolve each row's source and validity once, one thread per row
+        if (tid < TILE) {
+            bool ok   = base + tid < limit;
             uint src4 = 0u;
             if (ok) {
                 if (gather) {
-                    const int cell = data_idx[i_base + base + r];
+                    const int cell = data_idx[i_base + base + tid];
                     ok = cell >= 0 && cell < n_vis;
                     if (ok) {
                         src4 = (uint(cell)*p.c_s1 + s*p.c_s3)/4u;
                     }
                 } else {
-                    src4 = ((base + r)*p.k_s1 + s*p.k_s3)/4u;
+                    src4 = ((base + tid)*p.k_s1 + s*p.k_s3)/4u;
                 }
             }
-            // one leader per row writes the flag unconditionally, so no
-            // zero-init pass (and no extra barrier) is needed
-            if (c0 == 0u) {
-                row_ok[r] = ok ? 1u : 0u;
-            }
-            if (ok) {
-                [[unroll]] for (uint c = c0; c < D4; c += TPR) {
-                    Kt[r][c] = gather ? data_kc4[src4 + c] : data_k4[src4 + c];
-                }
+            row_ok  [tid] = ok ? 1u : 0u;
+            row_src4[tid] = src4;
+        }
+        barrier();
+
+        // stage TILE rows into LDS: flat strided copy, so a wave takes 32
+        // consecutive f16vec4 of one row — one coalesced burst, no bank
+        // conflicts, and r is wave-uniform so the row metadata is a scalar load
+        [[unroll]] for (uint e = tid; e < TILE*D4; e += WGS) {
+            const uint r = e/D4;
+            if (row_ok[r] != 0u) {
+                const uint c    = e%D4;
+                const uint src4 = row_src4[r];
+                Kt[r][c] = gather ? data_kc4[src4 + c] : data_k4[src4 + c];
             }
         }
         barrier();
 
-        // scores: TPH lanes cooperate on each row's DK-dim dot product
+        // scores: TPH lanes cooperate on each row's DK-dim dot product, and
+        // each staged K value feeds HPT heads
         for (uint j = 0; j < TILE; ++j) {
-            float sum = 0.0;
-            if (h_ok && row_ok[j] != 0u) {
-                [[unroll]] for (uint i = 0; i < DPT/4; ++i) {
-                    const vec4 kv4 = vec4(Kt[j][lane*(DPT/4) + i]);
-                    sum += Qr[4*i + 0]*kv4.x + Qr[4*i + 1]*kv4.y + Qr[4*i + 2]*kv4.z + Qr[4*i + 3]*kv4.w;
+            float sum[HPT];
+            [[unroll]] for (uint u = 0; u < HPT; ++u) {
+                sum[u] = 0.0;
+            }
+
+            if (grp_ok && row_ok[j] != 0u) {
+                [[unroll]] for (uint i = 0; i < V4; ++i) {
+                    const vec4 kv4 = vec4(Kt[j][i*TPH + lane]);
+                    [[unroll]] for (uint u = 0; u < HPT; ++u) {
+                        sum[u] += Qr[u][4*i + 0]*kv4.x + Qr[u][4*i + 1]*kv4.y
+                                + Qr[u][4*i + 2]*kv4.z + Qr[u][4*i + 3]*kv4.w;
+                    }
                 }
             }
-            sum += subgroupShuffleXor(sum, 8u);
-            sum += subgroupShuffleXor(sum, 4u);
-            sum += subgroupShuffleXor(sum, 2u);
-            sum += subgroupShuffleXor(sum, 1u);
+
+            [[unroll]] for (uint u = 0; u < HPT; ++u) {
+                sum[u] += subgroupShuffleXor(sum[u], 8u);
+                sum[u] += subgroupShuffleXor(sum[u], 4u);
+                sum[u] += subgroupShuffleXor(sum[u], 2u);
+                sum[u] += subgroupShuffleXor(sum[u], 1u);
+            }
+
             if (lane == 0u) {
-                float sc = sum;
-                if (row_ok[j] == 0u) {
-                    sc = uintBitsToFloat(0xFF800000); // -inf
-                } else if (!gather && has_mask) {
-                    // -inf mask entries flow through: exp(-inf - M) == 0 and
-                    // max() against M_INIT keeps M finite (no NaN paths)
-                    sc += float(data_m[m_base + base + j]);
+                // -inf mask entries flow through: exp(-inf - M) == 0 and
+                // max() against M_INIT keeps M finite (no NaN paths)
+                const bool  dead = row_ok[j] == 0u;
+                const float bias = (!gather && has_mask) ? float(data_m[m_base + base + j]) : 0.0;
+                [[unroll]] for (uint u = 0; u < HPT; ++u) {
+                    Pt[hg*HPT + u][j] = dead ? uintBitsToFloat(0xFF800000) : sum[u] + bias;
                 }
-                Pt[hl][j] = sc;
             }
         }
         barrier();
@@ -181,23 +231,25 @@ void main() {
         // per-head online softmax update — the TPH lanes of a head split the
         // TILE rows between them, so every thread works (doing this on
         // thread<HCHUNK left 15/16 of the workgroup stalled at the barrier)
-        {
+        [[unroll]] for (uint u = 0; u < HPT; ++u) {
+            const uint slot = hg*HPT + u;
+
             float tmax = float(M_INIT);
             [[unroll]] for (uint j = lane; j < TILE; j += TPH) {
-                tmax = max(tmax, Pt[hl][j]);
+                tmax = max(tmax, Pt[slot][j]);
             }
             tmax = max(tmax, subgroupShuffleXor(tmax, 8u));
             tmax = max(tmax, subgroupShuffleXor(tmax, 4u));
             tmax = max(tmax, subgroupShuffleXor(tmax, 2u));
             tmax = max(tmax, subgroupShuffleXor(tmax, 1u));
 
-            const float Mnew = max(M_run, tmax);
-            const float ms   = exp(M_run - Mnew);
+            const float Mnew = max(M_run[u], tmax);
+            const float ms   = exp(M_run[u] - Mnew);
 
             float l_add = 0.0;
             [[unroll]] for (uint j = lane; j < TILE; j += TPH) {
-                const float pv = exp(Pt[hl][j] - Mnew);
-                Pt[hl][j] = pv;
+                const float pv = exp(Pt[slot][j] - Mnew);
+                Pt[slot][j] = pv;
                 l_add += pv;
             }
             l_add += subgroupShuffleXor(l_add, 8u);
@@ -205,55 +257,69 @@ void main() {
             l_add += subgroupShuffleXor(l_add, 2u);
             l_add += subgroupShuffleXor(l_add, 1u);
 
-            M_run = Mnew;
-            L_run = L_run*ms + l_add;
-            m_scale = ms;
+            M_run  [u] = Mnew;
+            L_run  [u] = L_run[u]*ms + l_add;
+            m_scale[u] = ms;
         }
         barrier();
 
-        // accumulate O — each thread owns a VPT-dim slice of one head
-        {
-            const float ms = m_scale;
-            if (ms != 1.0) {
+        // accumulate O — each thread owns a VPT-dim slice of HPT heads
+        [[unroll]] for (uint u = 0; u < HPT; ++u) {
+            if (m_scale[u] != 1.0) {
                 [[unroll]] for (uint i = 0; i < VPT; ++i) {
-                    Or[i] *= ms;
+                    Or[u][i] *= m_scale[u];
                 }
             }
-            for (uint j = 0; j < TILE; ++j) {
-                const float pv = Pt[hl][j];
-                if (pv == 0.0) {
-                    continue;
-                }
-                [[unroll]] for (uint i = 0; i < VPT/4; ++i) {
-                    const vec4 vv = vec4(Kt[j][lane*(VPT/4) + i]);
-                    Or[4*i + 0] += pv*vv.x;
-                    Or[4*i + 1] += pv*vv.y;
-                    Or[4*i + 2] += pv*vv.z;
-                    Or[4*i + 3] += pv*vv.w;
+        }
+        for (uint j = 0; j < TILE; ++j) {
+            if (row_ok[j] == 0u) {
+                continue;
+            }
+            float pv[HPT];
+            bool  live = false;
+            [[unroll]] for (uint u = 0; u < HPT; ++u) {
+                pv[u] = Pt[hg*HPT + u][j];
+                live  = live || (pv[u] != 0.0);
+            }
+            if (!live) {
+                continue;
+            }
+            [[unroll]] for (uint i = 0; i < V4; ++i) {
+                const vec4 vv = vec4(Kt[j][i*TPH + lane]);
+                [[unroll]] for (uint u = 0; u < HPT; ++u) {
+                    Or[u][4*i + 0] += pv[u]*vv.x;
+                    Or[u][4*i + 1] += pv[u]*vv.y;
+                    Or[u][4*i + 2] += pv[u]*vv.z;
+                    Or[u][4*i + 3] += pv[u]*vv.w;
                 }
             }
         }
         barrier();
     }
-
-    if (!h_ok) {
-        return;
-    }
-
-    // sinks — every lane of the head holds the same running state already
-    float ms_f = 1.0;
-    if (has_sinks) {
-        const float sk   = data_s[h];
-        const float Mnew = max(M_run, sk);
-        ms_f  = exp(M_run - Mnew);
-        L_run = L_run*ms_f + exp(sk - Mnew);
-    }
-
-    const float li = L_run == 0.0 ? 0.0 : 1.0/L_run;
 
     // dst is contiguous f32 [DV, n_head, T, ns]
-    const uint o_base = DV*(h + p.n_head*(t + T*s)) + lane*VPT;
-    [[unroll]] for (uint i = 0; i < VPT; ++i) {
-        data_o[o_base + i] = Or[i]*ms_f*li;
+    [[unroll]] for (uint u = 0; u < HPT; ++u) {
+        if (!h_ok[u]) {
+            continue;
+        }
+
+        // sinks — every lane of the head holds the same running state already
+        float ms_f = 1.0;
+        if (has_sinks) {
+            const float sk   = data_s[hh[u]];
+            const float Mnew = max(M_run[u], sk);
+            ms_f     = exp(M_run[u] - Mnew);
+            L_run[u] = L_run[u]*ms_f + exp(sk - Mnew);
+        }
+
+        const float li     = L_run[u] == 0.0 ? 0.0 : 1.0/L_run[u];
+        const uint  o_base = DV*(hh[u] + p.n_head*(t + T*s));
+
+        [[unroll]] for (uint i = 0; i < V4; ++i) {
+            const uint d0 = (i*TPH + lane)*4;
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                data_o[o_base + d0 + c] = Or[u][4*i + c]*ms_f*li;
+            }
+        }
     }
 }
