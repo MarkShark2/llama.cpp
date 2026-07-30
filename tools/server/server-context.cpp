@@ -195,6 +195,10 @@ struct server_slot {
     // accepted by construction and must not enter the acceptance statistics.
     bool spec_replay = false;
 
+    // [fork] take the context checkpoint in post_decode() rather than before an extra
+    // prompt-batch decode -- see ckpt_prompt_breaks() in server_context.
+    bool ckpt_after_decode = false;
+
     // [fork, SPD] training-data collection state for the current task
     std::shared_ptr<server_spd_seq>          spd_seq;    // in-flight sequence (null = not collecting)
     std::vector<llama_token>                 spd_tokens; // text prompt tokens for the shard record
@@ -395,6 +399,9 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // [fork] a deferred checkpoint belongs to the task that armed it
+        ckpt_after_decode = false;
 
         // [fork, SPD] drop any incomplete collection sequence (a complete one
         // was already handed to the collector and this pointer cleared)
@@ -2590,6 +2597,29 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // [fork] how many trailing prompt-batch breaks to take so a context checkpoint can be
+    // snapshotted before a decode (env LLAMA_CKPT_PROMPT_BREAKS):
+    //   0 = none (default) -- snapshot in post_decode(), after the decode that completes the
+    //       prompt. That decode already drains the pipeline so the caller can sample, so the
+    //       snapshot is free, and the recovery point lands at the end of the prompt instead of
+    //       4 tokens short of it.
+    //   1 = break 4 tokens before the end (one extra decode)
+    //   2 = upstream (PR #20288): also break 4 + n_ubatch before the end
+    //
+    // Each break is a separate llama_decode, and a decode boundary drains the whole pipeline --
+    // a cost proportional to backend count, and independent of how many tokens the extra decode
+    // carries. Measured on a 10-stage RPC split with 15,360-token prompts: 243.0 t/s with no
+    // breaks, 205.4 with one (the 4-token one!), 180.3 with upstream's two.
+    static int ckpt_prompt_breaks() {
+        static const int n = [] {
+            const char * e = getenv("LLAMA_CKPT_PROMPT_BREAKS");
+            const int    v = e ? atoi(e) : 0;
+            return v < 0 ? 0 : (v > 2 ? 2 : v);
+        }();
+
+        return n;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -4089,28 +4119,18 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch   [fork: off by default, see below]
+                        //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         //
-                        // [fork] each break ends the prompt batch, and a decode boundary drains the
-                        // whole pipeline -- expensive in proportion to the stage count on a
-                        // multi-stage RPC split. Measured on DSV4 across 10 stages: the deep break
-                        // costs 15.0 s and the shallow one 10.3 s of an 85 s request. The deep break
-                        // only buys a fallback checkpoint n_ubatch tokens further back; per-turn
-                        // restores come from the user-message-boundary rule above and end-of-prompt
-                        // continuation from the shallow break, so it is off by default here.
-                        // LLAMA_CKPT_DEEP_BREAK=1 restores upstream's pair.
-                        if (do_checkpoint) {
-                            static const bool deep_break = [] {
-                                const char * e = getenv("LLAMA_CKPT_DEEP_BREAK");
-                                return e && atoi(e) != 0;
-                            }();
-
+                        // [fork] both breaks are opt-in now (LLAMA_CKPT_PROMPT_BREAKS, default 0):
+                        // by default the checkpoint is snapshotted in post_decode() instead, which
+                        // costs nothing. See ckpt_prompt_breaks().
+                        if (do_checkpoint && ckpt_prompt_breaks() > 0) {
                             const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
-                            for (int i = deep_break ? 0 : 1; i < 2; ++i) {
+                            for (int i = 2 - ckpt_prompt_breaks(); i < 2; ++i) {
                                 const int n_last = std::min(n_batch, checkpoint_offsets[i]);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -4134,7 +4154,15 @@ private:
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                    const bool prompt_complete = slot.prompt.n_tokens() == slot.task->n_tokens();
+
+                    // [fork] with no trailing prompt break there is no decode boundary left to
+                    // snapshot before: a pre-decode snapshot of the batch that completes the prompt
+                    // would capture everything except the prompt itself (pos_min < 0 for a fresh
+                    // one). Defer it to post_decode() instead.
+                    const bool ckpt_defer = do_checkpoint && prompt_complete && ckpt_prompt_breaks() == 0;
+
+                    if (prompt_complete) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.size() > 0);
@@ -4159,7 +4187,8 @@ private:
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
-                    if (do_checkpoint && pos_min < 0) {
+                    // [fork] a deferred snapshot reads pos_min after the decode, when it is valid
+                    if (do_checkpoint && pos_min < 0 && !ckpt_defer) {
                         do_checkpoint = false;
                     }
 
@@ -4175,7 +4204,11 @@ private:
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
-                    if (do_checkpoint) {
+                    if (ckpt_defer) {
+                        // [fork] ... unless it is deferred, in which case the checkpoint *does*
+                        // cover this batch and is taken in post_decode()
+                        slot.ckpt_after_decode = do_checkpoint;
+                    } else if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
@@ -4407,6 +4440,30 @@ private:
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
                 }
             }
+        });
+
+        // [fork] deferred context checkpoint: the decode that completed the prompt has landed, so
+        // the state now covers the whole prompt and reading it costs nothing -- the caller is about
+        // to sample from this same decode, which already drained the pipeline. Must run before the
+        // sampling pass below, so no generation decode can move the state first.
+        iterate(slots, [&](server_slot & slot) {
+            if (!slot.ckpt_after_decode || slot.state != SLOT_STATE_DONE_PROMPT || !is_inside_view(slot.i_batch)) {
+                return;
+            }
+
+            slot.ckpt_after_decode = false;
+
+            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+            if (pos_min < 0) {
+                SLT_DBG(slot, "%s", "deferred checkpoint skipped: nothing in memory\n");
+                return;
+            }
+
+            // n_tokens_cur = 0: unlike the pre-decode path, this checkpoint covers every token
+            // processed so far, including the batch that was just decoded
+            create_checkpoint(slot, 0, pos_min, pos_max);
         });
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
