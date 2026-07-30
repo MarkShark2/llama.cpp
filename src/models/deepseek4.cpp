@@ -61,7 +61,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
+void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
@@ -80,9 +80,19 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0);
-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+    // The hyper-connection collapse is classified LAYER_OUTPUT, so by default it
+    // follows dev_output. That is harmless while dev_output == the last layer's
+    // device, but --device-draft pins dev_output to the local draft GPU (the DSpark
+    // drafter's scheduler cannot use an RPC-resident output.weight), and then the
+    // collapse runs locally: every PipeDec body lane ends with a blocking
+    // CUDA0 <- RPC copy of the [n_embd, hc, n_tokens] state, which drains the whole
+    // RPC pipeline inside the lane's *submission* and serializes the lanes
+    // (~118 ms/lane measured on the 10-stage DSV4 split). Pin the collapse to the
+    // last transformer layer so the body graph stays entirely on the pipeline and
+    // only the collapsed [n_embd] rows cross to the head device.
+    hc_head_fn    = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0, n_layer - 1);
+    hc_head_base  = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult},         0, n_layer - 1);
+    hc_head_scale = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1},               0, n_layer - 1);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
