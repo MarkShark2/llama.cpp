@@ -166,7 +166,10 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
 
-    void clear_compressed(llama_seq_id seq_id, bool data);
+    // pos_max bounds the zeroing to the rows a sequence ending there could have
+    // written; DSV4_POS_ALL clears the whole per-stream slice. Ignored when
+    // seq_id < 0 (that path clears whole buffers server-side).
+    void clear_compressed(llama_seq_id seq_id, bool data, llama_pos pos_max);
 };
 
 // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept

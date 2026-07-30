@@ -18,6 +18,11 @@
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
+// [fork] "this sequence may have touched every compressed row" - passed to
+// clear_compressed() when the extent of the sequence being dropped is not known
+// and the whole per-stream slice has to be zeroed.
+static constexpr llama_pos DSV4_POS_ALL = INT32_MAX;
+
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
@@ -29,13 +34,31 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
-static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
+// [fork] Zero the first n_rows rows of one stream's slice.
+//
+// The row bound matters because ggml has no RPC memset command: the backend
+// emulates one by allocating a host buffer of the fill value and pushing it
+// through SET_TENSOR (ggml-rpc.cpp). Zeroing a whole compressed K cache
+// therefore *transfers* it - on the 9-stage DSV4 split that is ~1.7 GiB of
+// literal zeros off the head's single NIC, and a full sequence clear happens on
+// every request that misses the prompt cache.
+static void dsv4_clear_tensor_stream_rows(ggml_tensor * tensor, uint32_t stream, uint32_t n_rows) {
     GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(tensor->ne[3] == 1);
     GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
 
     const size_t stream_size = tensor->nb[2];
-    ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
+    const size_t size        = std::min<size_t>(stream_size, (size_t) n_rows*tensor->nb[1]);
+
+    if (size == 0) {
+        return;
+    }
+
+    ggml_backend_tensor_memset(tensor, 0, stream*stream_size, size);
+}
+
+static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
+    dsv4_clear_tensor_stream_rows(tensor, stream, (uint32_t) tensor->ne[1]);
 }
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
@@ -46,6 +69,21 @@ static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint
     const uint64_t n_rows = ((uint64_t) pos_max + 1)/ratio;
 
     return (uint32_t) std::min<uint64_t>(kv_size, n_rows);
+}
+
+// [fork] Rows of a compressed K cache that can hold anything for a sequence
+// that reached pos_max, i.e. how much of it a clear actually has to touch.
+//
+// The compressed caches are position-addressed rather than slot-allocated: row r
+// holds block r, so a sequence ending at pos_max made (pos_max + 1)/ratio rows
+// visible - the same bound state_write() serializes. One row of slack covers the
+// trailing block, which may be partially written before it becomes visible (the
+// row count is a floor). Rows above that have never been written since the
+// buffers were zeroed at allocation, so re-zeroing them is a no-op.
+static uint32_t dsv4_clear_n_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
+    const uint32_t n_used = dsv4_state_n_used_k_rows(pos_max, ratio, kv_size);
+
+    return n_used < kv_size ? n_used + 1 : kv_size;
 }
 
 static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
@@ -1160,7 +1198,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // graph does not necessarily overwrite; uninitialized buffer contents would
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
     // compressed buffers up front so reads of un-written rows are deterministic.
-    clear_compressed(-1, true);
+    clear_compressed(-1, true, DSV4_POS_ALL);
 }
 
 llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
@@ -1279,7 +1317,7 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
-    clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
+    clear_compressed(-1, true, DSV4_POS_ALL); // DSV4 compressed buffers must never expose stale/uninit rows
 }
 
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1328,10 +1366,17 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         return res;
     }
 
+    // [fork] Capture the extent of the sequence before the raw cache forgets it -
+    // clear_compressed() needs it to bound the zeroing to the rows this sequence
+    // could have written. Without it a full seq_rm ships the entire compressed
+    // allocation over RPC as zeros, which was ~13.6 s per request on the 9-stage
+    // DSV4 split at ctx 262144 (see dsv4_clear_tensor_stream_rows).
+    const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : DSV4_POS_ALL;
+
     const bool res = kv_raw->seq_rm(seq_id, p0, p1);
 
     if (res) {
-        clear_compressed(seq_id, true);
+        clear_compressed(seq_id, true, pos_max);
     }
 
     return res;
@@ -1360,8 +1405,10 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
             continue;
         }
 
+        const llama_pos pos_max = kv_raw->seq_pos_max(id);
+
         kv_raw->seq_rm(id, -1, -1);
-        clear_compressed(id, true);
+        clear_compressed(id, true, pos_max);
     }
 }
 
@@ -1520,27 +1567,33 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
     return lid_state.get();
 }
 
-void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data, llama_pos pos_max) {
     if (seq_id < 0) {
+        // whole-buffer clear: one server-side BUFFER_CLEAR per buffer, no payload
         kv_csa->clear(data);
         kv_hca->clear(data);
         kv_lid->clear(data);
     } else {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
 
-        const auto clear_seq = [seq_id, data](llama_kv_cache * kv) {
+        // [fork] Clear only the rows the sequence could have reached. Ratios match
+        // the partial-rollback path in seq_rm() and state_write(): lid shares the
+        // CSA ratio.
+        const auto clear_seq = [seq_id, data, pos_max](llama_kv_cache * kv, uint32_t ratio) {
             kv->seq_rm(seq_id, -1, -1);
 
             if (data) {
+                const uint32_t n_rows = dsv4_clear_n_k_rows(pos_max, ratio, kv->get_size());
+
                 for (uint32_t il : kv->get_layer_ids()) {
-                    dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
+                    dsv4_clear_tensor_stream_rows(kv->get_k_storage(il), (uint32_t) seq_id, n_rows);
                 }
             }
         };
 
-        clear_seq(kv_csa.get());
-        clear_seq(kv_hca.get());
-        clear_seq(kv_lid.get());
+        clear_seq(kv_csa.get(), DSV4_CSA_RATIO);
+        clear_seq(kv_hca.get(), DSV4_HCA_RATIO);
+        clear_seq(kv_lid.get(), DSV4_CSA_RATIO);
     }
 
     csa_state->clear(seq_id, data);
