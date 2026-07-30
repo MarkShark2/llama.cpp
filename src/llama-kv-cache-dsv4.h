@@ -93,6 +93,7 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
+                     uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -148,6 +149,14 @@ private:
     llama_hparams hparams_lid;
 
     const uint32_t n_seq_max;
+
+    // [fork] Maximum depth of a partial (suffix) rollback, in tokens. The compressor
+    // rings are built n_rs_seq rows wider than their block read window so that a
+    // discarded suffix of at most this many positions can be re-walked exactly;
+    // seq_rm() rejects anything deeper, which puts the caller back on the full
+    // state-restore path. 0 (the default, no drafter) reproduces the old behaviour
+    // bit for bit: no ring slack, no partial removal.
+    const uint32_t n_rs_seq;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;

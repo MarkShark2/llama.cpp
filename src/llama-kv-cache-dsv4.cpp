@@ -1039,13 +1039,15 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+                 uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
     hparams_lid(model.hparams),
-    n_seq_max(n_seq_max) {
+    n_seq_max(n_seq_max),
+    n_rs_seq(n_rs_seq) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1124,20 +1126,34 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
+    // [fork] Compressor-ring slack for bounded partial rollback.
+    //
+    // A compressor state row is addressed by pos % state_size and every write is a
+    // plain overwrite, so re-walking a discarded suffix rewrites exactly the rows
+    // those positions owned. The one way that can go wrong is aliasing: a discarded
+    // position q shares a row with a position m still inside a later block's read
+    // window, which needs q >= m + state_size. With a read window of W positions
+    // (2*ratio for the overlapped CSA/LID compressors, ratio for HCA) the walk is
+    // therefore exact for any rollback of at most state_size - W + 1 positions.
+    // Carrying W + n_rs_seq rows buys exactly the depth the caller asked for, at
+    // a few hundred KiB. n_rs_seq == 0 keeps the original W-row rings.
+    const uint32_t state_csa = 2*DSV4_CSA_RATIO + n_rs_seq;
+    const uint32_t state_hca =   DSV4_HCA_RATIO + n_rs_seq;
+
     csa_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, state_csa,
             2*model.hparams.n_embd_head_k(), "csa", filter_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
+            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, state_hca,
             model.hparams.n_embd_head_k(), "hca", filter_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, state_csa,
             2*model.hparams.indexer_head_size, "lid", filter_csa);
 
     // DSV4 attention reads compressed-K / compressor-state rows that the current
@@ -1272,8 +1288,33 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     }
 
     if (p0 > 0) {
-        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
-                p0 <= kv_raw->seq_pos_max(seq_id)) {
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+            return false;
+        }
+
+        // [fork] Bounded partial (suffix) rollback.
+        //
+        // Everything DSV4 keeps for a sequence can be rewound by re-walking the
+        // discarded positions:
+        //
+        //   - kv_raw is an ordinary ISWA cache; the discarded cells are inside the
+        //     128-token window and are simply freed and rewritten.
+        //   - the compressed caches are position-addressed, not slot-allocated (they
+        //     never see a ubatch): row r holds block r, a token at pos sees exactly
+        //     (pos + 1)/ratio rows, and a row becomes visible on the very step that
+        //     commits it. Rows at or past p0/ratio therefore go invisible on their
+        //     own and are overwritten as the walk returns. The seq_rm calls below
+        //     only keep their cell bookkeeping honest.
+        //   - the compressor states are rings keyed by pos % state_size, which the
+        //     re-walk restores as long as the discarded suffix is no deeper than the
+        //     slack the rings were built with (see the ctor).
+        //
+        // Anything deeper must go through a full state restore, so report failure and
+        // let the caller fall back - that is what n_rs_seq == 0 does for every
+        // partial removal, reproducing the pre-rollback behaviour exactly.
+        const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+
+        if (p0 <= pos_max && (uint32_t) (pos_max - p0 + 1) > n_rs_seq) {
             return false;
         }
 

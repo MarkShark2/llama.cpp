@@ -113,6 +113,17 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    // [fork] LLAMA_NO_RS_ROLLBACK=1 forces the caller back onto full state restores
+    // without changing anything else about the run. Kept because it is the only way
+    // to A/B a bounded rollback against the checkpoint path at identical verify
+    // batching (same graphs, same fp reduction order, only the rewind differs), and
+    // because it is the kill-switch if a rollback implementation is ever suspected.
+    if (cparams.n_rs_seq > 0 && getenv("LLAMA_NO_RS_ROLLBACK") &&
+            atoi(getenv("LLAMA_NO_RS_ROLLBACK")) != 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_NO_RS_ROLLBACK set - disabling bounded partial rollback (n_rs_seq %u -> 0)\n",
+                        __func__, cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;

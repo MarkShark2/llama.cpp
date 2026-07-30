@@ -1003,6 +1003,12 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        // [fork] DSV4's DSA compressor state is a ring addressed by pos % state_size
+        // whose rows are pure overwrites, so re-walking a discarded suffix restores it
+        // exactly - as long as the ring carries n_rs_seq rows of slack over the block
+        // read window. llama_kv_cache_dsv4 sizes itself from cparams.n_rs_seq and
+        // enforces the same bound in seq_rm().
+        case LLM_ARCH_DEEPSEEK4:
             return true;
         default:
             return false;
