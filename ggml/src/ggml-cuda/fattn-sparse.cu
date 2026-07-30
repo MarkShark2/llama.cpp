@@ -63,6 +63,16 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
     constexpr int TPH    = FATTN_SPARSE_NTH/HCHUNK; // threads per head
     constexpr int DPT    = DK/TPH;                  // dims per thread (Q/K dot slice)
     constexpr int VPT    = DV/TPH;                  // dims per thread (V accumulate slice)
+    constexpr int H2PT   = DPT/2;                   // half2 per thread per row
+    static_assert(DK == DV, "the strided lane mapping below indexes K and V alike");
+
+    // Lanes walk a K row with stride TPH, never in contiguous DPT-wide blocks:
+    // at 4 bytes per half2 a block mapping puts lane l at bank (l*16)%32, i.e.
+    // all TPH lanes of a warp on two banks -- an 8-way conflict on every K
+    // access, in both the score and the accumulate loop. Striding puts them on
+    // TPH consecutive banks instead. (Same bug fixed in flash_attn_sparse.comp;
+    // there it was worth 3.2x.) Staging below is unaffected: 16-byte shared
+    // writes are phased 8 threads at a time, which is already conflict-free.
 
     const int t  = blockIdx.x;             // query token
     const int hc = blockIdx.y;             // head chunk
@@ -83,8 +93,10 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
     if (h_ok) {
         const float * q_ptr = (const float *) (p.q + t*p.nbq1 + h*p.nbq2 + s*p.nbq3);
 #pragma unroll
-        for (int i = 0; i < DPT; ++i) {
-            Qr[i] = q_ptr[lane*DPT + i]*p.scale;
+        for (int i = 0; i < H2PT; ++i) {
+            const int d0 = (i*TPH + lane)*2;
+            Qr[2*i + 0] = q_ptr[d0 + 0]*p.scale;
+            Qr[2*i + 1] = q_ptr[d0 + 1]*p.scale;
         }
     } else {
 #pragma unroll
@@ -160,8 +172,8 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
                 if (h_ok && row_ok[j]) {
                     const half2 * krow = &Kt[j][0];
 #pragma unroll
-                    for (int i = 0; i < DPT/2; ++i) {
-                        const float2 kv2 = __half22float2(krow[lane*(DPT/2) + i]);
+                    for (int i = 0; i < H2PT; ++i) {
+                        const float2 kv2 = __half22float2(krow[i*TPH + lane]);
                         sum += Qr[2*i + 0]*kv2.x + Qr[2*i + 1]*kv2.y;
                     }
                 }
@@ -236,8 +248,8 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
                 }
                 const half2 * vrow = &Kt[j][0]; // V = DV-prefix of the staged row
 #pragma unroll
-                for (int i = 0; i < VPT/2; ++i) {
-                    const float2 vv = __half22float2(vrow[lane*(VPT/2) + i]);
+                for (int i = 0; i < H2PT; ++i) {
+                    const float2 vv = __half22float2(vrow[i*TPH + lane]);
                     Or[2*i + 0] += pv*vv.x;
                     Or[2*i + 1] += pv*vv.y;
                 }
@@ -264,8 +276,10 @@ static __global__ void flash_attn_sparse_f16(const fattn_sparse_params p) {
     // dst is contiguous [DV, H, T, ns]
     float * out = p.dst + (size_t) DV*(h + (size_t) p.n_head*(t + (size_t) gridDim.x*s));
 #pragma unroll
-    for (int i = 0; i < VPT; ++i) {
-        out[lane*VPT + i] = Or[i]*ms_f*li;
+    for (int i = 0; i < H2PT; ++i) {
+        const int d0 = (i*TPH + lane)*2;
+        out[d0 + 0] = Or[2*i + 0]*ms_f*li;
+        out[d0 + 1] = Or[2*i + 1]*ms_f*li;
     }
 }
 
