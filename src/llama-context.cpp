@@ -444,6 +444,40 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // [fork, SPD peer boundaries] a persistent device-resident boundary
+        // input for SPD stages past 0: the graph references it like a weight,
+        // so the scheduler neither stages it on the CPU nor re-uploads it per
+        // eval, and a peer push + on-server copy can deliver the previous
+        // stage's boundary without the bytes ever crossing the client.
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE && cparams.spd_stage > 0 &&
+            std::getenv("LLAMA_SPD_PEER") != nullptr && atoi(std::getenv("LLAMA_SPD_PEER")) != 0 &&
+            backends.size() > 1) {
+            // the boundary must live on the device that computes this stage's
+            // layers -- a graph must never reference a foreign endpoint's
+            // tensor over star RPC
+            ggml_backend_dev_t stage_dev = model.dev_layer((int) cparams.spd_layer_start);
+            ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+            spd_boundary_ctx = ggml_init(ip);
+            ggml_tensor * boundary = spd_boundary_ctx == nullptr || stage_dev == nullptr ? nullptr :
+                    ggml_new_tensor_2d(spd_boundary_ctx, GGML_TYPE_F32,
+                            (int64_t) cparams.n_embd_inp_ctx, (int64_t) cparams.n_batch);
+            spd_boundary_buf = boundary == nullptr ? nullptr :
+                    ggml_backend_alloc_ctx_tensors_from_buft(spd_boundary_ctx,
+                            ggml_backend_dev_buffer_type(stage_dev));
+            if (spd_boundary_buf != nullptr) {
+                ggml_set_name(boundary, "spd_boundary_inp");
+                cparams.spd_boundary_inp = boundary;
+                LLAMA_LOG_INFO("%s: SPD peer boundary input: %.1f MiB on %s\n", __func__,
+                        ggml_nbytes(boundary)/(1024.0*1024.0), ggml_backend_buffer_name(spd_boundary_buf));
+            } else {
+                if (spd_boundary_ctx != nullptr) {
+                    ggml_free(spd_boundary_ctx);
+                    spd_boundary_ctx = nullptr;
+                }
+                LLAMA_LOG_WARN("%s: SPD peer boundary input allocation failed, staying on the host path\n", __func__);
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -592,6 +626,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (spd_boundary_buf != nullptr) {
+        ggml_backend_buffer_free(spd_boundary_buf);
+    }
+    if (spd_boundary_ctx != nullptr) {
+        ggml_free(spd_boundary_ctx);
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1108,6 +1148,22 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
     return embd_layer_inp[lid].data;
+}
+
+ggml_tensor * llama_context::spd_peer_inp_tensor() const {
+    if (cparams.spd_boundary_inp != nullptr) {
+        return cparams.spd_boundary_inp;
+    }
+    return gf_res_prev ? gf_res_prev->t_inp_embd_wide : nullptr;
+}
+
+ggml_tensor * llama_context::spd_peer_out_tensor() const {
+    return gf_res_prev ? gf_res_prev->t_embd : nullptr;
+}
+
+void llama_context::set_spd_peer_io(bool skip_inp, bool skip_out) {
+    cparams.spd_peer_skip_inp = skip_inp;
+    cparams.spd_peer_skip_out = skip_out;
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -2393,7 +2449,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 : hparams.n_embd_out();
                         float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
-                        if (n_outputs) {
+                        // [fork, SPD peer boundaries] the boundary leaves via a
+                        // peer push; skipping the readback keeps the ~n_tokens x
+                        // n_embd_out f32 transfer off the client link entirely
+                        if (n_outputs && !cparams.spd_peer_skip_out) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
@@ -4496,6 +4555,18 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+ggml_tensor * llama_spd_peer_inp_tensor(llama_context * ctx) {
+    return ctx->spd_peer_inp_tensor();
+}
+
+ggml_tensor * llama_spd_peer_out_tensor(llama_context * ctx) {
+    return ctx->spd_peer_out_tensor();
+}
+
+void llama_set_spd_peer_io(llama_context * ctx, bool skip_inp, bool skip_out) {
+    ctx->set_spd_peer_io(skip_inp, skip_out);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

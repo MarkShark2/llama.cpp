@@ -123,6 +123,28 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API void llama_set_graph_reuse(struct llama_context * ctx, bool value);
 LLAMA_API void llama_set_stable_host_inputs(struct llama_context * ctx, bool value);
 
+// [fork, SPD peer boundaries] the last graph's raw (un-narrowed) embd input
+// tensor and embd output tensor -- the device-resident endpoints of a stage
+// boundary. Valid until the context builds a different graph; callers must
+// re-fetch after every decode. And the per-decode host-transfer skips: with
+// skip_inp the embd upload in set_input is suppressed (the data was placed on
+// device by a peer push + local copy), with skip_out the embeddings readback
+// in decode is suppressed (the boundary leaves via a peer push).
+LLAMA_API struct ggml_tensor * llama_spd_peer_inp_tensor(struct llama_context * ctx);
+LLAMA_API struct ggml_tensor * llama_spd_peer_out_tensor(struct llama_context * ctx);
+LLAMA_API void llama_set_spd_peer_io(struct llama_context * ctx, bool skip_inp, bool skip_out);
+
+// [fork, SPD peer boundaries] synchronous peer-push entry points, implemented
+// in ggml-rpc.cpp (exported from the RPC backend, declared here so the SPD
+// pipeline can drive them; see the "Synchronous peer push" block there for
+// the ordering contract).
+extern "C" {
+bool ggml_backend_rpc_sync_peer_prepare(const struct ggml_tensor * dst_probe);
+bool ggml_backend_rpc_sync_peer_push(const struct ggml_tensor * src, const struct ggml_tensor * dst, uint64_t * ordinal_out);
+bool ggml_backend_rpc_sync_peer_fence(const struct ggml_tensor * dst_probe, uint64_t ordinal);
+bool ggml_backend_rpc_sync_peer_guard(const struct ggml_tensor * src_probe);
+}
+
 // [PipeDec] deferred verify group (requires GGML_PIPEDEC_STAGE2 eligibility):
 // llama_pipedec_defer marks the NEXT llama_decode as a deferred group member -
 // its stage-2 token lanes are submitted but no head runs and no logits are

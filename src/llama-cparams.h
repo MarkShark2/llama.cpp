@@ -65,6 +65,18 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // [fork, SPD peer boundaries] toggled per decode by the SPD pipeline when
+    // a stage boundary moves board-to-board instead of through the client:
+    // skip the embd input upload (the data was peer-pushed and locally copied
+    // into the graph's input tensor) and/or the embd output readback (the
+    // boundary leaves via a peer push, the host never needs it).
+    bool spd_peer_skip_inp = false;
+    bool spd_peer_skip_out = false;
+    // persistent device-resident boundary input for an SPD stage, allocated by
+    // the context; build_inp_embd references it like a weight so the scheduler
+    // neither stages it on the CPU nor re-uploads it per eval
+    struct ggml_tensor * spd_boundary_inp = nullptr;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer() + 1] extract input embeddings for layer; slot n_layer = output of the final layer
 
     enum llama_context_type ctx_type;

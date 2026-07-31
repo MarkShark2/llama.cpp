@@ -1,6 +1,8 @@
 #include "spd-pipeline.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "llama-ext.h"
 
 #include <algorithm>
@@ -311,6 +313,33 @@ struct common_spd_pipeline::impl {
     int32_t dump_prefill_rows_left = 4096;
     FILE * dump_index = nullptr;
 
+    // LLAMA_SPD_PEER=1: ship prefill stage boundaries board-to-board through
+    // the deployed RPC peer machinery instead of hairpinning ~2x16.8 MB per
+    // cell through the client's per-board links serialized against compute.
+    // One record per CONSUMING stage. `staging` is a same-shape twin of the
+    // consumer graph's embd input on the same device: the producer pushes into
+    // it (safe to apply on arrival -- nothing reads it), and the consumer
+    // fences + does an on-server copy into the real input right before its
+    // decode. The consumed/pushed chunk handshake bounds the producer to one
+    // chunk ahead so staging is never overwritten before it is drained.
+    // All non-buffer fields are guarded by prefill_target's progress mutex.
+    struct peer_boundary {
+        ggml_context * staging_ctx = nullptr;
+        ggml_backend_buffer_t staging_buf = nullptr;
+        // two parity slots so the producer can run up to two chunks ahead --
+        // a single slot couples adjacent stages tightly enough that ordinary
+        // board-to-board variance propagates as stalls in both directions
+        ggml_tensor * staging[2] = { nullptr, nullptr };
+        uint64_t ordinals[2] = { 0, 0 };  // delivery fence target per slot
+        ggml_tensor * inp = nullptr;      // consumer graph's wide embd input
+        bool ready = false;               // consumer-side setup complete
+        bool dead  = false;               // route refused or a transfer failed
+        int32_t  pushed_chunk = -1;       // last chunk delivered by push
+        int32_t  consumed_chunk = -1;     // last chunk the consumer finished
+    };
+    std::array<peer_boundary, SPD_MAX_STAGE_COUNT> peer_links;
+    bool peer_boundaries_enabled = false;
+
     struct phase_timing {
         double prepare = 0.0;
         double stage_wall = 0.0;
@@ -337,6 +366,10 @@ struct common_spd_pipeline::impl {
         std::array<double, SPD_MAX_STAGE_COUNT> prefill_dep_wait = {};
         std::array<double, SPD_MAX_STAGE_COUNT> prefill_lock = {};
         std::array<uint64_t, SPD_MAX_STAGE_COUNT> prefill_calls = {};
+        // peer-boundary costs: fence+copy on the consumer, push on the producer
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_peer_in = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_push = {};
+        std::array<uint64_t, SPD_MAX_STAGE_COUNT> prefill_pushes = {};
         // busy time and call count bucketed by how many stages ran in the step
         std::array<std::array<double, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> busy_by_active = {};
         std::array<std::array<uint64_t, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> calls_by_active = {};
@@ -358,6 +391,9 @@ struct common_spd_pipeline::impl {
         if (const char * value = std::getenv("LLAMA_SPD_DUMP_LIMIT")) {
             dump_limit = std::atoi(value);
         }
+        if (const char * value = std::getenv("LLAMA_SPD_PEER")) {
+            peer_boundaries_enabled = std::atoi(value) != 0;
+        }
         initialize();
     }
 
@@ -365,6 +401,14 @@ struct common_spd_pipeline::impl {
         sidecar_worker.reset();
         for (auto & worker : stage_workers) {
             worker.reset();
+        }
+        for (auto & pb : peer_links) {
+            if (pb.staging_buf != nullptr) {
+                ggml_backend_buffer_free(pb.staging_buf);
+            }
+            if (pb.staging_ctx != nullptr) {
+                ggml_free(pb.staging_ctx);
+            }
         }
         llama_free(sidecar);
         llama_free(embed);
@@ -374,6 +418,9 @@ struct common_spd_pipeline::impl {
         }
         llama_sampler_free(sidecar_sampler);
         llama_sampler_free(head_sampler);
+        if (dump_index != nullptr) {
+            std::fclose(dump_index);
+        }
     }
 
     static void execute_stage_decode_job(void * data) {
@@ -676,7 +723,8 @@ struct common_spd_pipeline::impl {
             std::string & error,
             batch_storage * reusable_storage = nullptr,
             double * t_decode = nullptr,
-            double * t_read = nullptr) {
+            double * t_read = nullptr,
+            bool read_output = true) {
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
         storage.set(n_tokens, tokens, embeddings, n_embd_boundary, target_n_pos_per_embd, first_pos, true);
@@ -690,12 +738,14 @@ struct common_spd_pipeline::impl {
             *t_decode += std::chrono::duration<double>(read_start - decode_start).count();
         }
 
-        const float * result = llama_get_embeddings(stages[stage]);
-        if (result == nullptr) {
-            error = "target SPD stage " + std::to_string(stage) + " produced no hidden state";
-            return false;
+        if (read_output) {
+            const float * result = llama_get_embeddings(stages[stage]);
+            if (result == nullptr) {
+                error = "target SPD stage " + std::to_string(stage) + " produced no hidden state";
+                return false;
+            }
+            output.assign(result, result + (size_t) n_tokens*n_embd_boundary);
         }
-        output.assign(result, result + (size_t) n_tokens*n_embd_boundary);
 
         for (auto & item : anchor_outputs) {
             const int32_t anchor = anchors[item.first];
@@ -1053,6 +1103,60 @@ struct common_spd_pipeline::impl {
         return true;
     }
 
+    // Consumer-side peer-boundary setup for `stage`: capture the graph's embd
+    // input tensor, learn the endpoint's session id, and allocate the
+    // same-shape staging twin on the same device. Runs on the stage's worker
+    // thread (which owns that endpoint's main socket), after its first
+    // full-chunk decode so the input tensor exists.
+    void setup_peer_boundary(peer_boundary & pb, uint32_t stage, std::mutex & progress_mutex) {
+        ggml_tensor * inp = llama_spd_peer_inp_tensor(stages[stage]);
+        const char * why = nullptr;
+        if (inp == nullptr) {
+            why = "no input tensor on the last graph";
+        } else if (inp->buffer == nullptr) {
+            why = "input tensor has no buffer";
+        } else if (inp->type != GGML_TYPE_F32) {
+            why = "input tensor is not f32";
+        } else if (!ggml_backend_rpc_sync_peer_prepare(inp)) {
+            why = "peer prepare refused (endpoint / env / session)";
+        }
+        if (why != nullptr) {
+            fprintf(stderr, "SPD peer: stage %u boundary setup failed: %s%s%s\n",
+                    stage, why,
+                    inp != nullptr && inp->buffer != nullptr ? ", buffer=" : "",
+                    inp != nullptr && inp->buffer != nullptr ? ggml_backend_buffer_name(inp->buffer) : "");
+        }
+        bool ok = why == nullptr;
+        if (ok && pb.staging[0] == nullptr) {
+            ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+            pb.staging_ctx = ggml_init(ip);
+            ggml_tensor * st0 = pb.staging_ctx == nullptr ? nullptr :
+                    ggml_new_tensor_2d(pb.staging_ctx, GGML_TYPE_F32, inp->ne[0], inp->ne[1]);
+            ggml_tensor * st1 = st0 == nullptr ? nullptr :
+                    ggml_new_tensor_2d(pb.staging_ctx, GGML_TYPE_F32, inp->ne[0], inp->ne[1]);
+            pb.staging_buf = st1 == nullptr ? nullptr :
+                    ggml_backend_alloc_ctx_tensors_from_buft(pb.staging_ctx,
+                            ggml_backend_buffer_get_type(inp->buffer));
+            if (pb.staging_buf != nullptr) {
+                pb.staging[0] = st0;
+                pb.staging[1] = st1;
+            } else {
+                if (pb.staging_ctx != nullptr) {
+                    ggml_free(pb.staging_ctx);
+                    pb.staging_ctx = nullptr;
+                }
+                ok = false;
+            }
+        }
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        if (ok) {
+            pb.inp = inp;
+            pb.ready = true;
+        } else {
+            pb.dead = true;
+        }
+    }
+
     bool prefill_target(
             const std::vector<llama_token> & prompt,
             std::vector<float> & hidden,
@@ -1062,6 +1166,12 @@ struct common_spd_pipeline::impl {
         const int32_t n_chunks = (n_prompt + chunk_size - 1)/chunk_size;
         hidden.resize((size_t) n_prompt*n_embd_boundary);
         anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_prompt*n_embd));
+        for (auto & pb : peer_links) {
+            pb.pushed_chunk   = -1;
+            pb.ordinals[0]    = 0;
+            pb.ordinals[1]    = 0;
+            pb.consumed_chunk = -1;
+        }
 
         // A target-prefill cell (stage, chunk) depends on the previous stage
         // for the same chunk and on the previous chunk for the same stage.
@@ -1086,6 +1196,9 @@ struct common_spd_pipeline::impl {
                 std::vector<std::pair<size_t, std::vector<float> *>> wanted;
                 std::vector<float> chunk_output;
                 std::vector<std::vector<float>> chunk_anchors(anchors.size());
+                // set after a deferred-ack push; the next decode must be
+                // ordered behind the push's local read of the output tensor
+                ggml_tensor * guard_probe = nullptr;
 
                 for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
                     const auto wait_start = clock_type::now();
@@ -1109,6 +1222,21 @@ struct common_spd_pipeline::impl {
                         }
                     }
 
+                    // Peer-boundary roles for this cell, decided under the
+                    // progress lock: does the input arrive by push (consumer),
+                    // does the output leave by push (producer). Partial final
+                    // chunks stay on the host path (different graph shape).
+                    peer_boundary * pb_in  = stage > 0 ? &peer_links[stage] : nullptr;
+                    peer_boundary * pb_out = stage + 1 < stage_count ? &peer_links[stage + 1] : nullptr;
+                    bool peer_in = false, peer_out = false;
+                    if (peer_boundaries_enabled) {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        peer_in  = pb_in  != nullptr && pb_in->ready && !pb_in->dead &&
+                                   pb_in->pushed_chunk >= chunk && pb_in->inp != nullptr;
+                        peer_out = pb_out != nullptr && pb_out->ready && !pb_out->dead &&
+                                   count == chunk_size;
+                    }
+
                     std::string error;
                     bool ok = false;
                     const auto busy_start = clock_type::now();
@@ -1118,12 +1246,50 @@ struct common_spd_pipeline::impl {
                         for (size_t resource : stage_resources[stage]) {
                             resource_locks.emplace_back(*resource_mutexes[resource]);
                         }
-                        const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
-                        const float * embeddings = stage == 0
-                                ? nullptr
-                                : hidden.data() + (size_t) begin*n_embd_boundary;
-                        ok = decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error,
-                                nullptr, &timing.prefill_decode[stage], &timing.prefill_read[stage]);
+                        ok = true;
+                        if (guard_probe != nullptr) {
+                            ggml_backend_rpc_sync_peer_guard(guard_probe);
+                            guard_probe = nullptr;
+                        }
+                        if (peer_in) {
+                            // stall the endpoint's command loop until the push
+                            // has been applied, then move it from staging into
+                            // the graph's input tensor on-server
+                            const auto peer_start = clock_type::now();
+                            ggml_tensor * slot = pb_in->staging[chunk & 1];
+                            ok = ggml_backend_rpc_sync_peer_fence(slot, pb_in->ordinals[chunk & 1]);
+                            if (ok) {
+                                ggml_backend_tensor_copy(slot, pb_in->inp);
+                            } else {
+                                error = "SPD peer fence failed for stage " + std::to_string(stage);
+                            }
+                            timing.prefill_peer_in[stage] += seconds_since(peer_start);
+                        }
+                        if (ok) {
+                            llama_set_spd_peer_io(stages[stage], peer_in, peer_out);
+                            const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
+                            const float * embeddings = stage == 0
+                                    ? nullptr
+                                    : hidden.data() + (size_t) begin*n_embd_boundary;
+                            ok = decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error,
+                                    nullptr, &timing.prefill_decode[stage], &timing.prefill_read[stage],
+                                    /*read_output =*/ !peer_out);
+                            llama_set_spd_peer_io(stages[stage], false, false);
+                        }
+                        if (ok && peer_in) {
+                            // a rebuild would have read a different input tensor
+                            // than the copy filled; that cell would be garbage,
+                            // so surface it loudly instead
+                            if (llama_spd_peer_inp_tensor(stages[stage]) != pb_in->inp) {
+                                error = "SPD peer boundary input tensor moved under stage " + std::to_string(stage);
+                                ok = false;
+                            }
+                        } else if (ok && pb_in != nullptr && pb_in->ready && count == chunk_size) {
+                            // host-path cell on a peer-capable stage: keep the
+                            // captured input tensor current for the next push
+                            std::lock_guard<std::mutex> lock(progress_mutex);
+                            pb_in->inp = llama_spd_peer_inp_tensor(stages[stage]);
+                        }
                     }
                     timing.prefill_dep_wait[stage] += std::chrono::duration<double>(lock_start - wait_start).count();
                     timing.prefill_lock[stage] += std::chrono::duration<double>(busy_start - lock_start).count();
@@ -1140,16 +1306,89 @@ struct common_spd_pipeline::impl {
                         return;
                     }
 
-                    std::copy(chunk_output.begin(), chunk_output.end(),
-                            hidden.begin() + (size_t) begin*n_embd_boundary);
+                    // Producer side: ship the boundary straight to the next
+                    // stage's staging tensor. The graph is known complete (the
+                    // anchor readback inside llama_decode is a sync round-trip
+                    // behind GRAPH_COMPUTE on the same socket).
+                    bool pushed = false;
+                    if (peer_out) {
+                        const auto push_start = clock_type::now();
+                        {
+                            // never overwrite a staging slot before the
+                            // consumer drained it (two slots -> two ahead)
+                            std::unique_lock<std::mutex> lock(progress_mutex);
+                            progress_cv.wait(lock, [&] {
+                                return aborted || pb_out->consumed_chunk >= chunk - 2;
+                            });
+                            if (aborted) {
+                                return;
+                            }
+                        }
+                        ggml_tensor * out = llama_spd_peer_out_tensor(stages[stage]);
+                        ggml_tensor * slot = pb_out->staging[chunk & 1];
+                        uint64_t ordinal = 0;
+                        if (out != nullptr && slot != nullptr &&
+                            ggml_nbytes(out) == ggml_nbytes(slot) &&
+                            ggml_backend_rpc_sync_peer_push(out, slot, &ordinal)) {
+                            {
+                                std::lock_guard<std::mutex> lock(progress_mutex);
+                                pb_out->ordinals[chunk & 1] = ordinal;
+                                pb_out->pushed_chunk = chunk;
+                            }
+                            pushed = true;
+                            guard_probe = out;
+                            ++timing.prefill_pushes[stage];
+                        } else {
+                            // recover the boundary for the host path and stop
+                            // trying this pair
+                            {
+                                std::lock_guard<std::mutex> lock(progress_mutex);
+                                pb_out->dead = true;
+                            }
+                            if (out == nullptr) {
+                                {
+                                    std::lock_guard<std::mutex> lock(progress_mutex);
+                                    aborted = true;
+                                    fail("SPD peer push failed with no output tensor to recover from");
+                                }
+                                progress_cv.notify_all();
+                                return;
+                            }
+                            chunk_output.resize((size_t) count*n_embd_boundary);
+                            ggml_backend_tensor_get(out, chunk_output.data(), 0,
+                                    chunk_output.size()*sizeof(float));
+                        }
+                        timing.prefill_push[stage] += seconds_since(push_start);
+                    }
+
+                    if (!pushed) {
+                        std::copy(chunk_output.begin(), chunk_output.end(),
+                                hidden.begin() + (size_t) begin*n_embd_boundary);
+                    }
                     for (auto & item : wanted) {
                         std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
                                 anchor_data[item.first].begin() + (size_t) begin*n_embd);
                     }
 
+                    // consumer-side setup, once, after the first full-chunk
+                    // decode so the input tensor exists
+                    if (peer_boundaries_enabled && stage > 0 && count == chunk_size) {
+                        bool need_setup;
+                        {
+                            std::lock_guard<std::mutex> lock(progress_mutex);
+                            need_setup = !pb_in->ready && !pb_in->dead;
+                        }
+                        if (need_setup) {
+                            setup_peer_boundary(*pb_in, stage, progress_mutex);
+                        }
+                    }
+
                     {
                         std::lock_guard<std::mutex> lock(progress_mutex);
                         chunks_done[stage] = chunk + 1;
+                        if (pb_in != nullptr) {
+                            pb_in->consumed_chunk = chunk;
+                        }
                     }
                     progress_cv.notify_all();
                 }
@@ -1173,11 +1412,14 @@ struct common_spd_pipeline::impl {
                 }
                 fprintf(stderr,
                         "SPD timing: prefill stage %u: busy %.2fs/%" PRIu64 " calls (%.0f ms/call) | "
-                        "decode %.2fs | read %.2fs | dep-wait %.2fs | lock-wait %.2fs\n",
+                        "decode %.2fs | read %.2fs | dep-wait %.2fs | lock-wait %.2fs | "
+                        "peer-in %.2fs | push %.2fs/%" PRIu64 "\n",
                         stage, timing.prefill_busy[stage], timing.prefill_calls[stage],
                         1e3*timing.prefill_busy[stage]/(double) timing.prefill_calls[stage],
                         timing.prefill_decode[stage], timing.prefill_read[stage],
-                        timing.prefill_dep_wait[stage], timing.prefill_lock[stage]);
+                        timing.prefill_dep_wait[stage], timing.prefill_lock[stage],
+                        timing.prefill_peer_in[stage], timing.prefill_push[stage],
+                        timing.prefill_pushes[stage]);
             }
         }
 

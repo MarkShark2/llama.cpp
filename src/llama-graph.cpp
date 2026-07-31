@@ -70,7 +70,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
-    if (ubatch->embd) {
+    if (ubatch->embd && !(skip_upload != nullptr && *skip_upload)) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -83,7 +83,9 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd   && (persistent_embd
+            ? built_n_tokens == (int64_t) params.ubatch.n_tokens
+            : embd->ne[1]    == (int64_t) params.ubatch.n_tokens));
 
     return res;
 }
@@ -2193,15 +2195,34 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(n_embd_inp >= n_embd);
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    // cparams here is a reference to the owning llama_context's cparams, so
+    // this stays valid for the lifetime of the (possibly reused) graph
+    inp->skip_upload = &cparams.spd_peer_skip_inp;
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-    cb(inp->embd, "inp_embd", -1);
-    ggml_set_input(inp->embd);
+    // [fork, SPD peer boundaries] when the context carries a persistent
+    // device-resident boundary tensor, reference it like a weight instead of
+    // creating a per-graph input: the scheduler then neither stages the rows
+    // on the CPU nor re-uploads them per eval, and a peer push can deliver
+    // them board-to-board
+    // multi-token batches only: peer boundaries are a prefill mechanism, and
+    // keeping 1-token decode graphs on the classic input path keeps decode
+    // bitwise identical to the non-peer build
+    ggml_tensor * boundary = cparams.spd_boundary_inp;
+    if (boundary != nullptr && !ubatch.token && ubatch.n_tokens > 1 &&
+        boundary->ne[0] == n_embd_inp && boundary->ne[1] >= (int64_t) ubatch.n_tokens) {
+        inp->embd = boundary;
+        inp->persistent_embd = true;
+        inp->built_n_tokens = ubatch.n_tokens;
+    } else {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+        cb(inp->embd, "inp_embd", -1);
+        ggml_set_input(inp->embd);
+    }
 
     // select one of the 2 inputs, based on the batch contents
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
@@ -2241,6 +2262,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[1];
 
         cur = inp->embd;
+        if (inp->persistent_embd && cur->ne[1] != (int64_t) ubatch.n_tokens) {
+            cur = ggml_view_2d(ctx0, cur, n_embd_inp, ubatch.n_tokens, cur->nb[1], 0);
+        }
     }
 
     assert(ggml_are_same_shape (inps[0], inps[1]));

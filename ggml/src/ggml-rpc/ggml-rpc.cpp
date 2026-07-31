@@ -1856,6 +1856,318 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
     return msg;
 }
 
+// ---------------------------------------------------------------------------
+// Synchronous peer push  [fork, SPD]
+//
+// The SPD stage pipeline must run with GGML_RPC_ASYNC=0 (async loses 2.65x on
+// its decode and 1.7x on its prefill), which keeps rpc_lanes_get_active() null
+// and with it the scheduler's peer-transfer path. But its stage boundaries are
+// 16.8 MB f32 per 256-token chunk on DSV4, hairpinned through the client's
+// per-board ~1 Gbit links serialized against compute -- measured ~290 ms of
+// every ~1.23 s prefill cell.
+//
+// These entry points drive the DEPLOYED server peer machinery from a sync
+// client -- SESSION_INFO / PEER_OPEN / LANE_ATTACH(GET) / PUSH_TENSOR /
+// LANE_FENCE, no daemon change -- with ordering enforced by the caller's
+// command sequence instead of the async lane counters:
+//   - a push is only issued after the producer's graph is known complete
+//     (any response-bearing command on its main socket after GRAPH_COMPUTE
+//     proves that; SPD's anchor readback inside llama_decode qualifies);
+//   - a push lands in a tensor nothing reads concurrently (caller-owned
+//     staging, consumed via an on-server COPY_TENSOR);
+//   - LANE_FENCE{set = push ordinal} on the consumer's main socket stalls its
+//     command loop until the peer applier has applied that many pushes, so
+//     the following COPY_TENSOR reads the delivered payload.
+// Threading contract: prepare/fence run on the thread that owns the consumer
+// endpoint's main socket, push on the thread that owns the producer's. The
+// push lane is a dedicated GET-lane connection used for nothing else.
+// ---------------------------------------------------------------------------
+
+struct rpc_sync_peer_state {
+    std::mutex m;
+    std::unordered_map<std::string, uint64_t>   session_ids;  // endpoint -> session id
+    std::unordered_map<std::string, socket_ptr> push_lanes;   // producer endpoint -> GET lane
+    std::unordered_map<std::string, uint64_t>   push_counts;  // consumer endpoint -> pushes issued
+    // deferred-ack bookkeeping per PRODUCER endpoint: lane commands sent vs
+    // acks drained. The ack is the producer's local read completing -- costly
+    // to block on (a device read serialized into the cell), so it is drained
+    // lazily; ggml_backend_rpc_sync_peer_guard orders the producer's next
+    // graph behind the read with a get-lane fence instead.
+    std::unordered_map<std::string, uint64_t>   lane_sent;
+    std::unordered_map<std::string, uint64_t>   lane_acked;
+};
+
+static rpc_sync_peer_state & rpc_sync_peer() {
+    static rpc_sync_peer_state st;
+    return st;
+}
+
+static const char * rpc_tensor_endpoint(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) tensor->buffer->context;
+    return ctx->endpoint.c_str();
+}
+
+// SESSION_INFO over the endpoint's main socket; memoized. Must be called from
+// the thread that owns that socket.
+static bool rpc_sync_session_for(const std::string & endpoint, uint64_t & out) {
+    auto & st = rpc_sync_peer();
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.session_ids.find(endpoint);
+        if (it != st.session_ids.end()) {
+            out = it->second;
+            return true;
+        }
+    }
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_msg_session_info_rsp info = {};
+    if (!send_rpc_cmd(sock, RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info))) {
+        return false;
+    }
+    std::lock_guard<std::mutex> l(st.m);
+    st.session_ids[endpoint] = info.session_id;
+    out = info.session_id;
+    return true;
+}
+
+// PEER_OPEN from the producer's main socket, plain sync send (the async
+// rpc_peer_route_ready goes through the endpoint stream, which in sync mode
+// would race the caller thread's own traffic on that socket). Shares the
+// per-pair memo with the async path.
+static bool rpc_sync_peer_route_ready(const std::string & src_endpoint,
+                                      const std::string & dst_endpoint,
+                                      uint64_t dst_session_id) {
+    const std::string key = src_endpoint + ">" + dst_endpoint;
+    {
+        std::lock_guard<std::mutex> l(g_peer_route_m);
+        auto it = g_peer_routes.find(key);
+        if (it != g_peer_routes.end()) {
+            return it->second;
+        }
+    }
+    const std::string & via = rpc_peer_addr(dst_endpoint);
+    bool ok = false;
+    if (via.size() >= RPC_ENDPOINT_MAX) {
+        GGML_LOG_WARN("[rpc peer] endpoint '%s' too long to route\n", via.c_str());
+    } else if (rpc_server_patch(src_endpoint) < GGML_RPC_PEER_MIN_PATCH ||
+               rpc_server_patch(dst_endpoint) < GGML_RPC_PEER_MIN_PATCH) {
+        GGML_LOG_WARN("[rpc peer] %s -> %s: server too old for peer transfer\n",
+                      src_endpoint.c_str(), dst_endpoint.c_str());
+    } else {
+        rpc_msg_peer_open_req req = {};
+        req.session_id = dst_session_id;
+        memcpy(req.endpoint, via.c_str(), via.size());
+        rpc_msg_peer_open_rsp rsp = { 0 };
+        auto sock = get_socket(src_endpoint);
+        if (sock != nullptr) {
+            ok = send_rpc_cmd(sock, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.ok != 0;
+        }
+        if (ok) {
+            GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer (sync client)\n",
+                          src_endpoint.c_str(), dst_endpoint.c_str());
+        } else {
+            GGML_LOG_WARN("[rpc peer] %s -> %s: peer lane refused, using the client hairpin\n",
+                          src_endpoint.c_str(), dst_endpoint.c_str());
+        }
+    }
+    std::lock_guard<std::mutex> l(g_peer_route_m);
+    g_peer_routes[key] = ok;
+    return ok;
+}
+
+#if defined(_WIN32)
+#    define GGML_RPC_SYNC_PEER_API extern "C" __declspec(dllexport)
+#else
+#    define GGML_RPC_SYNC_PEER_API extern "C" __attribute__((visibility("default")))
+#endif
+
+// Learn the consumer endpoint's session id. Call from the thread that owns
+// that endpoint's main socket (in SPD: the consuming stage's worker).
+GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_prepare(const struct ggml_tensor * dst_probe) {
+    const char * ep = rpc_tensor_endpoint(dst_probe);
+    if (ep == nullptr || !rpc_peer_enabled() || rpc_async_enabled()) {
+        return false;
+    }
+    uint64_t session = 0;
+    return rpc_sync_session_for(ep, session);
+}
+
+// Ship `src` (whole tensor) from its server straight into `dst` on another
+// server. Call from the thread that owns the producer endpoint's main socket,
+// only after the producer's graph is known complete, and only into a `dst`
+// nothing can be reading. On success *ordinal_out is the fence target that
+// guarantees delivery. Returns false when the pair cannot route (caller keeps
+// the hairpin) or on a transfer error.
+GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
+        const struct ggml_tensor * src, const struct ggml_tensor * dst, uint64_t * ordinal_out) {
+    const char * src_ep_c = rpc_tensor_endpoint(src);
+    const char * dst_ep_c = rpc_tensor_endpoint(dst);
+    if (src_ep_c == nullptr || dst_ep_c == nullptr || !rpc_peer_enabled() || rpc_async_enabled()) {
+        return false;
+    }
+    const std::string src_ep(src_ep_c);
+    const std::string dst_ep(dst_ep_c);
+    if (src_ep == dst_ep) {
+        return false;
+    }
+    const size_t size = ggml_nbytes(src);
+    if (size == 0 || size != ggml_nbytes(dst)) {
+        return false;
+    }
+
+    auto & st = rpc_sync_peer();
+    uint64_t dst_session = 0;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.session_ids.find(dst_ep);
+        if (it == st.session_ids.end()) {
+            return false;   // consumer never called prepare
+        }
+        dst_session = it->second;
+    }
+    if (!rpc_sync_peer_route_ready(src_ep, dst_ep, dst_session)) {
+        return false;
+    }
+
+    // dedicated push lane to the producer (a GET-lane attach; single-writer by
+    // the threading contract, the mutex only guards the map)
+    socket_ptr lane;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.push_lanes.find(src_ep);
+        if (it != st.push_lanes.end()) {
+            lane = it->second;
+        }
+    }
+    if (lane == nullptr) {
+        uint64_t src_session = 0;
+        if (!rpc_sync_session_for(src_ep, src_session)) {
+            return false;
+        }
+        lane = rpc_lane_connect(src_ep, src_session, RPC_LANE_GET);
+        if (lane == nullptr) {
+            GGML_LOG_WARN("[rpc peer] %s: push lane attach failed\n", src_ep.c_str());
+            return false;
+        }
+        std::lock_guard<std::mutex> l(st.m);
+        st.push_lanes[src_ep] = lane;
+    }
+
+    const std::string & via = rpc_peer_addr(dst_ep);
+    rpc_msg_push_tensor_req req = {};
+    memcpy(req.endpoint, via.c_str(), std::min(via.size(), (size_t) RPC_ENDPOINT_MAX - 1));
+    req.src        = serialize_tensor(src);
+    req.dst        = serialize_tensor(dst);
+    req.src_offset = 0;
+    req.dst_offset = 0;
+    req.size       = size;
+    req.wait_main  = 0;   // apply on arrival: dst is caller-owned staging
+    req.wait_get   = 0;
+    req.bf16       = rpc_wire_bf16_ok(src, 0, size) ? 1 : 0;
+
+    // drain any acks still owed on this lane (their local reads finished long
+    // ago); a failed earlier push surfaces here and is fatal for the pair
+    uint64_t pending;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        pending = st.lane_sent[src_ep] - st.lane_acked[src_ep];
+    }
+    while (pending > 0) {
+        rpc_msg_push_tensor_rsp late = { 0 };
+        if (!recv_msg(lane, &late, sizeof(late)) || late.ok == 0) {
+            GGML_LOG_ERROR("[rpc peer] deferred push ack from %s failed\n", src_ep.c_str());
+            return false;
+        }
+        std::lock_guard<std::mutex> l(st.m);
+        ++st.lane_acked[src_ep];
+        --pending;
+    }
+
+    if (!send_lane_cmd(lane, RPC_CMD_PUSH_TENSOR, 0, 0, &req, sizeof(req))) {
+        GGML_LOG_WARN("[rpc peer] sync push %s -> %s failed\n", src_ep.c_str(), dst_ep.c_str());
+        return false;
+    }
+    uint64_t sent;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        sent = ++st.lane_sent[src_ep];
+    }
+    if (sent == 1) {
+        // block for the very first ack on the lane: it validates the whole
+        // route while the caller can still fall back to the hairpin cheaply
+        rpc_msg_push_tensor_rsp rsp = { 0 };
+        if (!recv_msg(lane, &rsp, sizeof(rsp)) || rsp.ok == 0) {
+            GGML_LOG_WARN("[rpc peer] sync push %s -> %s failed\n", src_ep.c_str(), dst_ep.c_str());
+            return false;
+        }
+        std::lock_guard<std::mutex> l(st.m);
+        ++st.lane_acked[src_ep];
+    }
+    uint64_t ordinal;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        ordinal = ++st.push_counts[dst_ep];
+    }
+    if (ordinal_out != nullptr) {
+        *ordinal_out = ordinal;
+    }
+    return true;
+}
+
+// Order the producer's next main-socket command (its next graph) behind every
+// push it has issued: get_done on its session counts executed get-lane
+// commands, which here are exactly the pushes, and each bumps only after its
+// local read of the source tensor completed. Fire-and-forget. Call from the
+// thread that owns the producer's main socket, before submitting work that
+// could overwrite a pushed source tensor.
+GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_guard(const struct ggml_tensor * src_probe) {
+    const char * ep = rpc_tensor_endpoint(src_probe);
+    if (ep == nullptr) {
+        return false;
+    }
+    uint64_t sent;
+    {
+        auto & st = rpc_sync_peer();
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.lane_sent.find(ep);
+        sent = it == st.lane_sent.end() ? 0 : it->second;
+    }
+    if (sent == 0) {
+        return true;
+    }
+    auto sock = get_socket(ep);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_msg_lane_fence_req req = { 0, sent };
+    return send_rpc_cmd(sock, RPC_CMD_LANE_FENCE, &req, sizeof(req));
+}
+
+// Stall the consumer's main command loop until `ordinal` pushes have been
+// applied there, then return. Fire-and-forget on the wire (LANE_FENCE has no
+// response); the next main-socket command to that endpoint executes after the
+// pushed data is in place. Call from the thread that owns the consumer's main
+// socket.
+GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_fence(
+        const struct ggml_tensor * dst_probe, uint64_t ordinal) {
+    const char * ep = rpc_tensor_endpoint(dst_probe);
+    if (ep == nullptr) {
+        return false;
+    }
+    auto sock = get_socket(ep);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_msg_lane_fence_req req = { ordinal, 0 };
+    return send_rpc_cmd(sock, RPC_CMD_LANE_FENCE, &req, sizeof(req));
+}
+
 // pool of events recorded on a source backend at enqueue time (i.e. in submission
 // order, right after that backend's graph_compute was submitted) so a stream worker
 // can wait for the source's async compute to finish before reading its output buffer.

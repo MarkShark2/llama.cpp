@@ -141,6 +141,16 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    // [fork, SPD peer boundaries] points at cparams.spd_peer_skip_inp; when
+    // set, the embd rows are already on-device (peer push + local copy) and
+    // the host upload must not overwrite them
+    const bool * skip_upload = nullptr;
+    // embd is the context's persistent device-resident boundary tensor rather
+    // than a per-graph input; its ne[1] is n_batch, so reuse is keyed on the
+    // build-time token count instead
+    bool    persistent_embd = false;
+    int64_t built_n_tokens  = 0;
+
     const int64_t n_embd = 0;
 };
 

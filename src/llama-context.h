@@ -91,6 +91,17 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    // [fork, SPD peer boundaries] the persistent boundary input tensor (or the
+    // last graph's raw embd input as a fallback) and the last graph's embd
+    // output tensor, for direct device-to-device boundary pushes; and the
+    // per-decode host-transfer skip toggles
+    ggml_tensor * spd_peer_inp_tensor() const;
+    ggml_tensor * spd_peer_out_tensor() const;
+    void          set_spd_peer_io(bool skip_inp, bool skip_out);
+
+    ggml_context         * spd_boundary_ctx = nullptr;
+    ggml_backend_buffer_t  spd_boundary_buf = nullptr;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
