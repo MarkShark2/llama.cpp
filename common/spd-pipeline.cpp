@@ -317,6 +317,15 @@ struct common_spd_pipeline::impl {
         std::array<double, SPD_MAX_STAGE_COUNT> stage_decode = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_read = {};
         std::array<uint64_t, SPD_MAX_STAGE_COUNT> stage_calls = {};
+        // prefill is a separate regime from decode: chunks of n_batch tokens
+        // walked as a stage/chunk grid, so it gets its own counters
+        double prefill_wall = 0.0;
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_busy = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_decode = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_read = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_dep_wait = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> prefill_lock = {};
+        std::array<uint64_t, SPD_MAX_STAGE_COUNT> prefill_calls = {};
         // busy time and call count bucketed by how many stages ran in the step
         std::array<std::array<double, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> busy_by_active = {};
         std::array<std::array<uint64_t, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> calls_by_active = {};
@@ -971,35 +980,46 @@ struct common_spd_pipeline::impl {
         hidden.resize((size_t) n_prompt*n_embd_boundary);
         anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_prompt*n_embd));
 
-        struct prefill_task_result {
-            bool ok;
-            std::string error;
-        };
+        // A target-prefill cell (stage, chunk) depends on the previous stage
+        // for the same chunk and on the previous chunk for the same stage.
+        // One worker per stage walking chunks in order satisfies the second
+        // dependency implicitly and waits on a progress counter for the first.
+        //
+        // This used to walk the grid by antidiagonals with a join at the end of
+        // every wave. The dependencies were satisfied, but the join is stronger
+        // than they are: a wave costs the *slowest* cell in it, so every fast
+        // stage sits idle until the slow one lands, on every wave. Per-cell
+        // dependencies let a stage run ahead into the next chunk instead.
+        const auto prefill_start = clock_type::now();
+        std::mutex progress_mutex;
+        std::condition_variable progress_cv;
+        std::vector<int32_t> chunks_done((size_t) stage_count, 0);
+        bool aborted = false;
 
-        // A target-prefill task depends on both the previous stage for the
-        // same chunk and the previous chunk for the same stage. Execute the
-        // stage/chunk grid by antidiagonals so both dependencies have finished
-        // while distinct stages can keep distinct accelerators busy together.
-        for (int32_t wave = 0; wave < n_chunks + (int32_t) stage_count - 1; ++wave) {
-            std::vector<std::future<prefill_task_result>> work;
-            for (uint32_t stage = 0; stage < stage_count; ++stage) {
-                const int32_t chunk = wave - (int32_t) stage;
-                if (chunk < 0 || chunk >= n_chunks) {
-                    continue;
-                }
+        std::vector<std::thread> workers;
+        workers.reserve(stage_count);
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            workers.emplace_back([&, stage]() {
+                std::vector<std::pair<size_t, std::vector<float> *>> wanted;
+                std::vector<float> chunk_output;
+                std::vector<std::vector<float>> chunk_anchors(anchors.size());
 
-                work.push_back(std::async(std::launch::async, [&, stage, chunk]() {
-                    std::vector<std::unique_lock<std::mutex>> resource_locks;
-                    resource_locks.reserve(stage_resources[stage].size());
-                    for (size_t resource : stage_resources[stage]) {
-                        resource_locks.emplace_back(*resource_mutexes[resource]);
+                for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
+                    const auto wait_start = clock_type::now();
+                    {
+                        std::unique_lock<std::mutex> lock(progress_mutex);
+                        progress_cv.wait(lock, [&] {
+                            return aborted || stage == 0 || chunks_done[stage - 1] > chunk;
+                        });
+                        if (aborted) {
+                            return;
+                        }
                     }
+                    const auto lock_start = clock_type::now();
 
                     const int32_t begin = chunk*chunk_size;
                     const int32_t count = std::min(chunk_size, n_prompt - begin);
-                    std::vector<float> chunk_output;
-                    std::vector<std::vector<float>> chunk_anchors(anchors.size());
-                    std::vector<std::pair<size_t, std::vector<float> *>> wanted;
+                    wanted.clear();
                     for (size_t ai = 0; ai < anchors.size(); ++ai) {
                         if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
                             wanted.push_back({ ai, &chunk_anchors[ai] });
@@ -1007,26 +1027,74 @@ struct common_spd_pipeline::impl {
                     }
 
                     std::string error;
-                    const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
-                    const float * embeddings = stage == 0 ? nullptr : hidden.data() + (size_t) begin*n_embd_boundary;
-                    if (!decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error)) {
-                        return prefill_task_result { false, std::move(error) };
+                    bool ok = false;
+                    const auto busy_start = clock_type::now();
+                    {
+                        std::vector<std::unique_lock<std::mutex>> resource_locks;
+                        resource_locks.reserve(stage_resources[stage].size());
+                        for (size_t resource : stage_resources[stage]) {
+                            resource_locks.emplace_back(*resource_mutexes[resource]);
+                        }
+                        const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
+                        const float * embeddings = stage == 0
+                                ? nullptr
+                                : hidden.data() + (size_t) begin*n_embd_boundary;
+                        ok = decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error,
+                                nullptr, &timing.prefill_decode[stage], &timing.prefill_read[stage]);
                     }
-                    std::copy(chunk_output.begin(), chunk_output.end(), hidden.begin() + (size_t) begin*n_embd_boundary);
+                    timing.prefill_dep_wait[stage] += std::chrono::duration<double>(lock_start - wait_start).count();
+                    timing.prefill_lock[stage] += std::chrono::duration<double>(busy_start - lock_start).count();
+                    timing.prefill_busy[stage] += seconds_since(busy_start);
+                    ++timing.prefill_calls[stage];
+
+                    if (!ok) {
+                        {
+                            std::lock_guard<std::mutex> lock(progress_mutex);
+                            aborted = true;
+                            fail(std::move(error));
+                        }
+                        progress_cv.notify_all();
+                        return;
+                    }
+
+                    std::copy(chunk_output.begin(), chunk_output.end(),
+                            hidden.begin() + (size_t) begin*n_embd_boundary);
                     for (auto & item : wanted) {
                         std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
                                 anchor_data[item.first].begin() + (size_t) begin*n_embd);
                     }
-                    return prefill_task_result { true, {} };
-                }));
-            }
 
-            for (auto & task : work) {
-                prefill_task_result task_result = task.get();
-                if (!task_result.ok) {
-                    fail(std::move(task_result.error));
-                    return false;
+                    {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        chunks_done[stage] = chunk + 1;
+                    }
+                    progress_cv.notify_all();
                 }
+            });
+        }
+        for (auto & worker : workers) {
+            worker.join();
+        }
+        timing.prefill_wall += seconds_since(prefill_start);
+        if (aborted) {
+            return false;
+        }
+
+        if (timing_enabled) {
+            fprintf(stderr, "SPD timing: prefill %d tok in %d chunks of %d, wall %.2fs (%.1f t/s)\n",
+                    n_prompt, n_chunks, chunk_size, timing.prefill_wall,
+                    timing.prefill_wall > 0.0 ? n_prompt/timing.prefill_wall : 0.0);
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                if (timing.prefill_calls[stage] == 0) {
+                    continue;
+                }
+                fprintf(stderr,
+                        "SPD timing: prefill stage %u: busy %.2fs/%" PRIu64 " calls (%.0f ms/call) | "
+                        "decode %.2fs | read %.2fs | dep-wait %.2fs | lock-wait %.2fs\n",
+                        stage, timing.prefill_busy[stage], timing.prefill_calls[stage],
+                        1e3*timing.prefill_busy[stage]/(double) timing.prefill_calls[stage],
+                        timing.prefill_decode[stage], timing.prefill_read[stage],
+                        timing.prefill_dep_wait[stage], timing.prefill_lock[stage]);
             }
         }
 
