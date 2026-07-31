@@ -84,7 +84,21 @@ def add_checkpoint_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tens
     )
 
 
-SUPPORTED_TARGET_ARCHS = ("qwen35", "gemma4")
+SUPPORTED_TARGET_ARCHS = ("qwen35", "gemma4", "deepseek4")
+
+
+def spd_stage_layers(trunk_blocks: int, num_stages: int) -> list[int]:
+    """Layer count per SPD stage.
+
+    Stages are NOT required to be uniform. DeepSeek-V4 has 43 trunk blocks -- a
+    prime -- so no stage count between 2 and 42 divides it evenly, and demanding
+    divisibility excluded the architecture outright. Every stage takes
+    ceil(trunk / stages) layers and the last takes the remainder, matching both
+    llama_context's slicing and the offline trainer's STAGE_PRESETS (43 over 9
+    stages -> 5x8 + 3). Reduces to an even split whenever the count divides.
+    """
+    per = -(-trunk_blocks // num_stages)
+    return [per]*(num_stages - 1) + [trunk_blocks - per*(num_stages - 1)]
 
 
 def validate_checkpoint(
@@ -139,9 +153,15 @@ def validate_checkpoint(
     nextn_field = target.get_field(f"{target_arch}.nextn_predict_layers")
     nextn_blocks = 0 if nextn_field is None else int(nextn_field.contents())
     trunk_blocks = target_blocks - nextn_blocks
-    if trunk_blocks <= 0 or trunk_blocks % num_stages != 0:
+    if trunk_blocks <= 0 or num_stages <= 0:
         raise ValueError(
             f"target trunk block count {trunk_blocks} cannot be divided into {num_stages} SPD stages"
+        )
+
+    expected_stage_layers = spd_stage_layers(trunk_blocks, num_stages)
+    if expected_stage_layers[-1] <= 0:
+        raise ValueError(
+            f"{num_stages} SPD stages over {trunk_blocks} trunk blocks leaves an empty trailing stage"
         )
     if anchors[0] != 0 or anchors[-1] >= trunk_blocks:
         raise ValueError(f"invalid SPD anchors for {trunk_blocks} target trunk blocks: {anchors}")
@@ -152,9 +172,11 @@ def validate_checkpoint(
         if sum(stage_layers) != trunk_blocks:
             raise ValueError(
                 f"checkpoint stage_layers {stage_layers} do not sum to the target trunk ({trunk_blocks})")
-        if len(set(stage_layers)) != 1:
+        if stage_layers != expected_stage_layers:
             raise ValueError(
-                f"the fork SPD decode path requires uniform stages, got stage_layers {stage_layers}")
+                f"checkpoint stage_layers {stage_layers} do not match the layout the decode path "
+                f"slices ({expected_stage_layers}); the head must be trained against "
+                f"ceil(trunk/stages) layers per stage with the remainder last")
         bounds = [0]
         for count in stage_layers[:-1]:
             bounds.append(bounds[-1] + count)
@@ -202,7 +224,8 @@ def validate_checkpoint(
         "anchors": anchors,
         "use_deepest": use_deepest,
         "trunk_blocks": trunk_blocks,
-        "stage_blocks": trunk_blocks // num_stages,
+        "stage_blocks": expected_stage_layers[0],
+        "stage_layers": expected_stage_layers,
         "version": version,
     }
 

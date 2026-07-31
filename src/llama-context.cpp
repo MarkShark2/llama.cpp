@@ -153,13 +153,24 @@ llama_context::llama_context(
         if (cparams.spd_stage_count == 0 || cparams.spd_stage >= cparams.spd_stage_count) {
             throw std::runtime_error("invalid SPD stage index/count");
         }
-        if (hparams.n_layer() % cparams.spd_stage_count != 0) {
-            throw std::runtime_error("target layer count must divide evenly into SPD stages");
+        // The trunk need not divide evenly. DeepSeek-V4 has 43 layers -- a prime
+        // -- so no stage count between 2 and 42 is uniform and requiring
+        // divisibility excluded the architecture outright. Every stage takes
+        // ceil(n_layer / count) layers and the last takes the remainder, which
+        // is exactly the layout the offline trainer's STAGE_PRESETS collect
+        // against (43 over 9 stages -> 5x8 + 3) and reduces to the old even
+        // split whenever the count does divide.
+        const uint32_t n_layer          = hparams.n_layer();
+        const uint32_t layers_per_stage = (n_layer + cparams.spd_stage_count - 1) / cparams.spd_stage_count;
+
+        if (layers_per_stage*(cparams.spd_stage_count - 1) >= n_layer) {
+            throw std::runtime_error("SPD stage count leaves an empty trailing stage");
         }
 
-        const uint32_t layers_per_stage = hparams.n_layer() / cparams.spd_stage_count;
         cparams.spd_layer_start = cparams.spd_stage * layers_per_stage;
-        cparams.spd_layer_end   = cparams.spd_layer_start + layers_per_stage;
+        cparams.spd_layer_end   = cparams.spd_layer_start + layers_per_stage < n_layer
+                                ? cparams.spd_layer_start + layers_per_stage
+                                : n_layer;
     }
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -4216,8 +4227,9 @@ llama_context * llama_init_from_model(
     if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
-        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_GEMMA4) {
-        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 or Gemma 4 model\n", __func__);
+        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_GEMMA4 &&
+        model->arch != LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5, Gemma 4 or DeepSeek-V4 model\n", __func__);
         return nullptr;
     }
 
