@@ -171,6 +171,36 @@ llama_context::llama_context(
         cparams.spd_layer_end   = cparams.spd_layer_start + layers_per_stage < n_layer
                                 ? cparams.spd_layer_start + layers_per_stage
                                 : n_layer;
+
+        // DeepSeek-V4's first hash_layer_count layers route experts by token id
+        // (ffn_gate_tid2eid gathered with the raw token). Only stage 0 is fed
+        // tokens -- every later stage receives hidden state -- so a hash layer
+        // landing past stage 0 would silently gather against an unset tensor.
+        if (model.arch == LLM_ARCH_DEEPSEEK4 && cparams.spd_stage > 0 &&
+            hparams.dsv4_hash_layer_count > cparams.spd_layer_start) {
+            throw std::runtime_error("SPD stage split puts a DeepSeek-V4 hash layer past stage 0, "
+                                     "which receives no token ids");
+        }
+    }
+
+    // Width of one row of batch.embd for this context. An SPD stage past 0 is
+    // handed the previous stage's raw residual, and the SPD head the last
+    // stage's, so both take the model's stage-boundary width -- which on
+    // DeepSeek-V4 is hc_mult streams wide, not n_embd. Stage 0 still takes
+    // tokens and keeps the ordinary width.
+    cparams.n_embd_inp_ctx = hparams.n_embd_inp();
+    if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE && cparams.spd_stage > 0) ||
+         cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD) {
+        cparams.n_embd_inp_ctx = llama_model_n_embd_spd_boundary(&model);
+    }
+
+    // ... and of one row of the embeddings output. Every SPD stage emits the
+    // residual it hands on, including stage 0, which is fed tokens and so has a
+    // narrower input than output. The head and embed contexts emit ordinary
+    // n_embd rows (post-norm hidden, and anchor 0 respectively).
+    cparams.n_embd_out_ctx = hparams.n_embd_out();
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+        cparams.n_embd_out_ctx = llama_model_n_embd_spd_boundary(&model);
     }
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -1674,8 +1704,19 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
+    // The SPD head and embed contexts are stateless and run through encode, but
+    // their input width is the pipeline's stage-boundary width, not the
+    // encoder's. On DeepSeek-V4 the head is handed the last stage's residual,
+    // which is hc_mult streams wide. Every other encoder keeps n_embd_inp_enc(),
+    // which eagle3/DFlash feature inputs override independently.
+    const int64_t n_embd_batch =
+        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD ||
+         cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED)
+            ? (int64_t) cparams.n_embd_inp_ctx
+            : n_embd;
+
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd_batch, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2096,7 +2137,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    // n_embd_inp_ctx, not n_embd: an SPD stage is fed the previous stage's raw
+    // residual, which on DeepSeek-V4 is hc_mult streams wide. n_embd stays as
+    // the model's own width for the embeddings output below.
+    if (!balloc->init(batch_inp, vocab, memory.get(), cparams.n_embd_inp_ctx, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2340,7 +2384,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         // extract token embeddings
                         GGML_ASSERT(embd.data != nullptr);
-                        const uint32_t n_embd_out = hparams.n_embd_out();
+                        // n_embd_out_ctx: an SPD stage emits the full residual
+                        // it hands on, which on DeepSeek-V4 is hc_mult streams
+                        // wide. Striding by n_embd_out here silently delivered
+                        // only the first stream to the next stage.
+                        const uint32_t n_embd_out = cparams.n_embd_out_ctx > 0
+                                ? cparams.n_embd_out_ctx
+                                : hparams.n_embd_out();
                         float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
                         if (n_outputs) {
@@ -2707,9 +2757,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
-    embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
-    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    // the embeddings buffer follows this context's output width (wide on an SPD
+    // stage); embd_nextn stays on the model's own width
+    const auto n_embd_out_emb = cparams.n_embd_out_ctx > 0 ? cparams.n_embd_out_ctx : n_embd_out;
+
+    logits.size     = has_logits     ? n_vocab*n_outputs_max        : 0;
+    embd.size       = has_embd       ? n_embd_out_emb*n_outputs_max : 0;
+    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max     : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
@@ -2914,8 +2968,11 @@ void llama_context::output_reorder() {
         }
 
         if (embd.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+            // embd rows are n_embd_out_ctx wide, which an SPD stage widens to
+            // the pipeline's boundary width
+            const uint64_t n_embd_row = cparams.n_embd_out_ctx > 0 ? cparams.n_embd_out_ctx : n_embd;
+            for (uint64_t k = 0; k < n_embd_row; k++) {
+                std::swap(embd.data[i0*n_embd_row + k], embd.data[i1*n_embd_row + k]);
             }
         }
 

@@ -144,3 +144,8 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 // returns the number of target pipeline stages encoded by an SPD sidecar, or zero for other architectures
 LLAMA_API uint32_t        llama_model_spd_stage_count   (const struct llama_model * model);
+// width of one token's state as handed from one SPD stage to the next. This is
+// n_embd for every architecture whose residual is a single stream, but
+// DeepSeek-V4 carries hc_mult hyper-connection streams between layers and a
+// mid-trunk boundary is that much wider.
+LLAMA_API uint32_t        llama_model_n_embd_spd_boundary(const struct llama_model * model);

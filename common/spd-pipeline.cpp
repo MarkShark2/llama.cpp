@@ -261,6 +261,7 @@ struct common_spd_pipeline::impl {
     common_spd_params params;
 
     int32_t n_embd = 0;
+    int32_t n_embd_boundary = 0; // width of the state handed between stages
     int32_t n_vocab = 0;
     int32_t n_layers = 0;
     int32_t layers_per_stage = 0;
@@ -451,9 +452,16 @@ struct common_spd_pipeline::impl {
         }
 
         n_embd = llama_model_n_embd(model_target);
+        // What a stage hands the next one. Equal to n_embd for every
+        // single-stream architecture, but DeepSeek-V4 carries hc_mult
+        // hyper-connection streams between layers, so a mid-trunk boundary is
+        // that much wider. Anchors stay n_embd wide -- they are stream means.
+        n_embd_boundary = (int32_t) llama_model_n_embd_spd_boundary(model_target);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_target));
         n_layers = llama_model_n_layer(model_target);
-        layers_per_stage = n_layers / (int32_t) stage_count;
+        // ceil, with the remainder on the last stage: 43 layers over 9 stages is
+        // 5x8 + 3. Matches llama_context's slicing and the trainer's presets.
+        layers_per_stage = (n_layers + (int32_t) stage_count - 1) / (int32_t) stage_count;
         target_n_pos_per_embd = llama_model_n_pos_per_embd(model_target);
         sidecar_n_embd_inp = llama_model_n_embd_inp(model_spd);
 
@@ -465,8 +473,8 @@ struct common_spd_pipeline::impl {
 
         const uint32_t n_anchor = llama_model_target_layer_ids_n(model_spd);
         const int32_t * anchor_data = llama_model_target_layer_ids(model_spd);
-        if (n_layers <= 0 || n_layers % (int32_t) stage_count != 0) {
-            fail("SPD target layer count must divide evenly into " +
+        if (n_layers <= 0 || layers_per_stage*((int32_t) stage_count - 1) >= n_layers) {
+            fail("SPD target layer count " + std::to_string(n_layers) + " leaves an empty stage at " +
                     std::to_string(stage_count) + " stages");
             return;
         }
@@ -496,7 +504,7 @@ struct common_spd_pipeline::impl {
         std::map<std::string, size_t> resource_ids;
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const int32_t layer_begin = (int32_t) stage*layers_per_stage;
-            const int32_t layer_end = layer_begin + layers_per_stage;
+            const int32_t layer_end = std::min(layer_begin + layers_per_stage, n_layers);
             for (int32_t layer = layer_begin; layer < layer_end; ++layer) {
                 const std::string key = execution_resource_key(
                         llama_model_layer_device(model_target, layer));
@@ -544,7 +552,15 @@ struct common_spd_pipeline::impl {
             // require a unified cache; forcing one changes long-context target
             // numerics enough to flip close greedy decisions.
             cp.kv_unified = false;
-            cp.n_rs_seq = 0;
+            // Rollback depth is at most stage_count - 1. Architectures whose
+            // cache can only rewind a bounded suffix -- DeepSeek-V4, whose
+            // compressor rings are built n_rs_seq rows wider than their read
+            // window -- need that budget declared up front, or seq_rm refuses
+            // every partial removal and the pipeline falls back to copying
+            // checkpoints across sequences on every stage of every step. Over a
+            // 9-stage RPC fabric that fallback costs more than the speculation
+            // saves. Ignored by caches that rewind by position alone.
+            cp.n_rs_seq = rollback_tokens;
             cp.embeddings = true;
             stages[stage] = llama_init_from_model(model_target, cp);
             if (stages[stage] == nullptr) {
@@ -637,7 +653,7 @@ struct common_spd_pipeline::impl {
             double * t_read = nullptr) {
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
-        storage.set(n_tokens, tokens, embeddings, n_embd, target_n_pos_per_embd, first_pos, true);
+        storage.set(n_tokens, tokens, embeddings, n_embd_boundary, target_n_pos_per_embd, first_pos, true);
         const auto decode_start = clock_type::now();
         if (llama_decode(stages[stage], storage.batch) != 0) {
             error = "target SPD stage " + std::to_string(stage) + " decode failed";
@@ -653,7 +669,7 @@ struct common_spd_pipeline::impl {
             error = "target SPD stage " + std::to_string(stage) + " produced no hidden state";
             return false;
         }
-        output.assign(result, result + (size_t) n_tokens*n_embd);
+        output.assign(result, result + (size_t) n_tokens*n_embd_boundary);
 
         for (auto & item : anchor_outputs) {
             const int32_t anchor = anchors[item.first];
@@ -696,7 +712,7 @@ struct common_spd_pipeline::impl {
         ++timing.head_calls;
         batch_storage local_storage;
         batch_storage & storage = static_decode_fast_path ? head_decode_batch : local_storage;
-        storage.set(1, nullptr, hidden.data(), n_embd, target_n_pos_per_embd, 0, true);
+        storage.set(1, nullptr, hidden.data(), n_embd_boundary, target_n_pos_per_embd, 0, true);
         if (llama_decode(head, storage.batch) != 0) {
             fail("target SPD head decode failed");
             return false;
@@ -952,7 +968,7 @@ struct common_spd_pipeline::impl {
         const int32_t n_prompt = (int32_t) prompt.size();
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
         const int32_t n_chunks = (n_prompt + chunk_size - 1)/chunk_size;
-        hidden.resize((size_t) n_prompt*n_embd);
+        hidden.resize((size_t) n_prompt*n_embd_boundary);
         anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_prompt*n_embd));
 
         struct prefill_task_result {
@@ -992,11 +1008,11 @@ struct common_spd_pipeline::impl {
 
                     std::string error;
                     const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
-                    const float * embeddings = stage == 0 ? nullptr : hidden.data() + (size_t) begin*n_embd;
+                    const float * embeddings = stage == 0 ? nullptr : hidden.data() + (size_t) begin*n_embd_boundary;
                     if (!decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error)) {
                         return prefill_task_result { false, std::move(error) };
                     }
-                    std::copy(chunk_output.begin(), chunk_output.end(), hidden.begin() + (size_t) begin*n_embd);
+                    std::copy(chunk_output.begin(), chunk_output.end(), hidden.begin() + (size_t) begin*n_embd_boundary);
                     for (auto & item : wanted) {
                         std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
                                 anchor_data[item.first].begin() + (size_t) begin*n_embd);
@@ -1145,8 +1161,8 @@ struct common_spd_pipeline::impl {
         }
 
         std::vector<float> last_hidden(
-                prompt_hidden.begin() + (size_t) (n_prompt - 1)*n_embd,
-                prompt_hidden.begin() + (size_t) n_prompt*n_embd);
+                prompt_hidden.begin() + (size_t) (n_prompt - 1)*n_embd_boundary,
+                prompt_hidden.begin() + (size_t) n_prompt*n_embd_boundary);
         llama_token first_token;
         if (!target_head(last_hidden, first_token)) {
             return false;

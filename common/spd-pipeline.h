@@ -7,7 +7,11 @@
 #include <string>
 #include <vector>
 
-constexpr uint32_t COMMON_SPD_MAX_STAGE_COUNT = 8;
+// Upper bound on SPD pipeline stages. Only sizes std::arrays of per-stage
+// bookkeeping, so raising it costs a little static storage and nothing else.
+// DeepSeek-V4 runs 9 stages (43 layers over the 8 BC-250s plus the 3080 Ti),
+// which the previous limit of 8 rejected outright.
+constexpr uint32_t COMMON_SPD_MAX_STAGE_COUNT = 16;
 
 struct common_spd_params {
     uint32_t n_ctx = 4096;

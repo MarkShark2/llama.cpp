@@ -19,6 +19,14 @@ struct llama_cparams {
     uint32_t spd_stage_count; // total logical SPD stages
     uint32_t spd_layer_start; // first target layer owned by this stage (inclusive)
     uint32_t spd_layer_end;   // last target layer owned by this stage (exclusive)
+    // Width of one input row this context accepts, i.e. the stride of
+    // batch.embd. Normally hparams.n_embd_inp(), but an SPD stage is handed the
+    // previous stage's raw residual, and on DeepSeek-V4 that residual is
+    // hc_mult streams wide rather than n_embd. 0 = not yet resolved.
+    uint32_t n_embd_inp_ctx;
+    // Width of one row of the embeddings output. Differs from n_embd_inp_ctx on
+    // an SPD stage 0, which is fed tokens but still emits the wide residual.
+    uint32_t n_embd_out_ctx;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 

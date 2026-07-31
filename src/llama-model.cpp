@@ -2908,3 +2908,19 @@ uint32_t llama_model_spd_stage_count(const struct llama_model * model) {
     }
     return static_cast<const llama_model_spd *>(model)->stage_count;
 }
+
+uint32_t llama_model_n_embd_spd_boundary(const struct llama_model * model) {
+    if (model == nullptr) {
+        return 0;
+    }
+    // What one stage hands the next is the raw inter-layer residual. On
+    // DeepSeek-V4 that residual is [n_embd, hc_mult, n_tokens] -- the streams
+    // only collapse at the very end of the trunk, via the learned hc_head -- so
+    // a mid-trunk boundary is hc_mult times wider. Collapsing at the boundary
+    // and re-expanding is not available: SPD stages are the verifier and have
+    // to stay bit-exact against a plain decode.
+    if (model->arch == LLM_ARCH_DEEPSEEK4 && model->hparams.dsv4_hc_mult > 0) {
+        return model->hparams.n_embd*model->hparams.dsv4_hc_mult;
+    }
+    return model->hparams.n_embd_inp();
+}

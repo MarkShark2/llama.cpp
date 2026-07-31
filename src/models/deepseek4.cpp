@@ -1299,20 +1299,72 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     llm_graph_context_dsv4_mla(params) {
     ggml_tensor * cur;
 
+    const bool is_spd_stage = params.gtype == LLM_GRAPH_TYPE_SPD_STAGE;
+    const bool is_spd_head  = params.gtype == LLM_GRAPH_TYPE_SPD_HEAD;
+    const bool is_spd_embed = params.gtype == LLM_GRAPH_TYPE_SPD_EMBED;
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const auto & model_dsv4 = static_cast<const llama_model_deepseek4 &>(model);
+
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
+
+    if (is_spd_embed) {
+        // SPD anchor 0 is the layer-0 input averaged over the hyper-connection
+        // streams, and hc_init only repeats the token embedding across all of
+        // them -- so that mean is the embedding itself.
+        res->t_embd = inp;
+        ggml_build_forward_expand(gf, inp);
+        return;
+    }
+
+    if (is_spd_head) {
+        // Handed the last stage's residual, still hc streams wide. Collapse it
+        // with the learned hc head -- NOT the stream mean that capture_layer_inp
+        // takes: the mean is the drafter's training feature, while this path has
+        // to reproduce the target's logits exactly for verification to mean
+        // anything.
+        ggml_tensor * h = ggml_reshape_3d(ctx0, res->t_inp_embd_wide, n_embd, hc, n_tokens);
+        cur = build_hc_head(h, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+        cb(cur, "hc_head", -1);
+        res->t_h_nextn = cur;
+
+        ggml_tensor * head_norm_w = model_dsv4.output_norm_trunk ? model_dsv4.output_norm_trunk : model.output_norm;
+        ggml_tensor * head_out_w  = model_dsv4.output_trunk      ? model_dsv4.output_trunk      : model.output;
+
+        cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = ggml_mul_mat(ctx0, head_out_w, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     ggml_tensor * inp_pos = build_inp_pos();
     // PipeDec body lanes are single-token and keep every row (the deferred head
     // consumes the raw h_nextn rows), so no out_ids gather is built for them.
-    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+    // SPD stages likewise hand every row on to the next stage.
+    ggml_tensor * inp_out_ids = (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY || is_spd_stage)
             ? nullptr : build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
 
-    const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL;
+    if (is_spd_stage && cparams.spd_stage > 0) {
+        // Stages past the first are fed the previous stage's raw residual, all
+        // hc streams of it. Same [n_embd, hc, n_tokens] layout the loop carries,
+        // so the flattened handoff reshapes straight back.
+        inpL = ggml_reshape_3d(ctx0, res->t_inp_embd_wide, n_embd, hc, n_tokens);
+        cb(inpL, "hc_carry", -1);
+    } else {
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
+    }
 
     // hidden-state extraction for speculative drafters (e.g. DSpark): the residual is
     // hc_mult streams wide, the extracted state is their mean, matching the reference
@@ -1327,7 +1379,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_build_forward_expand(gf, res->t_layer_inp[il]);
     };
 
-    for (int il = 0; il < n_layer; ++il) {
+    const int layer_start = is_spd_stage ? (int) cparams.spd_layer_start : 0;
+    const int layer_end   = is_spd_stage ? (int) cparams.spd_layer_end   : n_layer;
+
+    for (int il = layer_start; il < layer_end; ++il) {
         capture_layer_inp(il, inpL);
 
         ggml_tensor * residual = inpL;
@@ -1406,6 +1461,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(inpL, "l_last", il);
     }
 
+    if (is_spd_stage) {
+        // Hand the residual on exactly as the loop carries it: all hc streams,
+        // flattened to one row per token. The streams only collapse at the very
+        // end of the trunk, which for SPD lives in the head context.
+        ggml_tensor * out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, inpL), n_embd*hc, n_tokens);
+        cb(out, "spd_stage_output", -1);
+        res->t_embd = out;
+        ggml_build_forward_expand(gf, out);
+        return;
+    }
+
     capture_layer_inp(n_layer, inpL);
 
     // Masked nextn (plain decode / PipeDec): gather to the output rows BEFORE the
@@ -1445,7 +1511,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // Use the last-stage copies of the tail when they exist (see
     // load_arch_tensors): keeping the norm and lm_head on the pipeline is what
     // stops every ubatch from ending in a pipeline-draining RPC -> local copy.
-    const auto & model_dsv4 = static_cast<const llama_model_deepseek4 &>(model);
     ggml_tensor * out_norm_w = model_dsv4.output_norm_trunk ? model_dsv4.output_norm_trunk : model.output_norm;
     ggml_tensor * out_w      = model_dsv4.output_trunk      ? model_dsv4.output_trunk      : model.output;
 

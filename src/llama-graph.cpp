@@ -2183,7 +2183,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
-    const int64_t n_embd_inp = hparams.n_embd_inp();
+    // The context's own input width, which an SPD stage widens to the model's
+    // stage-boundary width (DeepSeek-V4 hands on hc_mult residual streams).
+    const int64_t n_embd_inp = cparams.n_embd_inp_ctx > 0
+                             ? (int64_t) cparams.n_embd_inp_ctx
+                             : (int64_t) hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
     assert(n_embd_inp >= n_embd);
@@ -2228,7 +2232,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         }
 
         if (n_embd_inp != n_embd) {
-            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            cur = ggml_pad(ctx0, cur, n_embd_inp - n_embd, 0, 0, 0);
         }
     }
 
@@ -2243,6 +2247,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
+
+    // keep the un-narrowed row available: a DeepSeek-V4 SPD stage needs all
+    // hc_mult residual streams, not just the first n_embd of them
+    res->t_inp_embd_wide = cur;
 
     if (n_embd_inp != n_embd) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);

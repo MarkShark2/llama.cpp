@@ -845,7 +845,12 @@ public:
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_inp_embd    = nullptr; // [n_embd, n_tokens] - narrowed
+    // [n_embd_inp_ctx, n_tokens] - the input row before it is narrowed to
+    // n_embd. Only interesting when the context takes rows wider than the
+    // model's embedding, i.e. a DeepSeek-V4 SPD stage receiving the previous
+    // stage's hc_mult-wide residual.
+    ggml_tensor * t_inp_embd_wide = nullptr;
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
