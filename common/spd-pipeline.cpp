@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <map>
 #include <mutex>
@@ -300,6 +301,16 @@ struct common_spd_pipeline::impl {
     bool light_rollback = false;
     bool timing_enabled = false;
 
+    // LLAMA_SPD_DUMP=<dir>: write every speculation input (selectors,
+    // positions, features) and every verification outcome for offline replay
+    // through the reference torch model. Capped so a long request cannot fill
+    // the disk; the cap counts speculation steps.
+    std::string dump_dir;
+    int32_t dump_limit = 200;
+    int32_t dump_step = 0;
+    int32_t dump_prefill_rows_left = 4096;
+    FILE * dump_index = nullptr;
+
     struct phase_timing {
         double prepare = 0.0;
         double stage_wall = 0.0;
@@ -340,6 +351,12 @@ struct common_spd_pipeline::impl {
         }
         if (const char * value = std::getenv("LLAMA_SPD_TIMING")) {
             timing_enabled = std::atoi(value) != 0;
+        }
+        if (const char * value = std::getenv("LLAMA_SPD_DUMP")) {
+            dump_dir = value;
+        }
+        if (const char * value = std::getenv("LLAMA_SPD_DUMP_LIMIT")) {
+            dump_limit = std::atoi(value);
         }
         initialize();
     }
@@ -815,6 +832,63 @@ struct common_spd_pipeline::impl {
         return true;
     }
 
+    // ---- LLAMA_SPD_DUMP support ----------------------------------------
+    // Row files carry the exact sidecar batch (selectors, positions,
+    // features); index.jsonl carries the event stream (prefill/spec/verify)
+    // so a torch replay can rebuild the sidecar's sequence state per step.
+
+    FILE * dump_open_index() {
+        if (dump_dir.empty()) {
+            return nullptr;
+        }
+        if (dump_index == nullptr) {
+            std::filesystem::create_directories(dump_dir);
+            dump_index = std::fopen((dump_dir + "/index.jsonl").c_str(), "a");
+        }
+        return dump_index;
+    }
+
+    void dump_rows(const char * kind,
+            const std::vector<llama_token> & selectors,
+            const std::vector<llama_pos> & positions,
+            const std::vector<float> & features,
+            llama_token sampled) {
+        FILE * index = dump_open_index();
+        if (index == nullptr) {
+            return;
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "%s_%06d.bin", kind, dump_step);
+        FILE * fh = std::fopen((dump_dir + "/" + name).c_str(), "wb");
+        if (fh == nullptr) {
+            return;
+        }
+        const int32_t n_rows = (int32_t) selectors.size();
+        std::fwrite(&n_rows, sizeof(n_rows), 1, fh);
+        std::fwrite(&sidecar_n_embd_inp, sizeof(sidecar_n_embd_inp), 1, fh);
+        std::fwrite(selectors.data(), sizeof(llama_token), selectors.size(), fh);
+        std::fwrite(positions.data(), sizeof(llama_pos), positions.size(), fh);
+        std::fwrite(features.data(), sizeof(float), features.size(), fh);
+        std::fclose(fh);
+        fprintf(index, "{\"kind\":\"%s\",\"step\":%d,\"file\":\"%s\",\"n_rows\":%d,"
+                "\"pos0\":%d,\"sampled\":%d}\n",
+                kind, dump_step, name, n_rows,
+                positions.empty() ? -1 : (int) positions.front(), (int) sampled);
+        fflush(index);
+    }
+
+    void dump_verify(llama_pos pos, llama_token drafted, llama_token verified) {
+        FILE * index = dump_open_index();
+        if (index == nullptr || dump_step >= dump_limit) {
+            return;
+        }
+        fprintf(index, "{\"kind\":\"verify\",\"step\":%d,\"pos\":%d,\"drafted\":%d,"
+                "\"verified\":%d,\"accepted\":%s}\n",
+                dump_step, (int) pos, (int) drafted, (int) verified,
+                drafted == verified ? "true" : "false");
+        fflush(index);
+    }
+
     bool prefill_sidecar(const std::vector<std::vector<float>> & anchor_data, int32_t n_tokens) {
         const int32_t prefill_len = std::max(0, n_tokens - (int32_t) stage_count + 1);
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
@@ -836,6 +910,10 @@ struct common_spd_pipeline::impl {
             }
             if (!sidecar_decode(selectors, features, positions, nullptr)) {
                 return false;
+            }
+            if (!dump_dir.empty() && dump_prefill_rows_left >= count) {
+                dump_prefill_rows_left -= count;
+                dump_rows("prefill", selectors, positions, features, LLAMA_TOKEN_NULL);
             }
         }
         return true;
@@ -908,8 +986,13 @@ struct common_spd_pipeline::impl {
             fail("failed to crop SPD sidecar cache at position " + std::to_string(input.min_pos));
             return false;
         }
-        return sidecar_decode(input.selectors, input.features, input.positions, &sampled,
+        const bool ok = sidecar_decode(input.selectors, input.features, input.positions, &sampled,
                 static_decode_fast_path ? &sidecar_decode_batch : nullptr);
+        if (ok && !dump_dir.empty() && dump_step < dump_limit) {
+            dump_rows("spec", input.selectors, input.positions, input.features, sampled);
+            ++dump_step;
+        }
+        return ok;
     }
 
     bool speculate(
@@ -1172,6 +1255,39 @@ struct common_spd_pipeline::impl {
             item.snap.values[captured_item.first] = std::move(captured[captured_item.first]);
             item.snap.present[captured_item.first] = true;
         }
+
+        // The boundary this stage just produced is the residual entering the
+        // next stage's first layer, i.e. the anchor tap at this stage's end.
+        // Stage graphs only capture taps at their own input, so without this a
+        // token that has completed d stages exposes d anchors where the head
+        // was trained on d+1 (reference depth_to_avail: depth d = anchors
+        // through the end of stage d-1), and every in-flight speculation row
+        // falls back to one aggregation pattern shallower than trained. The
+        // tap is the stream mean of the boundary; flat-residual targets have
+        // one stream and take a plain copy.
+        const int32_t end_layer = std::min<int32_t>((int32_t) (stage + 1)*layers_per_stage, n_layers);
+        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+            if (anchors[ai] != end_layer) {
+                continue;
+            }
+            const int32_t streams = n_embd_boundary/n_embd;
+            std::vector<float> & tap = item.snap.values[ai];
+            tap.assign(item.hidden.begin(), item.hidden.begin() + n_embd);
+            for (int32_t st = 1; st < streams; ++st) {
+                const float * src = item.hidden.data() + (size_t) st*n_embd;
+                for (int32_t j = 0; j < n_embd; ++j) {
+                    tap[j] += src[j];
+                }
+            }
+            if (streams > 1) {
+                const float scale = 1.0f/(float) streams;
+                for (int32_t j = 0; j < n_embd; ++j) {
+                    tap[j] *= scale;
+                }
+            }
+            item.snap.present[ai] = true;
+            break;
+        }
         elapsed = seconds_since(start);
         timing.stage_busy[stage] += elapsed;
         if (timing_active_count <= SPD_MAX_STAGE_COUNT) {
@@ -1386,6 +1502,7 @@ struct common_spd_pipeline::impl {
                         return false;
                     }
 
+                    dump_verify(target_pos, result.tokens[generated_index], verified_token);
                     if (result.tokens[generated_index] != verified_token) {
                         result.tokens.resize(generated_index);
                         result.accepted.resize(generated_index);
