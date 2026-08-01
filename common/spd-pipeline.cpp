@@ -274,6 +274,12 @@ struct common_spd_pipeline::impl {
     uint32_t rollback_tokens = 0;
 
     std::vector<int32_t> anchors;
+    // [fork] LLAMA_SPD_HOST_TAPS=0 restores the graph-tap readback on every
+    // stage (the pre-2026-08-01 behaviour) for A/B measurement.
+    const bool host_taps_enabled = [] {
+        const char * v = getenv("LLAMA_SPD_HOST_TAPS");
+        return v == nullptr || atoi(v) != 0;
+    }();
     std::array<llama_context *, SPD_MAX_STAGE_COUNT> stages = {};
     std::array<std::array<llama_pos, SPD_MAX_ROLLBACK_TOKENS>, SPD_MAX_STAGE_COUNT> checkpoint_pos = {};
     std::array<llama_pos, SPD_MAX_STAGE_COUNT> stage_tail_pos = {};
@@ -416,6 +422,13 @@ struct common_spd_pipeline::impl {
         // busy time and call count bucketed by how many stages ran in the step
         std::array<std::array<double, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> busy_by_active = {};
         std::array<std::array<uint64_t, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> calls_by_active = {};
+        // Orchestration cost, exactly: the step's stage-phase wall minus the
+        // slowest stage that actually ran in it. Bucketed by active count so a
+        // flat profile reads as dispatch overhead and a rising one reads as the
+        // cost of waiting on the slowest of N jittery stages. Taking the max
+        // per step (not the max of the per-stage means) keeps the two apart.
+        std::array<double,   SPD_MAX_STAGE_COUNT + 1> gap_by_active   = {};
+        std::array<uint64_t, SPD_MAX_STAGE_COUNT + 1> gap_calls       = {};
     };
     phase_timing timing;
     size_t timing_active_count = 0;
@@ -753,6 +766,50 @@ struct common_spd_pipeline::impl {
             positions.fill(-1);
         }
         stage_tail_pos.fill(-1);
+    }
+
+    // Which stage owns anchor `ai`, i.e. whose graph taps it as a layer input.
+    uint32_t anchor_stage(size_t ai) const {
+        return (uint32_t) std::min<int32_t>(anchors[ai]/layers_per_stage, stage_count - 1);
+    }
+
+    // An anchor sitting exactly on a stage's first layer is that stage's own
+    // boundary input, meaned over the hc streams -- the identical quantity the
+    // host computes from item.hidden the moment the PREVIOUS stage finishes
+    // (see the end_layer loop in the decode path). Reading the graph tap too
+    // costs a second blocking GET_TENSOR per stage per step and then
+    // overwrites the host value with the same numbers. DSV4-s9 anchors are
+    // [0,5,...,40], so this covers 8 of the 9 stages; anchor 0 has no previous
+    // stage and keeps its readback.
+    //
+    // Decode only. Prefill has no host-side end_layer tap (and with peer
+    // boundaries it never reads the hidden state back at all), so it still
+    // consumes the graph tap on every stage.
+    bool anchor_is_host_derived(size_t ai) const {
+        if (!host_taps_enabled) {
+            return false;
+        }
+        const uint32_t stage = anchor_stage(ai);
+        if (stage == 0) {
+            return false;
+        }
+        return anchors[ai] == std::min<int32_t>((int32_t) stage*layers_per_stage, n_layers);
+    }
+
+    // true when every anchor this stage taps is host-derived, so the decode can
+    // skip the readback entirely
+    bool stage_taps_all_host_derived(uint32_t stage) const {
+        bool any = false;
+        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+            if (anchor_stage(ai) != stage) {
+                continue;
+            }
+            if (!anchor_is_host_derived(ai)) {
+                return false;
+            }
+            any = true;
+        }
+        return any;
     }
 
     bool decode_stage(
@@ -1330,7 +1387,7 @@ struct common_spd_pipeline::impl {
                             timing.prefill_peer_in[stage] += seconds_since(peer_start);
                         }
                         if (ok) {
-                            llama_set_spd_peer_io(stages[stage], peer_in, peer_out);
+                            llama_set_spd_peer_io(stages[stage], peer_in, peer_out, false);
                             const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
                             const float * embeddings = stage == 0
                                     ? nullptr
@@ -1338,7 +1395,7 @@ struct common_spd_pipeline::impl {
                             ok = decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error,
                                     nullptr, &timing.prefill_decode[stage], &timing.prefill_read[stage],
                                     /*read_output =*/ !peer_out);
-                            llama_set_spd_peer_io(stages[stage], false, false);
+                            llama_set_spd_peer_io(stages[stage], false, false, false);
                         }
                         if (ok && peer_in) {
                             // a rebuild would have read a different input tensor
@@ -1584,18 +1641,19 @@ struct common_spd_pipeline::impl {
         std::vector<std::vector<float>> captured(anchors.size());
         std::vector<std::pair<size_t, std::vector<float> *>> wanted;
         for (size_t ai = 0; ai < anchors.size(); ++ai) {
-            if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
+            if (anchor_stage(ai) == stage && !anchor_is_host_derived(ai)) {
                 wanted.push_back({ ai, &captured[ai] });
             }
         }
 
         const llama_token * token = stage == 0 ? &item.token : nullptr;
         const float * embd = stage == 0 ? nullptr : item.hidden.data();
-        llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ false);
+        llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ false,
+                /*skip_layer_inp =*/ stage_taps_all_host_derived(stage));
         const bool decoded = decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
                 static_decode_fast_path ? &stage_decode_batches[stage] : nullptr,
                 &timing.stage_decode[stage], &timing.stage_read[stage]);
-        llama_set_spd_peer_io(stages[stage], false, false);
+        llama_set_spd_peer_io(stages[stage], false, false, false);
         if (!decoded) {
             return false;
         }
@@ -1855,7 +1913,16 @@ struct common_spd_pipeline::impl {
                     ok[stage] = advance_entry((uint32_t) stage, pipeline[stage], elapsed[stage], errors[stage]);
                 }
             }
-            timing.stage_wall += seconds_since(stage_phase_start);
+            const double stage_phase_wall = seconds_since(stage_phase_start);
+            timing.stage_wall += stage_phase_wall;
+            if (timing_enabled && active_count > 0 && active_count <= SPD_MAX_STAGE_COUNT) {
+                double slowest = 0.0;
+                for (size_t stage = 0; stage < active_count; ++stage) {
+                    slowest = std::max(slowest, elapsed[stage]);
+                }
+                timing.gap_by_active[active_count] += stage_phase_wall - slowest;
+                ++timing.gap_calls[active_count];
+            }
 
             {
                 scope_timer sidecar_wait_timer(timing.sidecar_extra);
@@ -2019,6 +2086,25 @@ struct common_spd_pipeline::impl {
                     }
                 }
                 fprintf(stderr, "%s\n", row);
+            }
+            {
+                char row[512];
+                size_t off = (size_t) snprintf(row, sizeof(row), "SPD timing: orchestration gap ms/step by active:");
+                double gap_total = 0.0;
+                uint64_t gap_steps = 0;
+                for (uint32_t a = 1; a <= stage_count && off < sizeof(row) - 32; ++a) {
+                    const uint64_t n = timing.gap_calls[a];
+                    gap_total += timing.gap_by_active[a];
+                    gap_steps += n;
+                    if (n == 0) {
+                        off += (size_t) snprintf(row + off, sizeof(row) - off, " a%u=-", a);
+                    } else {
+                        off += (size_t) snprintf(row + off, sizeof(row) - off, " a%u=%.2f/%" PRIu64,
+                                a, 1e3*timing.gap_by_active[a]/(double) n, n);
+                    }
+                }
+                fprintf(stderr, "%s | total %.2fs (%.2f ms/step)\n", row, gap_total,
+                        gap_steps > 0 ? 1e3*gap_total/(double) gap_steps : 0.0);
             }
         }
         result.tokens.resize(n_predict);

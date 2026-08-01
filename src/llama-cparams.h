@@ -72,6 +72,11 @@ struct llama_cparams {
     // boundary leaves via a peer push, the host never needs it).
     bool spd_peer_skip_inp = false;
     bool spd_peer_skip_out = false;
+    // [fork, SPD] suppress the per-decode layer-input tap readback. The graph
+    // still builds the tap (prefill needs it and the shape must not change
+    // between phases); only the blocking GET_TENSOR is skipped, for stages
+    // whose anchors the host derives from the previous stage's boundary.
+    bool spd_skip_layer_inp = false;
     // persistent device-resident boundary input for an SPD stage, allocated by
     // the context; build_inp_embd references it like a weight so the scheduler
     // neither stages it on the CPU nor re-uploads it per eval

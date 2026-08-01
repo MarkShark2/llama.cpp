@@ -97,7 +97,7 @@ struct llama_context {
     // per-decode host-transfer skip toggles
     ggml_tensor * spd_peer_inp_tensor() const;
     ggml_tensor * spd_peer_out_tensor() const;
-    void          set_spd_peer_io(bool skip_inp, bool skip_out);
+    void          set_spd_peer_io(bool skip_inp, bool skip_out, bool skip_layer_inp);
 
     ggml_context         * spd_boundary_ctx = nullptr;
     ggml_backend_buffer_t  spd_boundary_buf = nullptr;

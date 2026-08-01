@@ -1161,9 +1161,10 @@ ggml_tensor * llama_context::spd_peer_out_tensor() const {
     return gf_res_prev ? gf_res_prev->t_embd : nullptr;
 }
 
-void llama_context::set_spd_peer_io(bool skip_inp, bool skip_out) {
-    cparams.spd_peer_skip_inp = skip_inp;
-    cparams.spd_peer_skip_out = skip_out;
+void llama_context::set_spd_peer_io(bool skip_inp, bool skip_out, bool skip_layer_inp) {
+    cparams.spd_peer_skip_inp  = skip_inp;
+    cparams.spd_peer_skip_out  = skip_out;
+    cparams.spd_skip_layer_inp = skip_layer_inp;
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -2958,6 +2959,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    // [fork, SPD] the tap stays in the graph (prefill reads it, and toggling it
+    // per phase would reshape the stage graph); this only drops the blocking
+    // readback for stages whose anchors the host already has.
+    if (cparams.spd_skip_layer_inp) {
+        return;
+    }
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -4565,8 +4572,8 @@ ggml_tensor * llama_spd_peer_out_tensor(llama_context * ctx) {
     return ctx->spd_peer_out_tensor();
 }
 
-void llama_set_spd_peer_io(llama_context * ctx, bool skip_inp, bool skip_out) {
-    ctx->set_spd_peer_io(skip_inp, skip_out);
+void llama_set_spd_peer_io(llama_context * ctx, bool skip_inp, bool skip_out, bool skip_layer_inp) {
+    ctx->set_spd_peer_io(skip_inp, skip_out, skip_layer_inp);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

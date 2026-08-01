@@ -129,10 +129,12 @@ LLAMA_API void llama_set_stable_host_inputs(struct llama_context * ctx, bool val
 // re-fetch after every decode. And the per-decode host-transfer skips: with
 // skip_inp the embd upload in set_input is suppressed (the data was placed on
 // device by a peer push + local copy), with skip_out the embeddings readback
-// in decode is suppressed (the boundary leaves via a peer push).
+// in decode is suppressed (the boundary leaves via a peer push), and with
+// skip_layer_inp the layer-input tap readback is suppressed (the host derives
+// those anchors from the previous stage's boundary instead).
 LLAMA_API struct ggml_tensor * llama_spd_peer_inp_tensor(struct llama_context * ctx);
 LLAMA_API struct ggml_tensor * llama_spd_peer_out_tensor(struct llama_context * ctx);
-LLAMA_API void llama_set_spd_peer_io(struct llama_context * ctx, bool skip_inp, bool skip_out);
+LLAMA_API void llama_set_spd_peer_io(struct llama_context * ctx, bool skip_inp, bool skip_out, bool skip_layer_inp);
 
 // [fork, SPD peer boundaries] synchronous peer-push entry points, implemented
 // in ggml-rpc.cpp (exported from the RPC backend, declared here so the SPD
