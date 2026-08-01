@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-sparse.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -214,8 +215,17 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+// [fork] see the perf logger further down; the flags live here so init can set them
+static bool     cuda_perf_logger_enabled   = false;
+static uint32_t cuda_perf_logger_frequency = 100;
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
+
+    cuda_perf_logger_enabled = getenv("GGML_CUDA_PERF_LOGGER") != nullptr;
+    if (const char * f = getenv("GGML_CUDA_PERF_LOGGER_FREQUENCY")) {
+        cuda_perf_logger_frequency = std::max(1, atoi(f));
+    }
 
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {
@@ -3866,6 +3876,139 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [fork] GGML_CUDA_PERF_LOGGER=1 -- per-node GPU timing with the same shape
+// naming and GFLOPS/s column as the Vulkan perf logger, so a CUDA stage graph
+// can be compared op for op against a board's. Events must not land inside a
+// CUDA-graph capture, so this forces the direct-launch path: read it for
+// attribution, not for the absolute headline number.
+// GGML_CUDA_PERF_LOGGER_FREQUENCY=N prints every N graphs (default 100).
+static uint64_t ggml_cuda_perf_node_flops(const ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const uint64_t m     = node->ne[0];
+        const uint64_t n     = node->ne[1];
+        const uint64_t k     = node->src[1]->ne[0];
+        const uint64_t batch = node->ne[2] * node->ne[3];
+        return m * n * (k + (k - 1)) * batch;
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = node->src[0];
+        const ggml_tensor * k = node->src[1];
+        const ggml_tensor * v = node->src[2];
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+    }
+    return 0;
+}
+
+static std::string ggml_cuda_perf_node_name(const ggml_tensor * node) {
+    char buf[320];
+    if (node->op == GGML_OP_UNARY) {
+        return ggml_unary_op_name(ggml_get_unary_op(node));
+    }
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const bool vec = (node->op == GGML_OP_MUL_MAT    && node->ne[1] <= 8) ||
+                         (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1);
+        snprintf(buf, sizeof(buf), "%s%s %s m=%d n=%d k=%d n_expert=%d batch=%d",
+                 ggml_op_name(node->op), vec ? "_VEC" : "", ggml_type_name(node->src[0]->type),
+                 (int) node->ne[0], (int) node->ne[1], (int) node->src[1]->ne[0],
+                 (int) (node->op == GGML_OP_MUL_MAT_ID ? node->src[0]->ne[2] : 1),
+                 (int) (node->ne[2]*node->ne[3]));
+        return buf;
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = node->src[0];
+        const ggml_tensor * k = node->src[1];
+        snprintf(buf, sizeof(buf), "%s%s q(%d,%d,%d,%d) k(%d,%d)",
+                 ggml_op_name(node->op),
+                 ggml_cuda_fattn_sparse_is_sparse_node(node) ? "_SPARSE" : "",
+                 (int) q->ne[0], (int) q->ne[1], (int) q->ne[2], (int) q->ne[3],
+                 (int) k->ne[0], (int) k->ne[1]);
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%s (%d,%d,%d,%d)", ggml_op_name(node->op),
+             (int) node->ne[0], (int) node->ne[1], (int) node->ne[2], (int) node->ne[3]);
+    return buf;
+}
+
+struct ggml_cuda_perf_logger {
+    std::vector<cudaEvent_t> pool;      // 2 per timed node, reused across graphs
+    size_t                   used = 0;
+    std::vector<std::string> names;
+    std::vector<uint64_t>    flops;
+
+    std::map<std::string, std::pair<uint64_t, double>> agg;       // name -> (calls, us)
+    std::map<std::string, uint64_t>                    agg_flops;
+    uint32_t                                           n_graphs = 0;
+
+    cudaEvent_t take() {
+        if (used == pool.size()) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        return pool[used++];
+    }
+
+    void begin(cudaStream_t stream) { CUDA_CHECK(cudaEventRecord(take(), stream)); }
+
+    void end(cudaStream_t stream, const ggml_tensor * node, int n_fused) {
+        std::string name = ggml_cuda_perf_node_name(node);
+        if (n_fused > 0) {
+            name += " +" + std::to_string(n_fused) + "fused";
+        }
+        names.push_back(name);
+        flops.push_back(ggml_cuda_perf_node_flops(node));
+        CUDA_CHECK(cudaEventRecord(take(), stream));
+    }
+
+    void flush(cudaStream_t stream) {
+        if (names.empty()) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (size_t i = 0; i < names.size(); i++) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, pool[2*i], pool[2*i + 1]));
+            auto & e = agg[names[i]];
+            e.first++;
+            e.second += ms*1000.0;
+            agg_flops[names[i]] += flops[i];
+        }
+        names.clear();
+        flops.clear();
+        used = 0;
+
+        if (++n_graphs % cuda_perf_logger_frequency != 0) {
+            return;
+        }
+        double total = 0.0;
+        fprintf(stderr, "----------------\nCUDA Timings (%u graphs):\n", n_graphs);
+        std::vector<std::pair<std::string, std::pair<uint64_t, double>>> rows(agg.begin(), agg.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto & a, const auto & b) { return a.second.second > b.second.second; });
+        for (const auto & r : rows) {
+            fprintf(stderr, "%s: %" PRIu64 " x %.2f us = %.2f us", r.first.c_str(),
+                    r.second.first, r.second.second / r.second.first, r.second.second);
+            const uint64_t f = agg_flops[r.first];
+            if (f > 0) {
+                fprintf(stderr, " (%.1f GFLOPS/s)", (double) f / r.second.second / 1000.0);
+            }
+            fprintf(stderr, "\n");
+            total += r.second.second;
+        }
+        fprintf(stderr, "Total: %.2f us over %u graphs = %.3f ms/graph\n",
+                total, n_graphs, total / n_graphs / 1000.0);
+        fflush(stderr);
+        agg.clear();
+        agg_flops.clear();
+        n_graphs = 0;
+    }
+};
+
+static ggml_cuda_perf_logger * ggml_cuda_perf_logger_get() {
+    static ggml_cuda_perf_logger logger;
+    return &logger;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4006,9 +4149,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (cuda_perf_logger_enabled) {
+                    ggml_cuda_perf_logger_get()->begin(cuda_ctx->stream());
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (cuda_perf_logger_enabled) {
+                        ggml_cuda_perf_logger_get()->end(cuda_ctx->stream(), node, nodes_to_skip);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4032,6 +4182,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (cuda_perf_logger_enabled) {
+                    ggml_cuda_perf_logger_get()->end(cuda_ctx->stream(), node, 0);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4112,7 +4265,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    // the perf logger records events per node, which cannot be captured
+    if (graph->is_enabled() && !cuda_perf_logger_enabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4152,6 +4306,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (cuda_perf_logger_enabled) {
+        ggml_cuda_perf_logger_get()->flush(cuda_ctx->stream());
+    }
 
     return GGML_STATUS_SUCCESS;
 }
