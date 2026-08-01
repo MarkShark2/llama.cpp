@@ -2180,6 +2180,13 @@ bool common_spd_pipeline::generate(
         llama_model * model_target = pimpl->model_target;
         llama_model * model_spd = pimpl->model_spd;
         common_spd_params params = pimpl->params;
+        // Destroy before constructing. Assigning a freshly built impl over the
+        // old one holds both alive across the swap, so every device carries two
+        // full sets of stage contexts at the peak. A stage device sized to the
+        // model -- 3 DSV4 layers on an 8 GB card leaves ~318 MiB -- cannot
+        // allocate the second copy and the request fails with "failed to
+        // initialize target SPD stage N" on the *second* request of a session.
+        pimpl.reset();
         pimpl = std::make_unique<impl>(model_target, model_spd, params);
         if (!pimpl->ready) {
             return false;
