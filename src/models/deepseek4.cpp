@@ -125,6 +125,20 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     hc_head_base  = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult},         0, n_layer - 1);
     hc_head_scale = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1},               0, n_layer - 1);
 
+    // ...and a copy on the output device for the SPD head, which has the opposite
+    // problem to a PipeDec body lane. Its input is the last stage's boundary, read
+    // back to the host as an anchor tap regardless, so nothing is saved by
+    // collapsing it out on the pipeline -- while leaving the collapse and the norm
+    // there costs a blocking RPC round trip on every verified token (measured at
+    // ~5 ms of a 6 ms head call on the 9-stage DSV4 split, against 0.64 ms of
+    // actual device time). These three are a few KiB; output/output_norm already
+    // sit on the output device as the un-suffixed originals.
+    if (params.mtp_dev != nullptr && n_layer > 0) {
+        hc_head_fn_out    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, TENSOR_DUPLICATED);
+        hc_head_base_out  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult},         TENSOR_DUPLICATED);
+        hc_head_scale_out = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1},               TENSOR_DUPLICATED);
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -1327,12 +1341,24 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         // to reproduce the target's logits exactly for verification to mean
         // anything.
         ggml_tensor * h = ggml_reshape_3d(ctx0, res->t_inp_embd_wide, n_embd, hc, n_tokens);
-        cur = build_hc_head(h, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+
+        // Take the output-device copies when they exist. The trunk pin exists so a
+        // PipeDec body lane does not end on a foreign backend; this graph is not a
+        // lane, its input arrives from the host, and keeping the collapse+norm on
+        // the last stage splits a 31-node graph onto RPC and pays a blocking round
+        // trip per verified token. Falls back to the pinned originals when
+        // mtp_dev is unset, where they are the only copies and dev_output is the
+        // last layer's device anyway -- so this changes nothing without a draft device.
+        ggml_tensor * head_fn_w   = model_dsv4.hc_head_fn_out    ? model_dsv4.hc_head_fn_out    : model.hc_head_fn;
+        ggml_tensor * head_base_w = model_dsv4.hc_head_base_out  ? model_dsv4.hc_head_base_out  : model.hc_head_base;
+        ggml_tensor * head_sc_w   = model_dsv4.hc_head_scale_out ? model_dsv4.hc_head_scale_out : model.hc_head_scale;
+
+        cur = build_hc_head(h, head_fn_w, head_sc_w, head_base_w);
         cb(cur, "hc_head", -1);
         res->t_h_nextn = cur;
 
-        ggml_tensor * head_norm_w = model_dsv4.output_norm_trunk ? model_dsv4.output_norm_trunk : model.output_norm;
-        ggml_tensor * head_out_w  = model_dsv4.output_trunk      ? model_dsv4.output_trunk      : model.output;
+        ggml_tensor * head_norm_w = model.output_norm ? model.output_norm : model_dsv4.output_norm_trunk;
+        ggml_tensor * head_out_w  = model.output      ? model.output      : model_dsv4.output_trunk;
 
         cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
         cb(cur, "result_norm", -1);

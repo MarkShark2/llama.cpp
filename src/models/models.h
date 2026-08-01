@@ -1219,6 +1219,15 @@ struct llama_model_deepseek4 : public llama_model_base {
     ggml_tensor * output_norm_trunk = nullptr;
     ggml_tensor * output_trunk      = nullptr;
 
+    // Duplicates of the hyper-connection collapse weights on the OUTPUT device,
+    // the mirror image of the trunk pair above. The originals are pinned to the
+    // last transformer layer so PipeDec body lanes stay on the pipeline; the SPD
+    // head is a separate context fed a boundary the host already holds, so for it
+    // the pin is backwards and costs a round trip per verified token.
+    ggml_tensor * hc_head_fn_out    = nullptr;
+    ggml_tensor * hc_head_base_out  = nullptr;
+    ggml_tensor * hc_head_scale_out = nullptr;
+
     struct graph : public llm_graph_context_dsv4_mla {
         graph(const llama_model & model, const llm_graph_params & params);
 

@@ -1458,6 +1458,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     RPC_STATUS_ASSERT(rpc_buffer_set_tensor_raw(buffer, tensor, data, offset, size));
 }
 
+// defined with the other wire-bf16 helpers, further down next to the async lanes
+static bool rpc_wire_bf16_ok(const ggml_tensor * tensor, uint64_t offset, size_t size);
+
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_get_tensor_req request;
@@ -1470,10 +1473,29 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     const bool trace = rpc_wire_trace_enabled();
     rpc_wire_ep_stat * st = trace ? rpc_wire_stat(ctx->endpoint) : nullptr;
     const int64_t t0 = trace ? ggml_time_us() : 0;
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    // [fork] GGML_RPC_WIRE_BF16 used to reach only the async lanes, so the one
+    // path that needs it most never saw it: SPD requires GGML_RPC_ASYNC=0, and
+    // then set/get_tensor_async both fall back here. On a 9-stage split every
+    // board answers its boundary read within about a millisecond of the others,
+    // so ~512 KiB lands on the head's single gigabit NIC in a burst each step --
+    // and board compute is steady to p99 while the step time is not. The server
+    // side of GET_TENSOR_BF16 has been deployed since the wire-bf16 branch.
+    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
+    bool status;
+    if (wire_bf16) {
+        std::vector<uint8_t> wire(size / 2);
+        status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_GET_TENSOR_BF16,
+                                      &request, sizeof(request), wire.data(), wire.size());
+        if (status) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
+                                  (float *) data, size / sizeof(float));
+        }
+    } else {
+        status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    }
     if (trace) {
         st->get_us    += (uint64_t) (ggml_time_us() - t0);
-        st->get_bytes += size;
+        st->get_bytes += wire_bf16 ? size / 2 : size;
         st->get_n     += 1;
         rpc_wire_trace_tick();
     }
