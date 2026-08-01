@@ -1793,6 +1793,7 @@ struct vk_op_flash_attn_sparse_push_constants {
     uint32_t i_s1, i_s3;
     uint32_t n_s3;
     uint32_t flags;
+    uint32_t k_num;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -10576,8 +10577,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // [fork] DSA sparse FA extension — declared in ggml.c, not in public headers
 extern "C" bool ggml_flash_attn_ext_is_sparse(const struct ggml_tensor * a);
 
-// query heads per workgroup in flash_attn_sparse.comp (HGRP*HPT there)
+// must match flash_attn_sparse.comp: HCHUNK (HGRP*HPT), TILE, DV
 #define FA_SPARSE_HCHUNK 32
+#define FA_SPARSE_TILE   32
+#define FA_SPARSE_DV     512
 
 static bool ggml_vk_fattn_sparse_supported(const vk_device_struct * device, const ggml_tensor * op) {
     const ggml_tensor * q    = op->src[0];
@@ -10649,6 +10652,37 @@ static void ggml_vk_flash_attn_sparse(ggml_backend_vk_context * ctx, vk_context&
     const uint32_t H  = (uint32_t) q->ne[2];
     const uint32_t ns = (uint32_t) q->ne[3];
 
+    // [fork] split-K. The base dispatch is one workgroup per (token, head chunk,
+    // stream), so at decode (T = ns = 1, H = 64, HCHUNK = 32) it is TWO
+    // workgroups — 512 threads, 8 waves, against 36 CUs x 4 SIMDs. Measured
+    // 63.6 GFLOPS/s where the same op on the dense path does 1375.9, and the
+    // shader's own header records 1.36 TFLOPS once it has tokens to spread.
+    // Splitting the row walk is the only way to make more work: shrinking the
+    // workgroup just redistributes the same 8 waves.
+    //
+    // Prefill already saturates, so k_num stays 1 there and that path is
+    // bit-identical to before (the tile loop degenerates to the original walk).
+    const uint32_t base_wg = T * CEIL_DIV(H, FA_SPARSE_HCHUNK) * ns;
+    const uint32_t n_tiles = CEIL_DIV((uint32_t) k->ne[1], FA_SPARSE_TILE) +
+                             CEIL_DIV((uint32_t) idx->ne[0], FA_SPARSE_TILE);
+
+    uint32_t k_num = 1;
+    if (ctx->device->shader_core_count > 0 && base_wg < 2*ctx->device->shader_core_count) {
+        k_num = std::min(2*ctx->device->shader_core_count / base_wg, n_tiles);
+        k_num = std::max(k_num, 1u);
+    }
+
+    // reduce input: all O matrices [DV, n_head, k, T, ns], then L/M [n_head*2, k, T, ns]
+    const uint64_t split_k_size = k_num > 1
+        ? (uint64_t)(FA_SPARSE_DV*H*sizeof(float) + H*sizeof(float)*2) * k_num * T * ns : 0;
+    if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
+        k_num = 1;
+    }
+    if (k_num > 1 && ctx->prealloc_size_split_k < split_k_size) {
+        ctx->prealloc_size_split_k = split_k_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
@@ -10668,6 +10702,7 @@ static void ggml_vk_flash_attn_sparse(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t)(idx->nb[1]/ts_i), (uint32_t)(idx->nb[3]/ts_i),
         (uint32_t)(nvis->nb[3]/ts_i),
         (uint32_t)((mask ? 1u : 0u) | (sinks ? 2u : 0u)),
+        k_num,
     };
 
     vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
@@ -10679,13 +10714,41 @@ static void ggml_vk_flash_attn_sparse(ggml_backend_vk_context * ctx, vk_context&
     vk_subbuffer nvis_buf = ggml_vk_tensor_subbuffer(ctx, nvis);
     vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
 
-    // one workgroup per (query token, head chunk, stream); wg_denoms = {1,1,1}.
+    // one workgroup per (query token, head chunk, stream x split); wg_denoms = {1,1,1}.
     // FA_SPARSE_HCHUNK must match HCHUNK in flash_attn_sparse.comp.
-    std::array<uint32_t, 3> elements = { T, (H + FA_SPARSE_HCHUNK - 1)/FA_SPARSE_HCHUNK, ns };
+    std::array<uint32_t, 3> elements = { T, CEIL_DIV(H, FA_SPARSE_HCHUNK), ns*k_num };
 
+    if (k_num == 1) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {q_buf, k_buf, m_buf, s_buf, kc_buf, idx_buf, nvis_buf, dst_buf},
+            pc, elements);
+        return;
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    // partials go to the scratch buffer in place of dst
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {q_buf, k_buf, m_buf, s_buf, kc_buf, idx_buf, nvis_buf, dst_buf},
+        {q_buf, k_buf, m_buf, s_buf, kc_buf, idx_buf, nvis_buf, split_k_buf},
         pc, elements);
+
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // dst is [DV, n_head, T, ns], so the reduce's (ne1, ne2, ne3) = (H, T, ns)
+    // and its per-row sink index is the head — the same convention it uses on
+    // the dense path.
+    const vk_op_flash_attn_split_k_reduce_push_constants pc2 = {
+        FA_SPARSE_DV, H, T, ns, k_num, (sinks != nullptr)
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+        {split_k_buf, s_buf, dst_buf},
+        pc2, { H, FA_SPARSE_DV, T*ns });
+    ctx->prealloc_split_k_need_sync = true;
 }
 
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {

@@ -80,6 +80,7 @@ layout (push_constant) uniform parameter {
     uint  i_s3;
     uint  n_s3;       // nvis stream stride in elements
     uint  flags;      // bit 0: has mask, bit 1: has sinks
+    uint  k_num;      // split-K: number of row splits (1 = write dst directly)
 } p;
 
 shared f16vec4 Kt[TILE][D4];
@@ -90,8 +91,10 @@ shared uint    row_src4[TILE];
 void main() {
     const uint t   = gl_WorkGroupID.x;   // query token
     const uint hc  = gl_WorkGroupID.y;   // head chunk
-    const uint s   = gl_WorkGroupID.z;   // stream
+    const uint s   = gl_WorkGroupID.z/p.k_num;   // stream
+    const uint ks  = gl_WorkGroupID.z%p.k_num;   // split-K index
     const uint T   = gl_NumWorkGroups.x;
+    const uint ns  = gl_NumWorkGroups.z/p.k_num;
 
     const uint tid  = gl_LocalInvocationID.x;
     const uint hg   = tid / TPH;
@@ -153,7 +156,10 @@ void main() {
     const uint n_tiles_gather = (p.n_idx    + TILE - 1)/TILE;
     const uint n_tiles        = n_tiles_dense + n_tiles_gather;
 
-    [[dont_unroll]] for (uint tile = 0; tile < n_tiles; ++tile) {
+    // split-K: this workgroup takes every k_num'th tile. Strided rather than
+    // blocked so a split never draws only dense or only gathered tiles (they
+    // cost differently), and so k_num == 1 is exactly the original walk.
+    [[dont_unroll]] for (uint tile = ks; tile < n_tiles; tile += p.k_num) {
         const bool gather = tile >= n_tiles_dense;
         const uint base   = gather ? (tile - n_tiles_dense)*TILE : tile*TILE;
         const uint limit  = gather ? p.n_idx : p.ne_dense;
@@ -295,6 +301,34 @@ void main() {
             }
         }
         barrier();
+    }
+
+    if (p.k_num > 1u) {
+        // Split-K: hand the raw running state to flash_attn_split_k_reduce,
+        // which owns the cross-split rescale, the sinks and the 1/L. Layout is
+        // that shader's, with D=DV, ne1=n_head, ne2=T, ne3=ns: all O matrices
+        // first as [DV, n_head, k, T, ns], then L/M as [n_head*2, k, T, ns].
+        const uint slot    = ks + p.k_num*(t + T*s);
+        const uint lm_base = DV*p.n_head*T*ns*p.k_num + p.n_head*2u*slot;
+
+        [[unroll]] for (uint u = 0; u < HPT; ++u) {
+            if (!h_ok[u]) {
+                continue;
+            }
+            const uint o_base = DV*p.n_head*slot + DV*hh[u];
+            [[unroll]] for (uint i = 0; i < V4; ++i) {
+                const uint d0 = (i*TPH + lane)*4;
+                [[unroll]] for (uint c = 0; c < 4; ++c) {
+                    data_o[o_base + d0 + c] = Or[u][4*i + c];
+                }
+            }
+            // M_run/L_run are identical across the head's TPH lanes
+            if (lane == 0u) {
+                data_o[lm_base              + hh[u]] = L_run[u];
+                data_o[lm_base + p.n_head   + hh[u]] = M_run[u];
+            }
+        }
+        return;
     }
 
     // dst is contiguous f32 [DV, n_head, T, ns]
