@@ -1839,6 +1839,15 @@ struct common_spd_pipeline::impl {
         result.accepted.push_back(true);
         result.n_accepted = 1;
 
+        // Stop at end-of-generation like every other decode path. Without this
+        // the loop runs to n_predict exactly, and a client that sends no
+        // max_tokens gets n_predict = the whole remaining context -- 131k
+        // tokens on a 128k config, hours of decoding after the model already
+        // emitted EOS, with nothing streamed because the server only walks
+        // result.tokens once generate() returns.
+        const llama_vocab * vocab_target = llama_model_get_vocab(model_target);
+        int32_t n_final = n_predict;
+
         std::vector<entry> pipeline;
         pipeline.push_back(make_entry(first_token, n_prompt, std::move(first_embedding)));
         llama_pos next_position = n_prompt + 1;
@@ -1848,7 +1857,10 @@ struct common_spd_pipeline::impl {
         bool has_prev_evicted = false;
 
         const auto decode_start = clock_type::now();
-        while (verified_up_to - n_prompt < n_predict) {
+        if (llama_vocab_is_eog(vocab_target, first_token)) {
+            n_final = 1;
+        }
+        while (verified_up_to - n_prompt < n_final) {
             scope_timer step_timer(timing.step_total);
             ++result.decode_steps;
 
@@ -1996,6 +2008,11 @@ struct common_spd_pipeline::impl {
                         result.accepted.push_back(false);
                         ++result.n_rejected;
 
+                        if (llama_vocab_is_eog(vocab_target, verified_token)) {
+                            n_final = generated_index + 1;
+                            break;
+                        }
+
                         {
                             scope_timer rollback_timer(timing.rollback);
                             if (!rollback(target_pos)) {
@@ -2021,6 +2038,11 @@ struct common_spd_pipeline::impl {
 
                     ++result.n_accepted;
                     verified_up_to = target_pos + 1;
+
+                    if (llama_vocab_is_eog(vocab_target, verified_token)) {
+                        n_final = generated_index + 1;
+                        break;
+                    }
                 }
 
                 prev_evicted = std::move(completed_entry.snap);
@@ -2137,8 +2159,8 @@ struct common_spd_pipeline::impl {
                         gap_steps > 0 ? 1e3*gap_total/(double) gap_steps : 0.0);
             }
         }
-        result.tokens.resize(n_predict);
-        result.accepted.resize(n_predict);
+        result.tokens.resize(n_final);
+        result.accepted.resize(n_final);
         return true;
     }
 };
