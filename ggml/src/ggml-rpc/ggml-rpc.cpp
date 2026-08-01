@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -427,6 +428,71 @@ static void rpc_cmd_stats_add(enum rpc_cmd cmd, size_t bytes) {
         fprintf(stderr, "[rpc cmd stats]%s\n", buf);
         fflush(stderr);
     }
+}
+
+// [fork] per-endpoint wall accounting for the decode hot path, GGML_RPC_WIRE_TRACE=1.
+//
+// In the synchronous path (GGML_RPC_ASYNC=0) a stage's llama_decode is three
+// distinct things on one ordered socket: upload the graph inputs (SET), submit
+// the graph (fire-and-forget, no response), then read the output back (GET).
+// Only the GET blocks, and it blocks across the whole remote compute -- so
+// splitting set/submit/get separates "we are talking to the device" from "the
+// device is working", which the per-stage timers upstack cannot distinguish.
+// Bytes ride along so wire time can be divided out against the link rate.
+struct rpc_wire_ep_stat {
+    std::atomic<uint64_t> set_n{0}, set_us{0}, set_bytes{0};
+    std::atomic<uint64_t> get_n{0}, get_us{0}, get_bytes{0};
+    std::atomic<uint64_t> gc_n{0},  gc_us{0};
+};
+
+static bool rpc_wire_trace_enabled() {
+    static const bool enabled = []{
+        const char * e = std::getenv("GGML_RPC_WIRE_TRACE");
+        return e && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static std::mutex g_wire_stat_m;
+static std::map<std::string, std::unique_ptr<rpc_wire_ep_stat>> g_wire_stats;
+
+static rpc_wire_ep_stat * rpc_wire_stat(const std::string & endpoint) {
+    std::lock_guard<std::mutex> l(g_wire_stat_m);
+    auto it = g_wire_stats.find(endpoint);
+    if (it != g_wire_stats.end()) {
+        return it->second.get();
+    }
+    auto s = std::make_unique<rpc_wire_ep_stat>();
+    rpc_wire_ep_stat * ptr = s.get();
+    g_wire_stats[endpoint] = std::move(s);
+    return ptr;
+}
+
+// printed every ~5s from whichever thread finishes an op next
+static void rpc_wire_trace_tick() {
+    static std::atomic<int64_t> t_print{0};
+    const int64_t now = ggml_time_us();
+    int64_t prev = t_print.load();
+    if (now - prev <= 5*1000*1000 || !t_print.compare_exchange_strong(prev, now)) {
+        return;
+    }
+    const double window_s = prev == 0 ? 0.0 : (now - prev)/1e6;
+    std::lock_guard<std::mutex> l(g_wire_stat_m);
+    for (auto & kv : g_wire_stats) {
+        rpc_wire_ep_stat & s = *kv.second;
+        const uint64_t set_n = s.set_n.exchange(0), set_us = s.set_us.exchange(0), set_b = s.set_bytes.exchange(0);
+        const uint64_t get_n = s.get_n.exchange(0), get_us = s.get_us.exchange(0), get_b = s.get_bytes.exchange(0);
+        const uint64_t gc_n  = s.gc_n.exchange(0),  gc_us  = s.gc_us.exchange(0);
+        if (set_n == 0 && get_n == 0 && gc_n == 0) {
+            continue;
+        }
+        fprintf(stderr, "[rpc wire] %-22s win=%.1fs | set n=%llu %.2fms %.1fMB | submit n=%llu %.2fms | get n=%llu %.2fms %.1fMB\n",
+                kv.first.c_str(), window_s,
+                (unsigned long long) set_n, set_n ? set_us/1e3/(double) set_n : 0.0, set_b/1e6,
+                (unsigned long long) gc_n,  gc_n  ? gc_us /1e3/(double) gc_n  : 0.0,
+                (unsigned long long) get_n, get_n ? get_us/1e3/(double) get_n : 0.0, get_b/1e6);
+    }
+    fflush(stderr);
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -1206,6 +1272,16 @@ static bool rpc_buffer_set_tensor_raw(
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+    if (rpc_wire_trace_enabled()) {
+        rpc_wire_ep_stat * st = rpc_wire_stat(ctx->endpoint);
+        const int64_t t0 = ggml_time_us();
+        bool ok = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+        st->set_us    += (uint64_t) (ggml_time_us() - t0);
+        st->set_bytes += input.size();
+        st->set_n     += 1;
+        rpc_wire_trace_tick();
+        return ok;
+    }
     return send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
 }
 
@@ -1254,7 +1330,19 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
+    // this is the blocking point of a synchronous stage decode: the server
+    // answers only after every command queued ahead of it -- including the
+    // graph -- has run, so this call's wall time is remote compute + wire.
+    const bool trace = rpc_wire_trace_enabled();
+    rpc_wire_ep_stat * st = trace ? rpc_wire_stat(ctx->endpoint) : nullptr;
+    const int64_t t0 = trace ? ggml_time_us() : 0;
     bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    if (trace) {
+        st->get_us    += (uint64_t) (ggml_time_us() - t0);
+        st->get_bytes += size;
+        st->get_n     += 1;
+        rpc_wire_trace_tick();
+    }
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1719,6 +1807,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     const std::string endpoint = rpc_ctx->endpoint;
     const uint32_t device = rpc_ctx->device;
     const bool async = rpc_async_enabled();
+
+    const bool wire_trace = rpc_wire_trace_enabled();
+    rpc_wire_ep_stat * wire_st = wire_trace ? rpc_wire_stat(endpoint) : nullptr;
+    const int64_t wire_t0 = wire_trace ? ggml_time_us() : 0;
+    struct wire_submit_scope {
+        rpc_wire_ep_stat * st; int64_t t0;
+        ~wire_submit_scope() {
+            if (st != nullptr) {
+                st->gc_us += (uint64_t) (ggml_time_us() - t0);
+                st->gc_n  += 1;
+            }
+        }
+    } wire_scope { wire_st, wire_t0 };
 
     // LRU over the uids the server holds deserialized for this device. A hit
     // means the server can recompute without a serialize/deserialize round.
