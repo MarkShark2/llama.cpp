@@ -1832,6 +1832,14 @@ void llama_kv_cache_dsv4_comp_context::set_input_k_rot(ggml_tensor * dst) const 
     kv->set_input_k_rot(dst);
 }
 
+ggml_tensor * llama_kv_cache_dsv4_comp_context::dev_k_rot(int32_t il) const {
+    return kv->dev_k_rot(il);
+}
+
+bool llama_kv_cache_dsv4_comp_context::has_dev_rot() const {
+    return kv->has_dev_rot();
+}
+
 //
 // llama_kv_cache_dsv4_context
 //

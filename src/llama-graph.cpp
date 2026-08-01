@@ -3157,6 +3157,18 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
 
+ggml_tensor * llm_graph_input_dsv4::get_csa_k_rot(int32_t il) const {
+    return inp_csa.k_rot ? inp_csa.k_rot : mctx->get_csa()->dev_k_rot(il);
+}
+
+ggml_tensor * llm_graph_input_dsv4::get_hca_k_rot(int32_t il) const {
+    return inp_hca.k_rot ? inp_hca.k_rot : mctx->get_hca()->dev_k_rot(il);
+}
+
+ggml_tensor * llm_graph_input_dsv4::get_lid_k_rot(int32_t il) const {
+    return inp_lid.k_rot ? inp_lid.k_rot : mctx->get_lid()->dev_k_rot(il);
+}
+
 llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
     const auto * raw_ctx  = mctx_cur->get_raw();
@@ -3177,9 +3189,15 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
     dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
     dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
-    inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
-    inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
-    inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+    // prefer the cache-resident rotations (see llama_kv_cache::dev_k_rot). The
+    // lightning indexer forces attn_rot_k on regardless of K-cache type, so on
+    // DSV4 this input fired every eval: a 128x128 f32 constant, 64 KiB per
+    // stage per decode step, 41% of all bytes uploaded to a stage whose graph
+    // is a 98% cache hit. Null here means "ask the cache per layer" -- see
+    // get_csa_k_rot/get_lid_k_rot and their use in models/deepseek4.cpp.
+    inp->inp_csa.k_rot = mctx_cur->get_csa()->has_dev_rot() ? nullptr : mctx_cur->get_csa()->build_input_k_rot(ctx0);
+    inp->inp_hca.k_rot = mctx_cur->get_hca()->has_dev_rot() ? nullptr : mctx_cur->get_hca()->build_input_k_rot(ctx0);
+    inp->inp_lid.k_rot = mctx_cur->get_lid()->has_dev_rot() ? nullptr : mctx_cur->get_lid()->build_input_k_rot(ctx0);
 
     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
 }

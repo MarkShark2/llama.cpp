@@ -253,6 +253,13 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 
+    // device-resident constant rotation (see llama_kv_cache::dev_k_rot). The
+    // DSV4 lightning indexer forces attn_rot_k on even with an f16 K-cache, so
+    // without this its 128x128 hadamard was re-uploaded as a graph input on
+    // every eval -- 64 KiB per stage per decode step over RPC.
+    ggml_tensor * dev_k_rot(int32_t il) const;
+    bool has_dev_rot() const;
+
 private:
     llama_kv_cache * kv;
 

@@ -556,6 +556,14 @@ public:
     const comp_input & get_hca() const { return inp_hca; }
     const comp_input & get_lid() const { return inp_lid; }
 
+    // A comp_input's k_rot is null when the cache holds a device-resident copy
+    // of the constant, which the graph must then reference per layer (the
+    // rotation lives in the layer's own buffer type). Mirrors the plain-KV
+    // path in build_attn_mha.
+    ggml_tensor * get_csa_k_rot(int32_t il) const;
+    ggml_tensor * get_hca_k_rot(int32_t il) const;
+    ggml_tensor * get_lid_k_rot(int32_t il) const;
+
     std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw;
 
     comp_input inp_csa;
