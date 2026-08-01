@@ -336,9 +336,49 @@ struct common_spd_pipeline::impl {
         bool dead  = false;               // route refused or a transfer failed
         int32_t  pushed_chunk = -1;       // last chunk delivered by push
         int32_t  consumed_chunk = -1;     // last chunk the consumer finished
+
+        // Decode twins. A decode step moves one token, so the prefill staging
+        // pair (a full n_batch chunk, 16 MiB) is the wrong shape: the push
+        // requires ggml_nbytes(src) == ggml_nbytes(dst). `inp_dec` is a
+        // 1-token alias of the persistent boundary's first column -- the
+        // on-server copy target, since a 1-token graph reads column 0.
+        //
+        // The slot is chosen by the *entry position*, not a step counter:
+        // adjacent stages hold entries whose positions differ by one, so
+        // parity alone keeps the producer and consumer off the same slot, and
+        // a stale slot cannot be mistaken for a live one after a rejection
+        // resets the pipeline (`pushed_pos` is cleared there as well, because
+        // a refill can legitimately reissue the same positions).
+        ggml_tensor * staging_dec[2] = { nullptr, nullptr };
+        ggml_tensor * inp_dec = nullptr;
+        uint64_t  dec_ordinals[2] = { 0, 0 };
+        llama_pos pushed_pos[2] = { -1, -1 };
+        bool dec_ready = false;
     };
     std::array<peer_boundary, SPD_MAX_STAGE_COUNT> peer_links;
     bool peer_boundaries_enabled = false;
+    // per-producing-stage: a decode push is outstanding, so this stage's next
+    // graph must be ordered behind the push's read of the output tensor.
+    //
+    // A flag, not the tensor: ggml_backend_rpc_sync_peer_guard only needs the
+    // tensor to find its *endpoint*, and holding the previous step's t_embd
+    // across steps is a use-after-free -- a graph rebuild (~25 of 1567 steps
+    // here) frees it, and the guard then reads a dead tensor, resolves no
+    // endpoint, and silently skips the fence. The producer's next graph then
+    // overwrites the boundary while the push is still reading it, which shows
+    // up as a rare, nondeterministic wrong token. Derive the probe fresh.
+    std::array<bool, SPD_MAX_STAGE_COUNT> peer_push_pending = {};
+
+    // A rejection clears the pipeline and refills from the verified position,
+    // so positions already delivered can be reissued with different hidden
+    // states. Anything still sitting in a staging slot is stale by definition.
+    void peer_decode_invalidate() {
+        for (auto & pb : peer_links) {
+            pb.pushed_pos[0] = -1;
+            pb.pushed_pos[1] = -1;
+        }
+        peer_push_pending.fill(false);
+    }
 
     struct phase_timing {
         double prepare = 0.0;
@@ -370,6 +410,9 @@ struct common_spd_pipeline::impl {
         std::array<double, SPD_MAX_STAGE_COUNT> prefill_peer_in = {};
         std::array<double, SPD_MAX_STAGE_COUNT> prefill_push = {};
         std::array<uint64_t, SPD_MAX_STAGE_COUNT> prefill_pushes = {};
+        // decode-side peer boundary: pushes issued per producing stage. A zero
+        // here with LLAMA_SPD_PEER=1 means the pair fell back to the hairpin.
+        std::array<uint64_t, SPD_MAX_STAGE_COUNT> decode_pushes = {};
         // busy time and call count bucketed by how many stages ran in the step
         std::array<std::array<double, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> busy_by_active = {};
         std::array<std::array<uint64_t, SPD_MAX_STAGE_COUNT + 1>, SPD_MAX_STAGE_COUNT> calls_by_active = {};
@@ -1128,18 +1171,39 @@ struct common_spd_pipeline::impl {
         }
         bool ok = why == nullptr;
         if (ok && pb.staging[0] == nullptr) {
-            ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+            ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
             pb.staging_ctx = ggml_init(ip);
             ggml_tensor * st0 = pb.staging_ctx == nullptr ? nullptr :
                     ggml_new_tensor_2d(pb.staging_ctx, GGML_TYPE_F32, inp->ne[0], inp->ne[1]);
             ggml_tensor * st1 = st0 == nullptr ? nullptr :
                     ggml_new_tensor_2d(pb.staging_ctx, GGML_TYPE_F32, inp->ne[0], inp->ne[1]);
-            pb.staging_buf = st1 == nullptr ? nullptr :
+            // decode-sized twins + the 1-token destination alias. The alias is
+            // a view, so ggml_backend_alloc_ctx_tensors_from_buft binds it to
+            // the boundary's own buffer instead of giving it storage.
+            ggml_tensor * dec0 = st1 == nullptr ? nullptr :
+                    ggml_new_tensor_2d(pb.staging_ctx, GGML_TYPE_F32, inp->ne[0], 1);
+            ggml_tensor * dec1 = dec0 == nullptr ? nullptr :
+                    ggml_new_tensor_2d(pb.staging_ctx, GGML_TYPE_F32, inp->ne[0], 1);
+            ggml_tensor * dec_dst = dec1 == nullptr ? nullptr :
+                    ggml_view_2d(pb.staging_ctx, inp, inp->ne[0], 1, inp->nb[1], 0);
+            pb.staging_buf = dec_dst == nullptr ? nullptr :
                     ggml_backend_alloc_ctx_tensors_from_buft(pb.staging_ctx,
                             ggml_backend_buffer_get_type(inp->buffer));
             if (pb.staging_buf != nullptr) {
                 pb.staging[0] = st0;
                 pb.staging[1] = st1;
+                pb.staging_dec[0] = dec0;
+                pb.staging_dec[1] = dec1;
+                pb.inp_dec        = dec_dst;
+                pb.dec_ready = dec_dst->buffer != nullptr && dec_dst->data != nullptr &&
+                               ggml_nbytes(dec_dst) == ggml_nbytes(dec0);
+                if (!pb.dec_ready) {
+                    // decode keeps working on the hairpin, but silently: say so
+                    fprintf(stderr, "SPD peer: stage %u decode boundary unavailable "
+                            "(alias buffer=%p data=%p nbytes=%zu vs %zu)\n", stage,
+                            (void *) dec_dst->buffer, dec_dst->data,
+                            ggml_nbytes(dec_dst), ggml_nbytes(dec0));
+                }
             } else {
                 if (pb.staging_ctx != nullptr) {
                     ggml_free(pb.staging_ctx);
@@ -1461,6 +1525,51 @@ struct common_spd_pipeline::impl {
         timing.stage_lock[stage] += std::chrono::duration<double>(start - lock_start).count();
         ++timing.stage_calls[stage];
 
+        // [fork] Direct stage-to-stage boundary transfer during decode.
+        //
+        // Without this the hyper-connection-wide residual makes a round trip
+        // through the client every step: 64 KiB read off this stage, 64 KiB
+        // written back up to the next one, over the head's single NIC and
+        // serialized against every other stage doing the same. The push moves
+        // it board-to-board instead, and the consumer skips the upload.
+        //
+        // The readback stays: this stage's end-of-stage anchor tap is the
+        // stream mean of the boundary and the sidecar needs it one step before
+        // the next stage would capture it at its own input.
+        //
+        // Records belong to the CONSUMING stage, so `stage`'s inbound link is
+        // peer_links[stage] and its outbound one is peer_links[stage + 1].
+        peer_boundary * pb_in  = peer_boundaries_enabled && stage > 0
+                ? &peer_links[stage] : nullptr;
+        peer_boundary * pb_out = peer_boundaries_enabled && stage + 1 < stage_count
+                ? &peer_links[stage + 1] : nullptr;
+        const int slot = (int) (item.pos & 1);
+
+        // Order this stage's next graph behind the previous push's read of the
+        // output tensor -- the graph below overwrites exactly that tensor. The
+        // probe only names the endpoint, so the live previous-graph output
+        // works and nothing has to survive a rebuild.
+        if (peer_push_pending[stage]) {
+            ggml_tensor * probe = llama_spd_peer_out_tensor(stages[stage]);
+            if (probe == nullptr || !ggml_backend_rpc_sync_peer_guard(probe)) {
+                error = "SPD peer guard failed for decode stage " + std::to_string(stage);
+                return false;
+            }
+            peer_push_pending[stage] = false;
+        }
+
+        const bool peer_in = pb_in != nullptr && pb_in->ready && pb_in->dec_ready &&
+                             !pb_in->dead && pb_in->pushed_pos[slot] == item.pos;
+        if (peer_in) {
+            // stall the endpoint's command loop until the push landed, then
+            // move it from staging into the boundary the graph reads
+            if (!ggml_backend_rpc_sync_peer_fence(pb_in->staging_dec[slot], pb_in->dec_ordinals[slot])) {
+                error = "SPD peer fence failed for decode stage " + std::to_string(stage);
+                return false;
+            }
+            ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
+        }
+
         if (!light_rollback) {
             const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
             const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
@@ -1482,10 +1591,40 @@ struct common_spd_pipeline::impl {
 
         const llama_token * token = stage == 0 ? &item.token : nullptr;
         const float * embd = stage == 0 ? nullptr : item.hidden.data();
-        if (!decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
+        llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ false);
+        const bool decoded = decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
                 static_decode_fast_path ? &stage_decode_batches[stage] : nullptr,
-                &timing.stage_decode[stage], &timing.stage_read[stage])) {
+                &timing.stage_decode[stage], &timing.stage_read[stage]);
+        llama_set_spd_peer_io(stages[stage], false, false);
+        if (!decoded) {
             return false;
+        }
+        if (peer_in && llama_spd_peer_inp_tensor(stages[stage]) != pb_in->inp) {
+            // a rebuild would have read a different tensor than the copy
+            // filled, so that step would be garbage -- surface it loudly
+            error = "SPD peer boundary input tensor moved under decode stage " + std::to_string(stage);
+            return false;
+        }
+
+        // Producer side: ship this boundary straight to the next stage's
+        // staging slot. Issued before the host-side tap maths below so the
+        // transfer overlaps it. A failure is not fatal -- clearing `dead`
+        // ownership on the link puts the pair back on the host path for good.
+        if (pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead) {
+            ggml_tensor * out  = llama_spd_peer_out_tensor(stages[stage]);
+            ggml_tensor * dst  = pb_out->staging_dec[slot];
+            uint64_t ordinal = 0;
+            if (out != nullptr && ggml_nbytes(out) == ggml_nbytes(dst) &&
+                ggml_backend_rpc_sync_peer_push(out, dst, &ordinal)) {
+                pb_out->dec_ordinals[slot] = ordinal;
+                pb_out->pushed_pos[slot]   = item.pos;
+                peer_push_pending[stage]   = true;
+                ++timing.decode_pushes[stage];
+            } else {
+                pb_out->dead = true;
+                fprintf(stderr, "SPD peer: decode push %u -> %u failed, staying on the host path\n",
+                        stage, stage + 1);
+            }
         }
         if (static_decode_fast_path) {
             item.hidden.swap(output);
@@ -1579,6 +1718,25 @@ struct common_spd_pipeline::impl {
             llama_synchronize(sidecar);
             llama_set_stable_host_inputs(sidecar, true);
         }
+
+        // Decode-side peer boundaries do not inherit prefill's setup: a prompt
+        // shorter than one n_batch chunk never takes prefill's peer path at all
+        // (it needs count == chunk_size), so nothing would ever be allocated
+        // and every decode step would quietly stay on the hairpin. The input
+        // tensor a decode push targets is the context's persistent boundary,
+        // which exists from context creation, so setup needs no prior decode.
+        // Safe on this thread: prefill's workers have joined and the stage
+        // threads have not started.
+        if (peer_boundaries_enabled) {
+            std::mutex setup_mutex;
+            for (uint32_t stage = 1; stage < stage_count; ++stage) {
+                peer_boundary & pb = peer_links[stage];
+                if (!pb.ready && !pb.dead) {
+                    setup_peer_boundary(pb, stage, setup_mutex);
+                }
+            }
+        }
+        peer_decode_invalidate();
 
         std::map<llama_pos, snapshot> completed;
         const int32_t retained_begin = std::max(0, n_prompt - (int32_t) stage_count + 1);
@@ -1767,6 +1925,7 @@ struct common_spd_pipeline::impl {
                             return false;
                         }
                         pipeline.clear();
+                        peer_decode_invalidate();
                         pipeline.push_back(make_entry(verified_token, target_pos, std::move(corrected_embedding)));
                         next_position = target_pos + 1;
                         verified_up_to = target_pos + 1;
@@ -1836,10 +1995,11 @@ struct common_spd_pipeline::impl {
                 }
                 fprintf(stderr,
                         "SPD timing: stage %u: busy %.2fs/%" PRIu64 " calls (%.1f ms/call) | "
-                        "decode %.2fs | read %.2fs | lock-wait %.2fs | graphs_reused %d\n",
+                        "decode %.2fs | read %.2fs | lock-wait %.2fs | peer-push %" PRIu64 " | graphs_reused %d\n",
                         stage, timing.stage_busy[stage], timing.stage_calls[stage],
                         1e3*timing.stage_busy[stage]/(double) timing.stage_calls[stage],
                         timing.stage_decode[stage], timing.stage_read[stage], timing.stage_lock[stage],
+                        timing.decode_pushes[stage],
                         llama_perf_context(stages[stage]).n_reused);
             }
             fprintf(stderr, "SPD timing: graphs_reused sidecar %d | head %d | embed %d\n",

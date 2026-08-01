@@ -2209,11 +2209,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     // creating a per-graph input: the scheduler then neither stages the rows
     // on the CPU nor re-uploads them per eval, and a peer push can deliver
     // them board-to-board
-    // multi-token batches only: peer boundaries are a prefill mechanism, and
-    // keeping 1-token decode graphs on the classic input path keeps decode
-    // bitwise identical to the non-peer build
+    // Decode uses this too. A 1-token stage graph was re-uploading the whole
+    // hyper-connection-wide boundary (64 KiB) to its endpoint on every step,
+    // the largest per-eval upload left once the constant rotations went
+    // cache-resident. The rows themselves are unchanged either way -- with no
+    // peer push the host still writes them, just into the persistent tensor
+    // instead of a per-graph input -- so decode stays bitwise identical.
     ggml_tensor * boundary = cparams.spd_boundary_inp;
-    if (boundary != nullptr && !ubatch.token && ubatch.n_tokens > 1 &&
+    if (boundary != nullptr && !ubatch.token &&
         boundary->ne[0] == n_embd_inp && boundary->ne[1] >= (int64_t) ubatch.n_tokens) {
         inp->embd = boundary;
         inp->persistent_embd = true;

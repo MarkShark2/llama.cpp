@@ -532,27 +532,123 @@ static void rpc_wire_trace_tick() {
     fflush(stderr);
 }
 
+// [fork] Client-side write coalescing on the ordered command socket.
+//
+// A command frame is three send_data() calls -- cmd byte, size, payload -- so a
+// DSV4 SPD stage graph, which stages ~23 inputs per eval (about 20 of them 1x1
+// index scalars costing ~308 bytes each), spends ~70 blocking socket writes and
+// the same number of reads in the server's command loop to move ~100 KB. The
+// cost of a per-eval upload is dominated by the *command*, not the bytes:
+// removing one 64 KiB constant was worth 2.3 ms of stage latency against 0.56 ms
+// of link time, and 3.7 ms on a loopback stage that has no network at all.
+//
+// Frames that expect no response are appended to a per-socket buffer and leave
+// as one write. Ordering is exact: bytes are appended in call order, and the
+// buffer is flushed before anything reads from the socket. Graph submissions
+// append and flush immediately -- they are fire-and-forget, so a pending one
+// would leave the remote idle until some unrelated call happened along.
+//
+// Set GGML_RPC_SEND_COALESCE=0 to send frame-per-write again (the A/B control).
+static constexpr size_t RPC_SEND_COALESCE_MAX_PAYLOAD = 256*1024;
+static constexpr size_t RPC_SEND_COALESCE_FLUSH_AT    = 1024*1024;
+
+struct rpc_send_queue {
+    std::mutex m;
+    std::vector<uint8_t> pending;
+};
+
+static std::mutex g_send_queue_map_m;
+static std::unordered_map<socket_t *, std::unique_ptr<rpc_send_queue>> g_send_queues;
+
+// This sits on the path of every command, so it must not take a process-global
+// lock in the common case: a stage thread talks to one endpoint, so a one-entry
+// thread-local cache hits essentially always. Entries are never erased, and the
+// map is node-based, so the raw pointer stays valid for the process lifetime.
+static rpc_send_queue * rpc_send_queue_for(socket_t * key) {
+    static thread_local socket_t       * last_key = nullptr;
+    static thread_local rpc_send_queue * last_q   = nullptr;
+    if (key == last_key && last_q != nullptr) {
+        return last_q;
+    }
+    std::lock_guard<std::mutex> l(g_send_queue_map_m);
+    auto & slot = g_send_queues[key];
+    if (slot == nullptr) {
+        slot = std::make_unique<rpc_send_queue>();
+    }
+    last_key = key;
+    last_q   = slot.get();
+    return last_q;
+}
+
+static bool rpc_send_coalesce_enabled() {
+    static const bool enabled = []{
+        const char * e = std::getenv("GGML_RPC_SEND_COALESCE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// caller holds q.m
+static bool rpc_send_flush_locked(const socket_ptr & sock, rpc_send_queue & q) {
+    if (q.pending.empty()) {
+        return true;
+    }
+    const bool ok = sock->send_data(q.pending.data(), q.pending.size());
+    q.pending.clear();
+    return ok;
+}
+
+// caller holds q.m -- appends one frame and sends the buffer when it must not
+// be left pending
+static bool rpc_send_frame_locked(
+        const socket_ptr & sock, rpc_send_queue & q,
+        enum rpc_cmd cmd, const void * input, size_t input_size, bool flush) {
+    const uint8_t cmd_byte = cmd;
+    const uint64_t size64  = input_size;
+    const size_t   base    = q.pending.size();
+    q.pending.resize(base + sizeof(cmd_byte) + sizeof(size64) + input_size);
+    uint8_t * dst = q.pending.data() + base;
+    memcpy(dst, &cmd_byte, sizeof(cmd_byte));
+    dst += sizeof(cmd_byte);
+    memcpy(dst, &size64, sizeof(size64));
+    dst += sizeof(size64);
+    if (input_size > 0) {
+        memcpy(dst, input, input_size);
+    }
+    if (flush || q.pending.size() >= RPC_SEND_COALESCE_FLUSH_AT) {
+        return rpc_send_flush_locked(sock, q);
+    }
+    return true;
+}
+
+// a frame that must go out now: everything the remote could be left waiting on,
+// plus anything too large to be worth staging through the buffer
+static bool rpc_send_must_flush(enum rpc_cmd cmd, size_t input_size) {
+    return !rpc_send_coalesce_enabled() ||
+           input_size > RPC_SEND_COALESCE_MAX_PAYLOAD ||
+           cmd == RPC_CMD_GRAPH_COMPUTE ||
+           cmd == RPC_CMD_GRAPH_RECOMPUTE;
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     rpc_cmd_stats_add(cmd, input_size);
-    uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!sock->send_data(input, input_size)) {
-        return false;
-    }
-    return true;
+    rpc_send_queue * q = rpc_send_queue_for(sock.get());
+    std::lock_guard<std::mutex> l(q->m);
+    return rpc_send_frame_locked(sock, *q, cmd, input, input_size,
+            rpc_send_must_flush(cmd, input_size));
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+    rpc_cmd_stats_add(cmd, input_size);
+    // the send and the matching read are one transaction: nothing else may put
+    // bytes on this socket between them
+    rpc_send_queue * q = rpc_send_queue_for(sock.get());
+    std::lock_guard<std::mutex> l(q->m);
+    if (!rpc_send_frame_locked(sock, *q, cmd, input, input_size, /*flush =*/ true)) {
         return false;
     }
     uint64_t out_size;
@@ -1609,6 +1705,14 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    // NOTE: do not flush the coalescing buffer here. It looks like the natural
+    // place ("synchronize means everything I asked for has been sent") and it
+    // is not needed -- a buffered frame is always followed by a graph submit or
+    // a response-bearing command, both of which flush. It is also on the decode
+    // hot path: get_socket() and the queue map are both process-global, and
+    // taking them per synchronize across nine concurrent stage threads cost
+    // 9.10 -> 8.1 t/s on the DSV4 SPD split (measured 2026-07-31, with the
+    // buffering itself disabled, which is how it was isolated).
     if (!rpc_async_enabled()) {
         // legacy path: graph_compute is a blocking send and there are no async
         // ops in flight, so nothing to wait for
