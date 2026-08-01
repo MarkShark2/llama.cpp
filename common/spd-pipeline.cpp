@@ -402,6 +402,16 @@ struct common_spd_pipeline::impl {
         std::array<double, SPD_MAX_STAGE_COUNT> stage_lock = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_decode = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_read = {};
+        // [fork] the per-stage decode work that sits OUTSIDE llama_decode, split
+        // by protocol round trip. The guard, the fence and the staging->input
+        // copy are each a blocking command on the endpoint's single command
+        // loop, so `busy - decode` is three round trips plus the host-side tap,
+        // not bookkeeping. Sized before deciding what to cut.
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_guard = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_fence = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_copy  = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_push  = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_tap   = {};
         std::array<uint64_t, SPD_MAX_STAGE_COUNT> stage_calls = {};
         // prefill is a separate regime from decode: chunks of n_batch tokens
         // walked as a stage/chunk grid, so it gets its own counters
@@ -1607,6 +1617,7 @@ struct common_spd_pipeline::impl {
         // probe only names the endpoint, so the live previous-graph output
         // works and nothing has to survive a rebuild.
         if (peer_push_pending[stage]) {
+            scope_timer guard_timer(timing.stage_guard[stage]);
             ggml_tensor * probe = llama_spd_peer_out_tensor(stages[stage]);
             if (probe == nullptr || !ggml_backend_rpc_sync_peer_guard(probe)) {
                 error = "SPD peer guard failed for decode stage " + std::to_string(stage);
@@ -1620,10 +1631,14 @@ struct common_spd_pipeline::impl {
         if (peer_in) {
             // stall the endpoint's command loop until the push landed, then
             // move it from staging into the boundary the graph reads
-            if (!ggml_backend_rpc_sync_peer_fence(pb_in->staging_dec[slot], pb_in->dec_ordinals[slot])) {
-                error = "SPD peer fence failed for decode stage " + std::to_string(stage);
-                return false;
+            {
+                scope_timer fence_timer(timing.stage_fence[stage]);
+                if (!ggml_backend_rpc_sync_peer_fence(pb_in->staging_dec[slot], pb_in->dec_ordinals[slot])) {
+                    error = "SPD peer fence failed for decode stage " + std::to_string(stage);
+                    return false;
+                }
             }
+            scope_timer copy_timer(timing.stage_copy[stage]);
             ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
         }
 
@@ -1669,6 +1684,7 @@ struct common_spd_pipeline::impl {
         // transfer overlaps it. A failure is not fatal -- clearing `dead`
         // ownership on the link puts the pair back on the host path for good.
         if (pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead) {
+            scope_timer push_timer(timing.stage_push[stage]);
             ggml_tensor * out  = llama_spd_peer_out_tensor(stages[stage]);
             ggml_tensor * dst  = pb_out->staging_dec[slot];
             uint64_t ordinal = 0;
@@ -1704,28 +1720,31 @@ struct common_spd_pipeline::impl {
         // falls back to one aggregation pattern shallower than trained. The
         // tap is the stream mean of the boundary; flat-residual targets have
         // one stream and take a plain copy.
-        const int32_t end_layer = std::min<int32_t>((int32_t) (stage + 1)*layers_per_stage, n_layers);
-        for (size_t ai = 0; ai < anchors.size(); ++ai) {
-            if (anchors[ai] != end_layer) {
-                continue;
-            }
-            const int32_t streams = n_embd_boundary/n_embd;
-            std::vector<float> & tap = item.snap.values[ai];
-            tap.assign(item.hidden.begin(), item.hidden.begin() + n_embd);
-            for (int32_t st = 1; st < streams; ++st) {
-                const float * src = item.hidden.data() + (size_t) st*n_embd;
-                for (int32_t j = 0; j < n_embd; ++j) {
-                    tap[j] += src[j];
+        {
+            scope_timer tap_timer(timing.stage_tap[stage]);
+            const int32_t end_layer = std::min<int32_t>((int32_t) (stage + 1)*layers_per_stage, n_layers);
+            for (size_t ai = 0; ai < anchors.size(); ++ai) {
+                if (anchors[ai] != end_layer) {
+                    continue;
                 }
-            }
-            if (streams > 1) {
-                const float scale = 1.0f/(float) streams;
-                for (int32_t j = 0; j < n_embd; ++j) {
-                    tap[j] *= scale;
+                const int32_t streams = n_embd_boundary/n_embd;
+                std::vector<float> & tap = item.snap.values[ai];
+                tap.assign(item.hidden.begin(), item.hidden.begin() + n_embd);
+                for (int32_t st = 1; st < streams; ++st) {
+                    const float * src = item.hidden.data() + (size_t) st*n_embd;
+                    for (int32_t j = 0; j < n_embd; ++j) {
+                        tap[j] += src[j];
+                    }
                 }
+                if (streams > 1) {
+                    const float scale = 1.0f/(float) streams;
+                    for (int32_t j = 0; j < n_embd; ++j) {
+                        tap[j] *= scale;
+                    }
+                }
+                item.snap.present[ai] = true;
+                break;
             }
-            item.snap.present[ai] = true;
-            break;
         }
         elapsed = seconds_since(start);
         timing.stage_busy[stage] += elapsed;
@@ -2068,6 +2087,17 @@ struct common_spd_pipeline::impl {
                         timing.stage_decode[stage], timing.stage_read[stage], timing.stage_lock[stage],
                         timing.decode_pushes[stage],
                         llama_perf_context(stages[stage]).n_reused);
+                const double calls = (double) timing.stage_calls[stage];
+                fprintf(stderr,
+                        "SPD timing: stage %u outside-decode ms/call: guard %.2f | fence %.2f | copy %.2f | "
+                        "push %.2f | tap %.2f | sum %.2f (busy-decode %.2f)\n",
+                        stage,
+                        1e3*timing.stage_guard[stage]/calls, 1e3*timing.stage_fence[stage]/calls,
+                        1e3*timing.stage_copy[stage]/calls,  1e3*timing.stage_push[stage]/calls,
+                        1e3*timing.stage_tap[stage]/calls,
+                        1e3*(timing.stage_guard[stage] + timing.stage_fence[stage] + timing.stage_copy[stage] +
+                             timing.stage_push[stage] + timing.stage_tap[stage])/calls,
+                        1e3*(timing.stage_busy[stage] - timing.stage_decode[stage])/calls);
             }
             fprintf(stderr, "SPD timing: graphs_reused sidecar %d | head %d | embed %d\n",
                     llama_perf_context(sidecar).n_reused,
