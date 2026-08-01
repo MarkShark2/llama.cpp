@@ -3966,6 +3966,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    // [fork] This -- not graph_compute -- is the decode hot path: once a graph
+    // shape repeats, the client sends only a uid. It was the one command with no
+    // timing at all, which made every steady-state number an inference. Same
+    // GGML_RPC_GRAPH_TRACE gate; `compute` here is the device's honest cost for
+    // the stage, so client stage time minus this is the RPC overhead.
+    static const bool graph_trace = [] {
+        const char * value = getenv("GGML_RPC_GRAPH_TRACE");
+        return value && atoi(value) != 0;
+    }();
+    static int64_t t_prev_end = 0;
+    const int64_t  t_start    = graph_trace ? ggml_time_us() : 0;
+    const double   t_wait_ms  = (graph_trace && t_prev_end) ? (t_start - t_prev_end) / 1000.0 : 0.0;
+
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -3976,8 +3989,21 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         return false;
     }
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
+    const int64_t t_lookup = graph_trace ? ggml_time_us() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], it->second.graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (graph_trace) {
+        const int64_t t_end = ggml_time_us();
+        const double  epoch = std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        fprintf(stderr,
+                "[rpc regraph] t=%.3f dev=%u nodes=%d wait=%.2fms lookup=%.2fms compute=%.2fms\n",
+                epoch, device, it->second.graph->n_nodes, t_wait_ms,
+                (t_lookup - t_start) / 1000.0,
+                (t_end    - t_lookup) / 1000.0);
+        fflush(stderr);
+        t_prev_end = ggml_time_us();
+    }
     return true;
 }
 
