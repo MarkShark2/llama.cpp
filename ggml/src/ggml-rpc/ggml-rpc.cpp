@@ -3854,6 +3854,51 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     return result;
 }
 
+// [fork] GGML_RPC_GRAPH_OPS=1: one histogram per distinct (device, uid) graph.
+// tau on the SPD split is linear in node count, so the question "which ops make
+// up a stage graph, and how many are free views" is what picks the fusion
+// target. Fires once per shape, on the server, where the graph actually is.
+static void rpc_graph_ops_dump(uint32_t device, uint64_t uid, const ggml_cgraph * graph) {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_RPC_GRAPH_OPS");
+        return v && atoi(v) != 0;
+    }();
+    if (!enabled || graph == nullptr) {
+        return;
+    }
+    static std::mutex m;
+    static std::unordered_set<std::string> seen;
+    std::lock_guard<std::mutex> l(m);
+    if (!seen.insert(std::to_string(device) + ":" + std::to_string(uid)).second) {
+        return;
+    }
+    std::map<std::string, int> hist;
+    int n_view = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const ggml_tensor * n = graph->nodes[i];
+        std::string name = ggml_op_name(n->op);
+        if (n->op == GGML_OP_UNARY) {
+            name += std::string("/") + ggml_unary_op_name(ggml_get_unary_op(n));
+        } else if (n->op == GGML_OP_GLU) {
+            name += std::string("/") + ggml_glu_op_name(ggml_get_glu_op(n));
+        }
+        hist[name]++;
+        // the set every backend treats as free: no dispatch, no device work
+        if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+            n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE) {
+            n_view++;
+        }
+    }
+    std::vector<std::pair<std::string, int>> rows(hist.begin(), hist.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+    fprintf(stderr, "[rpc graph ops] dev=%u uid=%" PRIu64 " nodes=%d free_views=%d dispatched=%d\n",
+            device, uid, graph->n_nodes, n_view, graph->n_nodes - n_view);
+    for (const auto & r : rows) {
+        fprintf(stderr, "[rpc graph ops]   %-28s %5d\n", r.first.c_str(), r.second);
+    }
+    fflush(stderr);
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     static const bool graph_trace = [] {
         const char * value = getenv("GGML_RPC_GRAPH_TRACE");
@@ -3938,6 +3983,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     const int64_t t_compute = graph_trace ? ggml_time_us() : 0;
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    rpc_graph_ops_dump(device, uid, graph);
     if (uid != 0) {
         sg.graph = graph;
         stored_graphs[device][uid] = std::move(sg);
