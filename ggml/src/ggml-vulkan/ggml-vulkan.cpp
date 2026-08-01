@@ -10666,8 +10666,16 @@ static void ggml_vk_flash_attn_sparse(ggml_backend_vk_context * ctx, vk_context&
     const uint32_t n_tiles = CEIL_DIV((uint32_t) k->ne[1], FA_SPARSE_TILE) +
                              CEIL_DIV((uint32_t) idx->ne[0], FA_SPARSE_TILE);
 
+    // GGML_VK_FA_SPARSE_SPLIT=0 is the A/B control: it restores the pre-split
+    // walk exactly, which is the only way to re-price this without a fleet
+    // rebuild. Split-K changes the summation order, so decode output moves.
+    static const bool split_enabled = [] {
+        const char * v = getenv("GGML_VK_FA_SPARSE_SPLIT");
+        return v == nullptr || atoi(v) != 0;
+    }();
+
     uint32_t k_num = 1;
-    if (ctx->device->shader_core_count > 0 && base_wg < 2*ctx->device->shader_core_count) {
+    if (split_enabled && ctx->device->shader_core_count > 0 && base_wg < 2*ctx->device->shader_core_count) {
         k_num = std::min(2*ctx->device->shader_core_count / base_wg, n_tiles);
         k_num = std::max(k_num, 1u);
     }
