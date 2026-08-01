@@ -445,16 +445,41 @@ struct rpc_wire_ep_stat {
     std::atomic<uint64_t> gc_n{0},  gc_us{0};
 };
 
-static bool rpc_wire_trace_enabled() {
-    static const bool enabled = []{
-        const char * e = std::getenv("GGML_RPC_WIRE_TRACE");
-        return e && atoi(e) != 0;
-    }();
-    return enabled;
-}
-
 static std::mutex g_wire_stat_m;
 static std::map<std::string, std::unique_ptr<rpc_wire_ep_stat>> g_wire_stats;
+
+static int rpc_wire_trace_level() {
+    static const int level = []{
+        const char * e = std::getenv("GGML_RPC_WIRE_TRACE");
+        return e ? atoi(e) : 0;
+    }();
+    return level;
+}
+
+static bool rpc_wire_trace_enabled() {
+    return rpc_wire_trace_level() != 0;
+}
+
+// level 2: which tensors are being re-uploaded. A cache-hit graph should be
+// staging almost nothing per eval, so the per-name breakdown is what says
+// whether an input can be made cache-resident (the cache_k_rot pattern).
+struct rpc_wire_name_stat {
+    uint64_t n = 0, bytes = 0;
+};
+static std::map<std::string, rpc_wire_name_stat> g_wire_names;
+
+static void rpc_wire_note_set(const ggml_tensor * tensor, size_t size) {
+    if (rpc_wire_trace_level() < 2) {
+        return;
+    }
+    char key[96];
+    snprintf(key, sizeof(key), "%s [%s %lldx%lld]", tensor->name, ggml_type_name(tensor->type),
+             (long long) tensor->ne[0], (long long) tensor->ne[1]);
+    std::lock_guard<std::mutex> l(g_wire_stat_m);
+    rpc_wire_name_stat & s = g_wire_names[key];
+    s.n     += 1;
+    s.bytes += size;
+}
 
 static rpc_wire_ep_stat * rpc_wire_stat(const std::string & endpoint) {
     std::lock_guard<std::mutex> l(g_wire_stat_m);
@@ -491,6 +516,18 @@ static void rpc_wire_trace_tick() {
                 (unsigned long long) set_n, set_n ? set_us/1e3/(double) set_n : 0.0, set_b/1e6,
                 (unsigned long long) gc_n,  gc_n  ? gc_us /1e3/(double) gc_n  : 0.0,
                 (unsigned long long) get_n, get_n ? get_us/1e3/(double) get_n : 0.0, get_b/1e6);
+    }
+    if (rpc_wire_trace_level() >= 2 && !g_wire_names.empty()) {
+        std::vector<std::pair<std::string, rpc_wire_name_stat>> rows(g_wire_names.begin(), g_wire_names.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+            return a.second.bytes > b.second.bytes;
+        });
+        for (const auto & row : rows) {
+            fprintf(stderr, "[rpc set-by-name] %-44s n=%llu %.1fMB (%.0f B each)\n",
+                    row.first.c_str(), (unsigned long long) row.second.n, row.second.bytes/1e6,
+                    row.second.n ? (double) row.second.bytes/(double) row.second.n : 0.0);
+        }
+        g_wire_names.clear();
     }
     fflush(stderr);
 }
@@ -1274,6 +1311,7 @@ static bool rpc_buffer_set_tensor_raw(
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     if (rpc_wire_trace_enabled()) {
         rpc_wire_ep_stat * st = rpc_wire_stat(ctx->endpoint);
+        rpc_wire_note_set(tensor, input.size());
         const int64_t t0 = ggml_time_us();
         bool ok = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
         st->set_us    += (uint64_t) (ggml_time_us() - t0);
