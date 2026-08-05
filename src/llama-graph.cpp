@@ -2297,6 +2297,15 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     cb(cur, "embd", -1);
 
+    // [fork] pin the token-embedding lookup: the scheduler's size heuristic
+    // otherwise offloads it for large ubatches and keeps it on the CPU for
+    // small ones, and that backend-id flip forces a galloc realloc on every
+    // large<->small alternation - locally ~1 ms upstream, but over a deep RPC
+    // pipeline each realloc is a full drain (measured ~10 s at 9 stages).
+    if (ubatch.token) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+    }
+
     res->add_input(std::move(inp));
 
     // make sure the produced embeddings are immediately materialized in the ggml graph

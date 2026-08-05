@@ -12,11 +12,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
+
+// [fork, chained decode] set by llama_decode around init_batch for chained
+// cohort calls: the batch is already one cohort and LLAMA_DECODE_SPLIT must
+// not cut it into singles (which multiplies per-ubatch submit cost by G)
+static bool dsv4_decode_split_suppressed = false;
+extern "C" void dsv4_decode_split_suppress(bool on) {
+    dsv4_decode_split_suppressed = on;
+}
 
 // [fork] "this sequence may have touched every compressed row" - passed to
 // clear_compressed() when the extent of the sequence being dropped is not known
@@ -231,6 +240,31 @@ static bool dsv4_batch_has_coupled(const llama_batch & batch) {
     return false;
 }
 
+// [fork] A pure token-generation batch -- every token belongs to a different
+// sequence, one token each -- is k INDEPENDENT walks of the stage pipeline that
+// llama.cpp merges into one wide ubatch. Merged, the k tokens cross the stages
+// together and every stage idles (k-1)/k of the step; split one sequence per
+// ubatch they pipeline, which is what the RPC split was built for. Detected
+// here rather than trusted from the caller because a prompt chunk that happens
+// to be one token per sequence is the same shape and wants the same treatment.
+static bool dsv4_batch_is_decode(const llama_batch & batch) {
+    if (!batch.n_seq_id || !batch.seq_id || batch.n_tokens < 2) {
+        return false;
+    }
+
+    std::set<llama_seq_id> seen;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1) {
+            return false;
+        }
+        if (!seen.insert(batch.seq_id[i][0]).second) {
+            return false; // more than one token for this sequence -- a prompt chunk
+        }
+    }
+
+    return true;
+}
+
 static int64_t dsv4_comp_graph_n_stream(const llama_ubatch & ubatch, uint32_t n_stream) {
     // Coupled sequence sets must stay in one graph stream because their
     // compressed state is shared. Independent per-seq state can fan out.
@@ -440,6 +474,22 @@ static void dsv4_state_read_k_cache(
     }
 }
 
+// [fork] LLAMA_DSV4_PLAN_BUCKET=<blocks>: quantize the per-ubatch plan-input
+// tensor sizes (state write/read/persist) to multiples of <blocks> so ubatches
+// of different shapes keep an identical graph topology. Without this, any
+// ubatch that grows one of these 1D inputs past the scheduler's cached galloc
+// plan forces a reserve, and every reserve is a full pipeline drain (~2.7 s
+// over 9 RPC stages) - concurrent short-prompt prefill was measured
+// serializing at one ubatch per ~2.9 s on exactly this, and decode-lane reuse
+// broke every time a sequence crossed a compression-block boundary.
+static uint32_t dsv4_plan_bucket_step() {
+    static const uint32_t step = []() {
+        const char * e = getenv("LLAMA_DSV4_PLAN_BUCKET");
+        return e ? (uint32_t) std::max(0L, strtol(e, nullptr, 10)) : 0u;
+    }();
+    return step;
+}
+
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     std::ostringstream ss;
     ss << "[";
@@ -569,9 +619,18 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    if (ratio == DSV4_CSA_RATIO && plan.state_write_idxs.empty() && !plan.state_pos.empty()) {
+    if ((ratio == DSV4_CSA_RATIO || dsv4_plan_bucket_step() > 0) &&
+        plan.state_write_idxs.empty() && !plan.state_pos.empty()) {
         // Non-boundary CSA steps still need a write op so their graph matches
         // boundary steps. Use a padded scratch row that is masked from attention.
+        // With LLAMA_DSV4_PLAN_BUCKET the same treatment extends to the HCA
+        // cache, whose write op otherwise flips in and out of the graph.
+        // The synthetic block MUST read a real row (never the appended
+        // zero/-inf row): a window whose scores are all -inf softmaxes to NaN,
+        // and the persist ordering dep (0*sum(comp)) then propagates that NaN
+        // into every state row the ubatch persists - planted at prompt time,
+        // detonating at the first decode block boundary that consumes those
+        // rows, while every timing metric stays normal.
         assert(kv_size > 0);
 
         uint32_t i = 0;
@@ -636,6 +695,52 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     for (const persist_row & row : persist_rows) {
         plan.state_persist_src_idxs.push_back(row.src);
         plan.state_persist_dst_idxs.push_back(row.dst);
+    }
+
+    // [fork] quantize the plan-input sizes (see dsv4_plan_bucket_step). Pad
+    // blocks read the first real token's scratch row and write the masked
+    // scratch cell (the same trick the non-boundary write above uses); all
+    // pad blocks compute the same value from the same windows, so duplicate
+    // scratch writes are deterministic. NEVER pad reads with the appended
+    // zero/-inf row: an all--inf score window softmaxes to NaN (which the
+    // persist zero-dep spreads to every persisted state row - the 2026-08-02
+    // decode corruption), and the non-overlap HCA gather source doesn't even
+    // have the appended row, so the index is out of bounds there. Persist
+    // pads repeat the last real (src, dst) pair - set_rows re-writing a row
+    // with its own gathered value is idempotent.
+    if (const uint32_t plan_step = dsv4_plan_bucket_step(); plan_step > 0 && !plan.state_pos.empty()) {
+        uint32_t i0 = 0;
+        while (i0 < ubatch.n_tokens && ubatch.pos[i0] < 0) {
+            ++i0;
+        }
+        GGML_ASSERT(i0 < ubatch.n_tokens);
+        const int32_t pad_src = (int32_t) (state_rows + i0);
+        const int64_t scratch_cell = dsv4_stream_offset(n_stream, ubatch.seq_id[i0][0], kv_size) + kv_size - 1;
+
+        const size_t nw   = plan.state_write_idxs.size();
+        const size_t nw_b = GGML_PAD(nw, (size_t) plan_step);
+        if (nw_b > nw) {
+            const size_t n_pad = nw_b - nw;
+            // the overlap read layout is [ all prev | all cur ]: the prev
+            // half's pads go at its end, before appending to the cur half
+            if (overlap) {
+                const size_t half = plan.state_read_idxs.size()/2;
+                GGML_ASSERT(plan.state_read_idxs.size() == 2*half);
+                plan.state_read_idxs.insert(plan.state_read_idxs.begin() + half, n_pad*ratio, pad_src);
+                plan.state_read_idxs.insert(plan.state_read_idxs.end(),          n_pad*ratio, pad_src);
+            } else {
+                plan.state_read_idxs.insert(plan.state_read_idxs.end(), n_pad*ratio, pad_src);
+            }
+            plan.state_write_idxs.insert(plan.state_write_idxs.end(), n_pad, scratch_cell);
+            plan.state_write_pos .insert(plan.state_write_pos .end(), n_pad, 0);
+        }
+
+        const size_t np   = plan.state_persist_src_idxs.size();
+        const size_t np_b = GGML_PAD(np, (size_t) plan_step);
+        if (np > 0 && np_b > np) {
+            plan.state_persist_src_idxs.insert(plan.state_persist_src_idxs.end(), np_b - np, plan.state_persist_src_idxs.back());
+            plan.state_persist_dst_idxs.insert(plan.state_persist_dst_idxs.end(), np_b - np, plan.state_persist_dst_idxs.back());
+        }
     }
 
     static const bool debug = []() {
@@ -1234,6 +1339,71 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
                 std::move(ubatches),
                 std::move(ubatches_raw));
     };
+
+    // [fork] LLAMA_DECODE_SPLIT=G: cut a token-generation batch into G ubatches so
+    // concurrent slots PIPELINE across the RPC stages instead of crossing them
+    // together as one wide ubatch, which leaves every stage idle (k-1)/k of the
+    // step. Needs LLAMA_GRAPH_REUSE_DISABLE=2 to pay off -- the reuse path drains
+    // the pipeline before set_inputs, which would just serialize the pieces.
+    // Chained cohort calls (LLAMA_DECODE_CHAIN) suppress the cut: each call IS
+    // one group, and cutting it into singles multiplies the per-ubatch submit
+    // cost by the cohort size.
+    //
+    // G is a real tradeoff, not "more is better". Board time per step is
+    //     k * c + G * w
+    // where c is per-token compute on a stage (~8.6 ms here; it does NOT fall with
+    // batch width, see the vault -- 6-of-256 expert routing means k tokens read k
+    // disjoint expert sets) and w is the client's per-ubatch submit cost (~10 ms,
+    // dominated by the graph rebuild that reuse-off forces). G = k, one sequence
+    // per ubatch, pays w for every single token and pins throughput at 1/(c+w)
+    // regardless of how many slots are added. G just large enough to fill the
+    // stages amortises w over a whole group instead. Set it to the stage count.
+    static const int decode_split = [] {
+        const char * e = getenv("LLAMA_DECODE_SPLIT");
+        return e ? atoi(e) : 0;
+    }();
+
+    // with chained cohorts active, classic mixed rounds must produce the SAME
+    // group shape as the chain cohorts (fixed size G) - a fixed group COUNT
+    // makes ceil(n_seq/count)-sized groups that realloc-churn the lane graphs
+    // on every prompt event
+    static const int chain_group_size = [] {
+        const char * e = getenv("LLAMA_DECODE_CHAIN");
+        return e ? atoi(e) : 0;
+    }();
+
+    if (decode_split != 0 && !dsv4_decode_split_suppressed && !has_coupled && dsv4_batch_is_decode(balloc.get_batch())) {
+        balloc.split_reset();
+
+        const uint32_t n_seq  = (uint32_t) balloc.get_n_tokens();
+        const uint32_t groups = decode_split < 0
+            ? n_seq
+            : std::min(n_seq, (uint32_t) decode_split);
+        const uint32_t per_group = chain_group_size > 0
+            ? std::min<uint32_t>((uint32_t) chain_group_size, n_seq)
+            : (n_seq + groups - 1) / groups;
+
+        // split_equal admits sequences until the set EXCEEDS its bound, so it
+        // returns bound+1 of them; ask for one less to land on per_group.
+        const uint32_t bound = per_group > 0 ? per_group - 1 : 0;
+
+        std::vector<llama_ubatch> ubatches;
+        while (true) {
+            auto ubatch = bound == 0
+                ? balloc.split_seq(n_ubatch)
+                : balloc.split_equal(bound, true, 0);
+            if (ubatch.n_tokens == 0) {
+                break;
+            }
+            ubatches.push_back(std::move(ubatch)); // NOLINT
+        }
+
+        if (balloc.get_n_used() == balloc.get_n_tokens()) {
+            if (auto ctx = make_context(std::move(ubatches))) {
+                return ctx;
+            }
+        }
+    }
 
     // Match llama_kv_cache_iswa splitting when DSV4 compressed state does not
     // require per-sequence graph layout.
