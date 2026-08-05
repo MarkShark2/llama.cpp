@@ -39,6 +39,16 @@ struct common_sampler;
 // note: can mutate params in some cases
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params);
 
+// Tokenize a generation prompt into the tokens the template has already placed
+// in the prompt, i.e. the ones a fresh grammar or reasoning-budget sampler has
+// to be advanced past before generation starts.
+//
+// Exposed because SPD samples with a bare argmax and builds no common_sampler,
+// yet has to arm its reasoning budget from the same tokens. Seeding it from the
+// whole prompt instead made a user message containing a literal start tag arm
+// the counter under SPD and under nothing else.
+std::vector<llama_token> common_sampler_prefill_tokens(const struct llama_vocab * vocab, const std::string & generation_prompt);
+
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
@@ -63,6 +73,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+
+// [fork] sample from a raw logits row (no context sync, no backend samplers);
+// used by chained cohort decode after a lane-scoped wait
+llama_token common_sampler_sample_row(struct common_sampler * gsmpl, const struct llama_vocab * vocab, const float * row, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
 //

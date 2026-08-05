@@ -565,7 +565,13 @@ int main(int argc, char ** argv) {
     const auto spd_wall_start = clock_type::now();
     do {
         common_spd_result current;
-        if (!pipeline->generate(prompt_tokens, n_predict, current)) {
+        common_spd_gen_params gparams;
+        gparams.n_predict = n_predict;
+        // This loop re-sends the same prompt to build a duration benchmark.
+        // With prefix reuse on, every iteration after the first would reuse the
+        // prompt wholesale and the prefill number would measure nothing.
+        gparams.prefix_reuse = false;
+        if (!pipeline->generate(prompt_tokens, gparams, current)) {
             std::fprintf(stderr, "SPD generation failed: %s\n", pipeline->error().c_str());
             pipeline.reset();
             llama_model_free(sidecar);

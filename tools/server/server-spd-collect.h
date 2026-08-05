@@ -35,7 +35,8 @@
 struct server_spd_seq {
     std::string id;
 
-    int32_t n_tokens = 0; // expected prompt length
+    int32_t  n_tokens = 0; // positions with harvestable taps (prompt + fed generated tokens)
+    uint32_t n_embd   = 0; // tap row width, set at begin_seq
 
     std::vector<llama_token> tokens; // provided at end_seq
     std::vector<uint8_t>     labels; // per-token loss mask
@@ -48,6 +49,19 @@ struct server_spd_seq {
 
     bool complete() const {
         return n_filled == n_tokens;
+    }
+
+    // [fork] decode-time collection: extend the sequence by one generated
+    // position. Generated positions always carry loss (label 1) - the prompt's
+    // labels came from the request's ranges. Called at batch-build time, so a
+    // grow never races a harvest (harvests run post-decode).
+    void append_gen_row() {
+        for (auto & tap : taps) {
+            tap.resize((size_t) (n_tokens + 1) * n_embd);
+        }
+        labels.push_back(1);
+        row_filled.push_back(0);
+        n_tokens++;
     }
 };
 
@@ -112,13 +126,19 @@ public:
 
     const std::vector<int32_t> & taps() const { return taps_; }
 
+    // n_reserve: expected final row count (prompt + n_predict) - reserving up
+    // front keeps mid-generation append_gen_row() growth from reallocating
     std::shared_ptr<server_spd_seq> begin_seq(
             const std::string & id,
             int32_t n_tokens,
-            const std::vector<std::pair<int32_t, int32_t>> & label_ranges) {
+            const std::vector<std::pair<int32_t, int32_t>> & label_ranges,
+            int32_t n_reserve = 0) {
         auto seq = std::make_shared<server_spd_seq>();
         seq->id       = id;
         seq->n_tokens = n_tokens;
+        seq->n_embd   = n_embd_;
+
+        n_reserve = std::max(n_reserve, n_tokens);
 
         if (label_ranges.empty()) {
             seq->labels.assign(n_tokens, 1);
@@ -130,11 +150,14 @@ public:
                 }
             }
         }
+        seq->labels.reserve(n_reserve);
 
         seq->taps.resize(taps_.size());
         for (auto & tap : seq->taps) {
+            tap.reserve((size_t) n_reserve * n_embd_);
             tap.resize((size_t) n_tokens * n_embd_);
         }
+        seq->row_filled.reserve(n_reserve);
         seq->row_filled.assign(n_tokens, 0);
 
         return seq;

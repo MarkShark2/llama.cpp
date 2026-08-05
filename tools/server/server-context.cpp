@@ -21,6 +21,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -167,6 +168,17 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // How this slot's state is serialized for the prompt cache and for context
+    // checkpoints. Ordinarily these wrap ctx_tgt/ctx_dft; under SPD io_tgt is
+    // the pipeline's own framing over its nine stage contexts plus the sidecar,
+    // and io_dft is a null-context no-op because the drafter is inside io_tgt.
+    // Everything above this line -- --cache-ram, --cache-disk, --ctx-checkpoints
+    // -- then works without knowing which it has.
+    common_state_seq_io_ctx io_ctx_tgt;
+    common_state_seq_io_ctx io_ctx_dft;
+    common_state_seq_io * io_tgt = nullptr;
+    common_state_seq_io * io_dft = nullptr;
+
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -202,7 +214,6 @@ struct server_slot {
     // [fork, SPD] training-data collection state for the current task
     std::shared_ptr<server_spd_seq>          spd_seq;    // in-flight sequence (null = not collecting)
     std::vector<llama_token>                 spd_tokens; // text prompt tokens for the shard record
-    std::vector<std::pair<int32_t, int32_t>> spd_rows;   // (global batch index, prompt pos) added this batch
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -248,8 +259,8 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t cur_size_tgt = io_tgt->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = io_dft->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -265,7 +276,7 @@ struct server_slot {
             // stream the state directly to disk - peak RAM usage stays bounded by the io staging buffer
             const std::string path_tgt = server_state_file_path(prompt_cache.disk_dir, "prompt-tgt");
 
-            const size_t n_tgt = llama_state_seq_save_file_ext(ctx_tgt, path_tgt.c_str(), id, nullptr, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t n_tgt = io_tgt->save_file(path_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (n_tgt == 0) {
                 SRV_ERR("failed to save prompt cache state to '%s'\n", path_tgt.c_str());
 
@@ -275,10 +286,10 @@ struct server_slot {
             }
             cur->data.file_main = std::make_shared<common_state_file>(path_tgt, n_tgt);
 
-            if (ctx_dft) {
+            if (cur_size_dft > 0) {
                 const std::string path_dft = server_state_file_path(prompt_cache.disk_dir, "prompt-dft");
 
-                const size_t n_dft = llama_state_seq_save_file_ext(ctx_dft, path_dft.c_str(), id, nullptr, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const size_t n_dft = io_dft->save_file(path_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
                 if (n_dft == 0) {
                     SRV_ERR("failed to save prompt cache state to '%s'\n", path_dft.c_str());
 
@@ -289,9 +300,9 @@ struct server_slot {
                 cur->data.file_drft = std::make_shared<common_state_file>(path_dft, n_dft);
             }
         } else {
-            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (ctx_dft) {
-                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            io_tgt->get_data(cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (cur_size_dft > 0) {
+                io_dft->get_data(cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             }
         }
 
@@ -299,7 +310,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, *io_tgt, *io_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -334,6 +345,7 @@ struct server_slot {
     // TODO @ngxson : move all metrics to a sub-struct for clarity
     int64_t t_start_process_prompt;
     int64_t t_start_generation;
+    int64_t t_task_launched = 0; // [fork] when the slot took its task (prompt-burst admission)
     int64_t t_print_last = 0;
     int32_t n_decoded_last = 0;
 
@@ -407,7 +419,6 @@ struct server_slot {
         // was already handed to the collector and this pointer cleared)
         spd_seq.reset();
         spd_tokens.clear();
-        spd_rows.clear();
     }
 
     void init_sampler() const {
@@ -562,6 +573,14 @@ struct server_slot {
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
+
+            // [fork, SPD collect] the sampled token is about to be fed at the
+            // next position - the decode below computes its taps, so the
+            // sequence gains a labeled row (and the token joins the record)
+            if (spd_seq) {
+                spd_seq->append_gen_row();
+                spd_tokens.push_back(sampled);
+            }
 
             add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
 
@@ -1029,6 +1048,22 @@ private:
     bool spd_mode = false;
     std::unique_ptr<common_spd_pipeline> spd_pipeline;
 
+    // Server-wide state serializers, for the paths that hold no slot (the
+    // speculative-rollback checkpoint, create_checkpoint). Same rule as the
+    // per-slot ones: under SPD the target's is the pipeline's framing, and the
+    // draft's is a null-context no-op because the sidecar rides with it.
+    common_state_seq_io_ctx io_ctx_tgt;
+    common_state_seq_io_ctx io_ctx_dft;
+
+    common_state_seq_io & state_io_tgt() {
+        return spd_mode && spd_pipeline ? spd_pipeline->state_io()
+                                        : static_cast<common_state_seq_io &>(io_ctx_tgt);
+    }
+
+    common_state_seq_io & state_io_dft() {
+        return io_ctx_dft;
+    }
+
     // [fork, SPD] hidden-state collection for offline SPD training
     std::unique_ptr<server_spd_collector> spd_collector;
 
@@ -1334,10 +1369,6 @@ private:
                 SRV_ERR("%s", "--spd-collect-dir requires --spd-collect-layers\n");
                 return false;
             }
-            if (params_base.n_parallel != 1) {
-                SRV_ERR("%s", "SPD collection requires --parallel 1 (tap rows are batch-ordered)\n");
-                return false;
-            }
             const int32_t n_layer = llama_model_n_layer(model_tgt);
 
             std::vector<int32_t> taps = params_base.spd_collect_layers;
@@ -1499,6 +1530,11 @@ private:
             model_dft = nullptr;
         }
 
+        // after ctx_dft has settled -- the branch above can null it and destroy
+        // the context behind it, so binding earlier would leave a dangling one
+        io_ctx_tgt.ctx = ctx_tgt;
+        io_ctx_dft.ctx = spec_spd ? nullptr : ctx_dft;
+
         if (spec_spd) {
             common_spd_params spd_params;
             spd_params.n_ctx           = n_ctx_slot;
@@ -1533,6 +1569,17 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+
+            // Under SPD the sidecar is serialized inside the pipeline's own
+            // frame, so the draft io is deliberately given no context: a null
+            // one returns 0 from every call, which is what turns each _dft
+            // step above into a no-op rather than a special case at the call
+            // site.
+            slot.io_ctx_tgt.ctx = ctx_tgt;
+            slot.io_ctx_dft.ctx = spd_mode ? nullptr : ctx_dft;
+            slot.io_tgt = spd_mode ? &spd_pipeline->state_io()
+                                   : static_cast<common_state_seq_io *>(&slot.io_ctx_tgt);
+            slot.io_dft = &slot.io_ctx_dft;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1863,8 +1910,20 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                const bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                if (!loaded) {
                     ret->prompt_clear();
+                }
+
+                // Either branch has just replaced what the SPD caches hold --
+                // a restored entry, or nothing at all. The pipeline keeps its
+                // own record of the resident prefix to decide how much of the
+                // next prompt it can skip, and that record now describes state
+                // that is gone. Left alone it would reuse a prefix that is not
+                // there, which is silent corruption rather than a failure.
+                if (spd_mode) {
+                    spd_pipeline->note_resident_prefix(
+                            loaded ? ret->prompt.tokens.get_text_tokens() : llama_tokens{});
                 }
 
                 prompt_cache->update();
@@ -1923,17 +1982,7 @@ private:
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         if (spd_mode) {
-            const auto & sampling = task.params.sampling;
-            const bool raw_greedy = sampling.temp <= 0.0f &&
-                sampling.n_probs == 0 &&
-                sampling.grammar.empty() &&
-                sampling.logit_bias.empty() &&
-                sampling.penalty_repeat == 1.0f &&
-                sampling.penalty_freq == 0.0f &&
-                sampling.penalty_present == 0.0f &&
-                sampling.dry_multiplier == 0.0f &&
-                !sampling.ignore_eos &&
-                sampling.reasoning_budget_tokens < 0;
+            auto & sampling = task.params.sampling;
 
             if (task.type != SERVER_TASK_TYPE_COMPLETION) {
                 send_error(task, "SPD currently supports text completion tasks only", ERROR_TYPE_NOT_SUPPORTED);
@@ -1943,15 +1992,94 @@ private:
                 send_error(task, "SPD currently supports one completion per request", ERROR_TYPE_NOT_SUPPORTED);
                 return false;
             }
-            if (!raw_greedy) {
-                send_error(task,
-                        "SPD currently requires raw greedy sampling (temperature <= 0, no logit bias, grammar, probabilities, or penalties)",
-                        ERROR_TYPE_NOT_SUPPORTED);
-                return false;
-            }
             if (!task.params.lora.empty()) {
                 send_error(task, "SPD does not currently support LoRA adapters", ERROR_TYPE_NOT_SUPPORTED);
                 return false;
+            }
+            // A grammar is a contract about the shape of the output, not a
+            // preference: a JSON schema or a tool call either holds or the
+            // response is unusable. The pipeline enforces it at the target
+            // head's argmax -- the one place SPD selects -- so it is honoured
+            // here for the same reason it is anywhere else. Drafts are not
+            // constrained, and do not need to be: a draft is accepted only when
+            // it equals the constrained argmax.
+            //
+            // reasoning_control is the case that still cannot be honoured. It
+            // ends the thinking block on a control task the client posts
+            // mid-generation, and update_slots_spd runs a whole request
+            // synchronously -- the task queue is not serviced again until the
+            // slot is released, so the control task cannot be dequeued until
+            // the generation it was meant to interrupt has already finished.
+            // Accepting it would mean silently ignoring it.
+            if (sampling.reasoning_control) {
+                send_error(task,
+                        "SPD cannot honour reasoning_control (it generates a whole request synchronously, so a mid-generation control task cannot be delivered)",
+                        ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+
+            // --ignore-eos *is* a logit bias upstream: the request handler
+            // appends -inf on every EOG token rather than carrying a flag down
+            // to the sampler. The pipeline implements that mask itself, on both
+            // the head and the sidecar, so those entries are already honoured
+            // and must be consumed here rather than counted against the caller.
+            // Reading them by shape instead of by provenance also gets the
+            // hand-rolled form right: a client that bans EOG through raw
+            // logit_bias is asking for ignore_eos, so give it ignore_eos.
+            if (!sampling.logit_bias.empty()) {
+                size_t kept = 0;
+                for (const auto & lb : sampling.logit_bias) {
+                    if (lb.bias == -INFINITY && llama_vocab_is_eog(vocab, lb.token)) {
+                        sampling.ignore_eos = true;
+                    } else {
+                        sampling.logit_bias[kept++] = lb;
+                    }
+                }
+                sampling.logit_bias.resize(kept);
+            }
+
+            // Any bias left is not a preference. -INFINITY on a token is the
+            // standard way to say "never emit this", which a caller relies on
+            // the same way it relies on a grammar; SPD argmaxes raw logits and
+            // would emit it anyway. Nobody sends a bias by accident, so
+            // refusing costs no ordinary client anything.
+            if (!sampling.logit_bias.empty()) {
+                send_error(task,
+                        "SPD cannot honour logit_bias (it decodes greedily against the target's argmax)",
+                        ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            // Likewise n_probs: it asks for a different response *shape*, and
+            // SPD has no distribution to report -- verification is an equality
+            // test, not a sample. Answering without the probabilities would be
+            // answering a different question.
+            if (sampling.n_probs != 0) {
+                send_error(task,
+                        "SPD cannot report token probabilities (it verifies by argmax equality and forms no distribution)",
+                        ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+
+            // What is left the sampler chain would have done *is* a preference,
+            // so coerce rather than refuse. Verification is greedy equivalence
+            // -- a draft is accepted iff it matches the target head's argmax --
+            // which is what makes SPD output bit-identical to plain greedy
+            // decoding, so greedy is the only sampling that can be served here.
+            // Clients default to temperature 1 (open-webui among them) and
+            // would otherwise never get a single completion out of this server.
+            std::vector<const char *> coerced;
+            if (sampling.temp > 0.0f)             { sampling.temp = 0.0f;             coerced.push_back("temperature"); }
+            if (sampling.penalty_repeat != 1.0f)  { sampling.penalty_repeat = 1.0f;   coerced.push_back("repeat_penalty"); }
+            if (sampling.penalty_freq != 0.0f)    { sampling.penalty_freq = 0.0f;     coerced.push_back("frequency_penalty"); }
+            if (sampling.penalty_present != 0.0f) { sampling.penalty_present = 0.0f;  coerced.push_back("presence_penalty"); }
+            if (sampling.dry_multiplier != 0.0f)  { sampling.dry_multiplier = 0.0f;   coerced.push_back("dry_multiplier"); }
+            if (!coerced.empty()) {
+                std::string ignored;
+                for (size_t i = 0; i < coerced.size(); ++i) {
+                    ignored += (i == 0 ? "" : ", ");
+                    ignored += coerced[i];
+                }
+                SRV_INF("SPD decodes greedily; ignoring %s for this request\n", ignored.c_str());
             }
         }
 
@@ -1973,6 +2101,11 @@ private:
                 send_error(task, "SPD collection requires a non-empty prompt", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
+            if (spec) {
+                // draft rows would interleave with real rows in the tap buffers
+                send_error(task, "SPD collection does not support speculative decoding", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
 
             // every prompt token must be recomputed for its taps to exist
             task.params.cache_prompt = false;
@@ -1981,12 +2114,11 @@ private:
             slot.spd_seq    = spd_collector->begin_seq(
                     task.params.spd_collect_id,
                     (int32_t) slot.spd_tokens.size(),
-                    task.params.spd_collect_label_ranges);
-            slot.spd_rows.clear();
+                    task.params.spd_collect_label_ranges,
+                    (int32_t) slot.spd_tokens.size() + std::max(0, task.params.n_predict));
         } else {
             slot.spd_seq.reset();
             slot.spd_tokens.clear();
-            slot.spd_rows.clear();
         }
 
         // process per-request lora adapters
@@ -2101,6 +2233,8 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        slot.t_task_launched = ggml_time_us();
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2378,6 +2512,25 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // [fork, SPD collect] the request is done: every fed position's taps
+        // were harvested in the window that computed them (harvest runs before
+        // sampling, and the token that triggered the stop was never fed), so
+        // the sequence is finished. Hand it to the shard writer.
+        if (slot.spd_seq && spd_collector) {
+            auto & seq = *slot.spd_seq;
+            if ((int32_t) slot.spd_tokens.size() > seq.n_tokens) {
+                slot.spd_tokens.resize(seq.n_tokens);
+            }
+            if (seq.n_tokens > 0 && seq.complete() && (int32_t) slot.spd_tokens.size() == seq.n_tokens) {
+                spd_collector->end_seq(std::move(slot.spd_seq), std::move(slot.spd_tokens));
+            } else {
+                SLT_WRN(slot, "dropping incomplete SPD sequence (%d of %d rows harvested)\n",
+                        seq.n_filled, seq.n_tokens);
+            }
+            slot.spd_seq.reset();
+            slot.spd_tokens.clear();
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2660,9 +2813,9 @@ private:
 
         if (!params_base.cache_disk.empty()) {
             // stream the checkpoint state directly to disk instead of materializing it in RAM
-            cur.update_tgt_file(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+            cur.update_tgt_file(state_io_tgt(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
                     server_state_file_path(params_base.cache_disk, "ckpt-tgt"));
-            cur.update_dft_file(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+            cur.update_dft_file(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
                     server_state_file_path(params_base.cache_disk, "ckpt-dft"));
 
             if (cur.empty()) {
@@ -2673,8 +2826,8 @@ private:
                 return;
             }
         } else {
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_tgt(state_io_tgt(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3058,10 +3211,12 @@ private:
     int64_t t_decode      = 0;
     int64_t t_post_decode = 0;
     int64_t t_sampl       = 0;
+    int64_t t_sync        = 0;
     int64_t n_pre_decode  = 0;
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+    int64_t n_sync        = 0;
 
     // speculative phase timings, printed every 5s when LLAMA_SERVER_TIMINGS=1 [fork]
     int64_t t_spec_draft = 0;
@@ -3126,14 +3281,6 @@ private:
                 slot.release();
                 return;
             }
-            if (prompt.size() < spd_stage_count) {
-                send_error(slot,
-                        string_format("SPD requires a prompt of at least %u tokens; received %zu",
-                                spd_stage_count, prompt.size()),
-                        ERROR_TYPE_INVALID_REQUEST);
-                slot.release();
-                return;
-            }
 
             const int32_t n_available = slot.n_ctx - (int32_t) prompt.size() -
                 (int32_t) spd_stage_count - 1;
@@ -3173,35 +3320,60 @@ private:
                         !slot.task->params.return_progress);
             }
 
+            common_spd_gen_params gparams;
+            gparams.n_predict               = n_predict;
+            gparams.ignore_eos              = slot.task->params.sampling.ignore_eos;
+            gparams.reasoning_budget_start  = slot.task->params.sampling.reasoning_budget_start;
+            gparams.reasoning_budget_end    = slot.task->params.sampling.reasoning_budget_end;
+            gparams.reasoning_budget_forced = slot.task->params.sampling.reasoning_budget_forced;
+            gparams.reasoning_budget_tokens = slot.task->params.sampling.reasoning_budget_tokens;
+            gparams.n_ctx_checkpoints       = params_base.n_ctx_checkpoints;
+            gparams.checkpoint_min_step     = params_base.checkpoint_min_step;
+            // A grammar, a JSON schema, or the tool-call grammar the chat
+            // template compiled from this request's tools -- all of them arrive
+            // here as one already-built grammar string.
+            gparams.grammar                 = common_grammar_value(slot.task->params.sampling.grammar);
+            gparams.grammar_lazy            = slot.task->params.sampling.grammar_lazy;
+            gparams.grammar_triggers        = slot.task->params.sampling.grammar_triggers;
+            gparams.grammar_needs_prefill   = common_grammar_needs_prefill(slot.task->params.sampling.grammar);
+            // the same tokens common_sampler would advance its own budget and
+            // grammar samplers past, from the same helper -- not the whole prompt
+            gparams.generation_prompt_tokens = common_sampler_prefill_tokens(
+                    vocab, slot.task->params.sampling.generation_prompt);
+
             common_spd_result spd_result;
-            if (!spd_pipeline->generate(prompt, n_predict, spd_result)) {
-                send_error(slot, "SPD generation failed: " + spd_pipeline->error(), ERROR_TYPE_SERVER);
-                slot.release();
-                return;
-            }
-
-            slot.state = SLOT_STATE_GENERATING;
-            slot.t_start_generation = ggml_time_us();
-            slot.t_prompt_processing = std::max(0.001, spd_result.prefill_seconds*1e3);
-            slot.t_token_generation = std::max(0.001, spd_result.decode_seconds*1e3);
-            slot.n_draft_accepted = (int32_t) (spd_result.n_accepted > 0 ? spd_result.n_accepted - 1 : 0);
-            slot.n_draft_total = slot.n_draft_accepted + (int32_t) spd_result.n_rejected;
-            slot.n_draft_verif_steps = (int32_t) spd_result.decode_steps;
-            metrics.on_prompt_eval(slot);
-
-            SLT_INF(slot,
-                    "SPD generated %zu tokens in %.3f s (accepted %d/%d drafts, %" PRIu64 " pipeline steps)\n",
-                    spd_result.tokens.size(), spd_result.decode_seconds,
-                    slot.n_draft_accepted, slot.n_draft_total, spd_result.decode_steps);
-
             bool stopped = false;
-            for (size_t i = 0; i < spd_result.tokens.size(); ++i) {
-                if (i > 0) {
-                    slot.prompt.tokens.push_back(spd_result.tokens[i - 1]);
+            bool prompt_eval_reported = false;
+            llama_token prev_token = LLAMA_TOKEN_NULL;
+
+            // Stream as the pipeline verifies rather than after it returns.
+            // A token reported here is behind the verified frontier, so no
+            // later rejection can retract it -- that is what makes sending it
+            // safe. Walking result.tokens afterwards instead meant a client saw
+            // nothing at all until the whole generation finished, and it is
+            // also process_token() that evaluates the stop conditions, so a
+            // stop string could not end a request early either.
+            slot.state = SLOT_STATE_GENERATING;
+            auto on_token = [&](llama_token tok, size_t /* index */) {
+                if (!prompt_eval_reported) {
+                    prompt_eval_reported = true;
+                    slot.t_start_generation        = ggml_time_us();
+                    slot.t_prompt_processing       = std::max(0.001, spd_result.prefill_seconds*1e3);
+                    slot.n_prompt_tokens_cache     = spd_result.n_prompt_reused;
+                    slot.n_prompt_tokens_processed = spd_result.n_prompt_processed;
+                    metrics.on_prompt_eval(slot);
                 }
 
+                // prompt.tokens tracks what the caches hold, which trails the
+                // newest token by one -- it has been generated but not yet fed
+                // back in.
+                if (prev_token != LLAMA_TOKEN_NULL) {
+                    slot.prompt.tokens.push_back(prev_token);
+                }
+                prev_token = tok;
+
                 completion_token_output token;
-                token.tok = spd_result.tokens[i];
+                token.tok = tok;
                 const bool special = params_base.special ||
                     slot.task->params.sampling.preserved_tokens.find(token.tok) !=
                     slot.task->params.sampling.preserved_tokens.end();
@@ -3209,11 +3381,40 @@ private:
                 token.prob = 1.0f;
 
                 ++slot.n_decoded;
+                slot.t_token_generation = std::max(0.001, (ggml_time_us() - slot.t_start_generation)/1e3);
                 if (!process_token(token, slot)) {
                     stopped = true;
-                    break;
+                    return false;
                 }
+                return true;
+            };
+
+            if (!spd_pipeline->generate(prompt, gparams, spd_result, on_token)) {
+                send_error(slot, "SPD generation failed: " + spd_pipeline->error(), ERROR_TYPE_SERVER);
+                slot.release();
+                return;
             }
+
+            // slot.prompt.tokens is the server's record of what the caches
+            // hold, and it is what the prompt cache is keyed on. The pipeline
+            // drops its in-flight tail on the way out, so the record has to be
+            // cut to match -- otherwise a later restore would report those
+            // trailing tokens as resident and the next request would skip
+            // prefilling cells that were never kept.
+            if ((size_t) spd_result.n_cached_tokens < slot.prompt.tokens.size()) {
+                slot.prompt.tokens.keep_first(spd_result.n_cached_tokens);
+            }
+
+            slot.n_draft_accepted = (int32_t) (spd_result.n_accepted > 0 ? spd_result.n_accepted - 1 : 0);
+            slot.n_draft_total = slot.n_draft_accepted + (int32_t) spd_result.n_rejected;
+            slot.n_draft_verif_steps = (int32_t) spd_result.decode_steps;
+
+            SLT_INF(slot,
+                    "SPD generated %zu tokens in %.3f s (prompt %d new / %d reused, accepted %d/%d drafts, "
+                    "%" PRIu64 " pipeline steps)\n",
+                    spd_result.tokens.size(), spd_result.decode_seconds,
+                    spd_result.n_prompt_processed, spd_result.n_prompt_reused,
+                    slot.n_draft_accepted, slot.n_draft_total, spd_result.decode_steps);
 
             if (!stopped) {
                 slot.stop = STOP_TYPE_LIMIT;
@@ -3244,15 +3445,29 @@ private:
             if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
                 t_prev = t_start;
                 auto avg = [](int64_t t, int64_t n) { return n > 0 ? (double) t / (double) n / 1000.0 : 0.0; };
-                SRV_INF("timings (avg ms/call): draft %7.2f (n=%" PRId64 ") | verify %7.2f (n=%" PRId64 ", submit %7.2f) | spec_proc %7.2f | sample %7.2f | pre %7.2f | decode %7.2f | post %7.2f\n",
-                        avg(t_spec_draft, n_spec_draft), n_spec_draft,
-                        avg(t_spec_verif, n_spec_verif), n_spec_verif,
+                // stderr, and per-window averages (counters reset after each
+                // print): the launcher captures only stderr, and cumulative
+                // averages hide steady-state shifts in short measurements
+                fprintf(stderr, "[timings] window avg ms/call: pre %7.2f (n=%" PRId64 ") | decode %7.2f (n=%" PRId64 ") | sync %7.2f (n=%" PRId64 ") | sample %7.2f (n=%" PRId64 ") | post %7.2f (n=%" PRId64 ") | spec draft %.2f verify %.2f submit %.2f proc %.2f\n",
+                        avg(t_pre_decode, n_pre_decode), n_pre_decode,
+                        avg(t_decode,     n_decode),     n_decode,
+                        avg(t_sync,       n_sync),       n_sync,
+                        avg(t_sampl,      n_sampl),      n_sampl,
+                        avg(t_post_decode, n_post_decode), n_post_decode,
+                        avg(t_spec_draft, n_spec_draft),
+                        avg(t_spec_verif, n_spec_verif),
                         avg(t_spec_submt, n_spec_submt),
-                        avg(t_spec_procs, n_spec_procs),
-                        avg(t_sampl,      n_sampl),
-                        avg(t_pre_decode, n_pre_decode),
-                        avg(t_decode,     n_decode),
-                        avg(t_post_decode, n_post_decode));
+                        avg(t_spec_procs, n_spec_procs));
+                fflush(stderr);
+                t_pre_decode  = 0; n_pre_decode  = 0;
+                t_decode      = 0; n_decode      = 0;
+                t_post_decode = 0; n_post_decode = 0;
+                t_sampl       = 0; n_sampl       = 0;
+                t_sync        = 0; n_sync        = 0;
+                t_spec_draft  = 0; n_spec_draft  = 0;
+                t_spec_verif  = 0; n_spec_verif  = 0;
+                t_spec_submt  = 0; n_spec_submt  = 0;
+                t_spec_procs  = 0; n_spec_procs  = 0;
             }
         }
 
@@ -3278,6 +3493,14 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
+        }
+
+        // [fork] chained cohort decode: while every busy slot is plainly
+        // generating, service one cohort per iteration and skip the classic
+        // batched round entirely. Falls through (after flushing in-flight
+        // cohorts) as soon as prompt or other non-chainable work appears.
+        if (chain_step()) {
+            return;
         }
 
         try {
@@ -3416,18 +3639,19 @@ private:
                 }
 
                 slot.truncated = true;
+
+                // [fork, SPD collect] a context shift moves positions out from
+                // under the pos == token-index mapping the harvest relies on
+                if (slot.spd_seq) {
+                    SLT_WRN(slot, "%s", "context shift during SPD collection - dropping the sequence\n");
+                    slot.spd_seq.reset();
+                    slot.spd_tokens.clear();
+                }
             }
         });
 
         // start populating the batch for this iteration
         batch.clear();
-
-        // [fork, SPD] row mappings refer to the batch being populated
-        if (spd_collector) {
-            iterate(slots, [](server_slot & slot) {
-                slot.spd_rows.clear();
-            });
-        }
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3475,7 +3699,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3620,7 +3844,7 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
                 common_context_seq_rm(ctx_dft, slot.id, ckpt.pos_max + 1, -1);
@@ -3637,7 +3861,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(state_io_tgt(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3649,7 +3873,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
         });
@@ -3670,12 +3894,51 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // [fork] LLAMA_PROMPT_BURST=N: while decode slots are active, hold
+            // freshly-launched prompts until N are pending or the oldest has
+            // waited LLAMA_PROMPT_BURST_MS (default 1500), then admit them all
+            // in one iteration. Every decode step that carries prompt work pays
+            // that work's full pipeline latency inside its sampling barrier, so
+            // dribbling one prompt into each step multiplies the cost by the
+            // number of prompts; a burst pays the barrier once.
+            static const int32_t prompt_burst_n = []() {
+                const char * e = getenv("LLAMA_PROMPT_BURST");
+                return e ? atoi(e) : 0;
+            }();
+            static const int64_t prompt_burst_us = []() {
+                const char * e = getenv("LLAMA_PROMPT_BURST_MS");
+                return (e ? atoll(e) : 1500) * 1000;
+            }();
+
+            bool hold_new_prompts = false;
+            if (prompt_burst_n > 0) {
+                int32_t n_started = 0;
+                int32_t n_active  = 0;
+                int64_t t_oldest  = INT64_MAX;
+                for (const auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_STARTED) {
+                        n_started++;
+                        t_oldest = std::min(t_oldest, slot.t_task_launched);
+                    } else if (slot.is_processing()) {
+                        n_active++;
+                    }
+                }
+                hold_new_prompts = n_started > 0 && n_active > 0 &&
+                        n_started < prompt_burst_n &&
+                        ggml_time_us() - t_oldest < prompt_burst_us;
+            }
+
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                // [fork] prompt-burst admission: leave this task queued for now
+                if (hold_new_prompts && slot.state == SLOT_STATE_STARTED) {
                     return;
                 }
 
@@ -3931,8 +4194,8 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_tgt(state_io_tgt(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_dft(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
@@ -4090,12 +4353,6 @@ private:
                             break;
                         }
 
-                        // [fork, SPD] remember which batch row carries which
-                        // prompt position for tap harvesting after the decode
-                        if (slot.spd_seq) {
-                            slot.spd_rows.emplace_back((int32_t) batch.size(), slot.prompt.n_tokens());
-                        }
-
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
@@ -4220,55 +4477,336 @@ private:
         }
     }
 
-    // [fork, SPD] copy this decode window's tap rows into the collecting
-    // slots' sequence buffers, then hand completed sequences to the shard
-    // writer. llama_get_embeddings_layer_inp synchronizes once per window -
-    // free here, since the pipeline cannot span llama_decode calls anyway.
-    void spd_harvest(int32_t off, int32_t n_view) {
+    // [fork, SPD] copy the last decode window's tap rows into the collecting
+    // slots' sequence buffers. Rows are matched by the context's (seq_id, pos)
+    // metadata, so ubatch merging/grouping/reordering under parallel slots is
+    // immaterial - never assume batch order. Completed sequences are handed to
+    // the writer at send_final_response, not here: a generating slot's
+    // sequence is "complete" after every step. The metadata accessor
+    // synchronizes once per window - free here, since the server samples from
+    // this window right after anyway.
+    void spd_harvest() {
         if (!spd_collector) {
             return;
         }
+        bool any = false;
+        for (auto & slot : slots) {
+            if (slot.spd_seq) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return;
+        }
+
+        const llama_seq_id * sids = nullptr;
+        const llama_pos    * poss = nullptr;
+        const int32_t n_rows = llama_get_embeddings_layer_inp_rows(ctx_tgt, &sids, &poss);
+        if (n_rows <= 0) {
+            return;
+        }
+
         const auto & taps = spd_collector->taps();
         const size_t n_embd = (size_t) llama_model_n_embd(model_tgt);
 
-        for (auto & slot : slots) {
-            if (!slot.spd_seq || slot.spd_rows.empty()) {
+        for (size_t t = 0; t < taps.size(); ++t) {
+            const float * base = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) taps[t]);
+            if (base == nullptr) {
                 continue;
             }
-            const auto & rows = slot.spd_rows;
-
-            for (size_t t = 0; t < taps.size(); ++t) {
-                const float * base = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) taps[t]);
-                if (base == nullptr) {
+            int32_t i = 0;
+            while (i < n_rows) {
+                server_slot * slot = get_slot_by_id((int) sids[i]);
+                if (slot == nullptr || !slot->spd_seq) {
+                    i++;
                     continue;
                 }
-                // harvest contiguous (batch row, prompt pos) runs inside this window
-                size_t i = 0;
-                while (i < rows.size()) {
-                    if (rows[i].first < off || rows[i].first >= off + n_view) {
-                        i++;
-                        continue;
-                    }
-                    size_t j = i + 1;
-                    while (j < rows.size() &&
-                           rows[j].first  == rows[j - 1].first  + 1 &&
-                           rows[j].second == rows[j - 1].second + 1 &&
-                           rows[j].first  <  off + n_view) {
-                        j++;
-                    }
-                    spd_collector->harvest(*slot.spd_seq, t,
-                            base + (size_t) (rows[i].first - off) * n_embd,
-                            rows[i].second, (int32_t) (j - i));
-                    i = j;
+                auto & seq = *slot->spd_seq;
+                // coalesce a contiguous (same seq, pos+1) run into one convert
+                int32_t j = i + 1;
+                while (j < n_rows && sids[j] == sids[i] && poss[j] == poss[j - 1] + 1) {
+                    j++;
                 }
-            }
-
-            if (slot.spd_seq->complete()) {
-                spd_collector->end_seq(std::move(slot.spd_seq), std::move(slot.spd_tokens));
-                slot.spd_seq.reset();
-                slot.spd_tokens.clear();
+                if (poss[i] >= 0 && poss[i] + (j - i) <= seq.n_tokens) {
+                    spd_collector->harvest(seq, t, base + (size_t) i * n_embd, poss[i], j - i);
+                } else if (t == 0) {
+                    SLT_WRN(*slot, "SPD harvest rows outside sequence (pos %d..%d, n_tokens %d) - skipped\n",
+                            poss[i], poss[i] + (int32_t) (j - i) - 1, seq.n_tokens);
+                }
+                i = j;
             }
         }
+    }
+
+    // [fork] chained cohort decode (LLAMA_DECODE_CHAIN=G). The 64-slot round
+    // pays (stages + groups - 1) pipeline slots but only (groups) of them are
+    // steady-state work - the fill/drain tax is paid on every sampling
+    // barrier. Chaining decodes each aligned G-slot cohort as its own
+    // llama_decode call held in flight on its own lane: sync one lane, sample
+    // its G seqs, resubmit, while the other cohorts keep every stage busy.
+    std::vector<uint8_t>              chain_inflight;
+    std::vector<std::vector<int32_t>> chain_members;
+    uint32_t                          chain_cursor = 0;
+    uint32_t                          chain_pick_rr = 0;
+    bool                              chain_broken = false;
+
+    static int32_t chain_group_size() {
+        static const int32_t g = [] {
+            const char * e = std::getenv("LLAMA_DECODE_CHAIN");
+            return e ? atoi(e) : 0;
+        }();
+        return g;
+    }
+
+    static int32_t chain_lanes_cap() {
+        static const int32_t n = [] {
+            const char * e = std::getenv("LLAMA_DECODE_LANES");
+            return e ? atoi(e) : 0;
+        }();
+        return n;
+    }
+
+    bool chain_eligible() {
+        if (chain_broken || chain_group_size() <= 0 || chain_lanes_cap() <= 0 || spd_mode || spec) {
+            return false;
+        }
+        bool any = false;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            // every busy slot must be a plain generating slot: prompt work,
+            // speculation, probs, embeddings and lora all take the classic path
+            if (slot.state != SLOT_STATE_GENERATING || slot.can_speculate() ||
+                    !slot.spec_draft.empty() || slot.need_embd() ||
+                    slot.task->params.sampling.n_probs > 0 || !slot.lora.empty()) {
+                return false;
+            }
+            any = true;
+        }
+        return any;
+    }
+
+    void chain_harvest_slot(server_slot & slot) {
+        if (!spd_collector || !slot.spd_seq) {
+            return;
+        }
+        auto & seq = *slot.spd_seq;
+        // the token this decode consumed was fed at the slot's last position
+        const llama_pos pos = (llama_pos) slot.prompt.n_tokens() - 1;
+        const auto & taps = spd_collector->taps();
+        for (size_t t = 0; t < taps.size(); ++t) {
+            const float * row = llama_chain_tap_row(ctx_tgt, (uint32_t) taps[t], slot.id);
+            if (row == nullptr) {
+                continue;
+            }
+            if (pos >= 0 && pos + 1 <= seq.n_tokens) {
+                spd_collector->harvest(seq, t, row, pos, 1);
+            } else if (t == 0) {
+                SLT_WRN(slot, "chain SPD harvest row outside sequence (pos %d, n_tokens %d) - skipped\n", pos, seq.n_tokens);
+            }
+        }
+    }
+
+    void chain_sample_cohort(int32_t c) {
+        const int32_t lane = c % chain_lanes_cap();
+        {
+            scoped_timer t(t_sync, n_sync);
+            llama_chain_lane_sync(ctx_tgt, lane);
+        }
+        const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
+        for (int32_t id : chain_members[c]) {
+            server_slot * slot_ptr = get_slot_by_id(id);
+            if (slot_ptr == nullptr || slot_ptr->state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+            auto & slot = *slot_ptr;
+
+            chain_harvest_slot(slot);
+
+            const float * row = llama_chain_logits_row(ctx_tgt, id);
+            llama_token tok;
+            {
+                scoped_timer t(t_sampl, n_sampl);
+                tok = common_sampler_sample_row(slot.smpl.get(), vocab, row);
+            }
+
+            static const bool chain_trace = std::getenv("LLAMA_CHAIN_TRACE") != nullptr;
+            if (chain_trace) {
+                int32_t amax = 0;
+                const int32_t nv = llama_vocab_n_tokens(vocab);
+                for (int32_t v = 1; v < nv; ++v) {
+                    if (row[v] > row[amax]) amax = v;
+                }
+                fprintf(stderr, "[chain] slot=%d pos=%d argmax=%d logit=%.3f sampled=%d\n",
+                        id, (int) slot.prompt.n_tokens(), amax, row[amax], tok);
+                fflush(stderr);
+            }
+
+            common_sampler_accept(slot.smpl.get(), tok, true);
+
+            slot.i_batch = -1;
+
+            const int64_t t_now = ggml_time_us();
+            slot.n_decoded += 1;
+            if (slot.n_decoded == 1) {
+                slot.t_start_generation = t_now;
+                slot.t_print_last = t_now;
+                slot.n_decoded_last = 0;
+                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                metrics.on_prompt_eval(slot);
+            }
+            slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
+
+            const bool accept_special = params_base.special ||
+                slot.task->params.sampling.preserved_tokens.find(tok) != slot.task->params.sampling.preserved_tokens.end();
+
+            completion_token_output result;
+            result.tok          = tok;
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special);
+            result.prob         = 1.0f;
+
+            if (!process_token(result, slot)) {
+                slot.print_timings();
+                send_final_response(slot);
+                metrics.on_prediction(slot);
+                slot.release();
+                continue;
+            }
+
+            slot.print_timings_tg();
+        }
+        chain_inflight[c] = 0;
+    }
+
+    bool chain_submit_cohort(int32_t c) {
+        const int32_t G = chain_group_size();
+
+        batch.clear();
+        auto & members = chain_members[c];
+        members.clear();
+
+        // slots already riding another in-flight cohort are off limits
+        std::vector<uint8_t> busy(slots.size(), 0);
+        for (size_t k = 0; k < chain_inflight.size(); ++k) {
+            if (!chain_inflight[k]) {
+                continue;
+            }
+            for (int32_t id : chain_members[k]) {
+                if (id >= 0 && (size_t) id < busy.size()) {
+                    busy[id] = 1;
+                }
+            }
+        }
+
+        // repack: take up to G generating slots round-robin from the pool.
+        // Keeping the cohort at full G whenever possible keeps the lane graph
+        // shape constant - membership churn with fixed id-windows caused a
+        // realloc drain (and its in-flight corruption hazard) on every slot
+        // join/leave.
+        const int32_t n_slots = (int32_t) slots.size();
+        for (int32_t k = 0; k < n_slots && (int32_t) members.size() < G; ++k) {
+            const int32_t id = (int32_t) ((chain_pick_rr + k) % n_slots);
+            server_slot * slot_ptr = get_slot_by_id(id);
+            if (slot_ptr == nullptr || slot_ptr->state != SLOT_STATE_GENERATING || busy[id]) {
+                continue;
+            }
+            auto & slot = *slot_ptr;
+            if (slot.prompt.n_tokens() + 1 >= slot.n_ctx && !params_base.ctx_shift) {
+                send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                slot.release();
+                continue;
+            }
+            if (!batch.slot_batched) {
+                batch.slot_batched = &slot;
+            }
+            slot.handle_last_sampled_token(batch);
+            members.push_back(id);
+        }
+        if (!members.empty()) {
+            chain_pick_rr = (uint32_t) ((members.back() + 1) % n_slots);
+        }
+
+        if (batch.size() == 0) {
+            chain_inflight[c] = 0;
+            return false;
+        }
+        batch.render();
+
+        llama_batch view = batch.get_view(0, batch.size());
+        int ret;
+        {
+            scoped_timer t(t_decode, n_decode);
+            llama_chain_arm(ctx_tgt, c % chain_lanes_cap());
+            ret = llama_decode(ctx_tgt, view);
+        }
+        metrics.on_decoded(slots);
+
+        if (ret != 0) {
+            SRV_ERR("chain decode failed, ret = %d\n", ret);
+            std::fill(chain_inflight.begin(), chain_inflight.end(), 0);
+            abort_all_slots("chain decode failed, ret = " + std::to_string(ret));
+            return false;
+        }
+
+        // the context must have staged this call chained (seq-keyed rows); a
+        // silent classic fallback would leave every row we read stale
+        const int32_t lane_used = llama_chain_last_lane(ctx_tgt);
+        if (lane_used != c % chain_lanes_cap()) {
+            SRV_ERR("chain call for cohort %d staged on lane %d (expected %d) - disabling chained decode\n",
+                    c, lane_used, c % chain_lanes_cap());
+            chain_broken = true;
+            std::fill(chain_inflight.begin(), chain_inflight.end(), 0);
+            llama_synchronize(ctx_tgt);
+            abort_all_slots("chained decode staging mismatch");
+            return false;
+        }
+
+        chain_inflight[c] = 1;
+        return true;
+    }
+
+    void chain_flush() {
+        const int32_t n_cohorts = (int32_t) chain_inflight.size();
+        for (int32_t k = 0; k < n_cohorts; ++k) {
+            const int32_t c = (int32_t) ((chain_cursor + k) % n_cohorts);
+            if (chain_inflight[c]) {
+                chain_sample_cohort(c);
+            }
+        }
+    }
+
+    // one cohort serviced per update_slots iteration, so streaming responses
+    // and the task queue keep flowing between steps
+    bool chain_step() {
+        const int32_t G = chain_group_size();
+        if (G <= 0) {
+            return false;
+        }
+        const int32_t n_cohorts = (params_base.n_parallel + G - 1) / G;
+        if ((int32_t) chain_inflight.size() != n_cohorts) {
+            chain_inflight.assign(n_cohorts, 0);
+            chain_members.assign(n_cohorts, {});
+        }
+        if (!chain_eligible()) {
+            chain_flush();
+            return false;
+        }
+        for (int32_t k = 0; k < n_cohorts; ++k) {
+            const int32_t c = (int32_t) ((chain_cursor + k) % n_cohorts);
+            bool progressed = false;
+            if (chain_inflight[c]) {
+                chain_sample_cohort(c);
+                progressed = true;
+            }
+            progressed |= chain_submit_cohort(c);
+            if (progressed) {
+                chain_cursor = (uint32_t) ((c + 1) % n_cohorts);
+                return true;
+            }
+        }
+        return false;
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -4353,8 +4891,8 @@ private:
             return false; // retry with the updated n_batch
         }
 
-        // [fork, SPD] harvest hidden-state taps of this window's prompt rows
-        spd_harvest(off, batch_view.n_tokens);
+        // [fork, SPD] harvest hidden-state taps of this window's rows
+        spd_harvest();
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
@@ -4422,6 +4960,13 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        // bill the deferred pipeline drain here, not to the first slot's
+        // sampler call, so t_sampl reads pure sampler CPU
+        {
+            scoped_timer t(t_sync, n_sync);
+            llama_synchronize(ctx_tgt);
+        }
+
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4647,13 +5192,13 @@ private:
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         {
-                            ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_tgt(state_io_tgt(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                             common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
                         }
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_dft(state_io_dft(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                             common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
                         }

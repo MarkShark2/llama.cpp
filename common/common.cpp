@@ -2152,55 +2152,71 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+// A null context is legal and common -- ctx_dft is null whenever there is no
+// draft model -- and every caller relied on the old `if (ctx == nullptr)
+// return;` guards. Returning 0 keeps that: a zero-sized state round-trips
+// through the checkpoint and prompt-cache paths as "nothing to save".
+size_t common_state_seq_io_ctx::get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return ctx ? llama_state_seq_get_size_ext(ctx, seq_id, flags) : 0;
+}
+
+size_t common_state_seq_io_ctx::get_data(uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return ctx ? llama_state_seq_get_data_ext(ctx, dst, size, seq_id, flags) : 0;
+}
+
+size_t common_state_seq_io_ctx::set_data(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return ctx ? llama_state_seq_set_data_ext(ctx, src, size, seq_id, flags) : 0;
+}
+
+size_t common_state_seq_io_ctx::save_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return ctx ? llama_state_seq_save_file_ext(ctx, path.c_str(), seq_id, nullptr, 0, flags) : 0;
+}
+
+size_t common_state_seq_io_ctx::load_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (!ctx) {
+        return 0;
+    }
+    size_t n_token_count = 0;
+    return llama_state_seq_load_file_ext(ctx, path.c_str(), seq_id, nullptr, 0, &n_token_count, flags);
+}
+
 void common_prompt_checkpoint::update_tgt(
-        llama_context * ctx,
+        common_state_seq_io & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    const size_t ckpt_size = io.get_size(seq_id, flags);
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = io.get_data(data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
 }
 
 void common_prompt_checkpoint::update_dft(
-        llama_context * ctx,
+        common_state_seq_io & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    const size_t ckpt_size = io.get_size(seq_id, flags);
 
     data_dft.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    const size_t n = io.get_data(data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
 }
 
 void common_prompt_checkpoint::update_tgt_file(
-        llama_context * ctx,
+        common_state_seq_io & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags,
         const std::string & path) {
-    if (ctx == nullptr) {
-        return;
-    }
-
     data_tgt.clear();
     file_tgt.reset();
 
-    const size_t n = llama_state_seq_save_file_ext(ctx, path.c_str(), seq_id, nullptr, 0, flags);
+    const size_t n = io.save_file(path, seq_id, flags);
     if (n == 0) {
         LOG_ERR("%s: failed to save checkpoint state to '%s'\n", __func__, path.c_str());
         return;
@@ -2210,18 +2226,21 @@ void common_prompt_checkpoint::update_tgt_file(
 }
 
 void common_prompt_checkpoint::update_dft_file(
-        llama_context * ctx,
+        common_state_seq_io & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags,
         const std::string & path) {
-    if (ctx == nullptr) {
-        return;
-    }
-
     data_dft.clear();
     file_dft.reset();
 
-    const size_t n = llama_state_seq_save_file_ext(ctx, path.c_str(), seq_id, nullptr, 0, flags);
+    // No draft state to write is not a failure: there may be no draft context
+    // at all, or -- under SPD -- the drafter is serialized inside the target's
+    // own frame. Asking first keeps that case out of the error log.
+    if (io.get_size(seq_id, flags) == 0) {
+        return;
+    }
+
+    const size_t n = io.save_file(path, seq_id, flags);
     if (n == 0) {
         LOG_ERR("%s: failed to save checkpoint state to '%s'\n", __func__, path.c_str());
         return;
@@ -2231,16 +2250,11 @@ void common_prompt_checkpoint::update_dft_file(
 }
 
 void common_prompt_checkpoint::load_tgt(
-        llama_context * ctx,
+        common_state_seq_io & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
     if (file_tgt) {
-        size_t n_token_count = 0;
-        const size_t n = llama_state_seq_load_file_ext(ctx, file_tgt->path.c_str(), seq_id, nullptr, 0, &n_token_count, flags);
+        const size_t n = io.load_file(file_tgt->path, seq_id, flags);
         if (n == 0) {
             GGML_ABORT("failed to load checkpoint state from '%s'\n", file_tgt->path.c_str());
         }
@@ -2251,23 +2265,18 @@ void common_prompt_checkpoint::load_tgt(
         return;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    const size_t n = io.set_data(data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
     }
 }
 
 void common_prompt_checkpoint::load_dft(
-        llama_context * ctx,
+        common_state_seq_io & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
     if (file_dft) {
-        size_t n_token_count = 0;
-        const size_t n = llama_state_seq_load_file_ext(ctx, file_dft->path.c_str(), seq_id, nullptr, 0, &n_token_count, flags);
+        const size_t n = io.load_file(file_dft->path, seq_id, flags);
         if (n == 0) {
             GGML_ABORT("failed to load checkpoint state from '%s'\n", file_dft->path.c_str());
         }
@@ -2278,7 +2287,7 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    const size_t n = io.set_data(data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
     }

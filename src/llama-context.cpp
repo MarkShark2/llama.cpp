@@ -22,6 +22,7 @@
 // [fork, PipeDec] fork-internal ggml export, kept out of ggml-backend.h so the
 // public header (a dependency of every CUDA object) stays untouched.
 extern "C" void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable);
+extern "C" void ggml_backend_sched_set_pipeline_lane(ggml_backend_sched_t sched, bool lane);
 
 //
 // llama_context
@@ -760,6 +761,10 @@ void llama_context::sched_reserve() {
     gf_res_pipedec_head.reset();
     sched_pipedec_head.reset();
 
+    // [fork] same for the decode lane pool; lanes rebuild lazily
+    gf_res_decode_lane.clear();
+    sched_decode_lane.clear();
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
@@ -878,6 +883,11 @@ void llama_context::synchronize() {
     }
     if (sched_pipedec_head) {
         ggml_backend_sched_synchronize(sched_pipedec_head.get());
+    }
+    for (auto & lane_sched : sched_decode_lane) {
+        if (lane_sched) {
+            ggml_backend_sched_synchronize(lane_sched.get());
+        }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1148,6 +1158,70 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
     return embd_layer_inp[lid].data;
+}
+
+int32_t llama_context::get_embeddings_layer_inp_rows(const llama_seq_id ** seq_ids, const llama_pos ** pos) {
+    GGML_ASSERT(embd_layer_inp_seq.size() == embd_layer_inp_pos.size());
+
+    *seq_ids = embd_layer_inp_seq.data();
+    *pos     = embd_layer_inp_pos.data();
+
+    return (int32_t) embd_layer_inp_seq.size();
+}
+
+// [fork] chained cohort decode accessors. No output_reorder: chain calls are
+// single sorted ubatches with no output swaps, and rows are seq-keyed.
+void llama_context::chain_read_note(ggml_backend_t backend) {
+    if (std::find(chain_read_backends.begin(), chain_read_backends.end(), backend) == chain_read_backends.end()) {
+        chain_read_backends.push_back(backend);
+    }
+}
+
+void llama_context::chain_lane_sync(int32_t lane) {
+    // wait only on this lane's own read fences: an endpoint-global
+    // ggml_backend_synchronize would also fence every younger cohort's
+    // graph_computes on the shared daemons and drain the whole pipeline
+    GGML_ASSERT(lane >= 0);
+    // diagnostic bisect: full context sync instead of the read fences,
+    // keeping every other part of the chained path identical
+    static const bool sync_full = [] {
+        const char * e = getenv("LLAMA_DECODE_CHAIN_SYNC_FULL");
+        return e && atoi(e) != 0;
+    }();
+    if (sync_full) {
+        synchronize();
+        if ((size_t) lane < chain_lane_reads.size()) {
+            chain_lane_reads[lane].clear();
+        }
+        return;
+    }
+    if ((size_t) lane >= chain_lane_reads.size()) {
+        return;
+    }
+    for (auto & fence : chain_lane_reads[lane]) {
+        if (ggml_backend_is_rpc(fence.first)) {
+            ggml_backend_rpc_read_wait(fence.first, fence.second);
+        } else {
+            ggml_backend_synchronize(fence.first);
+        }
+    }
+    chain_lane_reads[lane].clear();
+}
+
+const float * llama_context::chain_logits_row(int32_t row) const {
+    GGML_ASSERT(logits.data != nullptr);
+    const int64_t n_vocab = model.vocab.n_tokens();
+    GGML_ASSERT((int64_t) (row + 1)*n_vocab <= (int64_t) logits.size);
+    return logits.data + (int64_t) row*n_vocab;
+}
+
+const float * llama_context::chain_tap_row(uint32_t lid, int32_t row) const {
+    if (lid >= embd_layer_inp.size() || !embd_layer_inp[lid].has_data()) {
+        return nullptr;
+    }
+    const size_t n_embd = model.hparams.n_embd;
+    GGML_ASSERT(((size_t) row + 1)*n_embd <= embd_layer_inp[lid].size);
+    return embd_layer_inp[lid].data + (size_t) row*n_embd;
 }
 
 ggml_tensor * llama_context::spd_peer_inp_tensor() const {
@@ -1625,6 +1699,97 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    return res;
+}
+
+// [fork] LLAMA_DECODE_LANES=N caps the decode lane pool (0 = off). Group
+// ubatches beyond the cap fall back to the shared scheduler.
+static int32_t llama_decode_lanes_max() {
+    static const int32_t n = [] {
+        const char * e = getenv("LLAMA_DECODE_LANES");
+        return e ? atoi(e) : 0;
+    }();
+    return n;
+}
+
+// [fork] LLAMA_DECODE_CHAIN=G (0 = off): cohort-chained decode. The caller
+// decodes seq-aligned cohorts of up to G single-token sequences as separate
+// llama_decode calls and keeps several in flight; each cohort's outputs land
+// at rows keyed by seq id and its lane is a pure function of the cohort, so
+// the caller can sync one lane and sample its rows while the other cohorts
+// are still walking the pipeline.
+static int32_t llama_decode_chain_group() {
+    static const int32_t g = [] {
+        const char * e = getenv("LLAMA_DECODE_CHAIN");
+        return e ? atoi(e) : 0;
+    }();
+    return g;
+}
+
+llm_graph_result * llama_context::process_ubatch_decode_lane(
+        const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, uint32_t lane, ggml_status & ret) {
+    if (mctx && !mctx->apply()) {
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    if (sched_decode_lane.size() <= lane) {
+        sched_decode_lane.resize(lane + 1);
+        gf_res_decode_lane.resize(lane + 1);
+    }
+
+    auto & lane_sched = sched_decode_lane[lane];
+    auto & lane_res   = gf_res_decode_lane[lane];
+
+    if (!lane_sched) {
+        // Sized like the primary scheduler: lane membership shifts when slots
+        // finish or join, so a lane must be able to hold any decode group.
+        const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        lane_sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes, false, cparams.op_offload));
+        ggml_backend_sched_set_stable_host_inputs(lane_sched.get(), true);
+        ggml_backend_sched_set_pipeline_lane(lane_sched.get(), true);
+        lane_res.reset(new llm_graph_result(max_nodes));
+        LLAMA_LOG_INFO("%s: initialized decode lane %u\n", __func__, lane);
+    }
+
+    auto * res = lane_res.get();
+    auto * gf  = res->get_gf();
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, lane_sched.get());
+
+    if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
+        // no synchronize: this lane's previous graph retired at the last
+        // llama_get_* drain, and no other lane touches this lane's tensors
+        n_reused++;
+    } else {
+        res->reset();
+        ggml_backend_sched_reset(lane_sched.get());
+        ggml_backend_sched_set_eval_callback(
+                lane_sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        gf = model.build_graph(gparams);
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to initialize graph for decode lane %u\n", __func__, lane);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (!ggml_backend_sched_alloc_graph(lane_sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph for decode lane %u\n", __func__, lane);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+    }
+
+    res->set_inputs(&ubatch);
+
+    ret = ggml_backend_sched_graph_compute_async(lane_sched.get(), res->get_gf());
+    if (ret != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute graph for decode lane %u, status: %d\n", __func__, lane, (int) ret);
+        return nullptr;
+    }
 
     return res;
 }
@@ -2277,6 +2442,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    // [fork, SPD collect] row metadata describes only the current decode call
+    embd_layer_inp_seq.clear();
+    embd_layer_inp_pos.clear();
+
+    // [fork] chained cohort decode: reset the per-call staging verdict and
+    // consume the one-shot opt-in. An armed call also suppresses the
+    // LLAMA_DECODE_SPLIT cut - the batch already is one cohort.
+    chain_last_lane = -1;
+    const int32_t chain_armed_call = chain_armed_lane;
+    chain_armed_lane = -1;
+    // unconditional: also self-heals a leaked suppress from an aborted call
+    dsv4_decode_split_suppress(chain_armed_call >= 0);
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -2344,6 +2522,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool    pipedec_trace   = pipedec_stage2 && getenv("GGML_PIPEDEC_TRACE") && atoi(getenv("GGML_PIPEDEC_TRACE")) != 0;
     const int64_t pipedec_body_t0 = pipedec_stage2 ? ggml_time_us() : 0;
 
+    // [fork] decode lane pool eligibility. Lanes carry the plain logits path
+    // plus layer-input taps (both resolve tensors against the lane scheduler);
+    // every other extraction below resolves against the shared scheduler, so
+    // any of those features sends the whole batch there.
+    bool decode_lanes_ok = llama_decode_lanes_max() > 0 && !pipedec_stage2 &&
+            !output_all && !has_samplers && !cparams.embeddings && !cparams.embeddings_nextn;
+    uint32_t decode_lane_next = 0;
+
+    static const bool decode_trace = [] {
+        const char * e = getenv("LLAMA_DECODE_TRACE");
+        return e && atoi(e) != 0;
+    }();
+    if (decode_trace) {
+        fprintf(stderr, "[dec] call n_tokens_all=%d n_outputs_all=%d lanes_ok=%d samplers=%d output_all=%d embd=%d nextn=%d\n",
+                (int) n_tokens_all, (int) n_outputs_all, (int) decode_lanes_ok, (int) has_samplers,
+                (int) output_all, (int) cparams.embeddings, (int) cparams.embeddings_nextn);
+        fflush(stderr);
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2367,8 +2564,36 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const uint32_t pipedec_lane = pipedec_group_tokens + n_tokens_prev;
         if (pipedec_stage2) { PIPEDEC_STEP("loop: dispatch body lane=%u n_tokens=%u\n", pipedec_lane, ubatch.n_tokens); }
+
+        // [fork] a decode-group ubatch (one token per sequence) rides its own
+        // persistent lane; anything else takes the shared scheduler
+        int32_t decode_lane = decode_lanes_ok &&
+                ubatch.n_seq_tokens == 1 && ubatch.n_tokens == ubatch.n_seqs &&
+                (int32_t) decode_lane_next < llama_decode_lanes_max()
+                ? (int32_t) decode_lane_next++ : -1;
+
+        // [fork] chained cohort call: the caller armed this call onto an
+        // explicit lane (cohorts are repacked each cycle from whatever seqs
+        // are generating, keeping the ubatch shape constant so the lane graph
+        // reuses instead of realloc-draining on every membership change).
+        // Output rows are keyed by seq id, so calls for different cohorts
+        // write disjoint regions of the output buffers regardless of packing
+        // and can stay in flight together.
+        const bool chain_call = chain_armed_call >= 0 && decode_lane >= 0;
+        if (chain_call) {
+            decode_lane = chain_armed_call % llama_decode_lanes_max();
+        }
+
+        if (decode_trace) {
+            fprintf(stderr, "[dec] ubatch lane=%d n_tok=%u n_seq_tokens=%u n_seqs=%u n_outputs=%d\n",
+                    decode_lane, ubatch.n_tokens, ubatch.n_seqs > 0 ? ubatch.n_seq_tokens : 0, ubatch.n_seqs, (int) n_outputs);
+            fflush(stderr);
+        }
+
         const auto * res = pipedec_stage2
                 ? process_ubatch_pipedec_body(ubatch, mctx.get(), pipedec_lane, status)
+                : decode_lane >= 0
+                ? process_ubatch_decode_lane(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), (uint32_t) decode_lane, status)
                 : process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
         if (pipedec_stage2) { PIPEDEC_STEP("loop: body lane=%u returned res=%p status=%d\n", pipedec_lane, (void*) res, (int) status); }
 
@@ -2418,13 +2643,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            // [fork] a lane ubatch's tensors live in the lane scheduler
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(
+                    decode_lane >= 0 ? sched_decode_lane[decode_lane].get() : sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            if (chain_call) {
+                // rows keyed by seq id so concurrent cohort calls stay disjoint;
+                // the buffer holds n_seq_max rows (output_reserve floor)
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const int64_t row = ubatch.seq_id[i][0];
+                    GGML_ASSERT((row + 1)*n_vocab <= (int64_t) logits.size);
+                    ggml_backend_tensor_get_async(backend_res, t_logits,
+                            logits.data + row*n_vocab, (size_t) i*n_vocab*sizeof(float), n_vocab*sizeof(float));
+                }
+                chain_read_note(backend_res);
+            } else if (n_outputs) {
+                float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
-            if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -2508,7 +2745,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
             extract_layer_inputs_pipedec(res, sched_pipedec_body[pipedec_lane].get(), pipedec_lane);
             PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u end\n", pipedec_lane);
         } else {
-            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+            extract_layer_inputs(res,
+                    decode_lane >= 0 ? sched_decode_lane[decode_lane].get() : sched.get(),
+                    ubatch, n_tokens_prev, chain_call);
+        }
+
+        // [fork] chained cohort call: snapshot the read fences now that every
+        // async read for this call is enqueued. A completed read also proves
+        // the graph that produced it retired on that stage (daemon FIFO), so
+        // these fences double as per-stage completion for the lane.
+        if (chain_call) {
+            if (chain_lane_reads.size() <= (size_t) decode_lane) {
+                chain_lane_reads.resize(decode_lane + 1);
+            }
+            auto & fences = chain_lane_reads[decode_lane];
+            fences.clear();
+            for (ggml_backend_t b : chain_read_backends) {
+                fences.emplace_back(b, ggml_backend_is_rpc(b) ? ggml_backend_rpc_read_ordinal(b) : 0);
+            }
+            chain_read_backends.clear();
+            chain_last_lane = decode_lane;
         }
 
         // extract nextn embeddings before
@@ -2958,13 +3214,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, bool chain_rows) {
     // [fork, SPD] the tap stays in the graph (prefill reads it, and toggling it
     // per phase would reshape the stage graph); this only drops the blocking
     // readback for stages whose anchors the host already has.
     if (cparams.spd_skip_layer_inp) {
         return;
     }
+    const size_t n_tokens = ubatch.n_tokens;
+
+    bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2983,12 +3242,37 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
-        const size_t dst_offset = token_offset * row_floats;
-        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(res_sched, t);
         GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+
+        if (chain_rows) {
+            // chained cohort call: rows keyed by seq id, so cohort calls in
+            // flight together write disjoint regions. No (seq,pos) metadata -
+            // the caller reads rows by seq id and tracks positions itself.
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const size_t row = (size_t) ubatch.seq_id[i][0];
+                GGML_ASSERT((row + 1) * row_floats <= embd_layer_inp[il].size);
+                ggml_backend_tensor_get_async(backend, t,
+                        embd_layer_inp[il].data + row*row_floats, i*row_floats*sizeof(float), row_floats*sizeof(float));
+            }
+            chain_read_note(backend);
+        } else {
+            const size_t dst_offset = token_offset * row_floats;
+            GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        }
+        extracted = true;
+    }
+
+    // [fork, SPD collect] publish (seq_id, pos) per extracted row - collectors
+    // must map rows by this, never by batch index (ubatch order differs)
+    if (extracted && !chain_rows) {
+        GGML_ASSERT(embd_layer_inp_seq.size() == token_offset);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            embd_layer_inp_seq.push_back(ubatch.seq_id[i][0]);
+            embd_layer_inp_pos.push_back(ubatch.pos[i]);
+        }
     }
 }
 
@@ -3048,15 +3332,11 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
-            }
-        }
+        // [fork, SPD collect] embd_layer_inp is deliberately NOT swapped here:
+        // its rows are token-indexed (one per ubatch token) while output_swaps
+        // are output-space indices, so applying them scrambled tap rows in any
+        // batch where n_outputs != n_tokens. Rows stay in extraction order and
+        // collectors map them via llama_get_embeddings_layer_inp_rows.
 
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
@@ -4563,6 +4843,38 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
     return ctx->get_embeddings_layer_inp(lid);
 }
+
+int32_t llama_get_embeddings_layer_inp_rows(llama_context * ctx, const llama_seq_id ** seq_ids, const llama_pos ** pos) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_layer_inp_rows(seq_ids, pos);
+}
+
+// [fork] chained cohort decode (LLAMA_DECODE_CHAIN): lane-scoped wait + seq-
+// keyed row reads, exported for the server without touching the public header
+extern "C" {
+
+void llama_chain_lane_sync(llama_context * ctx, int32_t lane) {
+    ctx->chain_lane_sync(lane);
+}
+
+const float * llama_chain_logits_row(llama_context * ctx, int32_t row) {
+    return ctx->chain_logits_row(row);
+}
+
+const float * llama_chain_tap_row(llama_context * ctx, uint32_t lid, int32_t row) {
+    return ctx->chain_tap_row(lid, row);
+}
+
+int32_t llama_chain_last_lane(llama_context * ctx) {
+    return ctx->chain_last_lane_get();
+}
+
+void llama_chain_arm(llama_context * ctx, int32_t lane) {
+    ctx->chain_arm(lane);
+}
+
+} // extern "C"
 
 ggml_tensor * llama_spd_peer_inp_tensor(llama_context * ctx) {
     return ctx->spd_peer_inp_tensor();

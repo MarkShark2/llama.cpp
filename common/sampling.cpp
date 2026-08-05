@@ -184,6 +184,28 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+std::vector<llama_token> common_sampler_prefill_tokens(const struct llama_vocab * vocab, const std::string & generation_prompt) {
+    std::vector<llama_token> prefill_tokens;
+    if (generation_prompt.empty()) {
+        return prefill_tokens;
+    }
+
+    GGML_ASSERT(vocab != nullptr);
+
+    auto tokens = common_tokenize(vocab, generation_prompt, false, true);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        std::string piece = common_token_to_piece(vocab, tokens[i], true);
+        if (i == 0 && !piece.empty() && std::isspace((unsigned char) piece[0]) && !std::isspace((unsigned char) generation_prompt[0])) {
+            // Some tokenizers will add a space before the first special token, need to exclude
+            continue;
+        }
+        LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
+        prefill_tokens.push_back(tokens[i]);
+    }
+
+    return prefill_tokens;
+}
+
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -264,20 +286,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     // Compute prefill tokens from the generation prompt
-    std::vector<llama_token> prefill_tokens;
-    if (!params.generation_prompt.empty()) {
-        GGML_ASSERT(vocab != nullptr);
-        auto tokens = common_tokenize(vocab, params.generation_prompt, false, true);
-        for (size_t i = 0; i < tokens.size(); i++) {
-            std::string piece = common_token_to_piece(vocab, tokens[i], true);
-            if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
-                // Some tokenizers will add a space before the first special token, need to exclude
-                continue;
-            }
-            LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
-            prefill_tokens.push_back(tokens[i]);
-        }
-    }
+    const std::vector<llama_token> prefill_tokens = common_sampler_prefill_tokens(vocab, params.generation_prompt);
 
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
@@ -630,6 +639,71 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     return id;
+}
+
+llama_token common_sampler_sample_row(struct common_sampler * gsmpl, const struct llama_vocab * vocab, const float * row, bool grammar_first) {
+    // [fork] sample from a raw logits row without touching the context: no
+    // synchronize, no backend-sampler path. Used by chained cohort decode,
+    // where the caller has already waited on the owning lane.
+    const auto tm = gsmpl->tm();
+
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur     = gsmpl->cur;
+    auto & cur_p   = gsmpl->cur_p;
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    auto set_row = [&]() {
+        cur.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[token_id] = llama_token_data{token_id, row[token_id], 0.0f};
+        }
+        cur_p = { cur.data(), cur.size(), -1, false };
+    };
+
+    set_row();
+
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_first && grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    llama_token id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+
+    // grammar-based rejection sampling, mirroring common_sampler_sample
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        if (single_token_data_array.data[0].logit != -INFINITY) {
+            return id;
+        }
+    }
+
+    set_row();
+
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {

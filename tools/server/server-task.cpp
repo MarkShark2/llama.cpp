@@ -1777,7 +1777,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, common_state_seq_io & io_tgt, common_state_seq_io & io_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1813,8 +1813,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         if (it_best->data.file_main) {
             auto & file = it_best->data.file_main;
 
-            size_t n_token_count = 0;
-            const size_t n = llama_state_seq_load_file_ext(ctx_tgt, file->path.c_str(), id_slot, nullptr, 0, &n_token_count, 0);
+            const size_t n = io_tgt.load_file(file->path, id_slot, 0);
             if (n == 0) {
                 SRV_ERR("failed to restore state from '%s'\n", file->path.c_str());
 
@@ -1828,7 +1827,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = io_tgt.set_data(data.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
@@ -1840,12 +1839,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         if (it_best->data.file_drft) {
-            GGML_ASSERT(ctx_dft);
+            // Was GGML_ASSERT(ctx_dft): draft state exists, so there must be
+            // somewhere to put it. Stated against the io instead -- one with no
+            // context behind it reports zero size, which is the same invariant
+            // without naming a context the caller may not have.
+            GGML_ASSERT(io_dft.get_size(id_slot, 0) > 0);
 
             auto & file = it_best->data.file_drft;
 
-            size_t n_token_count = 0;
-            const size_t n = llama_state_seq_load_file_ext(ctx_dft, file->path.c_str(), id_slot, nullptr, 0, &n_token_count, 0);
+            const size_t n = io_dft.load_file(file->path, id_slot, 0);
             if (n == 0) {
                 SRV_WRN("failed to restore state from '%s'\n", file->path.c_str());
 
@@ -1859,10 +1861,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             auto & data = it_best->data.drft;
 
             if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+                GGML_ASSERT(io_dft.get_size(id_slot, 0) > 0);
 
                 const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                const size_t n = io_dft.set_data(data.data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 

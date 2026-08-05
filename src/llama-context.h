@@ -91,6 +91,18 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    // [fork, SPD collect] row metadata of embd_layer_inp for the last decode
+    int32_t get_embeddings_layer_inp_rows(const llama_seq_id ** seq_ids, const llama_pos ** pos);
+
+    // [fork] chained cohort decode (LLAMA_DECODE_CHAIN=G): output rows are
+    // keyed by seq id, so a caller holding several cohort calls in flight can
+    // wait on one lane and read that cohort's rows without draining the rest
+    void          chain_lane_sync(int32_t lane);
+    const float * chain_logits_row(int32_t row) const;
+    const float * chain_tap_row(uint32_t lid, int32_t row) const;
+    int32_t       chain_last_lane_get() const { return chain_last_lane; }
+    void          chain_arm(int32_t lane) { chain_armed_lane = lane; }
+
     // [fork, SPD peer boundaries] the persistent boundary input tensor (or the
     // last graph's raw embd input as a fallback) and the last graph's embd
     // output tensor, for direct device-to-device boundary pushes; and the
@@ -159,6 +171,19 @@ struct llama_context {
     // without multiplying the much larger prompt/prefill graph buffers.
     llm_graph_result * process_ubatch_pipedec_body(
                 const llama_ubatch & ubatch,
+            llama_memory_context_i * mctx,
+                           uint32_t   lane,
+                       ggml_status & ret);
+
+    // [fork] decode lane pool (LLAMA_DECODE_LANES): one persistent scheduler +
+    // graph per decode-group ubatch, reused across steps with no drain. Safe
+    // because each lane's tensors are private, at most one graph per lane is in
+    // flight (all lanes retire at the per-step llama_get_* synchronize), and
+    // cross-lane ordering rides each backend's stream/socket FIFO — the safety
+    // argument the rejected copy-slot rotation never had.
+    llm_graph_result * process_ubatch_decode_lane(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                            uint32_t   lane,
                        ggml_status & ret);
@@ -264,8 +289,11 @@ private:
     int64_t output_resolve_row(int32_t i) const;
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
-    // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    // from backend into host-side embd_layer_inp buffers. res_sched is the
+    // scheduler the ubatch actually ran on (a decode lane's tensors are not
+    // resolvable against the shared scheduler); the ubatch supplies the
+    // per-row (seq_id, pos) metadata published to collectors.
+    void extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, bool chain_rows = false);
 
     // [fork, PipeDec] stage-2 variant: async-GET each enabled layer-input row of a
     // single-token body lane into the stable per-group buffers (published to
@@ -343,6 +371,14 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
 
+    // [fork, SPD collect] (seq_id, pos) per embd_layer_inp row of the LAST
+    // llama_decode call, in the buffers' physical row order (concatenated
+    // ubatch order - NOT user-batch order: split_equal merges prompts and the
+    // grouped decode split reorders sequences, so collectors must map rows by
+    // this metadata rather than by batch index)
+    std::vector<llama_seq_id> embd_layer_inp_seq;
+    std::vector<llama_pos>    embd_layer_inp_pos;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -384,6 +420,25 @@ private:
 
     static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 8;
     std::array<ggml_backend_sched_ptr, PIPEDEC_STAGE2_MAX_LANES> sched_pipedec_body;
+
+    // [fork] decode lane pool, grown lazily to the number of decode-group
+    // ubatches per step (see process_ubatch_decode_lane)
+    std::vector<ggml_backend_sched_ptr> sched_decode_lane;
+
+    // [fork] chained cohort decode: per-lane read fences (backend, GET-stream
+    // ordinal). A lane sync waits only on these - an endpoint-global backend
+    // synchronize would fence every younger cohort's graphs too.
+    std::vector<std::vector<std::pair<ggml_backend_t, uint64_t>>> chain_lane_reads;
+    std::vector<ggml_backend_t> chain_read_backends; // scratch, current call
+    int32_t chain_last_lane = -1;
+    // one-shot per-call opt-in (llama_chain_arm): without it a classic caller's
+    // single-token decode would be silently staged seq-keyed while the caller
+    // reads packed rows via output_ids. Value = the lane this call rides
+    // (cohorts are repacked from whatever seqs are generating, so the lane
+    // cannot be derived from the seq ids); -1 = not armed.
+    int32_t chain_armed_lane = -1;
+
+    void chain_read_note(ggml_backend_t backend);
 
     // Stage 2 keeps the deferred output head on a separate scheduler so
     // switching to the tiny head graph does not evict the reusable 4k-node
@@ -431,6 +486,7 @@ private:
     llm_graph_result_ptr gf_res_reserve;
     std::array<llm_graph_result_ptr, PIPEDEC_STAGE2_MAX_LANES> gf_res_pipedec_body;
     llm_graph_result_ptr gf_res_pipedec_head;
+    std::vector<llm_graph_result_ptr> gf_res_decode_lane; // [fork] decode lane pool
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -457,7 +513,14 @@ private:
         if (graph_reuse_disable_all) {
             return false;
         }
-        return ubatch.n_tokens < cparams.n_ubatch;
+        // decode-shaped only (one token per sequence): prompt chunks must
+        // rebuild, because the reuse path drains the pipeline under
+        // pipeline_parallel, and a merged multi-sequence prompt ubatch can
+        // land just under n_ubatch and masquerade as token generation (the
+        // old `n_tokens < n_ubatch` test serialized concurrent prefill at
+        // one full pipeline walk per ubatch once plan bucketing made the
+        // shapes stable enough to actually reuse)
+        return ubatch.n_seq_tokens == 1;
     }
 
     // perf

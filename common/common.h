@@ -1133,6 +1133,46 @@ struct common_state_file {
 
 using common_state_file_ptr = std::shared_ptr<common_state_file>;
 
+// Something whose per-sequence state can be serialized.
+//
+// Ordinarily this is one llama_context, and the checkpoint and prompt-cache
+// layers used to take a `llama_context *` directly. SPD's target is nine stage
+// contexts plus a sidecar that only mean anything together, so it cannot be
+// handed over as a context -- and every mechanic built on those layers
+// (--ctx-checkpoints, --checkpoint-min-step, --cache-ram, --cache-disk) would
+// otherwise have to grow an SPD special case, or SPD would have to reimplement
+// each of them. Neither is acceptable: the policy belongs in one place and
+// speculative implementations should differ only in how they produce bytes.
+//
+// So the layers talk to this instead, and only the construction site knows
+// which kind it has.
+struct common_state_seq_io {
+    virtual ~common_state_seq_io() = default;
+
+    virtual size_t get_size(llama_seq_id seq_id, llama_state_seq_flags flags) = 0;
+    virtual size_t get_data(uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) = 0;
+    virtual size_t set_data(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) = 0;
+
+    // Streamed variants for --cache-disk, so a large state never has to be
+    // materialized in host RAM. Return 0 on failure.
+    virtual size_t save_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) = 0;
+    virtual size_t load_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) = 0;
+};
+
+// The ordinary case: one context.
+struct common_state_seq_io_ctx : common_state_seq_io {
+    llama_context * ctx = nullptr;
+
+    common_state_seq_io_ctx() = default;
+    explicit common_state_seq_io_ctx(llama_context * ctx) : ctx(ctx) {}
+
+    size_t get_size(llama_seq_id seq_id, llama_state_seq_flags flags) override;
+    size_t get_data(uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) override;
+    size_t set_data(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) override;
+    size_t save_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) override;
+    size_t load_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) override;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1164,35 +1204,35 @@ struct common_prompt_checkpoint {
             llama_pos pos_max);
 
     void update_tgt(
-            llama_context * ctx,
+            common_state_seq_io & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
     void update_dft(
-            llama_context * ctx,
+            common_state_seq_io & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
     // stream the state to a file instead of materializing it in RAM
     void update_tgt_file(
-            llama_context * ctx,
+            common_state_seq_io & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags,
             const std::string & path);
 
     void update_dft_file(
-            llama_context * ctx,
+            common_state_seq_io & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags,
             const std::string & path);
 
     void load_tgt(
-            llama_context * ctx,
+            common_state_seq_io & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
     void load_dft(
-            llama_context * ctx,
+            common_state_seq_io & io,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 

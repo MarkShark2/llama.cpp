@@ -43,6 +43,13 @@ struct llama_sampler * common_reasoning_budget_init(
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
 
+// The token this sampler is currently forcing, or LLAMA_TOKEN_NULL when it is
+// not in the FORCING state. `apply` expresses forcing by driving every other
+// logit to -inf, which a decode path that builds a llama_token_data_array picks
+// up for free. SPD samples with a bare argmax over the head's logits and never
+// builds one, so it asks for the forced token directly instead.
+llama_token common_reasoning_budget_get_forced(const struct llama_sampler * smpl);
+
 // The end sequence that transitioned the sampler to DONE, or nullptr if none
 // was recorded. Cleared when a new start sequence re-arms the sampler.
 const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);

@@ -116,6 +116,12 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// [fork, SPD collect] per-row (seq_id, pos) metadata of the layer-input tap
+// buffers for the last llama_decode call, in the buffers' physical row order
+// (concatenated ubatch order, NOT user-batch order). Returns the row count;
+// the arrays are valid until the next llama_decode on this context.
+LLAMA_API int32_t llama_get_embeddings_layer_inp_rows(struct llama_context * ctx, const llama_seq_id ** seq_ids, const llama_pos ** pos);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 // Allow callers with stable, reusable input storage to opt a context back into
@@ -145,6 +151,34 @@ bool ggml_backend_rpc_sync_peer_prepare(const struct ggml_tensor * dst_probe);
 bool ggml_backend_rpc_sync_peer_push(const struct ggml_tensor * src, const struct ggml_tensor * dst, uint64_t * ordinal_out);
 bool ggml_backend_rpc_sync_peer_fence(const struct ggml_tensor * dst_probe, uint64_t ordinal);
 bool ggml_backend_rpc_sync_peer_guard(const struct ggml_tensor * src_probe);
+// [fork, chained decode] ordinal-scoped async-read fences (see ggml-rpc.cpp):
+// a completed read also proves the graph that produced its tensor retired
+uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t backend);
+void     ggml_backend_rpc_read_wait(ggml_backend_t backend, uint64_t ordinal);
+bool     ggml_backend_is_rpc(ggml_backend_t backend);
+}
+
+// [fork] chained cohort decode (LLAMA_DECODE_CHAIN=G): the caller decodes
+// seq-aligned cohorts of up to G single-token sequences as separate
+// llama_decode calls held in flight together. Output rows are keyed by seq
+// id; the cohort's lane is (first_seq/G) % LLAMA_DECODE_LANES. Wait on the
+// lane, then read that cohort's rows - the other cohorts keep flowing.
+extern "C" {
+LLAMA_API void          llama_chain_lane_sync (struct llama_context * ctx, int32_t lane);
+LLAMA_API const float * llama_chain_logits_row(struct llama_context * ctx, int32_t row);
+LLAMA_API const float * llama_chain_tap_row   (struct llama_context * ctx, uint32_t lid, int32_t row);
+// lane the last llama_decode staged as a chain call, or -1 if it took the
+// classic path - callers MUST check this after every chained submit (a silent
+// fallback would leave the seq-keyed rows stale)
+LLAMA_API int32_t       llama_chain_last_lane (struct llama_context * ctx);
+// one-shot opt-in consumed by the NEXT llama_decode: without it no call is
+// ever staged chained (classic callers read packed rows via output_ids and
+// must never be hijacked into seq-keyed staging). `lane` is the decode lane
+// the call rides - cohorts are repacked per cycle, so the caller names it.
+LLAMA_API void          llama_chain_arm      (struct llama_context * ctx, int32_t lane);
+// internal (llama-kv-cache-dsv4.cpp): armed calls suppress the
+// LLAMA_DECODE_SPLIT cut for the duration of init_batch
+void dsv4_decode_split_suppress(bool on);
 }
 
 // [PipeDec] deferred verify group (requires GGML_PIPEDEC_STAGE2 eligibility):
