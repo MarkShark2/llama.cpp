@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <thread>
 #include <ctime>
+#include <cstdarg>
+#include <cstdlib>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -4098,6 +4100,70 @@ static void rpc_graph_ops_dump(uint32_t device, uint64_t uid, const ggml_cgraph 
     fflush(stderr);
 }
 
+// [fork] Batched trace output.
+//
+// The daemons run with stdout/stderr redirected straight to a log file on the
+// node's root filesystem. On the boards whose root is a USB-NVMe bridge (the
+// four carrying a Mellanox card in the M.2 slot), that filesystem is btrfs on a
+// JMicron/uas device, and btrfs commits its transaction every 30 s. A write()
+// landing inside a commit blocks in D-state for seconds. GGML_RPC_GRAPH_TRACE
+// used to fprintf+fflush once per graph -- ~72 syscalls/s per board -- so the
+// daemon was nearly always inside the filesystem when a commit stalled. That
+// showed up as 0.4-3.3 s mid-generation pipeline stalls, on those four boards
+// only and never on the five with SATA SSDs (measured 2026-08-05).
+//
+// Batching keeps every line and every byte, but collapses the syscall rate by
+// ~700x so the daemon is rarely in write() when a commit hits. Trace lines stay
+// in order among themselves; only unrelated stderr output can interleave
+// differently. GGML_RPC_GRAPH_TRACE_FLUSH_MS=0 restores line-at-a-time output.
+static std::mutex  g_trace_mtx;
+static std::string g_trace_buf;
+static int64_t     g_trace_last_us = 0;
+
+static void rpc_trace_flush() {
+    std::lock_guard<std::mutex> lock(g_trace_mtx);
+    if (!g_trace_buf.empty()) {
+        fwrite(g_trace_buf.data(), 1, g_trace_buf.size(), stderr);
+        fflush(stderr);
+        g_trace_buf.clear();
+    }
+}
+
+static void rpc_trace_emit(const char * fmt, ...) {
+    static const int64_t flush_us = [] {
+        const char * v = getenv("GGML_RPC_GRAPH_TRACE_FLUSH_MS");
+        return (int64_t)(v ? atoi(v) : 5000) * 1000;
+    }();
+    static const bool registered = [] {
+        std::atexit(rpc_trace_flush);
+        return true;
+    }();
+    (void) registered;
+
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_trace_mtx);
+    g_trace_buf.append(line, std::min((size_t) n, sizeof(line) - 1));
+
+    const int64_t now = ggml_time_us();
+    if (g_trace_last_us == 0) {
+        g_trace_last_us = now;
+    }
+    if (g_trace_buf.size() >= 64*1024 || now - g_trace_last_us >= flush_us) {
+        fwrite(g_trace_buf.data(), 1, g_trace_buf.size(), stderr);
+        fflush(stderr);
+        g_trace_buf.clear();
+        g_trace_last_us = now;
+    }
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     static const bool graph_trace = [] {
         const char * value = getenv("GGML_RPC_GRAPH_TRACE");
@@ -4196,7 +4262,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         const int64_t t_end = ggml_time_us();
         const double  epoch = std::chrono::duration<double>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-        fprintf(stderr,
+        rpc_trace_emit(
                 "[rpc graph] t=%.3f dev=%u nodes=%u tensors=%u wait=%.2fms parse=%.2fms build=%.2fms compute=%.2fms store=%.2fms total=%.2fms\n",
                 epoch, device, n_nodes, n_tensors, t_wait_ms,
                 (t_parse   - t_start)   / 1000.0,
@@ -4204,7 +4270,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                 (t_compute - t_build)   / 1000.0,
                 (t_end     - t_compute) / 1000.0,
                 (t_end     - t_start)   / 1000.0);
-        fflush(stderr);
         t_prev_end = ggml_time_us();
     }
     return true;
@@ -4241,12 +4306,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         const int64_t t_end = ggml_time_us();
         const double  epoch = std::chrono::duration<double>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-        fprintf(stderr,
+        rpc_trace_emit(
                 "[rpc regraph] t=%.3f dev=%u nodes=%d wait=%.2fms lookup=%.2fms compute=%.2fms\n",
                 epoch, device, it->second.graph->n_nodes, t_wait_ms,
                 (t_lookup - t_start) / 1000.0,
                 (t_end    - t_lookup) / 1000.0);
-        fflush(stderr);
         t_prev_end = ggml_time_us();
     }
     return true;
