@@ -110,8 +110,10 @@ int main(int argc, char ** argv) {
 
     // Save the rolled-back state and restore it into a fresh context.
     common_prompt_checkpoint ckpt;
-    ckpt.update_tgt(ctx_src, 0, 0);
-    ckpt.load_tgt(ctx_dst, 0, 0);
+    common_state_seq_io_ctx io_src(ctx_src);
+    common_state_seq_io_ctx io_dst(ctx_dst);
+    ckpt.update_tgt(io_src, 0, 0);
+    ckpt.load_tgt(io_dst, 0, 0);
 
     // Replay the rolled-back token on both contexts and compare logits.
     if (!decode_one(ctx_src, last_tok, last_pos) ||
@@ -161,7 +163,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    ckpt.load_tgt(ctx_dirty, 0, 0);
+    common_state_seq_io_ctx io_dirty(ctx_dirty);
+    ckpt.load_tgt(io_dirty, 0, 0);
 
     if (!decode_one(ctx_dirty, last_tok, last_pos)) {
         fprintf(stderr, "%s : dirty replay failed\n", __func__);
