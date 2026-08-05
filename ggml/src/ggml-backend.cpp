@@ -831,6 +831,13 @@ struct ggml_backend_sched {
     // destination-wide synchronization.
     bool stable_host_inputs;
 
+    // The caller guarantees this scheduler has at most one graph in flight and
+    // that all of its tensors are private to it, so every copy lands on the
+    // destination stream in submission order and no host-side synchronization
+    // is needed between consecutive computes (single-flight lane; see the
+    // decode lane pool in llama-context) [fork]
+    bool pipeline_lane;
+
     int debug;
 
     // per-backend split wall time, printed every 5s when GGML_SCHED_TIMING=1 [fork]
@@ -1638,7 +1645,40 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         // [fork] this is a full pipeline drain - flag it on stderr when tracing
         if (getenv("GGML_SCHED_SUBMIT_TRACE") && atoi(getenv("GGML_SCHED_SUBMIT_TRACE"))) {
-            fprintf(stderr, "[sched] REALLOC drain (backend_ids_changed or galloc alloc failed)\n");
+            if (backend_ids_changed) {
+                int diff_node = -1;
+                for (int i = 0; i < sched->graph.n_nodes; i++) {
+                    if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
+                        sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
+                        diff_node = i;
+                        break;
+                    }
+                }
+                if (diff_node >= 0) {
+                    const ggml_tensor * dn = sched->graph.nodes[diff_node];
+                    fprintf(stderr, "[sched] REALLOC drain sched=%p n_nodes=%d: node %d '%s' (%s) backend %s -> %s\n",
+                            (void *) sched, sched->graph.n_nodes, diff_node, dn->name, ggml_op_name(dn->op),
+                            ggml_backend_name(sched->backends[sched->prev_node_backend_ids[diff_node]]),
+                            ggml_backend_name(sched->backends[sched->node_backend_ids[diff_node]]));
+                } else {
+                    int diff_leaf = -1;
+                    for (int i = 0; i < sched->graph.n_leafs; i++) {
+                        if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
+                            sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
+                            diff_leaf = i;
+                            break;
+                        }
+                    }
+                    const ggml_tensor * dl = diff_leaf >= 0 ? sched->graph.leafs[diff_leaf] : nullptr;
+                    fprintf(stderr, "[sched] REALLOC drain sched=%p n_nodes=%d: leaf %d '%s' backend %s -> %s\n",
+                            (void *) sched, sched->graph.n_nodes, diff_leaf, dl ? dl->name : "?",
+                            dl ? ggml_backend_name(sched->backends[sched->prev_leaf_backend_ids[diff_leaf]]) : "?",
+                            dl ? ggml_backend_name(sched->backends[sched->leaf_backend_ids[diff_leaf]]) : "?");
+                }
+            } else {
+                fprintf(stderr, "[sched] REALLOC drain sched=%p n_nodes=%d: galloc alloc failed (graph outgrew reserve)\n",
+                        (void *) sched, sched->graph.n_nodes);
+            }
             fflush(stderr);
         }
         const bool realloc_trace = getenv("GGML_SCHED_SUBMIT_TRACE") && atoi(getenv("GGML_SCHED_SUBMIT_TRACE"));
@@ -1723,7 +1763,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 const int64_t pd_t = pd_trace ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if ((sched->n_copies > 1 || (ggml_sched_pipedec_enabled() && sched->n_copies == 1)) &&
+                if ((sched->n_copies > 1 || sched->pipeline_lane ||
+                     (ggml_sched_pipedec_enabled() && sched->n_copies == 1)) &&
                     ggml_backend_buffer_is_host(input->buffer) &&
                     split_backend->iface.set_tensor_async != NULL &&
                     strncmp(ggml_backend_name(split_backend), "RPC", 3) == 0) {
@@ -1759,11 +1800,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else if (!(ggml_sched_pipedec_enabled() && sched->n_copies == 1)) {
+                } else if (!((ggml_sched_pipedec_enabled() || sched->pipeline_lane) && sched->n_copies == 1)) {
                     // [fork, PipeDec] skipped when pipelining: with n_copies == 1 every
                     // copy path below lands on the dst backend's stream/socket in
                     // submission order, so overwrite-before-use cannot happen (the
-                    // synchronous fallback below does its own synchronization)
+                    // synchronous fallback below does its own synchronization).
+                    // A pipeline lane [fork] adds the stronger guarantee that its
+                    // previous graph has fully retired before this compute is
+                    // submitted, so the wait is dead weight there too.
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -2298,6 +2342,11 @@ extern "C" {
 GGML_API void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable) {
     GGML_ASSERT(sched);
     sched->stable_host_inputs = stable;
+}
+
+GGML_API void ggml_backend_sched_set_pipeline_lane(ggml_backend_sched_t sched, bool lane) {
+    GGML_ASSERT(sched);
+    sched->pipeline_lane = lane;
 }
 }
 

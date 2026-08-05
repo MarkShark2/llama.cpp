@@ -913,6 +913,18 @@ struct rpc_stream {
         cv_done.wait(l, [&]{ return completed == submitted; });
     }
 
+    // [fork, chained decode] ordinal-scoped wait: block only until tasks
+    // enqueued at snapshot time have finished, not the whole stream
+    uint64_t submitted_seq() {
+        std::lock_guard<std::mutex> l(m);
+        return submitted;
+    }
+
+    void wait_completed(uint64_t target) {
+        std::unique_lock<std::mutex> l(m);
+        cv_done.wait(l, [&]{ return completed >= target; });
+    }
+
     void run() {
         for (;;) {
             std::function<void()> fn;
@@ -1912,8 +1924,10 @@ static bool rpc_node_is_foreign(const ggml_tensor * t, const std::string & endpo
     return ep != nullptr && endpoint != ep;
 }
 
-static void serialize_graph(uint32_t device, uint64_t uid, const std::string & endpoint,
-                            const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+// [fork] Collect and emit are split so the caller can gather the node/tensor set
+// once, derive a content uid from it, and only pay for the payload on a miss.
+static void collect_graph(const std::string & endpoint, const ggml_cgraph * cgraph,
+                          std::vector<ggml_tensor *> & nodes, std::vector<rpc_tensor> & tensors) {
     // Drop nodes whose data lives on a different RPC endpoint before shipping the
     // subgraph. RPC is star-only — there is no remote<->remote memory path — so a
     // board can never dereference another board's buffer; serializing such a node
@@ -1926,7 +1940,8 @@ static void serialize_graph(uint32_t device, uint64_t uid, const std::string & e
     // Skipping them is loss-free (nothing kept references them) and keeps the graph
     // uid -> filtered-node-set mapping deterministic, so the server's graph cache
     // stays consistent across recompute.
-    std::vector<ggml_tensor *> nodes;
+    nodes.clear();
+    tensors.clear();
     nodes.reserve(cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (rpc_node_is_foreign(cgraph->nodes[i], endpoint)) {
@@ -1934,12 +1949,100 @@ static void serialize_graph(uint32_t device, uint64_t uid, const std::string & e
         }
         nodes.push_back(cgraph->nodes[i]);
     }
-    uint32_t n_nodes = nodes.size();
-    std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
-    for (uint32_t i = 0; i < n_nodes; i++) {
+    for (size_t i = 0; i < nodes.size(); i++) {
         add_tensor(nodes[i], tensors, visited);
     }
+}
+
+// [fork] GGML_RPC_STABLE_UID=1: derive the graph uid from what the server
+// actually stores -- the filtered node list and the tensor descriptors -- rather
+// than from ggml's monotonic counter, which hands every rebuild a fresh id and so
+// can never hit the server's graph cache.
+//
+// This is what makes pipelined decode affordable. Pipelining requires graph reuse
+// to be OFF (the reuse path drains the pipeline before set_inputs), and with it
+// off every ubatch was re-shipping the full node list + ~1300 tensor descriptors
+// to every stage. A rebuilt-but-identical graph now costs a 16-byte RECOMPUTE.
+//
+// Safety rests entirely on the uid covering every byte serialize_collected emits:
+// any change of shape, op param, buffer offset, data pointer or node set yields a
+// different uid and falls back to a full send. Per-token differences (token ids,
+// positions, masks, the DSV4 compressed-state index inputs) travel as tensor DATA
+// via SET_TENSOR, not as graph structure, which is exactly why the same stored
+// graph can be recomputed for them -- the same contract the existing reuse path
+// already relies on. rpc_tensor is fully initialized (serialize_tensor memsets
+// name and padding), so hashing it raw is deterministic.
+static uint64_t graph_content_uid(const std::vector<ggml_tensor *> & nodes,
+                                  const std::vector<rpc_tensor> & tensors) {
+    auto mix = [](uint64_t h, const void * p, size_t bytes) {
+        const uint64_t * w = (const uint64_t *) p;
+        for (size_t i = 0; i < bytes/sizeof(uint64_t); i++) {
+            h ^= w[i] + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        }
+        return h;
+    };
+
+    // The `id`/`src`/`view_src` fields are HOST POINTERS to the ggml_tensor structs
+    // of this build. Rebuilding an identical graph allocates fresh structs at fresh
+    // addresses, so hashing them raw makes every graph unique and the cache can
+    // never hit. They also do not affect execution: the server uses them only to
+    // rewire the DAG at deserialize time, and the tensors it stores carry their own
+    // copies. So references are canonicalised to indices into `tensors` (add_tensor
+    // walks a fixed-order DFS, so the order is deterministic for a given topology)
+    // while everything that DOES affect execution -- type, buffer, ne/nb, op,
+    // op_params, flags, view_offs and the device `data` pointer -- is hashed
+    // verbatim. A graph that would compute anything different therefore cannot
+    // collide with one already on the server.
+    std::unordered_map<uint64_t, uint64_t> index_of;
+    index_of.reserve(tensors.size()*2);
+    for (size_t i = 0; i < tensors.size(); i++) {
+        index_of[tensors[i].id] = i;
+    }
+    const auto ref = [&](uint64_t id) -> uint64_t {
+        if (id == 0) {
+            return UINT64_MAX;
+        }
+        auto it = index_of.find(id);
+        return it == index_of.end() ? UINT64_MAX - 1 : it->second;
+    };
+
+    uint64_t h = 1469598103934665603ull;
+    const uint64_t counts[2] = { (uint64_t) nodes.size(), (uint64_t) tensors.size() };
+    h = mix(h, counts, sizeof(counts));
+
+    for (const ggml_tensor * n : nodes) {
+        const uint64_t idx = ref((uint64_t) (uintptr_t) n);
+        h = mix(h, &idx, sizeof(idx));
+    }
+
+    for (const rpc_tensor & t : tensors) {
+        uint64_t refs[GGML_MAX_SRC + 1];
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            refs[i] = ref(t.src[i]);
+        }
+        refs[GGML_MAX_SRC] = ref(t.view_src);
+        h = mix(h, refs, sizeof(refs));
+
+        // every execution-affecting field, pointer identity excluded
+        const uint64_t scalars[4] = { t.buffer, t.view_offs, t.data,
+                                      ((uint64_t) t.type << 32) | (uint64_t) t.op };
+        h = mix(h, scalars, sizeof(scalars));
+        h = mix(h, t.ne, sizeof(t.ne));
+        h = mix(h, t.nb, sizeof(t.nb));
+        h = mix(h, t.op_params, sizeof(t.op_params));
+        const uint64_t flags = (uint64_t) (uint32_t) t.flags;
+        h = mix(h, &flags, sizeof(flags));
+    }
+
+    return h == 0 ? 1 : h; // uid 0 means "do not cache" in the protocol
+}
+
+static void serialize_collected(uint32_t device, uint64_t uid,
+                                const std::vector<ggml_tensor *> & nodes,
+                                const std::vector<rpc_tensor> & tensors,
+                                std::vector<uint8_t> & output) {
+    uint32_t n_nodes = nodes.size();
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
@@ -1960,6 +2063,14 @@ static void serialize_graph(uint32_t device, uint64_t uid, const std::string & e
     dest += sizeof(n_tensors);
     rpc_tensor * out_tensors = (rpc_tensor *)dest;
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+}
+
+static void serialize_graph(uint32_t device, uint64_t uid, const std::string & endpoint,
+                            const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+    std::vector<ggml_tensor *> nodes;
+    std::vector<rpc_tensor>    tensors;
+    collect_graph(endpoint, cgraph, nodes, tensors);
+    serialize_collected(device, uid, nodes, tensors, output);
 }
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -1985,20 +2096,49 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         }
     } wire_scope { wire_st, wire_t0 };
 
+    // [fork] see graph_content_uid(): a content-derived uid lets a rebuilt but
+    // structurally identical graph hit the server cache, which is what a
+    // reuse-disabled (i.e. pipelined) decode needs to stay affordable.
+    static const bool stable_uid = [] {
+        const char * e = getenv("GGML_RPC_STABLE_UID");
+        return e && atoi(e) != 0;
+    }();
+
+    std::vector<ggml_tensor *> nodes;
+    std::vector<rpc_tensor>    tensors;
+    uint64_t uid = cgraph->uid;
+    if (stable_uid) {
+        collect_graph(endpoint, cgraph, nodes, tensors);
+        uid = graph_content_uid(nodes, tensors);
+    }
+
     // LRU over the uids the server holds deserialized for this device. A hit
     // means the server can recompute without a serialize/deserialize round.
+    //
+    // [fork] GGML_RPC_GRAPH_SLOTS: the default 32 was sized for one graph shape
+    // per ubatch. Under a split decode the working set is (sequences in flight) x
+    // (GGML_SCHED_COPIES) distinct graphs -- each sequence views its own KV stream
+    // and each rotates through the pipeline copy slots -- so 16 slots and 6 copies
+    // want ~96 and thrash a 32-entry cache down to a ~1% hit rate. Each cached
+    // graph costs the daemon a deserialized node/tensor set (~0.5 MB here).
+    static const size_t graph_slots = [] {
+        const char * e = getenv("GGML_RPC_GRAPH_SLOTS");
+        const int v = e ? atoi(e) : 0;
+        return v > 0 ? (size_t) v : (size_t) RPC_GRAPH_CACHE_SLOTS;
+    }();
+
     bool reuse = false;
     uint64_t evicted_uid = 0;
-    if (cgraph->uid != 0) {
+    if (uid != 0) {
         auto & known = rpc_dev_ctx->known_graph_uids;
-        auto it = std::find(known.begin(), known.end(), cgraph->uid);
+        auto it = std::find(known.begin(), known.end(), uid);
         if (it != known.end()) {
             known.erase(it);
-            known.insert(known.begin(), cgraph->uid);
+            known.insert(known.begin(), uid);
             reuse = true;
         } else {
-            known.insert(known.begin(), cgraph->uid);
-            if (known.size() > RPC_GRAPH_CACHE_SLOTS) {
+            known.insert(known.begin(), uid);
+            if (known.size() > graph_slots) {
                 evicted_uid = known.back();
                 known.pop_back();
             }
@@ -2007,7 +2147,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = device;
-        request.uid    = cgraph->uid;
+        request.uid    = uid;
         if (async) {
             // enqueue on the endpoint's stream so the scheduler thread does not block
             rpc_main_enqueue_counted(endpoint, get_stream(endpoint), 1, [endpoint, request]{
@@ -2030,7 +2170,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     } else {
         rpc_trace_xdev(endpoint, cgraph);
         std::vector<uint8_t> input;
-        serialize_graph(device, cgraph->uid, endpoint, cgraph, input);
+        if (stable_uid) {
+            serialize_collected(device, uid, nodes, tensors, input);
+        } else {
+            serialize_graph(device, uid, endpoint, cgraph, input);
+        }
         rpc_msg_graph_forget_req forget = { device, evicted_uid };
         if (async) {
             auto in = std::make_shared<std::vector<uint8_t>>(std::move(input));
@@ -2251,6 +2395,39 @@ static bool rpc_sync_peer_route_ready(const std::string & src_endpoint,
 #else
 #    define GGML_RPC_SYNC_PEER_API extern "C" __attribute__((visibility("default")))
 #endif
+
+// [fork, chained decode] read fences: ordinal-scoped completion of async
+// GET_TENSOR reads on one endpoint. ggml_backend_rpc_synchronize is endpoint-
+// global (it fences every submitted command, including later cohorts' graph
+// computes), but a chained caller only needs its OWN reads back - and the
+// server FIFO orders a read after the graph that produced its tensor, so a
+// completed read also proves that graph retired. Snapshot the ordinal right
+// after issuing the reads, wait on it later; work submitted after the
+// snapshot is never waited on.
+GGML_RPC_SYNC_PEER_API uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t backend) {
+    if (!rpc_async_enabled()) {
+        return 0; // reads were synchronous; nothing to wait for
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    rpc_ep_lanes * ep = rpc_lanes_get_active(rpc_ctx->endpoint);
+    if (ep != nullptr) {
+        return ep->get_stream->submitted_seq();
+    }
+    return get_stream(rpc_ctx->endpoint)->submitted_seq();
+}
+
+GGML_RPC_SYNC_PEER_API void ggml_backend_rpc_read_wait(ggml_backend_t backend, uint64_t ordinal) {
+    if (!rpc_async_enabled() || ordinal == 0) {
+        return;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    rpc_ep_lanes * ep = rpc_lanes_get_active(rpc_ctx->endpoint);
+    if (ep != nullptr) {
+        ep->get_stream->wait_completed(ordinal);
+        return;
+    }
+    get_stream(rpc_ctx->endpoint)->wait_completed(ordinal);
+}
 
 // Learn the consumer endpoint's session id. Call from the thread that owns
 // that endpoint's main socket (in SPD: the consuming stage's worker).
