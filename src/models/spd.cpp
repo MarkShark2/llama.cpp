@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace {
 
@@ -61,6 +62,33 @@ void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SPD_STAGE_COUNT, stage_count);
     ml.get_key(LLM_KV_SPD_USE_DEEPEST, use_deepest);
 
+    // The sidecar is trained on fixed-length windows cut out of the corpus
+    // (train_offline.py --chunk), so it has never attended across more than
+    // that many positions. RoPE is relative, so *where* a training window sat
+    // in its document is not something the head could have learned -- the span
+    // is the whole of it. Serving it against a full context therefore runs it
+    // outside its training distribution as soon as the conversation is longer
+    // than the chunk: on the DSV4 head (chunk 1024) measured acceptance fell
+    // from 34-41% below ~8k of context to 2-7% above ~18k, which is the
+    // difference between SPD being a 20% speedup and a slowdown.
+    //
+    // So bound the sidecar's attention to the span it was trained on.
+    // LLAMA_SWA_TYPE_STANDARD masks every key more than n_swa positions back,
+    // which is exactly the training window. The per-layer SWA pattern is left
+    // dense on purpose: is_swa(il) also selects the separate SWA rope
+    // frequency, and a windowed-but-not-interleaved model wants one plain
+    // windowed cache, not the base/SWA pair llama_kv_cache_iswa builds.
+    uint32_t train_span = 0;
+    ml.get_key(LLM_KV_SPD_TRAIN_SPAN, train_span, false);
+    if (const char * value = std::getenv("LLAMA_SPD_SPAN")) {
+        // sidecars converted before the key existed do not carry a span, and
+        // the window is worth sweeping against a fixed head; 0 disables it
+        train_span = (uint32_t) std::max(0, std::atoi(value));
+    }
+
+    hparams.n_swa    = train_span;
+    hparams.swa_type = train_span > 0 ? LLAMA_SWA_TYPE_STANDARD : LLAMA_SWA_TYPE_NONE;
+
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("SPD model requires target_layers in GGUF metadata");
     }
@@ -82,6 +110,15 @@ void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: SPD checkpoint v%u, stages = %u, aggregation types = %zu\n",
             __func__, checkpoint_version, stage_count, target_layer_ids.size());
+    if (hparams.n_swa > 0) {
+        LLAMA_LOG_INFO("%s: SPD trained attention span = %u (sidecar attention is windowed)\n",
+                __func__, hparams.n_swa);
+    } else {
+        LLAMA_LOG_WARN("%s: SPD sidecar declares no trained attention span, so it will attend over "
+                "the whole context. Acceptance collapses once a request is longer than the window "
+                "the head was trained on. Reconvert with tools/spd/convert_spd_to_gguf.py, or set "
+                "LLAMA_SPD_SPAN to the trainer's --chunk.\n", __func__);
+    }
 }
 
 void llama_model_spd::load_arch_tensors(llama_model_loader &) {

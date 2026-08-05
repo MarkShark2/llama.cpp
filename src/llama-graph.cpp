@@ -2681,7 +2681,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
     {
-        GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
+        // Only *interleaved* SWA needs the base/SWA cache pair. A uniformly
+        // windowed model -- swa_type set with no per-layer pattern, which is how
+        // the SPD sidecar declares its trained span -- runs on one plain
+        // llama_kv_cache that holds the window itself, and the mask built below
+        // comes from that cache with the window already applied.
+        GGML_ASSERT(!hparams.is_swa_any() && "Use llama_kv_cache_iswa for interleaved SWA");
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
@@ -2794,7 +2799,12 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
 
     {
-        GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
+        // Only *interleaved* SWA needs the base/SWA cache pair. A uniformly
+        // windowed model -- swa_type set with no per-layer pattern, which is how
+        // the SPD sidecar declares its trained span -- runs on one plain
+        // llama_kv_cache that holds the window itself, and the mask built below
+        // comes from that cache with the window already applied.
+        GGML_ASSERT(!hparams.is_swa_any() && "Use llama_kv_cache_iswa for interleaved SWA");
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
 

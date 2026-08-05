@@ -322,6 +322,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SPD_CHECKPOINT_VERSION, "%s.checkpoint_version"   },
     { LLM_KV_SPD_STAGE_COUNT,        "%s.stage_count"          },
     { LLM_KV_SPD_USE_DEEPEST,        "%s.use_deepest"          },
+    { LLM_KV_SPD_TRAIN_SPAN,         "%s.train_span"           },
     { LLM_KV_DECODER_ARCH,          "%s.decoder_arch"         },
     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
 

@@ -2302,8 +2302,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_rs_seq,
                                 filter,
                                 reuse);
-                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                        GGML_ASSERT(hparams.is_swa_any());
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa_any()) {
+                        // interleaved SWA: some layers are windowed and some are
+                        // dense, so the cache is a base/SWA pair. A model that is
+                        // windowed *uniformly* -- swa_type set with no per-layer
+                        // pattern, which is how the SPD sidecar declares its
+                        // trained span -- falls through to the plain cache below,
+                        // which already applies n_swa/swa_type to every layer.
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
@@ -2355,6 +2360,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        uint32_t kv_size = cparams.n_ctx_seq;
+
+                        // Uniformly windowed (swa_type set, no per-layer pattern):
+                        // only the last n_swa positions are ever readable, so size
+                        // the cache to the window exactly as llama_kv_cache_iswa
+                        // sizes its SWA half. Sizing matters as much as masking --
+                        // cells outside the window are recyclable either way, but
+                        // over a full-context allocation they get recycled across
+                        // the whole of it, used_max_p1() climbs to n_ctx, and every
+                        // attention still runs full width against a mask that is
+                        // almost entirely -inf.
+                        if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && !params.swa_full) {
+                            const uint32_t n_swa_seq =
+                                hparams.n_swa*(cparams.kv_unified ? cparams.n_seq_max : 1);
+
+                            kv_size = GGML_PAD(std::min(kv_size, n_swa_seq + cparams.n_ubatch), 256);
+
+                            LLAMA_LOG_INFO("%s: creating windowed KV cache, size = %u cells (n_swa = %u)\n",
+                                    __func__, kv_size, hparams.n_swa);
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2363,7 +2389,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
                                 hparams.n_swa,
