@@ -164,6 +164,7 @@ class Keys:
         SPD_CHECKPOINT_VERSION            = "{arch}.checkpoint_version"
         SPD_STAGE_COUNT                   = "{arch}.stage_count"
         SPD_USE_DEEPEST                   = "{arch}.use_deepest"
+        SPD_TRAIN_SPAN                    = "{arch}.train_span"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
 
     class Attention:

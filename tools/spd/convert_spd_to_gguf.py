@@ -101,6 +101,27 @@ def spd_stage_layers(trunk_blocks: int, num_stages: int) -> list[int]:
     return [per]*(num_stages - 1) + [trunk_blocks - per*(num_stages - 1)]
 
 
+def resolve_train_span(config: dict[str, Any], override: int | None) -> int:
+    """The window length the speculation head was trained on, in tokens.
+
+    The trainer cuts fixed-length windows out of the corpus (train_offline.py
+    --chunk), so the head has never attended across more positions than that.
+    The decode path bounds the sidecar's attention to this span; without it the
+    head runs outside its training distribution on any request longer than the
+    chunk and acceptance collapses. 0 means "unknown", which the fork loads as
+    unbounded attention and warns about.
+    """
+    if override is not None:
+        if override < 0:
+            raise ValueError("--train-span must not be negative")
+        return int(override)
+
+    span = int(config.get("train_span") or 0)
+    if span < 0:
+        raise ValueError(f"checkpoint records a negative train_span: {span}")
+    return span
+
+
 def validate_checkpoint(
     config: dict[str, Any],
     state_dict: dict[str, torch.Tensor],
@@ -231,7 +252,7 @@ def validate_checkpoint(
 
 
 def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
-            assets_path: Path | None = None) -> None:
+            assets_path: Path | None = None, train_span: int | None = None) -> None:
     LOGGER.info("Loading SPD checkpoint: %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict) or set(checkpoint) != {"config", "state_dict"}:
@@ -244,6 +265,7 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
     LOGGER.info("Reading target GGUF metadata: %s", target_path)
     target = gguf.GGUFReader(target_path)
     meta = validate_checkpoint(config, state_dict, target)
+    span = resolve_train_span(config, train_span)
 
     if assets_path is not None:
         # Training computes spec logits as lm_head(target_final_norm(g0)); the
@@ -314,6 +336,15 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
     writer.add_spd_checkpoint_version(int(meta["version"]))
     writer.add_spd_stage_count(int(meta["num_stages"]))
     writer.add_spd_use_deepest(bool(meta["use_deepest"]))
+    if span > 0:
+        writer.add_spd_train_span(span)
+        LOGGER.info("trained attention span: %d tokens (the decode path windows the sidecar to this)", span)
+    else:
+        LOGGER.warning(
+            "this checkpoint does not record the window it was trained on, so the GGUF carries no "
+            "%s.train_span and the sidecar will attend over the whole context -- acceptance "
+            "collapses on requests longer than the trainer's --chunk. Re-run the conversion with "
+            "--train-span N, or set LLAMA_SPD_SPAN=N at serve time.", SPD_ARCH)
     copy_tokenizer_metadata(target, writer)
 
     num_aggr_types = int(meta["num_aggr_types"])
@@ -359,6 +390,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assets", type=Path, default=None,
                         help="spd-train assets .pt; folds the target final-norm weight "
                              "into output.weight (required for spd-train checkpoints)")
+    parser.add_argument("--train-span", type=int, default=None,
+                        help="window length the head was trained on, in tokens (the trainer's "
+                             "--chunk). Overrides the value recorded in the checkpoint; needed "
+                             "for checkpoints written before the trainer recorded it. 0 serves "
+                             "the sidecar with unbounded attention")
     return parser.parse_args()
 
 
@@ -381,7 +417,7 @@ def main() -> None:
     if args.assets is not None and not args.assets.is_file():
         raise FileNotFoundError(args.assets)
 
-    convert(checkpoint, target, output, assets_path=args.assets)
+    convert(checkpoint, target, output, assets_path=args.assets, train_span=args.train_span)
 
 
 if __name__ == "__main__":

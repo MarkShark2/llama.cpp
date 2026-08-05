@@ -985,6 +985,10 @@ class GGUFWriter:
 
     def add_spd_use_deepest(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SPD_USE_DEEPEST.format(arch=self.arch), value)
+
+    def add_spd_train_span(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.SPD_TRAIN_SPAN.format(arch=self.arch), value)
+
     def add_norm_before_fc(self, value: bool) -> None:
         self.add_bool(Keys.LLM.NORM_BEFORE_FC.format(arch=self.arch), value)
 
