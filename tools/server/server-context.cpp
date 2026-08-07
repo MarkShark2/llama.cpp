@@ -4627,14 +4627,20 @@ private:
         return false;
     }
 
-    // consecutive iterations we have held generating slots back for prompt
-    // work; bounded so a slot wedged in a prompt state cannot starve decode
+    // consecutive rounds we have held the generating slots back for prompt
+    // work. Bounded because a deferred round leaves every lane idle: a long
+    // prompt run (a burst admits several batches back to back) would otherwise
+    // park the whole fabric for a minute at a time. On reaching the bound we
+    // do not fall back to the mixed batch - that is the shape churn this
+    // exists to avoid - we service one cohort to keep the lanes moving and
+    // re-arm, so prompt batches and decode rounds interleave at
+    // LLAMA_CHAIN_DEFER_MAX : 1.
     uint32_t chain_defer_run = 0;
 
     static uint32_t chain_defer_max() {
         static const uint32_t v = [] {
             const char * e = std::getenv("LLAMA_CHAIN_DEFER_MAX");
-            return (uint32_t) (e ? atoi(e) : 256);
+            return (uint32_t) (e ? atoi(e) : 2);
         }();
         return v;
     }
@@ -4657,7 +4663,7 @@ private:
             if (slot.state != SLOT_STATE_GENERATING) {
                 // prompt work: chain_step() yields the round to it rather than
                 // dropping every generating slot onto the classic path
-                if (chain_split_prompt() && chain_defer_run < chain_defer_max()) {
+                if (chain_split_prompt()) {
                     continue;
                 }
                 return false;
@@ -4891,6 +4897,9 @@ private:
             chain_flush();
             return false;
         }
+        // either no prompt is pending or the defer bound tripped; in both
+        // cases we service a cohort now and let the deferral re-arm
+        chain_defer_run = 0;
         for (int32_t k = 0; k < n_cohorts; ++k) {
             const int32_t c = (int32_t) ((chain_cursor + k) % n_cohorts);
             bool progressed = false;
