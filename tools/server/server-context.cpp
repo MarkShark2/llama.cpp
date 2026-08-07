@@ -3885,7 +3885,8 @@ private:
         // already flushed them, and keeping the batch prompt-only is what
         // holds the primary scheduler at one ubatch shape (see
         // chain_split_prompt). They resume on the lanes next round.
-        if (!chain_defer_to_prompt()) {
+        const bool deferred_generating = chain_defer_to_prompt();
+        if (!deferred_generating) {
             iterate(generating, [&](server_slot & slot) {
                 slot.handle_last_sampled_token(batch);
             });
@@ -4481,6 +4482,18 @@ private:
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
+            });
+        }
+
+        // [fork] the deferral above is optimistic: prompt work can be pending
+        // and still put nothing in this batch - LLAMA_PROMPT_BURST holds
+        // started slots for up to LLAMA_PROMPT_BURST_MS, and a prompt that
+        // cannot split waits for one that fits n_batch. An empty batch is not
+        // harmless (decode() aborts on the fourth in a row), so if nothing was
+        // admitted, take the generating slots back and decode them normally.
+        if (deferred_generating && batch.size() == 0) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
             });
         }
     }
