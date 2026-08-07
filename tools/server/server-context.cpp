@@ -4637,6 +4637,28 @@ private:
     // LLAMA_CHAIN_DEFER_MAX : 1.
     uint32_t chain_defer_run = 0;
 
+    // a cohort has been submitted since the last full context sync, so lane
+    // graphs may still be computing on the boards
+    bool chain_lane_dirty = false;
+
+    // [fork] hand the classic path a quiesced fabric.
+    //
+    // chain_flush() waits on each lane's read fences only - deliberately, so a
+    // sync does not fence every younger cohort's graph_compute on the shared
+    // daemons. That leaves a lane's graph still computing on the boards, and
+    // pre_decode() then performs KV surgery on the same buffers
+    // (common_context_seq_rm -> llama_kv_cache_dsv4::seq_rm ->
+    // clear_compressed -> a memset over RPC). Racing those aborted the server
+    // twice on 2026-08-07. Only the first hand-off after a cohort submission
+    // needs the full sync: consecutive deferred rounds put nothing new in
+    // flight.
+    void chain_quiesce() {
+        if (chain_lane_dirty) {
+            llama_synchronize(ctx_tgt);
+            chain_lane_dirty = false;
+        }
+    }
+
     static uint32_t chain_defer_max() {
         static const uint32_t v = [] {
             const char * e = std::getenv("LLAMA_CHAIN_DEFER_MAX");
@@ -4853,6 +4875,7 @@ private:
         }
 
         chain_inflight[c] = 1;
+        chain_lane_dirty = true;
         return true;
     }
 
@@ -4886,6 +4909,7 @@ private:
         }
         if (!chain_eligible()) {
             chain_flush();
+            chain_quiesce();
             return false;
         }
         if (chain_defer_to_prompt()) {
@@ -4895,6 +4919,7 @@ private:
             // up again as soon as the prompt drains.
             chain_defer_run++;
             chain_flush();
+            chain_quiesce();
             return false;
         }
         // either no prompt is pending or the defer bound tripped; in both
