@@ -768,6 +768,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    // [fork] a brand-new scheduler holds none of the allocation the worst-case
+    // reserve produced, so memory_update() must do a real one next time
+    mem_reserve_valid = false;
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -998,20 +1002,68 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
+    //
+    // [fork] ...but only when the worst case actually moved. graph_reserve()
+    // re-splits and re-allocates the whole graph across every backend. On one
+    // local GPU that is microseconds; across the 9-board RPC fabric it is
+    // ~9.7 s during which nothing computes anywhere, and it fires on every
+    // request start and finish. Measured 2026-08-06 on 64-slot collection: 80
+    // of them in 1500 s = 695 s, 46% of the wall, each one followed by a full
+    // (uncached) graph on every daemon. See vault Models/DeepSeek-V4 DSpark.md.
+    //
+    // The worst case is (n_ubatch, n_seq_max, n_outputs_max) - three numbers
+    // that do not move for the life of the context - so once it is reserved,
+    // repeating it for an identical signature buys nothing. That is what the
+    // TODO above asks for: reserve only if the memory module reset anything.
+    //
+    // Safety: a wrong skip is not a correctness bug. ggml_backend_sched
+    // re-splits and reallocates on demand inside graph_compute, so the failure
+    // mode is slow, not wrong. sched_reserve() builds a brand-new scheduler and
+    // clears the signature, forcing the next one through.
+    // LLAMA_MEM_RESERVE_ALWAYS=1 restores the unconditional behaviour for A/B.
     {
-        const auto mctx = memory->init_full();
-        if (!mctx) {
-            throw std::runtime_error("failed to initialize memory context");
-        }
-
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+        static const bool always = [] {
+            const char * e = getenv("LLAMA_MEM_RESERVE_ALWAYS");
+            return e && atoi(e) != 0;
+        }();
+
+        const bool same = mem_reserve_valid            &&
+                          mem_reserve_n_tokens  == n_tokens &&
+                          mem_reserve_n_seqs    == n_seqs   &&
+                          mem_reserve_n_outputs == n_outputs_max;
+
+        if (same && !always) {
+            mem_reserve_skipped++;
+            if (mem_reserve_skipped == 1 || mem_reserve_skipped % 64 == 0) {
+                LLAMA_LOG_INFO("%s: skipped %lld redundant worst-case reserves (n_tokens = %u, n_seqs = %u, n_outputs = %u)\n",
+                        __func__, (long long) mem_reserve_skipped, n_tokens, n_seqs, n_outputs_max);
+            }
+        } else {
+            const auto mctx = memory->init_full();
+            if (!mctx) {
+                throw std::runtime_error("failed to initialize memory context");
+            }
+
+            const int64_t t_res0 = ggml_time_us();
+
+            auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+                mem_reserve_valid = false;
+            } else {
+                mem_reserve_valid     = true;
+                mem_reserve_n_tokens  = n_tokens;
+                mem_reserve_n_seqs    = n_seqs;
+                mem_reserve_n_outputs = n_outputs_max;
+            }
+
+            LLAMA_LOG_INFO("%s: worst-case reserve took %.2f s (n_tokens = %u, n_seqs = %u, n_outputs = %u)\n",
+                    __func__, (ggml_time_us() - t_res0) / 1e6, n_tokens, n_seqs, n_outputs_max);
         }
     }
 

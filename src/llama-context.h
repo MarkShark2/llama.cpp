@@ -447,6 +447,16 @@ private:
 
     bool sched_need_reserve = true;
 
+    // [fork] signature of the last worst-case graph reserved by memory_update().
+    // That reserve re-splits and re-allocates the whole graph across every
+    // backend; over an RPC fabric it costs seconds, and its three inputs never
+    // move for the life of the context. See memory_update() for the argument.
+    bool     mem_reserve_valid     = false;
+    uint32_t mem_reserve_n_tokens  = 0;
+    uint32_t mem_reserve_n_seqs    = 0;
+    uint32_t mem_reserve_n_outputs = 0;
+    int64_t  mem_reserve_skipped   = 0;
+
     // Avoid repeating the Stage 2 activation banner for every speculative
     // verification batch handled by this context.
     bool pipedec_stage2_reported = false;
