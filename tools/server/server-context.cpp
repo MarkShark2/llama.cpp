@@ -4859,8 +4859,13 @@ private:
             chain_inflight.assign(n_cohorts, 0);
             chain_members.assign(n_cohorts, {});
         }
-        if (!chain_eligible()) {
+        // the hand-off counter only clears once the prompt work it is bounding
+        // is gone - clearing it on the classic fallback would let it re-arm
+        // immediately and the cap would never trip
+        if (!chain_prompt_pending()) {
             chain_defer_run = 0;
+        }
+        if (!chain_eligible()) {
             chain_flush();
             return false;
         }
@@ -4873,7 +4878,6 @@ private:
             chain_flush();
             return false;
         }
-        chain_defer_run = 0;
         for (int32_t k = 0; k < n_cohorts; ++k) {
             const int32_t c = (int32_t) ((chain_cursor + k) % n_cohorts);
             bool progressed = false;
