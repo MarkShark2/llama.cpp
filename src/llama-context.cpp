@@ -1009,16 +1009,14 @@ void llama_context::galloc_restore_worstcase() {
     const int64_t t0 = ggml_time_us();
     if (!graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get())) {
         // the narrow plan still works, it just keeps costing drains
-        LLAMA_LOG_WARN("%s: failed to restore the worst-case reserve
-", __func__);
+        LLAMA_LOG_WARN("%s: failed to restore the worst-case reserve\n", __func__);
         return;
     }
     // graph_reserve() re-plans galloc itself, so resync rather than
     // re-firing on our own write
     galloc_epoch_seen = ggml_backend_sched_galloc_reserve_epoch(sched.get());
 
-    LLAMA_LOG_INFO("%s: restored worst-case galloc reserve in %.2f s (n_tokens = %u, n_seqs = %u)
-",
+    LLAMA_LOG_INFO("%s: restored worst-case galloc reserve in %.2f s (n_tokens = %u, n_seqs = %u)\n",
             __func__, (ggml_time_us() - t0) / 1e6, n_tokens, n_seqs);
 }
 
