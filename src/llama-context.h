@@ -80,6 +80,9 @@ struct llama_context {
     // [fork] restore the worst-case galloc reserve if a narrow graph shrank it
     void galloc_restore_worstcase();
 
+    // [fork] reserve a decode lane's galloc at its widest shape on creation
+    void decode_lane_reserve(uint32_t lane);
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();

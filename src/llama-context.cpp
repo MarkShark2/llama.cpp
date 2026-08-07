@@ -1020,6 +1020,80 @@ void llama_context::galloc_restore_worstcase() {
             __func__, (ggml_time_us() - t0) / 1e6, n_tokens, n_seqs);
 }
 
+void llama_context::decode_lane_reserve(uint32_t lane) {
+    // [fork] A lane's galloc starts empty and climbs to its widest shape one
+    // live ubatch at a time - and every step is a re-plan, which over the RPC
+    // fabric is ~9 s in which nothing computes anywhere. Measured 2026-08-06
+    // once galloc_restore_worstcase() had fixed the primary scheduler: 16 of
+    // the 23 remaining events were lanes, with 'embd' walking
+    // 6 -> 7 -> 8 -> 9 -> 10 -> 13 -> 20 -> 25 -> 41 -> 47 tokens.
+    //
+    // A lane only ever carries one-token-per-sequence batches (see the
+    // eligibility test in decode()), so its widest shape is n_seq_max - far
+    // narrower than the primary's n_ubatch, which is what makes reserving
+    // every lane up front affordable. Gated with the primary's restore.
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_GALLOC_KEEP_WORSTCASE");
+        return e && atoi(e) != 0;
+    }();
+    if (!enabled || !memory || lane >= sched_decode_lane.size()) {
+        return;
+    }
+    auto & lane_sched = sched_decode_lane[lane];
+    auto & lane_res   = gf_res_decode_lane[lane];
+    if (!lane_sched || !lane_res) {
+        return;
+    }
+
+    const uint32_t n_seqs = std::min(cparams.n_seq_max, cparams.n_ubatch);
+    if (n_seqs == 0) {
+        return;
+    }
+
+    const auto mctx = memory->init_full();
+    if (!mctx) {
+        return;
+    }
+
+    const auto save_n_outputs = this->n_outputs;
+    this->n_outputs = n_seqs;
+
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(1, n_seqs);
+
+    std::vector<llama_seq_id> seq_ids(n_seqs);
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        seq_ids[i] = i;
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i] = &seq_ids[i];
+        ubatch.output[i] = true;
+    }
+
+    const int64_t t0 = ggml_time_us();
+
+    auto * res = lane_res.get();
+    res->reset();
+    ggml_backend_sched_reset(lane_sched.get());
+
+    const auto gparams = graph_params(res, ubatch, mctx.get(),
+            ctx_type_to_graph_type(cparams.ctx_type), lane_sched.get());
+
+    auto * gf = model.build_graph(gparams);
+
+    this->n_outputs = save_n_outputs;
+
+    if (!gf || !ggml_backend_sched_reserve(lane_sched.get(), gf)) {
+        LLAMA_LOG_WARN("%s: lane %u worst-case reserve failed; it will grow under traffic\n", __func__, lane);
+    } else {
+        LLAMA_LOG_INFO("%s: lane %u reserved at n_seqs = %u in %.2f s\n",
+                __func__, lane, n_seqs, (ggml_time_us() - t0) / 1e6);
+    }
+
+    // the reserve graph must not be mistaken for a reusable live one
+    res->reset();
+    ggml_backend_sched_reset(lane_sched.get());
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -1861,6 +1935,10 @@ llm_graph_result * llama_context::process_ubatch_decode_lane(
         ggml_backend_sched_set_pipeline_lane(lane_sched.get(), true);
         lane_res.reset(new llm_graph_result(max_nodes));
         LLAMA_LOG_INFO("%s: initialized decode lane %u\n", __func__, lane);
+
+        // [fork] size its galloc for the widest decode group now, rather than
+        // letting it ratchet up under live traffic one ubatch at a time
+        decode_lane_reserve(lane);
     }
 
     auto * res = lane_res.get();
