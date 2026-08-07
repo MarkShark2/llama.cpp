@@ -77,6 +77,9 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // [fork] restore the worst-case galloc reserve if a narrow graph shrank it
+    void galloc_restore_worstcase();
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
@@ -451,6 +454,11 @@ private:
     // That reserve re-splits and re-allocates the whole graph across every
     // backend; over an RPC fabric it costs seconds, and its three inputs never
     // move for the life of the context. See memory_update() for the argument.
+    // [fork] galloc's plan is not a high-water mark - see
+    // galloc_restore_worstcase(). Tracks the scheduler's re-plan epoch so a
+    // shrunk reserve can be restored before it costs another fabric drain.
+    int      galloc_epoch_seen     = 0;
+
     bool     mem_reserve_valid     = false;
     uint32_t mem_reserve_n_tokens  = 0;
     uint32_t mem_reserve_n_seqs    = 0;

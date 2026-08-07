@@ -966,6 +966,62 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
+// [fork] exported block-form from ggml-backend.cpp - see the ggml public
+// header rule in the fork notes
+extern "C" int ggml_backend_sched_galloc_reserve_epoch(ggml_backend_sched_t sched);
+
+void llama_context::galloc_restore_worstcase() {
+    // [fork] ggml_gallocr's plan is not a high-water mark. Any forced
+    // re-plan sizes it to the graph that forced it, so one narrow ubatch
+    // shrinks the standing reserve and the next wide one pays another
+    // reserve - which over the RPC fabric is ~9 s in which nothing
+    // computes anywhere. Measured 2026-08-06 at 64 slots: 'embd' reading
+    // "needs 512 tok, fits 108/140/224/330/457/510" over and over, a flat
+    // ~15 events per 5 min across 30 min with no decay, 28-37% of the wall.
+    //
+    // Restoring the worst case makes the ratchet one-way: after this every
+    // live graph is narrower than the plan, and narrower always fits
+    // (ggml_gallocr_node_needs_realloc tests size_max >= node_size).
+    // Off by default; LLAMA_GALLOC_KEEP_WORSTCASE=1 enables.
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_GALLOC_KEEP_WORSTCASE");
+        return e && atoi(e) != 0;
+    }();
+    if (!enabled || !memory) {
+        return;
+    }
+
+    const int epoch = ggml_backend_sched_galloc_reserve_epoch(sched.get());
+    if (epoch == galloc_epoch_seen) {
+        return;
+    }
+    galloc_epoch_seen = epoch;
+
+    const uint32_t n_seqs        = cparams.n_seq_max;
+    const uint32_t n_tokens      = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+
+    const auto mctx = memory->init_full();
+    if (!mctx) {
+        return;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    if (!graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get())) {
+        // the narrow plan still works, it just keeps costing drains
+        LLAMA_LOG_WARN("%s: failed to restore the worst-case reserve
+", __func__);
+        return;
+    }
+    // graph_reserve() re-plans galloc itself, so resync rather than
+    // re-firing on our own write
+    galloc_epoch_seen = ggml_backend_sched_galloc_reserve_epoch(sched.get());
+
+    LLAMA_LOG_INFO("%s: restored worst-case galloc reserve in %.2f s (n_tokens = %u, n_seqs = %u)
+",
+            __func__, (ggml_time_us() - t0) / 1e6, n_tokens, n_seqs);
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -2509,6 +2565,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     dsv4_decode_split_suppress(chain_armed_call >= 0);
 
     sched_reserve();
+
+    // [fork] a previous narrow graph may have shrunk galloc's reserve
+    galloc_restore_worstcase();
 
     bool did_optimize = false;
 

@@ -853,6 +853,10 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // [fork] bumped on every forced galloc re-plan, so the scheduler's owner
+    // can tell that the standing reserve was replaced by a narrower one
+    int galloc_reserve_epoch;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1605,6 +1609,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// [fork] exported without touching ggml-backend.h - one header change is a
+// full CUDA rebuild, so fork-only entry points go out block-form from the .cpp
+extern "C" {
+int ggml_backend_sched_galloc_reserve_epoch(ggml_backend_sched_t sched) {
+    return sched ? sched->galloc_reserve_epoch : 0;
+}
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1709,6 +1721,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
+        // [fork] Every forced re-plan re-sizes galloc to THIS graph, discarding
+        // whatever wider shape it was holding: measured 2026-08-06 on 64-slot
+        // serving, 'embd' repeatedly reads "needs 512 tok, fits 108/140/224/
+        // 330/457/510" - a narrow ubatch shrinks the plan and the next wide one
+        // pays another reserve. Over the RPC fabric each is ~9 s of fabric-wide
+        // silence, so the oscillation never decays (a flat ~15 events per 5 min
+        // across 30 min). Bump an epoch so the owner can restore its worst-case
+        // reserve instead of letting the plan ratchet down.
+        sched->galloc_reserve_epoch++;
         const int64_t tr0 = ggml_time_us();
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         const int64_t tr1 = ggml_time_us();
@@ -2130,6 +2151,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
+    sched->galloc_reserve_epoch = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
