@@ -1676,8 +1676,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
                             dl ? ggml_backend_name(sched->backends[sched->leaf_backend_ids[diff_leaf]]) : "?");
                 }
             } else {
-                fprintf(stderr, "[sched] REALLOC drain sched=%p n_nodes=%d: galloc alloc failed (graph outgrew reserve)\n",
-                        (void *) sched, sched->graph.n_nodes);
+                // [fork] galloc could not fit the graph into the standing
+                // reserve. Print what actually moved: graph_size against the
+                // previous one (equal sizes mean an "unexpected" realloc, the
+                // PR #17143 case), the split/copy counts that feed graph_size,
+                // and node 0's row count - the ubatch token width that drives
+                // every tensor size in the graph. Over an RPC fabric each of
+                // these is seconds, so naming the shape is the whole game.
+                const ggml_tensor * n0 = sched->graph.n_nodes > 0 ? sched->graph.nodes[0] : nullptr;
+                fprintf(stderr, "[sched] REALLOC drain sched=%p n_nodes=%d n_leafs=%d: galloc alloc failed "
+                        "(graph_size %d -> %d, splits=%d, copies=%d, node0 '%s' ne=[%lld,%lld])\n",
+                        (void *) sched, sched->graph.n_nodes, sched->graph.n_leafs,
+                        sched->debug_prev_graph_size, sched->debug_graph_size,
+                        sched->n_splits, sched->n_copies,
+                        n0 ? n0->name : "?",
+                        n0 ? (long long) n0->ne[0] : -1LL,
+                        n0 ? (long long) n0->ne[1] : -1LL);
             }
             fflush(stderr);
         }
