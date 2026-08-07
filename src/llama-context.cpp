@@ -982,9 +982,14 @@ void llama_context::galloc_restore_worstcase() {
     // Restoring the worst case makes the ratchet one-way: after this every
     // live graph is narrower than the plan, and narrower always fits
     // (ggml_gallocr_node_needs_realloc tests size_max >= node_size).
-    // Off by default; LLAMA_GALLOC_KEEP_WORSTCASE=1 enables.
+    // Superseded on the primary scheduler once the server stopped mixing
+    // decode rows into prompt batches (LLAMA_CHAIN_SPLIT_PROMPT): the primary
+    // then only ever sees prompt ubatches, and reserving a decode-shaped
+    // worst case on it re-introduces the very shape alternation this was
+    // meant to stop. Now off unless LLAMA_GALLOC_PRIMARY_RESERVE=1; the lane
+    // reserve below is still gated on LLAMA_GALLOC_KEEP_WORSTCASE.
     static const bool enabled = [] {
-        const char * e = getenv("LLAMA_GALLOC_KEEP_WORSTCASE");
+        const char * e = getenv("LLAMA_GALLOC_PRIMARY_RESERVE");
         return e && atoi(e) != 0;
     }();
     if (!enabled || !memory) {

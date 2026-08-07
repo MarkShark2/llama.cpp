@@ -3879,9 +3879,17 @@ private:
         });
 
         // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
+        //
+        // [fork] while the chain lanes own decode and prompt work is pending,
+        // the generating slots stay off this batch entirely - chain_step()
+        // already flushed them, and keeping the batch prompt-only is what
+        // holds the primary scheduler at one ubatch shape (see
+        // chain_split_prompt). They resume on the lanes next round.
+        if (!chain_defer_to_prompt()) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -4567,8 +4575,65 @@ private:
         return n;
     }
 
+    // [fork] LLAMA_CHAIN_SPLIT_PROMPT (default on): prompt work no longer
+    // disqualifies the whole round. Mixing one-token decode rows into a prompt
+    // batch changes the primary scheduler's ubatch shape every iteration, and
+    // a shape change (node count / backend ids) is a full galloc re-plan -
+    // measured 2026-08-06 over the 9-board fabric at ~6 s each, ~2 per prompt,
+    // half of all storm wall. Splitting them keeps decode on the lanes (whose
+    // shape is constant) and leaves the primary scheduler a prompt-only batch,
+    // so neither plan is ever re-planned by the other's shape.
+    static bool chain_split_prompt() {
+        static const bool v = [] {
+            const char * e = std::getenv("LLAMA_CHAIN_SPLIT_PROMPT");
+            return e ? atoi(e) != 0 : true;
+        }();
+        return v;
+    }
+
+    // the chain machinery itself is usable; per-slot suitability is decided
+    // separately so one unsuitable slot cannot disable the lanes for everyone
+    bool chain_available() const {
+        return !chain_broken && chain_group_size() > 0 && chain_lanes_cap() > 0 && !spd_mode && !spec;
+    }
+
+    // a slot the lanes can carry: plain generating, no speculation, probs,
+    // embeddings or lora
+    static bool chain_slot_ok(const server_slot & slot) {
+        return slot.state == SLOT_STATE_GENERATING && !slot.can_speculate() &&
+                slot.spec_draft.empty() && !slot.need_embd() &&
+                slot.task->params.sampling.n_probs == 0 && slot.lora.empty();
+    }
+
+    bool chain_prompt_pending() {
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.state != SLOT_STATE_GENERATING) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // consecutive iterations we have held generating slots back for prompt
+    // work; bounded so a slot wedged in a prompt state cannot starve decode
+    uint32_t chain_defer_run = 0;
+
+    static uint32_t chain_defer_max() {
+        static const uint32_t v = [] {
+            const char * e = std::getenv("LLAMA_CHAIN_DEFER_MAX");
+            return (uint32_t) (e ? atoi(e) : 256);
+        }();
+        return v;
+    }
+
+    // true when this round should hand the batch to prompt work alone
+    bool chain_defer_to_prompt() {
+        return chain_available() && chain_split_prompt() &&
+               chain_defer_run < chain_defer_max() && chain_prompt_pending();
+    }
+
     bool chain_eligible() {
-        if (chain_broken || chain_group_size() <= 0 || chain_lanes_cap() <= 0 || spd_mode || spec) {
+        if (!chain_available()) {
             return false;
         }
         bool any = false;
@@ -4576,11 +4641,16 @@ private:
             if (!slot.is_processing()) {
                 continue;
             }
-            // every busy slot must be a plain generating slot: prompt work,
-            // speculation, probs, embeddings and lora all take the classic path
-            if (slot.state != SLOT_STATE_GENERATING || slot.can_speculate() ||
-                    !slot.spec_draft.empty() || slot.need_embd() ||
-                    slot.task->params.sampling.n_probs > 0 || !slot.lora.empty()) {
+            if (slot.state != SLOT_STATE_GENERATING) {
+                // prompt work: chain_step() yields the round to it rather than
+                // dropping every generating slot onto the classic path
+                if (chain_split_prompt() && chain_defer_run < chain_defer_max()) {
+                    continue;
+                }
+                return false;
+            }
+            // speculation, probs, embeddings and lora take the classic path
+            if (!chain_slot_ok(slot)) {
                 return false;
             }
             any = true;
@@ -4790,9 +4860,20 @@ private:
             chain_members.assign(n_cohorts, {});
         }
         if (!chain_eligible()) {
+            chain_defer_run = 0;
             chain_flush();
             return false;
         }
+        if (chain_defer_to_prompt()) {
+            // yield the round to the prompt batch. Flush first so the classic
+            // path sees a settled context, then pre_decode() builds a
+            // prompt-only batch (see chain_split_prompt) and the cohorts pick
+            // up again as soon as the prompt drains.
+            chain_defer_run++;
+            chain_flush();
+            return false;
+        }
+        chain_defer_run = 0;
         for (int32_t k = 0; k < n_cohorts; ++k) {
             const int32_t c = (int32_t) ((chain_cursor + k) % n_cohorts);
             bool progressed = false;
