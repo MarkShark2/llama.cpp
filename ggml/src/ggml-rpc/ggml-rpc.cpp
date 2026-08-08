@@ -101,6 +101,13 @@ enum rpc_cmd {
     // it straight down that lane, so a stage boundary never touches the client.
     RPC_CMD_PEER_OPEN,
     RPC_CMD_PUSH_TENSOR,
+    // imatrix collection without dragging the activations home [fork]:
+    // llama-imatrix only ever wants sum(x^2) per column (per expert, for
+    // MUL_MAT_ID) of a matmul's src1. Reading that tensor back over the wire
+    // costs ~10 GB per 512-token chunk on a 27-layer RPC split; the server can
+    // do the reduction in its own RAM and answer with the accumulator instead,
+    // which is token-count independent.
+    RPC_CMD_IMATRIX_SQSUM,
     RPC_CMD_COUNT,
 };
 
@@ -108,6 +115,8 @@ enum rpc_cmd {
 #define GGML_RPC_FDX_MIN_PATCH 1
 // ...and the peer (remote->remote) commands
 #define GGML_RPC_PEER_MIN_PATCH 2
+// ...and the server-side imatrix reduction
+#define GGML_RPC_IMAT_MIN_PATCH 3
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -289,6 +298,20 @@ struct rpc_msg_push_tensor_req {
 
 struct rpc_msg_push_tensor_rsp {
     uint8_t ok;
+};
+
+// [fork] server-side imatrix reduction. src1 is the activation the client
+// would otherwise GET in full; ids (MUL_MAT_ID only) says which expert each
+// (n_expert_used, token) slot was routed to. The reply is
+//   uint64 counts[n_mat]  followed by  float sums[src1.ne[0] * n_mat]
+// and its size depends on n_mat and ne[0] only, never on the token count.
+struct rpc_msg_imatrix_sqsum_req {
+    rpc_tensor src1;
+    rpc_tensor ids;       // ignored unless has_ids
+    uint32_t   n_mat;     // src0->ne[2] for MUL_MAT_ID, src0->ne[2]*ne[3] otherwise
+    uint32_t   has_ids;
+    uint32_t   src0_ne2;  // dense path: mat_id = (i3 % src0_ne3)*src0_ne2 + (i2 % src0_ne2)
+    uint32_t   src0_ne3;
 };
 
 #pragma pack(pop)
@@ -1514,6 +1537,80 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         rpc_wire_trace_tick();
     }
     RPC_STATUS_ASSERT(status);
+}
+
+// [fork] client half of RPC_CMD_IMATRIX_SQSUM -- see the enum comment. Returns
+// false (and collects nothing) whenever the tensor is not RPC-resident or the
+// daemon predates patch 3, so the caller can fall back to the plain GET path.
+// Exported block-form from the .cpp: a fork entry point must never cost a
+// public-header change.
+extern "C" {
+GGML_BACKEND_API bool ggml_backend_rpc_imatrix_sqsum(
+        const struct ggml_tensor * src1,
+        const struct ggml_tensor * ids,
+        int64_t                    n_mat,
+        int64_t                    src0_ne2,
+        int64_t                    src0_ne3,
+        float                    * sums,
+        int64_t                  * counts) {
+    if (src1 == nullptr || src1->buffer == nullptr || !ggml_backend_buffer_is_rpc(src1->buffer)) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || n_mat <= 0 || sums == nullptr) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) src1->buffer->context;
+    if (rpc_server_patch(ctx->endpoint) < GGML_RPC_IMAT_MIN_PATCH) {
+        return false;
+    }
+    if (ids != nullptr && (ids->buffer == nullptr || !ggml_backend_buffer_is_rpc(ids->buffer))) {
+        return false; // ids must be readable by the same daemon
+    }
+    if (ids != nullptr) {
+        ggml_backend_rpc_buffer_context * ictx = (ggml_backend_rpc_buffer_context *) ids->buffer->context;
+        if (ictx->endpoint != ctx->endpoint) {
+            return false;
+        }
+    }
+
+    rpc_msg_imatrix_sqsum_req request = {};
+    request.src1     = serialize_tensor(src1);
+    request.n_mat    = (uint32_t) n_mat;
+    request.has_ids  = ids != nullptr ? 1u : 0u;
+    request.src0_ne2 = (uint32_t) (src0_ne2 > 0 ? src0_ne2 : 1);
+    request.src0_ne3 = (uint32_t) (src0_ne3 > 0 ? src0_ne3 : 1);
+    if (ids != nullptr) {
+        request.ids = serialize_tensor(ids);
+    }
+
+    const int64_t ne0 = src1->ne[0];
+    std::vector<uint8_t> response(sizeof(uint64_t)*n_mat + sizeof(float)*ne0*n_mat);
+
+    const bool trace = rpc_wire_trace_enabled();
+    rpc_wire_ep_stat * st = trace ? rpc_wire_stat(ctx->endpoint) : nullptr;
+    const int64_t t0 = trace ? ggml_time_us() : 0;
+    const bool ok = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_IMATRIX_SQSUM,
+                                         &request, sizeof(request), response.data(), response.size());
+    if (trace) {
+        st->get_us    += (uint64_t) (ggml_time_us() - t0);
+        st->get_bytes += response.size();
+        st->get_n     += 1;
+        rpc_wire_trace_tick();
+    }
+    if (!ok) {
+        return false;
+    }
+
+    const uint64_t * rc = (const uint64_t *) response.data();
+    const float    * rs = (const float *) (response.data() + sizeof(uint64_t)*n_mat);
+    std::memcpy(sums, rs, sizeof(float)*ne0*n_mat);
+    if (counts != nullptr) {
+        for (int64_t m = 0; m < n_mat; ++m) {
+            counts[m] = (int64_t) rc[m];
+        }
+    }
+    return true;
+}
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -3250,6 +3347,7 @@ public:
     bool set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache = true);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+    bool imatrix_sqsum(const rpc_msg_imatrix_sqsum_req & request, std::vector<uint8_t> & response);
     bool get_tensor_bf16(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
@@ -3955,6 +4053,117 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     response.resize(request.size, 0);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    return true;
+}
+
+// [fork] sum-of-squares reduction of a matmul activation, done where the data
+// already lives. llama-imatrix accumulates sum(x^2) per column (per expert on
+// MUL_MAT_ID) and throws the activation away; pulling it home first costs
+// ~10 GB per 512-token chunk of DSV4 on a 27-layer RPC split, and the whole
+// imatrix pass is bandwidth-bound on that. The answer is [n_mat][ne0] floats
+// plus n_mat counts, which does not grow with the token count -- so a bigger
+// ubatch is now strictly cheaper per token.
+bool rpc_server::imatrix_sqsum(const rpc_msg_imatrix_sqsum_req & request, std::vector<uint8_t> & response) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * src1 = deserialize_tensor(ctx, &request.src1);
+    if (src1 == nullptr || src1->buffer == nullptr || src1->type != GGML_TYPE_F32) {
+        GGML_LOG_ERROR("[%s] error deserializing src1\n", __func__);
+        return false;
+    }
+
+    // same bounds check the GET path does: the client controls these offsets
+    auto in_bounds = [](const ggml_tensor * t) {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(t->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(t->buffer);
+        const size_t d0 = (size_t) t->data;
+        return d0 >= p0 && d0 < p1 && ggml_nbytes(t) <= (p1 - d0);
+    };
+    if (!in_bounds(src1)) {
+        GGML_LOG_ERROR("[%s] src1 out of buffer bounds\n", __func__);
+        return false;
+    }
+
+    const int64_t ne0   = src1->ne[0];
+    const int64_t n_mat = (int64_t) request.n_mat;
+    if (ne0 <= 0 || n_mat <= 0 || ne0*n_mat > (int64_t) 1 << 32) {
+        GGML_LOG_ERROR("[%s] bad reduction shape ne0=%" PRId64 " n_mat=%" PRId64 "\n", __func__, ne0, n_mat);
+        return false;
+    }
+
+    std::vector<char> src1_data((size_t) ggml_nbytes(src1));
+    ggml_backend_tensor_get(src1, src1_data.data(), 0, src1_data.size());
+    const char * data = src1_data.data();
+
+    response.assign(sizeof(uint64_t)*n_mat + sizeof(float)*ne0*n_mat, 0);
+    uint64_t * counts = (uint64_t *) response.data();
+    float    * sums   = (float *) (response.data() + sizeof(uint64_t)*n_mat);
+
+    if (request.has_ids) {
+        ggml_tensor * ids = deserialize_tensor(ctx, &request.ids);
+        if (ids == nullptr || ids->buffer == nullptr || !in_bounds(ids)) {
+            GGML_LOG_ERROR("[%s] error deserializing ids\n", __func__);
+            return false;
+        }
+        std::vector<char> ids_data((size_t) ggml_nbytes(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ids_data.size());
+
+        const int64_t n_ids = ids->ne[0];
+        if (ids->ne[1] != src1->ne[2]) {
+            GGML_LOG_ERROR("[%s] ids/src1 token mismatch\n", __func__);
+            return false;
+        }
+        // one pass over the routed slots; the client's loop scanned all
+        // n_mat experts per slot to find the matches (256x more iterations)
+        for (int64_t row = 0; row < src1->ne[2]; ++row) {
+            for (int64_t idx = 0; idx < n_ids; ++idx) {
+                const int32_t ex = *(const int32_t *)(ids_data.data() + row*ids->nb[1] + idx*ids->nb[0]);
+                if (ex < 0 || ex >= n_mat) {
+                    GGML_LOG_ERROR("[%s] expert id %d out of range\n", __func__, (int) ex);
+                    return false;
+                }
+                const int64_t i11 = idx % src1->ne[1];
+                const float * x = (const float *)(data + i11*src1->nb[1] + row*src1->nb[2]);
+                float * acc = sums + (int64_t) ex * ne0;
+                counts[ex]++;
+                for (int64_t j = 0; j < ne0; ++j) {
+                    acc[j] += x[j]*x[j];
+                }
+            }
+        }
+    } else {
+        const int64_t s0_ne2 = request.src0_ne2 ? (int64_t) request.src0_ne2 : 1;
+        const int64_t s0_ne3 = request.src0_ne3 ? (int64_t) request.src0_ne3 : 1;
+        for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+                const int64_t mat_id = (i3 % s0_ne3)*s0_ne2 + (i2 % s0_ne2);
+                if (mat_id < 0 || mat_id >= n_mat) {
+                    GGML_LOG_ERROR("[%s] mat_id out of range\n", __func__);
+                    return false;
+                }
+                float * acc = sums + mat_id*ne0;
+                for (int64_t row = 0; row < src1->ne[1]; ++row) {
+                    const float * x = (const float *)(data + row*src1->nb[1] + i2*src1->nb[2] + i3*src1->nb[3]);
+                    for (int64_t j = 0; j < ne0; ++j) {
+                        acc[j] += x[j]*x[j];
+                    }
+                }
+            }
+        }
+        // dense tensors carry a single count over all rows, as the client does
+        const int64_t nrows = ggml_nrows(src1);
+        for (int64_t m = 0; m < n_mat; ++m) {
+            counts[m] = (uint64_t) (nrows / n_mat);
+        }
+    }
+
     return true;
 }
 
@@ -4924,6 +5133,20 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 }
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_IMATRIX_SQSUM: {
+                rpc_msg_imatrix_sqsum_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.imatrix_sqsum(request, response)) {
                     return;
                 }
                 if (!send_msg(sock, response.data(), response.size())) {

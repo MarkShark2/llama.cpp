@@ -156,6 +156,16 @@ bool ggml_backend_rpc_sync_peer_guard(const struct ggml_tensor * src_probe);
 uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t backend);
 void     ggml_backend_rpc_read_wait(ggml_backend_t backend, uint64_t ordinal);
 bool     ggml_backend_is_rpc(ggml_backend_t backend);
+// [fork, imatrix] reduce a matmul activation to sum(x^2) per column (per
+// expert when ids != NULL) on the daemon that already holds it, instead of
+// GETting the whole activation. sums is [src1->ne[0] * n_mat], counts is
+// [n_mat] (may be NULL). Returns false when the tensor is not RPC-resident or
+// the daemon predates proto patch 3 - the caller must then do it the old way.
+bool ggml_backend_rpc_imatrix_sqsum(
+        const struct ggml_tensor * src1,
+        const struct ggml_tensor * ids,
+        int64_t n_mat, int64_t src0_ne2, int64_t src0_ne3,
+        float * sums, int64_t * counts);
 }
 
 // [fork] chained cohort decode (LLAMA_DECODE_CHAIN=G): the caller decodes

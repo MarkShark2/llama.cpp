@@ -4,6 +4,8 @@
 #include "log.h"
 #include "llama.h"
 #include "gguf.h"
+// [fork] staging header: ggml_backend_rpc_imatrix_sqsum (server-side reduction)
+#include "../../src/llama-ext.h"
 
 #include <algorithm>
 #include <chrono>
@@ -72,7 +74,27 @@ private:
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+    // [fork] scratch for the server-side reduction (RPC_CMD_IMATRIX_SQSUM)
+    std::vector<float>                     m_red_sums;
+    std::vector<int64_t>                   m_red_counts;
+    // [fork] ffn_gate_exps and ffn_up_exps take the *same* src1 tensor, as do
+    // the shared expert's gate/up - so the plain path pulls the identical
+    // activation home twice. Only ever read on the call immediately after the
+    // one that filled it; any declined node clears it (see the ask branch), so
+    // it cannot survive a graph, ubatch or eval boundary.
+    const ggml_tensor *                    m_last_src1 = nullptr;
+    const ggml_tensor *                    m_last_node = nullptr;
 };
+
+// [fork] LLAMA_IMATRIX_RPC_REDUCE=0 forces the activations back over the wire
+// (the pre-fork path) for A/B and for daemons older than proto patch 3.
+static bool imatrix_rpc_reduce_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("LLAMA_IMATRIX_RPC_REDUCE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
 
 // remove any prefix and suffixes from the name
 // CUDA0#blk.0.attn_k.weight#0 => blk.0.attn_k.weight
@@ -234,23 +256,65 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     // when ask is true, the scheduler wants to know if we are interested in data from this tensor
     // if we return true, a follow-up call will be made with ask=false in which we can do the actual collection
     if (ask) {
-        if (t->op == GGML_OP_MUL_MAT_ID) return true; // collect all indirect matrix multiplications
-        if (t->op != GGML_OP_MUL_MAT) return false;
+        bool want = true;
+        if (t->op == GGML_OP_MUL_MAT_ID) {
+            want = true; // collect all indirect matrix multiplications
+        } else if (t->op != GGML_OP_MUL_MAT) {
+            want = false;
         // why are small batches ignored (<16 tokens)?
-        if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) return false;
-        if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) return false;
-        return true;
+        } else if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) {
+            want = false;
+        } else if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) {
+            want = false;
+        }
+        // [fork] every node the scheduler walks reaches this branch, so a
+        // declined one is a hard fence for the src1 reuse cache below
+        if (!want) {
+            m_last_src1 = nullptr;
+            m_last_node = nullptr;
+        }
+        return want;
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // copy the data from the GPU memory if needed
     const bool is_host = ggml_backend_buffer_is_host(src1->buffer);
 
-    if (!is_host) {
+    // [fork] MUL_MAT_ID carries the routing in src[2]; a plain MUL_MAT spreads
+    // its activation over src0's higher dims instead
+    const bool           is_id = t->op == GGML_OP_MUL_MAT_ID;
+    const ggml_tensor *  ids   = is_id ? t->src[2] : nullptr;
+    const int64_t        n_mat = is_id ? src0->ne[2] : src0->ne[2]*src0->ne[3];
+    const int64_t        ne0   = src1->ne[0];
+
+    // [fork] Reduce where the data already lives. llama-imatrix only wants
+    // sum(x^2) per column (per expert on MUL_MAT_ID); dragging the activation
+    // home first was ~10 GB per 512-token DSV4 chunk and 100% of the wall time.
+    // The reply is [n_mat][ne0], which does not scale with the token count.
+    bool reduced = false;
+    if (!is_host && imatrix_rpc_reduce_enabled() && n_mat > 0) {
+        m_red_sums.assign((size_t) ne0*n_mat, 0.0f);
+        m_red_counts.assign((size_t) n_mat, 0);
+        reduced = ggml_backend_rpc_imatrix_sqsum(src1, ids, n_mat,
+                                                 src0->ne[2], src0->ne[3],
+                                                 m_red_sums.data(), m_red_counts.data());
+    }
+
+    // copy the data from the GPU memory if needed
+    if (!reduced && !is_host) {
         const size_t src1_nbytes = ggml_nbytes(src1);
-        m_src1_data.resize(src1_nbytes);
-        ggml_backend_tensor_get(src1, m_src1_data.data(), 0, src1_nbytes);
+        // [fork] gate and up share one src1; skip the second identical read
+        if (m_last_src1 == src1 && m_last_node != t && m_src1_data.size() == src1_nbytes) {
+            // m_src1_data already holds exactly these bytes
+        } else {
+            m_src1_data.resize(src1_nbytes);
+            ggml_backend_tensor_get(src1, m_src1_data.data(), 0, src1_nbytes);
+        }
+        m_last_src1 = src1;
+        m_last_node = t;
+    } else {
+        m_last_src1 = nullptr;
+        m_last_node = nullptr;
     }
 
     const char * data = is_host ? (const char *) src1->data : m_src1_data.data();
@@ -261,7 +325,6 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     if (t->op == GGML_OP_MUL_MAT_ID) {
         //   ids  -> [n_experts_used, n_tokens]
         //   src1 -> [cols, n_expert_used, n_tokens]
-        const ggml_tensor * ids = t->src[2];
         const int64_t n_as = src0->ne[2];
         const int64_t n_ids = ids->ne[0];
 
@@ -277,8 +340,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             GGML_ASSERT(false);
         }
 
-        m_ids.resize(ggml_nbytes(ids));
-        ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
+        if (!reduced) {
+            m_ids.resize(ggml_nbytes(ids));
+            ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
+        }
 
         auto & e = m_stats[wname];
 
@@ -299,33 +364,45 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             exit(1); //GGML_ABORT("fatal error");
         }
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[2], (int)src1->type);
-        // loop over all possible experts, regardless if they are used or not in the batch
-        for (int64_t ex = 0; ex < n_as; ++ex) {
-            size_t e_start = ex*src1->ne[0];
-
-            for (int64_t idx = 0; idx < n_ids; ++idx) {
-                for (int64_t row = 0; row < src1->ne[2]; ++row) {
+        if (reduced) {
+            // the daemon already did the routed pass; merge its accumulator
+            for (int64_t ex = 0; ex < n_as; ++ex) {
+                e.counts[ex] += m_red_counts[ex];
+                const size_t e_start = ex*ne0;
+                for (int64_t j = 0; j < ne0; ++j) {
+                    e.values[e_start + j] += m_red_sums[e_start + j];
+                }
+            }
+        } else {
+            // [fork] one pass over the routed slots. The original walked all
+            // n_as experts per slot to find its matches, i.e. 256x the
+            // iterations on a 256-expert model, and re-checked isfinite on
+            // every accumulated element; the check now happens once per tensor.
+            for (int64_t row = 0; row < src1->ne[2]; ++row) {
+                for (int64_t idx = 0; idx < n_ids; ++idx) {
                     const int excur = *(const int32_t *) (m_ids.data() + row*ids->nb[1] + idx*ids->nb[0]);
 
                     GGML_ASSERT(excur >= 0 && excur < n_as); // sanity check
 
-                    if (excur != ex) continue;
-
                     const int64_t i11 = idx % src1->ne[1];
-                    const int64_t i12 = row;
-                    const float * x = (const float *)(data + i11*src1->nb[1] + i12*src1->nb[2]);
+                    const float * x = (const float *)(data + i11*src1->nb[1] + row*src1->nb[2]);
 
-                    e.counts[ex]++;
+                    e.counts[excur]++;
 
-                    for (int64_t j = 0; j < src1->ne[0]; ++j) {
-                        e.values[e_start + j] += x[j] * x[j];
-                        if (!std::isfinite((float)e.values[e_start + j])) {
-                            LOG_ERR("%f detected in %s\n", (float)e.values[e_start + j], wname.c_str());
-                            exit(1);
-                        }
+                    float * acc = e.values.data() + (size_t) excur*ne0;
+                    for (int64_t j = 0; j < ne0; ++j) {
+                        acc[j] += x[j] * x[j];
                     }
                 }
             }
+        }
+        for (size_t k = 0; k < e.values.size(); ++k) {
+            if (!std::isfinite(e.values[k])) {
+                LOG_ERR("%f detected in %s\n", (double) e.values[k], wname.c_str());
+                exit(1);
+            }
+        }
+        for (int64_t ex = 0; ex < n_as; ++ex) {
             const int32_t n_chunk = e.counts[ex] / chunk_size;
             if (n_chunk > m_last_chunk) {
                 const int32_t chunk_step = n_chunk - m_last_chunk;
@@ -340,8 +417,6 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
     } else {
         auto & e = m_stats[wname];
-        const int64_t n_mat = src0->ne[2] * src0->ne[3];
-
         // use a single count per dense tensor
         // (necessary when merging older GGUF-imatrix files with 3d tensors)
         if (e.counts.size() > 1) {
@@ -366,22 +441,32 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[1], (int)src1->ne[2], (int)src1->type);
 
-        for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
-            for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
-                // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
-                const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
-                const int64_t mat_start = mat_id * src1->ne[0];
+        if (reduced) {
+            for (size_t k = 0; k < e.values.size(); ++k) {
+                e.values[k] += m_red_sums[k];
+            }
+        } else {
+            for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+                    // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
+                    const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
+                    float * acc = e.values.data() + mat_id * ne0;
 
-                for (int64_t row = 0; row < src1->ne[1]; ++row) {
-                    const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
-                    for (int64_t j = 0; j < src1->ne[0]; ++j) {
-                        e.values[mat_start + j] += x[j] * x[j];
-                        if (!std::isfinite((float)e.values[j])) {
-                            LOG_ERR("%f detected in %s\n", (float)e.values[j], wname.c_str());
-                            exit(1);
+                    for (int64_t row = 0; row < src1->ne[1]; ++row) {
+                        const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                        for (int64_t j = 0; j < ne0; ++j) {
+                            acc[j] += x[j] * x[j];
                         }
                     }
                 }
+            }
+        }
+        // [fork] hoisted out of the accumulation loop: it used to run per
+        // element (and, as written, only ever inspected e.values[j])
+        for (size_t k = 0; k < e.values.size(); ++k) {
+            if (!std::isfinite(e.values[k])) {
+                LOG_ERR("%f detected in %s\n", (double) e.values[k], wname.c_str());
+                exit(1);
             }
         }
         // only 1 count in practice, except when a tensor is used for both MUL_MAT_ID and MUL_MAT
@@ -833,7 +918,12 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
         logits.reserve((size_t)n_ctx * n_vocab);
     }
 
-    LOG_INF("%s: computing over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
+    // [fork] the output head only has to run over every position when something
+    // downstream reads those logits
+    const bool need_all_logits = params.compute_ppl || params.process_output;
+
+    LOG_INF("%s: computing over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d, all_logits=%d\n",
+            __func__, n_chunk, n_ctx, n_batch, n_seq, need_all_logits ? 1 : 0);
 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
@@ -868,9 +958,12 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                 for (int k = 0; k < batch_size; ++k) {
                     // NOTE: specifying all logits to get activations for the output.weight tensor
                     //       and also for the perplexity calculation.
-                    // TODO: only get outputs when (params.process_output || params.compute_ppl)
-                    //       (not possible when this skips FFN computation of the last layer)
-                    common_batch_add(batch, tokens[seq_start + k], j*n_batch + k, { seq }, true);
+                    // [fork] ...but neither is wanted with --no-ppl and no --process-output, and
+                    // asking for all of them runs the 4096 x 129280 output head over every
+                    // position and copies n_ctx*n_vocab floats back per chunk. Keep one output
+                    // per sequence so the decode still has an output row to write.
+                    const bool want_logits = need_all_logits || (k == batch_size - 1);
+                    common_batch_add(batch, tokens[seq_start + k], j*n_batch + k, { seq }, want_logits);
                 }
 
                 // restore the original token in case it was set to BOS

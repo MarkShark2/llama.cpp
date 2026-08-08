@@ -1612,7 +1612,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 // [fork] exported without touching ggml-backend.h - one header change is a
 // full CUDA rebuild, so fork-only entry points go out block-form from the .cpp
 extern "C" {
-int ggml_backend_sched_galloc_reserve_epoch(ggml_backend_sched_t sched) {
+GGML_API int ggml_backend_sched_galloc_reserve_epoch(ggml_backend_sched_t sched) {
     return sched ? sched->galloc_reserve_epoch : 0;
 }
 }
