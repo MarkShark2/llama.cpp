@@ -3340,6 +3340,14 @@ private:
             // grammar samplers past, from the same helper -- not the whole prompt
             gparams.generation_prompt_tokens = common_sampler_prefill_tokens(
                     vocab, slot.task->params.sampling.generation_prompt);
+            // A disconnect posts a cancel task, but the queue loop is blocked
+            // right here until generate() returns -- the pipeline has to poll
+            // for it, or a cancelled request runs to completion (and everything
+            // queued behind it waits for that).
+            const int id_task = slot.task->id;
+            gparams.should_cancel = [this, id_task]() {
+                return queue_tasks.has_cancel(id_task);
+            };
 
             common_spd_result spd_result;
             bool stopped = false;
@@ -3355,6 +3363,15 @@ private:
             // stop string could not end a request early either.
             slot.state = SLOT_STATE_GENERATING;
             auto on_token = [&](llama_token tok, size_t /* index */) {
+                // The prefill-side poll only reaches chunk boundaries; here it
+                // covers decode, one check per verified token. Leaving
+                // `stopped` unset lets the code below stamp the slot as a
+                // limit stop -- the final result is dropped at the response
+                // queue anyway, the reader is gone.
+                if (queue_tasks.has_cancel(id_task)) {
+                    SLT_INF(slot, "%s", "SPD generation cancelled by client\n");
+                    return false;
+                }
                 if (!prompt_eval_reported) {
                     prompt_eval_reported = true;
                     slot.t_start_generation        = ggml_time_us();
@@ -3390,6 +3407,15 @@ private:
             };
 
             if (!spd_pipeline->generate(prompt, gparams, spd_result, on_token)) {
+                if (spd_result.cancelled) {
+                    // Cancelled mid-prefill: the pipeline reset its caches (an
+                    // unfinished prefill leaves the stages unevenly advanced),
+                    // so the record must claim nothing is resident.
+                    SLT_INF(slot, "%s", "SPD request cancelled by client during prefill\n");
+                    slot.prompt.tokens.keep_first(spd_result.n_cached_tokens);
+                    slot.release();
+                    return;
+                }
                 send_error(slot, "SPD generation failed: " + spd_pipeline->error(), ERROR_TYPE_SERVER);
                 slot.release();
                 return;

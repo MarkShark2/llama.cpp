@@ -353,6 +353,11 @@ struct common_spd_pipeline::impl {
     bool gen_grammar_lazy = false;
     std::vector<llama_token_data> grammar_candidates;
 
+    // Request-scoped copy of gparams.should_cancel, cleared with the sampler
+    // views above. The stage-0 prefill worker polls it between chunks.
+    std::function<bool()> should_cancel;
+    bool prefill_cancelled = false;
+
     // What the stage caches currently hold: the prompt of the last request
     // followed by every token that request finalized, all at their own
     // positions. A new request whose prompt shares a prefix with this keeps
@@ -2130,6 +2135,16 @@ struct common_spd_pipeline::impl {
                 ggml_tensor * guard_probe = nullptr;
 
                 for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
+                    // Stage 0 paces the ladder, so its check is enough: once it
+                    // stops producing, every later stage drains what is in
+                    // flight and exits through the abort wakeup below.
+                    if (stage == 0 && should_cancel && should_cancel()) {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        prefill_cancelled = true;
+                        aborted = true;
+                        progress_cv.notify_all();
+                        return;
+                    }
                     const auto wait_start = clock_type::now();
                     {
                         std::unique_lock<std::mutex> lock(progress_mutex);
@@ -2647,11 +2662,14 @@ struct common_spd_pipeline::impl {
         gen_grammar      = grmr.get();
         gen_grammar_lazy = gparams.grammar_lazy;
         gen_rbudget      = nullptr;
+        should_cancel    = gparams.should_cancel;
+        prefill_cancelled = false;
         struct sampler_view_guard {
             impl * self;
             ~sampler_view_guard() {
                 self->gen_grammar = nullptr;
                 self->gen_rbudget = nullptr;
+                self->should_cancel = nullptr;
             }
         } sampler_view{this};
 
@@ -2702,6 +2720,7 @@ struct common_spd_pipeline::impl {
         std::vector<std::vector<float>> prompt_anchors;
         if (!prefill_target(prompt, n_keep, prompt_hidden, prompt_anchors, ckpt_at, ckpt_out) ||
             !prefill_sidecar(prompt_anchors, n_prompt, n_keep)) {
+            result.cancelled = prefill_cancelled;
             return false;
         }
         // Workers have joined, so every slice that landed is visible here.

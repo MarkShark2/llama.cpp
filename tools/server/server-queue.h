@@ -56,6 +56,20 @@ public:
         return sleeping;
     }
 
+    // Whether a cancel targeting id_target is waiting in the queue. Slot work
+    // that blocks the queue loop for a whole request (SPD generate) polls this:
+    // the loop cannot process the cancel task until that work returns, so the
+    // work itself has to look for it.
+    bool has_cancel(int id_target) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const auto & task : queue_tasks) {
+            if (task.type == SERVER_TASK_TYPE_CANCEL && task.id_target == id_target) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // end the start_loop routine
     void terminate();
 

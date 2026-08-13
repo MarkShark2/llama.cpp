@@ -81,6 +81,13 @@ struct common_spd_gen_params {
     // Minimum spacing between checkpoints taken during prefill, in tokens
     // (--checkpoint-min-step). Same meaning as on the ordinary server path.
     int32_t checkpoint_min_step = 0;
+
+    // Polled between prefill chunks; decode is covered by the token callback
+    // returning false. Returning true abandons the request: generate() returns
+    // false with no error message, result.cancelled is set, and the caches are
+    // reset like any other unfinished request. This is the only way a client
+    // cancel can reach a request whose caller is blocked inside generate().
+    std::function<bool()> should_cancel;
 };
 
 // Invoked as each token becomes final -- the target has verified it, so no
@@ -111,6 +118,10 @@ struct common_spd_result {
     // state to the prompt cache: a record longer than the state it describes
     // would let a later restore claim resident tokens that are not there.
     int32_t n_cached_tokens = 0;
+
+    // should_cancel abandoned the request during prefill. generate() returned
+    // false, but there is no error to report and nothing to send.
+    bool cancelled = false;
 
     double prefill_seconds = 0.0;
     double decode_seconds = 0.0;
