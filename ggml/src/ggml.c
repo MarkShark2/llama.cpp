@@ -208,11 +208,17 @@ void ggml_print_backtrace(void) {
         (void) !read(lock[0], lock, 1);
         close(lock[0]);
 #endif
+        // GGML_BACKTRACE_ALL: the aborting thread is often not the one gdb
+        // lands on after attach (e.g. an assert on a worker while the main
+        // thread waits in join), so allow dumping every thread
+        const char * bt_cmd = getenv("GGML_BACKTRACE_ALL")
+            ? "thread apply all bt -frame-info source-and-location"
+            : "bt -frame-info source-and-location";
         // try gdb
         execlp("gdb", "gdb", "--batch",
             "-ex", "set style enabled on",
             "-ex", attach,
-            "-ex", "bt -frame-info source-and-location",
+            "-ex", bt_cmd,
             "-ex", "detach",
             "-ex", "quit",
             (char *) NULL);
