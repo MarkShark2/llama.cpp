@@ -2079,6 +2079,20 @@ struct common_spd_pipeline::impl {
         const int32_t n_new = n_prompt - base;
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
         const int32_t n_chunks = (n_new + chunk_size - 1)/chunk_size;
+        // The peer path moves whole chunks: the staging twin, the push and the
+        // failed-push recovery all address one chunk of boundary rows. But
+        // spd_peer_out_tensor() is the *last graph's* t_embd, and a stage
+        // whose n_ubatch is smaller than the chunk decodes a chunk as several
+        // graphs -- the tensor then covers only the final ubatch, the push's
+        // size check can never pass, and the recovery read runs off the end
+        // of it (a 2048-token chunk over ubatch 256 read 8x past the tensor).
+        // A chunk-sized boundary exists on the device only when one graph
+        // carries the whole chunk, so peer boundaries require that; the host
+        // relay (llama_get_embeddings accumulates across ubatches) is correct
+        // at any ubatch size and is what prefill uses instead. Decode-side
+        // peer boundaries are untouched -- their graphs are one token wide.
+        const bool peer_chunk_capable =
+                (int32_t) llama_n_ubatch(stages[0]) >= chunk_size;
         hidden.resize((size_t) n_new*n_embd_boundary);
         anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_new*n_embd));
         for (auto & pb : peer_links) {
@@ -2144,7 +2158,7 @@ struct common_spd_pipeline::impl {
                     peer_boundary * pb_in  = stage > 0 ? &peer_links[stage] : nullptr;
                     peer_boundary * pb_out = stage + 1 < stage_count ? &peer_links[stage + 1] : nullptr;
                     bool peer_in = false, peer_out = false;
-                    if (peer_boundaries_enabled) {
+                    if (peer_boundaries_enabled && peer_chunk_capable) {
                         std::lock_guard<std::mutex> lock(progress_mutex);
                         peer_in  = pb_in  != nullptr && pb_in->ready && !pb_in->dead &&
                                    pb_in->pushed_chunk >= chunk && pb_in->inp != nullptr;
@@ -2260,16 +2274,22 @@ struct common_spd_pipeline::impl {
                                 std::lock_guard<std::mutex> lock(progress_mutex);
                                 pb_out->dead = true;
                             }
-                            if (out == nullptr) {
+                            // The boundary is only recoverable from `out` if it
+                            // actually covers the chunk. Anything else must be
+                            // a clean failure, not a read past the tensor.
+                            chunk_output.resize((size_t) count*n_embd_boundary);
+                            if (out == nullptr ||
+                                ggml_nbytes(out) != chunk_output.size()*sizeof(float)) {
                                 {
                                     std::lock_guard<std::mutex> lock(progress_mutex);
                                     aborted = true;
-                                    fail("SPD peer push failed with no output tensor to recover from");
+                                    fail(out == nullptr
+                                            ? "SPD peer push failed with no output tensor to recover from"
+                                            : "SPD peer push failed and the output tensor does not cover the chunk");
                                 }
                                 progress_cv.notify_all();
                                 return;
                             }
-                            chunk_output.resize((size_t) count*n_embd_boundary);
                             ggml_backend_tensor_get(out, chunk_output.data(), 0,
                                     chunk_output.size()*sizeof(float));
                         }
@@ -2287,7 +2307,7 @@ struct common_spd_pipeline::impl {
 
                     // consumer-side setup, once, after the first full-chunk
                     // decode so the input tensor exists
-                    if (peer_boundaries_enabled && stage > 0 && count == chunk_size) {
+                    if (peer_boundaries_enabled && peer_chunk_capable && stage > 0 && count == chunk_size) {
                         bool need_setup;
                         {
                             std::lock_guard<std::mutex> lock(progress_mutex);
