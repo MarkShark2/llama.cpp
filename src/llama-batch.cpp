@@ -55,6 +55,15 @@ bool llama_batch_allocr::init(
         }
     }
 
+    if (batch.routing_id) {
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.routing_id[i] < 0 || (uint32_t) batch.routing_id[i] >= vocab.n_tokens()) {
+                LLAMA_LOG_ERROR("%s: invalid routing_id[%d] = %d\n", __func__, i, batch.routing_id[i]);
+                return false;
+            }
+        }
+    }
+
     if (batch.seq_id) {
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
@@ -224,6 +233,7 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.routing_id   =*/ batch.routing_id,
             /*.data         =*/ {},
         };
 
@@ -430,6 +440,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.routing_id   =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -764,6 +775,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->routing_id.resize(batch.routing_id ? n_tokens : 0);
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -776,6 +788,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         if (batch.embd) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+        }
+
+        if (batch.routing_id) {
+            udata->routing_id[i] = batch.routing_id[idxs[i]];
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -831,6 +847,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.routing_id   =*/ batch.routing_id ? udata->routing_id.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 

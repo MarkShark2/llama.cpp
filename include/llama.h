@@ -264,6 +264,13 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // optional per-token routing ids for archs whose MoE routing is keyed on
+        // token id (DeepSeek-V4 hash layers). only consulted for embedding input
+        // (token == NULL): image embeddings have no token id, so the caller
+        // supplies synthetic ids (e.g. a palette cycled over image positions).
+        // NULL for token input - the token ids themselves are the routing ids.
+        llama_token  *  routing_id;
     } llama_batch;
 
     enum llama_model_kv_override_type {

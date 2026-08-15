@@ -138,6 +138,7 @@ struct decode_embd_batch {
     std::vector<llama_seq_id>   seq_id_0;
     std::vector<llama_seq_id *> seq_ids;
     std::vector<int8_t>         logits;
+    std::vector<llama_token>    routing_id;
     llama_batch batch;
     decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
         GGML_ASSERT(n_tokens > 0 && n_pos_per_embd > 0 && n_mmproj_embd > 0);
@@ -155,7 +156,20 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ n_seq_id.data(),
             /*seq_id         =*/ seq_ids.data(),
             /*logits         =*/ logits.data(),
+            /*routing_id     =*/ nullptr,
         };
+    }
+
+    // cycle a token-id palette over the image positions (DSV4 hash routing);
+    // the phase is anchored at the start of the image so it is independent of
+    // how the chunk is split into batches
+    void set_routing_palette(const int32_t * palette, size_t n_palette) {
+        GGML_ASSERT(palette && n_palette > 0);
+        routing_id.resize(batch.n_tokens);
+        for (int32_t i = 0; i < batch.n_tokens; i++) {
+            routing_id[i] = palette[i % n_palette];
+        }
+        batch.routing_id = routing_id.data();
     }
 
     void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
@@ -234,6 +248,7 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ batch.n_seq_id + offset,
             /*seq_id         =*/ batch.seq_id   + offset,
             /*logits         =*/ batch.logits   + offset,
+            /*routing_id     =*/ batch.routing_id ? batch.routing_id + offset : nullptr,
         };
     }
 };
@@ -289,6 +304,14 @@ int32_t mtmd_helper_decode_image_chunk(
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
+
+    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        size_t n_palette = 0;
+        const int32_t * palette = mtmd_get_routing_palette(ctx, &n_palette);
+        if (palette) {
+            batch_embd.set_routing_palette(palette, n_palette);
+        }
+    }
 
     if (mtmd_decode_use_mrope(ctx)) {
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {

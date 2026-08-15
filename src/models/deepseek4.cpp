@@ -1452,6 +1452,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
         if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+            // hash layers gather expert ids by token id; an embedding-only
+            // batch has none, so it must carry routing ids (image embeddings
+            // use the mmproj's palette) or the gather reads an unset tensor
+            GGML_ASSERT((ubatch.token || ubatch.routing_id) &&
+                        "DSV4 hash routing needs token ids or batch.routing_id for embedding input");
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
         }

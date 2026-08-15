@@ -568,10 +568,15 @@ struct mtmd_context {
                         // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
                         img_beg = "<|begin_of_image|>";
                         img_end = "<|end_of_image|>";
-                    } else {
+                    } else if (lookup_token("<|media_begin|>") != LLAMA_TOKEN_NULL) {
                         // <|media_begin|> ... (image embeddings) ... <|media_end|>
                         img_beg = "<|media_begin|>";
                         img_end = "<|media_end|>";
+                    } else {
+                        // text model with no media marker tokens (DeepSeek-V4 +
+                        // MoonViT adapter): raw image embeddings, no wrapping --
+                        // marker strings would tokenize as literal text here
+                        LOG_INF("%s: text vocab has no image marker tokens, images are inserted unwrapped\n", __func__);
                     }
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
@@ -1713,6 +1718,19 @@ int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
 
 const char * mtmd_get_marker(const mtmd_context * ctx) {
     return ctx->media_marker.c_str();
+}
+
+const int32_t * mtmd_get_routing_palette(const mtmd_context * ctx, size_t * n_out) {
+    *n_out = 0;
+    if (!ctx->ctx_v) {
+        return nullptr;
+    }
+    const auto & palette = clip_get_hparams(ctx->ctx_v)->dsv4_routing_palette;
+    if (palette.empty()) {
+        return nullptr;
+    }
+    *n_out = palette.size();
+    return palette.data();
 }
 
 //

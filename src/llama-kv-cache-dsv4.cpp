@@ -168,6 +168,9 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     if (ubatch.token) {
         data->token.reserve(n_tokens);
     }
+    if (ubatch.routing_id) {
+        data->routing_id.reserve(n_tokens);
+    }
 
     for (uint32_t s = 0; s < data->seq_id_unq.size(); ++s) {
         data->seq_idx[data->seq_id_unq[s]] = s;
@@ -183,6 +186,9 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
             const uint32_t dst = data->n_seq_id.size();
             if (ubatch.token) {
                 data->token.push_back(ubatch.token[i]);
+            }
+            if (ubatch.routing_id) {
+                data->routing_id.push_back(ubatch.routing_id[i]);
             }
             for (uint32_t p = 0; p < ubatch.n_pos; ++p) {
                 data->pos[(size_t) p*n_tokens + dst] = ubatch.pos[(size_t) p*ubatch.n_tokens + i];
@@ -211,6 +217,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.routing_id   =*/ data->routing_id.empty() ? nullptr : data->routing_id.data(),
         /*.data         =*/ data,
     };
 

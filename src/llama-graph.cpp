@@ -68,6 +68,14 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+    } else if (ubatch->routing_id && tokens && tokens->buffer) {
+        // embedding input with routing ids (e.g. mtmd image chunks on a
+        // token-id-routed arch): the tok_embd lookup on this tensor is pruned,
+        // so it only feeds routing consumers such as DSV4's hash-layer gather.
+        // archs with no routing consumer leave the tensor unallocated (no buffer)
+        const int64_t n_tokens = ubatch->n_tokens;
+
+        ggml_backend_tensor_set(tokens, ubatch->routing_id, 0, n_tokens*ggml_element_size(tokens));
     }
 
     if (ubatch->embd && !(skip_upload != nullptr && *skip_upload)) {

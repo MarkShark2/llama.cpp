@@ -96,6 +96,13 @@ class KimiK25Model(MmprojModel):
         self.gguf_writer.add_vision_min_pixels(min_patches * pixels_per_patch)
         self.gguf_writer.add_vision_max_pixels(in_patch_limit * pixels_per_patch)
 
+        # DeepSeek-V4 + MoonViT adapter (webbrain): token-id palette cycled over
+        # image positions to feed the LM's hash-routed MoE layers
+        deepseek_vision = self.global_config.get("deepseek_vision")
+        if deepseek_vision and deepseek_vision.get("routing_palette"):
+            palette = [int(x) for x in deepseek_vision["routing_palette"]]
+            self.gguf_writer.add_array("clip.vision.dsv4_routing_palette", palette)
+
     @staticmethod
     def permute(weights: Tensor, n_head: int) -> Tensor:
         out_dim, in_dim = weights.shape

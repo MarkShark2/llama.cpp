@@ -1422,6 +1422,7 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         hparams.rope_theta = 10000.0f;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        get_arr_int(KEY_DSV4_ROUTING_PALETTE, hparams.dsv4_routing_palette, false);
 
                         int min_pixels = 0, max_pixels = 0;
                         get_u32(KEY_IMAGE_MIN_PIXELS, min_pixels, false);

@@ -147,6 +147,11 @@ MTMD_API int mtmd_get_audio_sample_rate(const mtmd_context * ctx);
 // get the current marker string
 MTMD_API const char * mtmd_get_marker(const mtmd_context * ctx);
 
+// token-id palette to cycle over image positions when decoding image
+// embeddings on a token-id-routed LM (DeepSeek-V4 hash layers + MoonViT
+// adapter). returns NULL and *n_out = 0 when the mmproj carries no palette
+MTMD_API const int32_t * mtmd_get_routing_palette(const mtmd_context * ctx, size_t * n_out);
+
 // mtmd_bitmap
 //
 // if bitmap is image:

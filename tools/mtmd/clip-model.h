@@ -105,6 +105,10 @@ struct clip_hparams {
     // Granite4 Vision
     std::vector<int32_t> proj_spatial_offsets;
     int32_t downsample_query_side;
+
+    // DeepSeek-V4 + MoonViT adapter: token-id palette cycled over image
+    // positions to feed the LM's hash-routed MoE layers (empty = not present)
+    std::vector<int32_t> dsv4_routing_palette;
     int32_t downsample_window_side;
 
     // audio
