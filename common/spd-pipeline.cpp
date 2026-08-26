@@ -1063,15 +1063,14 @@ struct common_spd_pipeline::impl {
             // require a unified cache; forcing one changes long-context target
             // numerics enough to flip close greedy decisions.
             cp.kv_unified = false;
-            // Rollback depth is at most stage_count - 1. Architectures whose
-            // cache can only rewind a bounded suffix -- DeepSeek-V4, whose
-            // compressor rings are built n_rs_seq rows wider than their read
-            // window -- need that budget declared up front, or seq_rm refuses
-            // every partial removal and the pipeline falls back to copying
-            // checkpoints across sequences on every stage of every step. Over a
-            // 9-stage RPC fabric that fallback costs more than the speculation
-            // saves. Ignored by caches that rewind by position alone.
-            cp.n_rs_seq = rollback_tokens;
+            // The light path rewinds the live sequence directly and therefore
+            // needs the cache's bounded suffix-rollback snapshots. The recurrent
+            // path already keeps one complete sequence alias per in-flight stage
+            // and restores by seq_cp; allocating per-token rollback planes inside
+            // every alias is redundant. On DSV4 that double checkpointing added
+            // about 100 MiB per stage device after upstream switched its compressor
+            // state to full snapshot planes.
+            cp.n_rs_seq = light_rollback ? rollback_tokens : 0;
             cp.embeddings = true;
             stages[stage] = llama_init_from_model(model_target, cp);
             if (stages[stage] == nullptr) {
