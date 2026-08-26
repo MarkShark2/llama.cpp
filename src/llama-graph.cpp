@@ -3468,6 +3468,8 @@ ggml_tensor * llm_graph_input_dsv4::get_hca_k_rot(int32_t il) const {
 
 ggml_tensor * llm_graph_input_dsv4::get_lid_k_rot(int32_t il) const {
     return inp_lid.k_rot ? inp_lid.k_rot : mctx->get_lid()->dev_k_rot(il);
+}
+
 llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 

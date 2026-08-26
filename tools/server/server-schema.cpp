@@ -96,14 +96,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Array of [start,end) prompt-token ranges that carry training loss (empty = all tokens)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             ctx.params.spd_collect_label_ranges.clear();
-            const auto it = data.find("spd_collect_labels");
-            if (it == data.end() || it->is_null()) {
+            if (!data.contains("spd_collect_labels") || data.at("spd_collect_labels").is_null()) {
                 return;
             }
-            if (!it->is_array()) {
+            const auto & labels = data.at("spd_collect_labels");
+            if (!labels.is_array()) {
                 throw std::runtime_error("spd_collect_labels must be an array of [start, end) pairs");
             }
-            for (const auto & range : *it) {
+            for (const auto & range : labels) {
                 if (!range.is_array() || range.size() != 2) {
                     throw std::runtime_error("spd_collect_labels entries must be [start, end) pairs");
                 }

@@ -720,7 +720,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     indexer_q = ggml_rope_set_offset(indexer_q, n_embd_indexer_head_nope);
     cb(indexer_q, "lid_q_rope", il);
 
-    indexer_q = ggml_concat(ctx0, indexer_q_nope, indexer_q_pe, 0);
     indexer_q = llama_mul_mat_hadamard(ctx0, indexer_q, lid_k_rot);
     cb(indexer_q, "lid_q_rot", il);
 
@@ -1721,7 +1720,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.ffn_gate_exps,
             layer.ffn_down_exps,
             layer.ffn_exp_probs_b,
-            n_expert, hparams.n_expert_used,
+            n_expert, hparams.n_expert_used_impl,
             LLM_FFN_SILU, hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,

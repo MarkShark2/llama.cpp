@@ -145,6 +145,33 @@ static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, in
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
+// TODO @ngxson : maybe improve this in the future
+class llm_graph_input_logits_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_logits_bias(const llama_vocab & vocab) {
+        arr.resize(vocab.n_tokens(), 0.0f);
+        for (llama_token id : vocab.get_suppress_tokens()) {
+            if (0 <= id && id < (int32_t)vocab.n_tokens()) {
+                arr[id] = -INFINITY;
+            }
+        }
+    }
+    virtual ~llm_graph_input_logits_bias() = default;
+
+    void set_input(const llama_ubatch * /*ubatch*/) override {
+        const int64_t n_vocab = arr.size();
+        ggml_backend_tensor_set(logits_bias, arr.data(), 0, n_vocab*ggml_element_size(logits_bias));
+    }
+
+    bool can_reuse(const llm_graph_params & /*params*/) override {
+        return true;
+    }
+
+    ggml_tensor * logits_bias = nullptr; // F32 [n_vocab]
+
+    std::vector<float> arr;
+};
+
 llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params),
         model(model),

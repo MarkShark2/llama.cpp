@@ -16,8 +16,6 @@
 #include <sstream>
 #include <system_error>
 
-using json = nlohmann::ordered_json;
-
 //
 // task_params
 //

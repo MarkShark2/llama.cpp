@@ -1595,9 +1595,9 @@ struct llama_model_nemotron_h_moe : public llama_model_nemotron_h {
     llama_model_nemotron_h_moe(const struct llama_model_params & params) : llama_model_nemotron_h(params) {}
     // reuse load_arch_hparams and load_arch_tensors from llama_model_nemotron_h
 
-    using graph     = llama_model_nemotron_h::graph;
-    using graph_mtp = llama_model_nemotron_h::graph_mtp;
+    using graph = llama_model_nemotron_h::graph;
 
+    // Puzzle's MoE variant overrides the MTP step (see nemotron-h-moe.cpp)
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };

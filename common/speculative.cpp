@@ -176,12 +176,6 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
-    // true if this implementation requires the target context to extract post-norm embeddings
-    virtual bool need_embd() const = 0;
-
-    // true if this implementation requires the target context to extract pre-norm embeddings
-    virtual bool need_embd_nextn() const { return false; }
-
     // [fork, PipeDec probe] top candidates the draft sampler saw at draft step `step`
     // of the most recent draft() for this seq, best first. nullptr if unavailable.
     virtual const std::vector<llama_token> * dbg_topk(llama_seq_id /*seq_id*/, int /*step*/) const { return nullptr; }

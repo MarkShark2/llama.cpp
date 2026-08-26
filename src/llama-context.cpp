@@ -2082,27 +2082,14 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     return res;
 }
 
-static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(
-        const llama_ubatch & ubatch, uint32_t row_offset);
-static void copy_tensor_async_ints(
-        const std::map<llama_seq_id, ggml_tensor *> & tensor_map,
-        const buffer_view<llama_token> & sampled,
-        const std::map<llama_seq_id, uint32_t> & seq_to_row,
-        ggml_backend_sched_t sched);
-static void copy_tensor_async_floats(
-        const std::map<llama_seq_id, ggml_tensor *> & tensor_map,
-        const buffer_view<float> & dst,
-        size_t stride,
-        std::vector<uint32_t> & counts,
-        const std::map<llama_seq_id, uint32_t> & seq_to_row,
-        ggml_backend_sched_t sched);
-static void copy_tensor_async_candidates(
-        const std::map<llama_seq_id, ggml_tensor *> & tensor_map,
-        const buffer_view<llama_token> & dst,
-        size_t stride,
-        std::vector<uint32_t> & counts,
-        const std::map<llama_seq_id, uint32_t> & seq_to_row,
-        ggml_backend_sched_t sched);
+template <typename T>
+static void copy_tensor_async_rows(
+    const std::vector<ggml_tensor *> & tensors,
+    const buffer_view<T> & dst,
+    size_t stride,
+    uint32_t row_offset,
+    ggml_backend_sched_t sched,
+    std::vector<uint32_t> * counts = nullptr);
 static bool needs_raw_logits(
         const llama_ubatch & ubatch,
         const std::map<llama_seq_id, llama_sampler *> & samplers);
@@ -2222,17 +2209,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     if (use_backend_sampling &&
         (!res->t_sampled.empty() || !res->t_sampled_probs.empty() ||
          !res->t_sampled_logits.empty() || !res->t_candidates.empty())) {
-        const auto seq_to_output_row = build_seq_to_output_row(ubatch, 0);
-        copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
-        copy_tensor_async_floats(
-                res->t_sampled_logits, sampling.logits, n_vocab,
-                sampling.logits_count, seq_to_output_row, sched.get());
-        copy_tensor_async_floats(
-                res->t_sampled_probs, sampling.probs, n_vocab,
-                sampling.probs_count, seq_to_output_row, sched.get());
-        copy_tensor_async_candidates(
-                res->t_candidates, sampling.candidates, n_vocab,
-                sampling.candidates_count, seq_to_output_row, sched.get());
+        // the SPD head runs one ubatch, so its rows start at 0
+        copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,       0, sched.get());
+        copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
+        copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      n_vocab, 0, sched.get(), &sampling.probs_count);
+        copy_tensor_async_rows(res->t_candidates,     sampling.candidates, n_vocab, 0, sched.get(), &sampling.candidates_count);
     }
 
     // extract embeddings
@@ -2336,7 +2317,7 @@ static void copy_tensor_async_rows(
     size_t stride,
     uint32_t row_offset,
     ggml_backend_sched_t sched,
-    std::vector<uint32_t> * counts = nullptr) {
+    std::vector<uint32_t> * counts) {
     if (!dst.has_data()) {
         return;
     }

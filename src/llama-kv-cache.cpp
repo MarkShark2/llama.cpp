@@ -393,24 +393,16 @@ llama_kv_cache::llama_kv_cache(
     dev_rot_ready = !hparams.no_alloc && other == nullptr && (!dev_rot_k_map.empty() || !dev_rot_v_map.empty());
 
     {
-        const size_t memory_size_k     = size_k_bytes();
-        const size_t memory_size_v     = size_v_bytes();
-        const size_t memory_size_k_idx = size_k_idx_bytes();
-        const size_t memory_size_total = memory_size_k + memory_size_v + memory_size_k_idx;
+        // the MSA indexer cache moved out of this class upstream (llama-kv-cache-msa)
+        const size_t memory_size_k = size_k_bytes();
+        const size_t memory_size_v = size_v_bytes();
 
         constexpr float mib = 1024.0f * 1024.0f;
 
-        const std::string k_log = format(", K (%s): %7.2f MiB", ggml_type_name(type_k), (float) memory_size_k / mib);
-        const std::string v_log = format(", V (%s): %7.2f MiB", ggml_type_name(type_v), (float) memory_size_v / mib);
-
-        std::string k_idx_log;
-        if (memory_size_k_idx > 0) {
-            k_idx_log = format(", K_idx (%s): %7.2f MiB", ggml_type_name(GGML_TYPE_F32), (float) memory_size_k_idx / mib);
-        }
-
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs)%s%s%s\n", __func__,
-                (float) memory_size_total / mib, kv_size, (int) layers.size(), n_seq_max, n_stream,
-                k_log.c_str(), v_log.c_str(), k_idx_log.c_str());
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+                (float) (memory_size_k + memory_size_v) / mib, kv_size, (int) layers.size(), n_seq_max, n_stream,
+                ggml_type_name(type_k), (float) memory_size_k / mib,
+                ggml_type_name(type_v), (float) memory_size_v / mib);
     }
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");

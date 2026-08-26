@@ -580,7 +580,7 @@ struct server_slot {
             // the first spec_deferred_drafts drafts were already submitted as
             // streamed deferred lanes; the closing decode carries the rest
             for (size_t i = spec_deferred_drafts; i < spec_draft.size(); i++) {
-                add_ok &= batch.add(this->id, spec_draft[i], pos0 + 1 + (llama_pos) i, true);
+                add_ok &= batch.add(this->id, spec_draft[i], pos0 + 1 + (llama_pos) i, true, false);
             }
 
             GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
@@ -3214,11 +3214,9 @@ private:
                 return;
             }
 
-            slot.t_start_process_prompt = ggml_time_us();
-            slot.t_start_generation = 0;
-            slot.n_decoded = 0;
-            slot.n_decoded_last = 0;
-            slot.n_remaining = -1;
+            slot.stats = {};
+            slot.stats.update_prompt_start();
+            slot.n_gen_last = 0;
             slot.has_next_token = true;
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -3258,8 +3256,8 @@ private:
                 slot.truncated = true;
             }
 
-            slot.n_prompt_tokens_cache = 0;
-            slot.n_prompt_tokens_processed = (int32_t) prompt.size();
+            slot.stats.n_prompt_cached    = 0;
+            slot.stats.n_prompt_processed = prompt.size();
             slot.prompt.tokens.clear();
             slot.prompt.tokens.insert(prompt);
 
@@ -3322,11 +3320,15 @@ private:
                 }
                 if (!prompt_eval_reported) {
                     prompt_eval_reported = true;
-                    slot.t_start_generation        = ggml_time_us();
-                    slot.t_prompt_processing       = std::max(0.001, spd_result.prefill_seconds*1e3);
-                    slot.n_prompt_tokens_cache     = spd_result.n_prompt_reused;
-                    slot.n_prompt_tokens_processed = spd_result.n_prompt_processed;
-                    metrics.on_prompt_eval(slot);
+                    // the pipeline reports its own prefill wall time; land it on the
+                    // stats timeline so the ordinary timing/metrics paths read it
+                    const int64_t t_prefill_us = std::max<int64_t>(1, (int64_t) (spd_result.prefill_seconds*1e6));
+                    slot.stats.set_prompt_last(slot.stats.t_start + t_prefill_us);
+                    slot.stats.n_prompt_cached    = spd_result.n_prompt_reused;
+                    slot.stats.n_prompt_processed = spd_result.n_prompt_processed;
+
+                    metrics.add_prompt_cached(slot.stats.n_prompt_cached);
+                    metrics.add_prompt(slot.stats.n_prompt_processed, t_prefill_us);
                 }
 
                 // prompt.tokens tracks what the caches hold, which trails the
@@ -3345,8 +3347,8 @@ private:
                 token.text_to_send = common_token_to_piece(slot.ctx_tgt, token.tok, special);
                 token.prob = 1.0f;
 
-                ++slot.n_decoded;
-                slot.t_token_generation = std::max(0.001, (ggml_time_us() - slot.t_start_generation)/1e3);
+                slot.stats.n_gen += 1;
+                slot.stats.update_gen_last();
                 if (!process_token(token, slot)) {
                     stopped = true;
                     return false;
@@ -3396,14 +3398,9 @@ private:
                 slot.has_next_token = false;
             }
 
-            // process_token() and streaming responses use these controller
-            // timings. release() overwrites them only after the final result
-            // and metrics have already consumed them.
-            slot.t_prompt_processing = std::max(0.001, spd_result.prefill_seconds*1e3);
-            slot.t_token_generation = std::max(0.001, spd_result.decode_seconds*1e3);
+            slot.stats.update_gen_last();
             slot.print_timings();
             send_final_response(slot);
-            metrics.on_prediction(slot);
             slot.release();
         });
     }
@@ -4744,15 +4741,16 @@ private:
             slot.i_batch = -1;
 
             const int64_t t_now = ggml_time_us();
-            slot.n_decoded += 1;
-            if (slot.n_decoded == 1) {
-                slot.t_start_generation = t_now;
+
+            slot.stats.n_gen += 1;
+
+            if (slot.stats.n_gen == 1) {
+                slot.stats.update_prompt_last();
                 slot.t_print_last = t_now;
-                slot.n_decoded_last = 0;
-                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                metrics.on_prompt_eval(slot);
+                slot.n_gen_last = 0;
             }
-            slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
+
+            slot.stats.update_gen_last();
 
             const bool accept_special = params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(tok) != slot.task->params.sampling.preserved_tokens.end();
@@ -4765,7 +4763,6 @@ private:
             if (!process_token(result, slot)) {
                 slot.print_timings();
                 send_final_response(slot);
-                metrics.on_prediction(slot);
                 slot.release();
                 continue;
             }
@@ -4836,7 +4833,7 @@ private:
             llama_chain_arm(ctx_tgt, c % chain_lanes_cap());
             ret = llama_decode(ctx_tgt, view);
         }
-        metrics.on_decoded(slots);
+        metrics.n_decode++;
 
         if (ret != 0) {
             SRV_ERR("chain decode failed, ret = %d\n", ret);
