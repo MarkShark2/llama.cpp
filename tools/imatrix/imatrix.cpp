@@ -244,6 +244,15 @@ static void compute_cossim(std::vector<tensor_statistics> & tstats) {
     }
 }
 
+static bool all_finite(const float * v, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(v[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
 
@@ -364,8 +373,11 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             exit(1); //GGML_ABORT("fatal error");
         }
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[2], (int)src1->type);
+
+        const int64_t n_tokens = src1->ne[2];
+
         if (reduced) {
-            // the daemon already did the routed pass; merge its accumulator
+            // [fork] the daemon already did the routed pass; merge its accumulator
             for (int64_t ex = 0; ex < n_as; ++ex) {
                 e.counts[ex] += m_red_counts[ex];
                 const size_t e_start = ex*ne0;
@@ -373,35 +385,41 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     e.values[e_start + j] += m_red_sums[e_start + j];
                 }
             }
-        } else {
-            // [fork] one pass over the routed slots. The original walked all
-            // n_as experts per slot to find its matches, i.e. 256x the
-            // iterations on a 256-expert model, and re-checked isfinite on
-            // every accumulated element; the check now happens once per tensor.
-            for (int64_t row = 0; row < src1->ne[2]; ++row) {
-                for (int64_t idx = 0; idx < n_ids; ++idx) {
-                    const int excur = *(const int32_t *) (m_ids.data() + row*ids->nb[1] + idx*ids->nb[0]);
 
-                    GGML_ASSERT(excur >= 0 && excur < n_as); // sanity check
+            if (!all_finite(e.values.data(), e.values.size())) {
+                LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+                exit(1);
+            }
+        } else {
+            // single pass over the routing ids
+            std::vector<uint8_t> touched(n_as, 0);
+            for (int64_t idx = 0; idx < n_ids; ++idx) {
+                for (int64_t row = 0; row < n_tokens; ++row) {
+                    const int32_t ex = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
+
+                    GGML_ASSERT(ex >= 0 && ex < n_as);  // sanity check
 
                     const int64_t i11 = idx % src1->ne[1];
-                    const float * x = (const float *)(data + i11*src1->nb[1] + row*src1->nb[2]);
+                    const float * x   = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
+                    float *       acc = e.values.data() + ex * ne0;
 
-                    e.counts[excur]++;
-
-                    float * acc = e.values.data() + (size_t) excur*ne0;
+                    e.counts[ex]++;
+                    touched[ex] = 1;
                     for (int64_t j = 0; j < ne0; ++j) {
                         acc[j] += x[j] * x[j];
                     }
                 }
             }
-        }
-        for (size_t k = 0; k < e.values.size(); ++k) {
-            if (!std::isfinite(e.values[k])) {
-                LOG_ERR("%f detected in %s\n", (double) e.values[k], wname.c_str());
-                exit(1);
+
+            // check for non-finite values, only checking experts that were routed to and touched
+            for (int64_t ex = 0; ex < n_as; ++ex) {
+                if (touched[ex] && !all_finite(e.values.data() + ex * ne0, ne0)) {
+                    LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+                    exit(1);
+                }
             }
         }
+
         for (int64_t ex = 0; ex < n_as; ++ex) {
             const int32_t n_chunk = e.counts[ex] / chunk_size;
             if (n_chunk > m_last_chunk) {
@@ -442,6 +460,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[1], (int)src1->ne[2], (int)src1->type);
 
         if (reduced) {
+            // [fork] the daemon already reduced this tensor's activations
             for (size_t k = 0; k < e.values.size(); ++k) {
                 e.values[k] += m_red_sums[k];
             }
@@ -450,7 +469,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
                     // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
                     const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
-                    float * acc = e.values.data() + mat_id * ne0;
+                    float *       acc    = e.values.data() + mat_id * ne0;
 
                     for (int64_t row = 0; row < src1->ne[1]; ++row) {
                         const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
@@ -461,13 +480,11 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 }
             }
         }
-        // [fork] hoisted out of the accumulation loop: it used to run per
-        // element (and, as written, only ever inspected e.values[j])
-        for (size_t k = 0; k < e.values.size(); ++k) {
-            if (!std::isfinite(e.values[k])) {
-                LOG_ERR("%f detected in %s\n", (double) e.values[k], wname.c_str());
-                exit(1);
-            }
+
+        // check for non-finite values
+        if (!all_finite(e.values.data(), e.values.size())) {
+            LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+            exit(1);
         }
         // only 1 count in practice, except when a tensor is used for both MUL_MAT_ID and MUL_MAT
         for (size_t i = 0; i < e.counts.size(); ++i) {

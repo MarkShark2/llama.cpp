@@ -11,6 +11,16 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
 };
 
+// a second model that shares the devices of the main model, e.g. a draft model
+//   - its context follows the context of the main model, so its memory is measured again whenever that context changes
+//   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
+struct common_fit_extra_model {
+    const char * path_model;
+    llama_model_params * mparams;
+    llama_context_params * cparams;
+    bool shares_model;
+};
+
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state
@@ -22,14 +32,15 @@ common_params_fit_status common_fit_params(
                llama_context_params * cparams,
                               float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
    llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
-                              size_t * margins,               // margins of memory to leave per device in bytes
-                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
-                                bool   whole_layers,          // place only complete layers; never create tensor overrides
-                                bool   fill_rpc_first,        // fill non-primary devices with whole layers first; the primary device
-                                                              // takes every remaining layer, spilling MoE experts to system memory
-                                bool   cpu_moe,               // like fill_rpc_first, but overflow the primary device cannot hold
-                                                              // stays fully on the CPU instead of aborting (RPC-safe)
-                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                             size_t * margins,               // margins of memory to leave per device in bytes
+                           uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+      const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
+                               bool   whole_layers,          // place only complete layers; never create tensor overrides
+                               bool   fill_rpc_first,        // fill non-primary devices with whole layers first; the primary device
+                                                             // takes every remaining layer, spilling MoE experts to system memory
+                               bool   cpu_moe,               // like fill_rpc_first, but overflow the primary device cannot hold
+                                                             // stays fully on the CPU instead of aborting (RPC-safe)
+                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
 // print estimated memory to stdout
 void common_fit_print(

@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    5
-#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_MINOR_VERSION    1
 // patch 1: full-duplex transfer lanes (SESSION_INFO / LANE_ATTACH / LANE_FENCE).
 // patch 2: direct remote->remote transfer (PEER_OPEN / PUSH_TENSOR).
 // patch 3: server-side imatrix reduction (IMATRIX_SQSUM).

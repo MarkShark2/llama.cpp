@@ -217,3 +217,9 @@ LLAMA_API uint32_t        llama_model_spd_stage_count   (const struct llama_mode
 // DeepSeek-V4 carries hc_mult hyper-connection streams between layers and a
 // mid-trunk boundary is that much wider.
 LLAMA_API uint32_t        llama_model_n_embd_spd_boundary(const struct llama_model * model);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);

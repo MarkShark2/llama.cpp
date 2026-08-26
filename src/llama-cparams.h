@@ -27,6 +27,7 @@ struct llama_cparams {
     // Width of one row of the embeddings output. Differs from n_embd_inp_ctx on
     // an SPD stage 0, which is fed tokens but still emits the wide residual.
     uint32_t n_embd_out_ctx;
+    uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
