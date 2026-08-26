@@ -1397,6 +1397,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
+    compact_rs(n_seq_max == 1 && n_rs_seq > 0),
     rs_idx(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
@@ -1481,33 +1482,34 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
-    // [fork] Compressor-ring slack for bounded partial rollback.
+    // [fork] Compact compressor-ring slack for single-sequence rollback.
     //
-    // A compressor state row is addressed by pos % state_size and every write is a
-    // plain overwrite, so re-walking a discarded suffix rewrites exactly the rows
-    // those positions owned. The one way that can go wrong is aliasing: a discarded
-    // position q shares a row with a position m still inside a later block's read
-    // window, which needs q >= m + state_size. With a read window of W positions
-    // (2*ratio for the overlapped CSA/LID compressors, ratio for HCA) the walk is
-    // therefore exact for any rollback of at most state_size - W + 1 positions.
-    // Carrying W + n_rs_seq rows buys exactly the depth the caller asked for, at
-    // a few hundred KiB. n_rs_seq == 0 keeps the original W-row rings.
+    // Upstream's rollback planes are required when multiple sequences can have
+    // independent pending restores. A one-sequence context has no such ambiguity:
+    // the original bounded re-walk is exact when the W-row compressor ring carries
+    // n_rs_seq extra rows. Keep that proven layout for SPD/PipeDec contexts instead
+    // of allocating (1 + n_rs_seq) complete W-row planes. On the 9-stage DSV4 SPD
+    // split this removes about 86 MiB per stage device without changing the
+    // multi-sequence implementation.
+    const uint32_t state_csa = 2*DSV4_CSA_RATIO + (compact_rs ? n_rs_seq : 0);
+    const uint32_t state_hca =   DSV4_HCA_RATIO + (compact_rs ? n_rs_seq : 0);
+    const uint32_t state_n_rs = compact_rs ? 0 : n_rs_seq;
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
-            2*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
+            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, state_csa,
+            2*model.hparams.n_embd_head_k(), state_n_rs, "csa", filter_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
-            model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca);
+            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, state_hca,
+            model.hparams.n_embd_head_k(), state_n_rs, "hca", filter_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
-            2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
+            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, state_csa,
+            2*model.hparams.indexer_head_size, state_n_rs, "lid", filter_csa);
 
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
@@ -1753,6 +1755,17 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         const llama_pos rollback = pos_max - (p0 - 1);
         if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
             return false;
+        }
+
+        if (compact_rs) {
+            bool res = true;
+
+            res = res & kv_raw->seq_rm(seq_id, p0, -1);
+            res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
+            res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+
+            return res;
         }
 
         // pending rollback is single-use: stacked partial removals don't compose
@@ -2343,13 +2356,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_csa_state()->get_n_rs_seq(), kv->get_rs_idx())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_hca_state()->get_n_rs_seq(), kv->get_rs_idx())),
     plans_lid(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_lid_state()->get_n_rs_seq(), kv->get_rs_idx())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),
                 std::move(sinfos_raw_base_write),
