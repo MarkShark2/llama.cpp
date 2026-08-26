@@ -3386,7 +3386,12 @@ public:
     };
 
 private:
-    bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+    // Open a cache entry and report its size WITHOUT reading it. The payload is
+    // streamed into the tensor in chunks by set_tensor_hash; materialising a whole
+    // entry here is what used to drive a 16 GiB UMA board into its memory guard
+    // (llama.cpp hands the model over in ~1 GiB buffer chunks, so entries are that
+    // big). Returns false on a miss, leaving `ifs` unopened.
+    bool open_cached_file(uint64_t hash, std::ifstream & ifs, size_t & size);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -3396,6 +3401,11 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    // staging for open_cached_file -> ggml_backend_tensor_set. Reused so a warm
+    // load does not churn a fresh chunk-sized allocation per tensor. Only the
+    // main command thread runs SET_TENSOR_HASH (lane traffic takes set_tensor
+    // with allow_cache=false), so this needs no locking.
+    std::vector<uint8_t> cache_read_buf;
     size_t cache_limit;
     // set on a SET_TENSOR_HASH cache miss; the client's follow-up SET_TENSOR
     // for the same tensor region is the only upload that gets cached. Clients
@@ -3730,7 +3740,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input, bool allow_cache
     return true;
 }
 
-bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
+bool rpc_server::open_cached_file(uint64_t hash, std::ifstream & ifs, size_t & size) {
     if (!cache_dir) {
         return false;
     }
@@ -3741,15 +3751,42 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     if (!fs::exists(cache_file, ec)) {
         return false;
     }
-    std::ifstream ifs(cache_file, std::ios::binary);
+    ifs.open(cache_file, std::ios::binary);
+    if (!ifs) {
+        GGML_LOG_ERROR("[%s] cache entry '%s' exists but could not be opened\n",
+                       __func__, cache_file.string().c_str());
+        return false;
+    }
     ifs.seekg(0, std::ios::end);
-    size_t size = ifs.tellg();
+    const std::streamoff end = ifs.tellg();
+    if (end < 0) {
+        GGML_LOG_ERROR("[%s] cache entry '%s' has no readable size\n",
+                       __func__, cache_file.string().c_str());
+        ifs.close();
+        return false;
+    }
+    size = (size_t) end;
     ifs.seekg(0, std::ios::beg);
-    data.resize(size);
-    ifs.read((char *)data.data(), size);
     // bump the mtime so LRU eviction sees this entry as recently used
     fs::last_write_time(cache_file, fs::file_time_type::clock::now(), ec);
     return true;
+}
+
+// How much of a cache entry is held in host RAM at once while it is copied into
+// the device buffer. GGML_RPC_CACHE_CHUNK_MIB overrides it; 0 restores the old
+// read-it-all behaviour. Keep this well under the smallest node's spare RAM: the
+// BC-250s are 16 GiB UMA boards already holding a ~12.5 GiB shard when the cache
+// is read, and their memory guard kills the daemon below a 64 MiB floor.
+static size_t rpc_cache_chunk_bytes() {
+    static const size_t bytes = []() -> size_t {
+        const char * e = getenv("GGML_RPC_CACHE_CHUNK_MIB");
+        if (e == nullptr) {
+            return 32u*1024*1024;
+        }
+        const long mib = strtol(e, nullptr, 10);
+        return mib > 0 ? (size_t) mib*1024*1024 : 0;
+    }();
+    return bytes;
 }
 
 bool rpc_server::set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache) {
@@ -4003,8 +4040,9 @@ bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_pu
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     cache_pending = false;
-    std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file)) {
+    std::ifstream cached_file;
+    size_t size = 0;
+    if (!open_cached_file(request.hash, cached_file, size)) {
         // cache miss: the client will follow up with a full SET_TENSOR for
         // this region - mark it as eligible for caching
         cache_pending        = true;
@@ -4015,7 +4053,6 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         response.result = 0;
         return true;
     }
-    size_t size = cached_file.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -4045,7 +4082,31 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    // Stream the entry into the buffer instead of materialising it. Peak host
+    // RAM is one chunk rather than the whole entry, which is what keeps a UMA
+    // board off its memory guard during a warm load.
+    const size_t chunk = rpc_cache_chunk_bytes();
+    if (chunk == 0 || size <= chunk) {
+        cache_read_buf.resize(size);
+        if (size > 0 && !cached_file.read((char *) cache_read_buf.data(), (std::streamsize) size)) {
+            GGML_LOG_ERROR("[%s] short read of cache entry 0x%" PRIx64 " (%zu bytes)\n",
+                           __func__, request.hash, size);
+            return false;
+        }
+        ggml_backend_tensor_set(tensor, cache_read_buf.data(), request.offset, size);
+    } else {
+        cache_read_buf.resize(chunk);
+        for (size_t done = 0; done < size; ) {
+            const size_t n = std::min(chunk, size - done);
+            if (!cached_file.read((char *) cache_read_buf.data(), (std::streamsize) n)) {
+                GGML_LOG_ERROR("[%s] short read of cache entry 0x%" PRIx64 " at %zu/%zu\n",
+                               __func__, request.hash, done, size);
+                return false;
+            }
+            ggml_backend_tensor_set(tensor, cache_read_buf.data(), request.offset + done, n);
+            done += n;
+        }
+    }
     cache_hits++;
     cache_hit_bytes += size;
     response.result = 1;
