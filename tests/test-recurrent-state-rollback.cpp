@@ -334,8 +334,8 @@ int main(int argc, char ** argv) {
 
     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     common_prompt_checkpoint ckpt_partial;
-    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
-    ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+    ckpt_partial.update_tgt(io_src, 0, partial_flags);
+    ckpt_partial.load_tgt(io_dst, 0, partial_flags);
 
     if (!replay_and_compare("partial")) {
         return 1;
