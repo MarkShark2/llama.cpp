@@ -26,6 +26,10 @@
 #include <thread>
 #include <utility>
 
+extern "C" {
+LLAMA_API bool llama_model_supports_rs_rollback(const llama_model * model);
+}
+
 namespace {
 
 constexpr uint32_t SPD_MAX_STAGE_COUNT = COMMON_SPD_MAX_STAGE_COUNT;
@@ -953,9 +957,14 @@ struct common_spd_pipeline::impl {
         // Attention KV entries are position-addressed, so a rejection can rewind
         // a stage with llama_memory_seq_rm alone (rollback depth is at most
         // stage_count - 1 and the iswa cache keeps n_ubatch slack past the SWA
-        // window). Recurrent/hybrid targets mutate state in place and still need
-        // the cross-stream checkpoint copies.
-        light_rollback = !llama_model_is_recurrent(model_target) && !llama_model_is_hybrid(model_target);
+        // window). Architectures with an explicit bounded rollback implementation
+        // can do the same even if the generic model taxonomy calls them hybrid.
+        // This matters for DeepSeek-V4: upstream classified it as hybrid after the
+        // fork had already implemented and measured its compressor-ring rollback.
+        // Falling back to seq_cp there multiplies every stage KV cache by the stage
+        // count and defeats the bounded rollback path entirely.
+        light_rollback = llama_model_supports_rs_rollback(model_target) ||
+                (!llama_model_is_recurrent(model_target) && !llama_model_is_hybrid(model_target));
         if (const char * value = std::getenv("LLAMA_SPD_SEQCP_ROLLBACK")) {
             if (std::atoi(value) != 0) {
                 light_rollback = false;
