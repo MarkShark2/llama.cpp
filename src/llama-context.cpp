@@ -202,7 +202,10 @@ llama_context::llama_context(
     // narrower input than output. The head and embed contexts emit ordinary
     // n_embd rows (post-norm hidden, and anchor 0 respectively).
     cparams.n_embd_out_ctx = hparams.n_embd_out();
-    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD ||
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) {
+        cparams.n_embd_out_ctx = hparams.n_embd;
+    } else if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
         cparams.n_embd_out_ctx = llama_model_n_embd_spd_boundary(&model);
     }
 
@@ -2226,7 +2229,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
                 {
                     // extract token embeddings
                     GGML_ASSERT(embd.data != nullptr);
-                    const uint32_t n_embd_out = hparams.n_embd_out();
+                    // SPD head/embed graphs return the context-specific width.
+                    // In particular, DeepSeek-V4's model n_embd_out is the wide
+                    // hyperconnection state used by MTP, while SPD_EMBED returns
+                    // one ordinary n_embd token-embedding row.
+                    const uint32_t n_embd_out = cparams.n_embd_out_ctx > 0
+                            ? cparams.n_embd_out_ctx
+                            : hparams.n_embd_out();
 
                     GGML_ASSERT(n_tokens*n_embd_out <= (int64_t) embd.size);
                     ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_tokens*n_embd_out*sizeof(float));
