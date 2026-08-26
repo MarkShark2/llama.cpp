@@ -2414,6 +2414,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr);
                 } else {
+                    // [fork] each SPD stage context caches only its own target layers.
+                    // Without this every one of the nine stage contexts allocates the
+                    // whole model's raw + compressed caches (576 MiB per board for the
+                    // CSA cache alone), and the boards die on their memory guard part
+                    // way through building them.
+                    llama_memory_i::layer_filter_cb filter = nullptr;
+                    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+                        filter = [start = cparams.spd_layer_start,
+                                  end   = cparams.spd_layer_end](int32_t il) {
+                            return il >= (int32_t) start && il < (int32_t) end;
+                        };
+                    }
+
                     res = new llama_kv_cache_dsv4(
                             *this,
                             params.type_k,
@@ -2427,7 +2440,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_ubatch,
                             1,
                             cparams.n_rs_seq,
-                            nullptr,
+                            filter,
                             nullptr);
                 }
             } break;
@@ -2605,25 +2618,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (arch == LLM_ARCH_DEEPSEEK4) {
-                        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
-
-                        res = new llama_kv_cache_dsv4(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                params.swa_full,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                cparams.n_ubatch,
-                                1,
-                                cparams.n_rs_seq,
-                                filter,
-                                reuse);
-                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa_any()) {
+                    // note: DEEPSEEK4 never reaches here - it has its own case above,
+                    // which is where its SPD stage filter lives
+                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa_any()) {
                         // interleaved SWA: some layers are windowed and some are
                         // dense, so the cache is a base/SWA pair. A model that is
                         // windowed *uniformly* -- swa_type set with no per-layer
