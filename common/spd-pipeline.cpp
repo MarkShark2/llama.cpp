@@ -1774,6 +1774,21 @@ struct common_spd_pipeline::impl {
         }
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
+        // [fork, diagnostic] the sidecar's logits go all-NaN/-inf on some steps
+        // and ARGMAX then correctly returns -1. features is already on the host,
+        // so checking the INPUT side costs nothing and says whether the NaN is
+        // produced inside the sidecar or arrives with the stage boundaries.
+        if (getenv("LLAMA_SPD_FEATURE_CHECK")) {
+            size_t n_nan = 0, n_inf = 0;
+            for (float v : features) {
+                if (std::isnan(v)) { ++n_nan; }
+                else if (std::isinf(v)) { ++n_inf; }
+            }
+            if (n_nan || n_inf) {
+                fprintf(stderr, "SPD feature-check: rows=%zu n=%zu nan=%zu inf=%zu\n",
+                        selectors.size(), features.size(), n_nan, n_inf);
+            }
+        }
         storage.set(selectors, features, sidecar_n_embd_inp, positions);
         if (llama_decode(sidecar, storage.batch) != 0) {
             fail("SPD sidecar decode failed");
