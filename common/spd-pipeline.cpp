@@ -1857,8 +1857,18 @@ struct common_spd_pipeline::impl {
                 else if (std::isinf(v)) { ++n_inf; }
             }
             if (n_nan || n_inf) {
-                fprintf(stderr, "SPD feature-check: rows=%zu n=%zu nan=%zu inf=%zu\n",
-                        selectors.size(), features.size(), n_nan, n_inf);
+                size_t bad_row = 0, bad_blk = 0, first_bad = 0;
+                for (size_t i = 0; i < features.size(); ++i) {
+                    if (std::isnan(features[i]) || std::isinf(features[i])) {
+                        first_bad = i;
+                        bad_row   = i/(size_t) sidecar_n_embd_inp;
+                        bad_blk   = (i % (size_t) sidecar_n_embd_inp)/(size_t) n_embd;
+                        break;
+                    }
+                }
+                fprintf(stderr, "SPD feature-check: rows=%zu n=%zu nan=%zu inf=%zu first=%zu row=%zu anchor_blk=%zu sel=%d\n",
+                        selectors.size(), features.size(), n_nan, n_inf, first_bad, bad_row, bad_blk,
+                        bad_row < selectors.size() ? (int) selectors[bad_row] : -1);
             }
         }
         storage.set(selectors, features, sidecar_n_embd_inp, positions);
@@ -2652,6 +2662,22 @@ struct common_spd_pipeline::impl {
         llama_set_spd_peer_io(stages[stage], false, false, false);
         if (!decoded) {
             return false;
+        }
+        if (getenv("LLAMA_SPD_FEATURE_CHECK")) {
+            size_t bad_out = 0;
+            for (float v : output) { if (std::isnan(v) || std::isinf(v)) { ++bad_out; } }
+            if (bad_out) {
+                fprintf(stderr, "SPD stage-check: stage %u boundary out bad=%zu of %zu pos=%d peer_in=%d\n",
+                        stage, bad_out, output.size(), (int) item.pos, (int) peer_in);
+            }
+            for (auto & w : wanted) {
+                size_t bad_tap = 0;
+                for (float v : *w.second) { if (std::isnan(v) || std::isinf(v)) { ++bad_tap; } }
+                if (bad_tap) {
+                    fprintf(stderr, "SPD stage-check: stage %u tap anchor %zu bad=%zu of %zu pos=%d\n",
+                            stage, w.first, bad_tap, w.second->size(), (int) item.pos);
+                }
+            }
         }
         if (peer_in && llama_spd_peer_inp_tensor(stages[stage]) != pb_in->inp) {
             // a rebuild would have read a different tensor than the copy
