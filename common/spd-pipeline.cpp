@@ -37,6 +37,56 @@ constexpr uint32_t SPD_MAX_ROLLBACK_TOKENS = SPD_MAX_STAGE_COUNT - 1;
 
 using clock_type = std::chrono::steady_clock;
 
+// LLAMA_SPD_NANCHECK: walk every sidecar node after it computes and report the
+// first ones that contain NaN. The sidecar's logits come back all-NaN/-inf on
+// the failing steps while its inputs are provably finite, so the point is to
+// name the op that manufactures them. Diagnostic only -- to be reverted.
+bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+    if (ask) {
+        return t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16;
+    }
+    static int      reported = 0;
+    static uint64_t node_seq = 0;
+    ++node_seq;
+    if (reported >= 10 || !ggml_is_contiguous(t)) {
+        return true;
+    }
+    const int64_t n = ggml_nelements(t);
+    if (n <= 0 || n > (int64_t) 8 * 1024 * 1024) {
+        return true;
+    }
+    std::vector<char> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    int64_t nnan = 0;
+    int64_t ninf = 0;
+    if (t->type == GGML_TYPE_F32) {
+        const float * d = (const float *) buf.data();
+        for (int64_t i = 0; i < n; ++i) {
+            if (std::isnan(d[i])) { ++nnan; } else if (std::isinf(d[i])) { ++ninf; }
+        }
+    } else {
+        const uint16_t * d = (const uint16_t *) buf.data();
+        for (int64_t i = 0; i < n; ++i) {
+            if (((d[i] >> 10) & 0x1f) == 0x1f) {
+                if (d[i] & 0x3ff) { ++nnan; } else { ++ninf; }
+            }
+        }
+    }
+    if (nnan > 0) {
+        ++reported;
+        fprintf(stderr,
+                "SPD nancheck: node %llu name=%s op=%s ne=[%lld,%lld,%lld,%lld] nan=%lld inf=%lld src0=%s src1=%s\n",
+                (unsigned long long) node_seq, t->name, ggml_op_name(t->op),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                (long long) nnan, (long long) ninf,
+                t->src[0] ? t->src[0]->name : "-",
+                t->src[1] ? t->src[1]->name : "-");
+    }
+    return true;
+}
+
+
 double seconds_since(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
 }
@@ -1149,6 +1199,10 @@ struct common_spd_pipeline::impl {
         // that.
         llama_context_params sp = make_context_params(
                 std::max<uint32_t>(params.n_batch, stage_count + 1), true);
+        if (getenv("LLAMA_SPD_NANCHECK") != nullptr) {
+            sp.cb_eval           = spd_nan_eval_cb;
+            sp.cb_eval_user_data = nullptr;
+        }
         sidecar = llama_init_from_model(model_spd, sp);
         if (sidecar == nullptr) {
             fail("failed to initialize the SPD sidecar context");
