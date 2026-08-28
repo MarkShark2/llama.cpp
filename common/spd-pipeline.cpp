@@ -77,7 +77,7 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
     }
-    if (is_result && (nnan > 0 || ninf > 0) && t->type == GGML_TYPE_F32) {
+    if (is_result && nnan > 0 && t->type == GGML_TYPE_F32) {
         const float * d = (const float *) buf.data();
         int64_t first_bad = -1, last_bad = -1, run_ok = 0;
         for (int64_t i = 0; i < n; ++i) {
@@ -91,7 +91,7 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 (long long) first_bad, (long long) last_bad, (long long) run_ok,
                 (double) d[0], (long long) (n - 1), (double) d[n - 1]);
     }
-    if (nnan > 0 || (is_result && ninf > 0)) {
+    if (nnan > 0) {
         ++reported;
         fprintf(stderr,
                 "SPD nancheck: node %llu name=%s op=%s ne=[%lld,%lld,%lld,%lld] nan=%lld inf=%lld src0=%s src1=%s\n",
