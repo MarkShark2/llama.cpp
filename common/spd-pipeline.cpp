@@ -91,6 +91,32 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 (long long) first_bad, (long long) last_bad, (long long) run_ok,
                 (double) d[0], (long long) (n - 1), (double) d[n - 1]);
     }
+    if (nnan > 0 && reported == 0) {
+        // first NaN of the run: characterise it and its f32 sources so an
+        // overflow (finite but huge) is distinguishable from corrupt data
+        auto absmax = [](ggml_tensor * u, double & mx, int64_t & bad) {
+            mx = 0.0; bad = 0;
+            if (u == nullptr || u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u)) { return false; }
+            const int64_t m = ggml_nelements(u);
+            if (m <= 0 || m > (int64_t) 8*1024*1024) { return false; }
+            std::vector<float> h((size_t) m);
+            ggml_backend_tensor_get(u, h.data(), 0, (size_t) m*sizeof(float));
+            for (float v : h) {
+                if (std::isnan(v) || std::isinf(v)) { ++bad; }
+                else if (std::fabs(v) > mx) { mx = std::fabs(v); }
+            }
+            return true;
+        };
+        double mx_self = 0.0; int64_t bad_self = 0; absmax(t, mx_self, bad_self);
+        double mx0 = -1.0, mx1 = -1.0; int64_t b0 = -1, b1 = -1;
+        if (!absmax(t->src[0], mx0, b0)) { mx0 = -1.0; b0 = -1; }
+        if (!absmax(t->src[1], mx1, b1)) { mx1 = -1.0; b1 = -1; }
+        fprintf(stderr,
+                "SPD nancheck: FIRST %s op=%s absmax=%.4g | src0=%s type=%d absmax=%.4g bad=%lld | src1=%s type=%d absmax=%.4g bad=%lld\n",
+                t->name, ggml_op_name(t->op), mx_self,
+                t->src[0] ? t->src[0]->name : "-", t->src[0] ? (int) t->src[0]->type : -1, mx0, (long long) b0,
+                t->src[1] ? t->src[1]->name : "-", t->src[1] ? (int) t->src[1]->type : -1, mx1, (long long) b1);
+    }
     if (nnan > 0) {
         ++reported;
         fprintf(stderr,
