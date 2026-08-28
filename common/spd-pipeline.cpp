@@ -49,7 +49,11 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     static int      reported = 0;
     static uint64_t node_seq = 0;
     ++node_seq;
-    if (reported >= 10 || !ggml_is_contiguous(t)) {
+    if (node_seq == 1) {
+        fprintf(stderr, "SPD nancheck: active, first node name=%s op=%s\n", t->name, ggml_op_name(t->op));
+    }
+    const bool is_result = strncmp(t->name, "result", 6) == 0;
+    if ((reported >= 10 && !is_result) || !ggml_is_contiguous(t)) {
         return true;
     }
     const int64_t n = ggml_nelements(t);
@@ -73,7 +77,7 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
     }
-    if (nnan > 0) {
+    if (nnan > 0 || (is_result && ninf > 0)) {
         ++reported;
         fprintf(stderr,
                 "SPD nancheck: node %llu name=%s op=%s ne=[%lld,%lld,%lld,%lld] nan=%lld inf=%lld src0=%s src1=%s\n",
