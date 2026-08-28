@@ -2996,8 +2996,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     ggml_backend_synchronize(b);
                 }
                 if (getenv("LLAMA_SAMPLED_TRACE")) {
-                    fprintf(stderr, "SAMPLED-TRACE drain: host_after_sync=%d\n",
-                            (int) sampling.sampled.data[n_outputs_prev]);
+                    ggml_tensor * ts = res->t_sampled[0];
+                    auto * gf = res->get_gf();
+                    int pos = -1;
+                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                        if (ggml_graph_node(gf, i) == ts) { pos = i; break; }
+                    }
+                    fprintf(stderr, "SAMPLED-TRACE drain: host=%d compute_flag=%d in_graph=%d n_nodes=%d op=%s\n",
+                            (int) sampling.sampled.data[n_outputs_prev],
+                            (int) ((ts->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                            pos, ggml_graph_n_nodes(gf), ggml_op_name(ts->op));
                 }
             }
         }
