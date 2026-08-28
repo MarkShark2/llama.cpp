@@ -116,6 +116,25 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 t->name, ggml_op_name(t->op), mx_self,
                 t->src[0] ? t->src[0]->name : "-", t->src[0] ? (int) t->src[0]->type : -1, mx0, (long long) b0,
                 t->src[1] ? t->src[1]->name : "-", t->src[1] ? (int) t->src[1]->type : -1, mx1, (long long) b1);
+        // if the source is a Q8_0 weight, read it back and look at the block
+        // scales: a NaN there means the weight memory itself was clobbered
+        if (t->src[0] != nullptr && t->src[0]->type == GGML_TYPE_Q8_0) {
+            const size_t nb = ggml_nbytes(t->src[0]);
+            std::vector<uint8_t> w(nb);
+            ggml_backend_tensor_get(t->src[0], w.data(), 0, nb);
+            const size_t nblk = nb/34;
+            size_t bad_d = 0; size_t first_blk = 0; bool have = false;
+            for (size_t b = 0; b < nblk; ++b) {
+                uint16_t d; std::memcpy(&d, w.data() + b*34, 2);
+                if (((d >> 10) & 0x1f) == 0x1f) {
+                    ++bad_d;
+                    if (!have) { first_blk = b; have = true; }
+                }
+            }
+            fprintf(stderr, "SPD nancheck: weight %s bytes=%zu blocks=%zu bad_scales=%zu first_blk=%zu (row %zu)\n",
+                    t->src[0]->name, nb, nblk, bad_d, first_blk,
+                    t->src[0]->ne[0] > 0 ? first_blk/(size_t) (t->src[0]->ne[0]/32) : 0);
+        }
     }
     if (nnan > 0) {
         ++reported;
