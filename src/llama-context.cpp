@@ -3006,6 +3006,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             (int) sampling.sampled.data[n_outputs_prev],
                             (int) ((ts->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
                             pos, ggml_graph_n_nodes(gf), ggml_op_name(ts->op));
+
+                    // ARGMAX only returns -1 when nothing in the row compares
+                    // greater than -FLT_MAX: an all-NaN or all -inf row. Read
+                    // the model's own logits to find out which. Failing steps
+                    // only, so the vocabulary readback costs nothing normally.
+                    if (sampling.sampled.data[n_outputs_prev] == LLAMA_TOKEN_NULL && res->t_logits) {
+                        const int64_t nv = ggml_nelements(res->t_logits);
+                        std::vector<float> row((size_t) nv);
+                        ggml_backend_t lb = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits);
+                        if (lb) {
+                            ggml_backend_tensor_get(res->t_logits, row.data(), 0, nv*sizeof(float));
+                            size_t n_nan = 0, n_inf = 0;
+                            float mn = INFINITY, mx = -INFINITY;
+                            for (int64_t k = 0; k < nv; ++k) {
+                                const float v = row[k];
+                                if (std::isnan(v)) { ++n_nan; continue; }
+                                if (std::isinf(v)) { ++n_inf; }
+                                mn = std::min(mn, v); mx = std::max(mx, v);
+                            }
+                            fprintf(stderr, "SAMPLED-TRACE logits: n=%lld nan=%zu inf=%zu min=%g max=%g first=%g %g %g\n",
+                                    (long long) nv, n_nan, n_inf, mn, mx,
+                                    row[0], row[1], row[2]);
+                        }
+                    }
                 }
             }
         }
