@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1448,10 +1449,10 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
         const int64_t row = output_resolve_row(idx);
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
         if (getenv("LLAMA_SAMPLED_TRACE")) {
-            fprintf(stderr, "SAMPLED-TRACE read: ctx=%p dst=%p idx=%d row=%lld size=%zu value=%d\n",
+            fprintf(stderr, "SAMPLED-TRACE read: tid=%zu ctx=%p dst=%p row=%lld value=%d\n",
+                    (size_t) std::hash<std::thread::id>{}(std::this_thread::get_id()),
                     (void *) this, (void *) sampling.sampled.data,
-                    idx, (long long) row, sampling.sampled.size,
-                    (int) sampling.sampled.data[row]);
+                    (long long) row, (int) sampling.sampled.data[row]);
         }
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
@@ -2968,10 +2969,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_sampled[0]);
                     bname = b ? ggml_backend_name(b) : "NULL-BACKEND";
                 }
-                fprintf(stderr, "SAMPLED-TRACE copy: ctx=%p dst=%p t_sampled=%zu set=%zu prev=%u n_out=%u dst_size=%zu backend=%s\n",
-                        (void *) this, (void *) sampling.sampled.data,
-                        res->t_sampled.size(), n_set, n_outputs_prev, n_outputs,
-                        sampling.sampled.size, bname);
+                const void * tptr = res->t_sampled.empty() ? nullptr : (void *) res->t_sampled[0];
+                const void * tdat = (res->t_sampled.empty() || !res->t_sampled[0]) ? nullptr : res->t_sampled[0]->data;
+                const char * bufn = "none";
+                if (!res->t_sampled.empty() && res->t_sampled[0] && res->t_sampled[0]->buffer) {
+                    bufn = ggml_backend_buffer_name(res->t_sampled[0]->buffer);
+                }
+                fprintf(stderr, "SAMPLED-TRACE copy: tid=%zu ctx=%p dst=%p t=%p tdata=%p buf=%s set=%zu backend=%s\n",
+                        (size_t) std::hash<std::thread::id>{}(std::this_thread::get_id()),
+                        (void *) this, (void *) sampling.sampled.data, tptr, tdat, bufn, n_set, bname);
             }
 
             // async copy the sampling data from the backend to the host
