@@ -2631,6 +2631,22 @@ struct common_spd_pipeline::impl {
             }
             scope_timer copy_timer(timing.stage_copy[stage]);
             ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
+            if (getenv("LLAMA_SPD_FEATURE_CHECK")) {
+                auto scan = [](ggml_tensor * t, const char * tag, uint32_t st, int pos) {
+                    if (t == nullptr || t->type != GGML_TYPE_F32) { return; }
+                    const int64_t n = ggml_nelements(t);
+                    std::vector<float> h((size_t) n);
+                    ggml_backend_tensor_get(t, h.data(), 0, (size_t) n*sizeof(float));
+                    size_t bad = 0;
+                    for (float v : h) { if (std::isnan(v) || std::isinf(v)) { ++bad; } }
+                    if (bad) {
+                        fprintf(stderr, "SPD peer-check: stage %u pos=%d %s bad=%zu of %lld\n",
+                                st, pos, tag, bad, (long long) n);
+                    }
+                };
+                scan(pb_in->staging_dec[slot], "staging", stage, (int) item.pos);
+                scan(pb_in->inp_dec, "inp_dec", stage, (int) item.pos);
+            }
         }
 
         if (!light_rollback) {
