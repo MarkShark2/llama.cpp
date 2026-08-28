@@ -17,7 +17,6 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
-#include <thread>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1448,12 +1447,6 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     try {
         const int64_t row = output_resolve_row(idx);
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
-        if (getenv("LLAMA_SAMPLED_TRACE")) {
-            fprintf(stderr, "SAMPLED-TRACE read: tid=%zu ctx=%p dst=%p row=%lld value=%d\n",
-                    (size_t) std::hash<std::thread::id>{}(std::this_thread::get_id()),
-                    (void *) this, (void *) sampling.sampled.data,
-                    (long long) row, (int) sampling.sampled.data[row]);
-        }
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled token id %d, reason: %s\n", __func__, idx, err.what());
@@ -2220,13 +2213,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
         (!res->t_sampled.empty() || !res->t_sampled_probs.empty() ||
          !res->t_sampled_logits.empty() || !res->t_candidates.empty())) {
         // the SPD head runs one ubatch, so its rows start at 0
-        if (getenv("LLAMA_SAMPLED_TRACE")) {
-            size_t n_set = 0;
-            for (auto * t : res->t_sampled) { n_set += (t != nullptr); }
-            fprintf(stderr, "SAMPLED-TRACE head-copy: ctx=%p dst=%p t_sampled=%zu set=%zu dst_size=%zu\n",
-                    (void *) this, (void *) sampling.sampled.data,
-                    res->t_sampled.size(), n_set, sampling.sampled.size);
-        }
         copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,       0, sched.get());
         copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
         copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      n_vocab, 0, sched.get(), &sampling.probs_count);
@@ -2958,80 +2944,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (has_samplers) {
             const auto stride = n_vocab;
 
-            // [fork, diagnostic] LLAMA_SAMPLED_TRACE=1. Deliberately reads no
-            // device memory: an extra ggml_backend_tensor_get here acts as a
-            // barrier and hides the very defect we are chasing.
-            if (getenv("LLAMA_SAMPLED_TRACE")) {
-                size_t n_set = 0;
-                for (auto * t : res->t_sampled) { n_set += (t != nullptr); }
-                const char * bname = "none";
-                if (!res->t_sampled.empty() && res->t_sampled[0]) {
-                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_sampled[0]);
-                    bname = b ? ggml_backend_name(b) : "NULL-BACKEND";
-                }
-                const void * tptr = res->t_sampled.empty() ? nullptr : (void *) res->t_sampled[0];
-                const void * tdat = (res->t_sampled.empty() || !res->t_sampled[0]) ? nullptr : res->t_sampled[0]->data;
-                const char * bufn = "none";
-                if (!res->t_sampled.empty() && res->t_sampled[0] && res->t_sampled[0]->buffer) {
-                    bufn = ggml_backend_buffer_name(res->t_sampled[0]->buffer);
-                }
-                fprintf(stderr, "SAMPLED-TRACE copy: tid=%zu ctx=%p dst=%p t=%p tdata=%p buf=%s set=%zu backend=%s\n",
-                        (size_t) std::hash<std::thread::id>{}(std::this_thread::get_id()),
-                        (void *) this, (void *) sampling.sampled.data, tptr, tdat, bufn, n_set, bname);
-            }
-
             // async copy the sampling data from the backend to the host
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
-
-            // [fork, diagnostic] LLAMA_SAMPLED_SYNC=1: drain the backend right
-            // where the copy is issued. If this alone makes the NULL sampled
-            // tokens disappear, the copy is fine and the defect is that nothing
-            // between here and the getter actually waits for it.
-            if (getenv("LLAMA_SAMPLED_SYNC") && !res->t_sampled.empty() && res->t_sampled[0]) {
-                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_sampled[0]);
-                if (b) {
-                    ggml_backend_synchronize(b);
-                }
-                if (getenv("LLAMA_SAMPLED_TRACE")) {
-                    ggml_tensor * ts = res->t_sampled[0];
-                    auto * gf = res->get_gf();
-                    int pos = -1;
-                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                        if (ggml_graph_node(gf, i) == ts) { pos = i; break; }
-                    }
-                    fprintf(stderr, "SAMPLED-TRACE drain: host=%d compute_flag=%d in_graph=%d n_nodes=%d op=%s\n",
-                            (int) sampling.sampled.data[n_outputs_prev],
-                            (int) ((ts->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
-                            pos, ggml_graph_n_nodes(gf), ggml_op_name(ts->op));
-
-                    // ARGMAX only returns -1 when nothing in the row compares
-                    // greater than -FLT_MAX: an all-NaN or all -inf row. Read
-                    // the model's own logits to find out which. Failing steps
-                    // only, so the vocabulary readback costs nothing normally.
-                    if (sampling.sampled.data[n_outputs_prev] == LLAMA_TOKEN_NULL && res->t_logits) {
-                        const int64_t nv = ggml_nelements(res->t_logits);
-                        std::vector<float> row((size_t) nv);
-                        ggml_backend_t lb = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits);
-                        if (lb) {
-                            ggml_backend_tensor_get(res->t_logits, row.data(), 0, nv*sizeof(float));
-                            size_t n_nan = 0, n_inf = 0;
-                            float mn = INFINITY, mx = -INFINITY;
-                            for (int64_t k = 0; k < nv; ++k) {
-                                const float v = row[k];
-                                if (std::isnan(v)) { ++n_nan; continue; }
-                                if (std::isinf(v)) { ++n_inf; }
-                                mn = std::min(mn, v); mx = std::max(mx, v);
-                            }
-                            fprintf(stderr, "SAMPLED-TRACE logits: n=%lld nan=%zu inf=%zu min=%g max=%g first=%g %g %g\n",
-                                    (long long) nv, n_nan, n_inf, mn, mx,
-                                    row[0], row[1], row[2]);
-                        }
-                    }
-                }
-            }
         }
 
         n_outputs_prev += n_outputs;

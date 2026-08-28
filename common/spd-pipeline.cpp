@@ -37,119 +37,6 @@ constexpr uint32_t SPD_MAX_ROLLBACK_TOKENS = SPD_MAX_STAGE_COUNT - 1;
 
 using clock_type = std::chrono::steady_clock;
 
-// LLAMA_SPD_NANCHECK: walk every sidecar node after it computes and report the
-// first ones that contain NaN. The sidecar's logits come back all-NaN/-inf on
-// the failing steps while its inputs are provably finite, so the point is to
-// name the op that manufactures them. Diagnostic only -- to be reverted.
-bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
-    (void) user_data;
-    if (ask) {
-        return t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16;
-    }
-    static int      reported = 0;
-    static uint64_t node_seq = 0;
-    ++node_seq;
-    if (node_seq == 1) {
-        fprintf(stderr, "SPD nancheck: active, first node name=%s op=%s\n", t->name, ggml_op_name(t->op));
-    }
-    const bool is_result = strncmp(t->name, "result", 6) == 0;
-    if ((reported >= 10 && !is_result) || !ggml_is_contiguous(t)) {
-        return true;
-    }
-    const int64_t n = ggml_nelements(t);
-    if (n <= 0 || n > (int64_t) 8 * 1024 * 1024) {
-        return true;
-    }
-    std::vector<char> buf(ggml_nbytes(t));
-    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
-    int64_t nnan = 0;
-    int64_t ninf = 0;
-    if (t->type == GGML_TYPE_F32) {
-        const float * d = (const float *) buf.data();
-        for (int64_t i = 0; i < n; ++i) {
-            if (std::isnan(d[i])) { ++nnan; } else if (std::isinf(d[i])) { ++ninf; }
-        }
-    } else {
-        const uint16_t * d = (const uint16_t *) buf.data();
-        for (int64_t i = 0; i < n; ++i) {
-            if (((d[i] >> 10) & 0x1f) == 0x1f) {
-                if (d[i] & 0x3ff) { ++nnan; } else { ++ninf; }
-            }
-        }
-    }
-    if (is_result && nnan > 0 && t->type == GGML_TYPE_F32) {
-        const float * d = (const float *) buf.data();
-        int64_t first_bad = -1, last_bad = -1, run_ok = 0;
-        for (int64_t i = 0; i < n; ++i) {
-            const bool bad = std::isnan(d[i]) || std::isinf(d[i]);
-            if (bad) { if (first_bad < 0) { first_bad = i; } last_bad = i; }
-            else if (first_bad < 0) { ++run_ok; }
-        }
-        fprintf(stderr,
-                "SPD nancheck: %s type=%d n=%lld nan=%lld inf=%lld first_bad=%lld last_bad=%lld leading_ok=%lld v[0]=%g v[%lld]=%g\n",
-                t->name, (int) t->type, (long long) n, (long long) nnan, (long long) ninf,
-                (long long) first_bad, (long long) last_bad, (long long) run_ok,
-                (double) d[0], (long long) (n - 1), (double) d[n - 1]);
-    }
-    if (nnan > 0 && reported == 0) {
-        // first NaN of the run: characterise it and its f32 sources so an
-        // overflow (finite but huge) is distinguishable from corrupt data
-        auto absmax = [](ggml_tensor * u, double & mx, int64_t & bad) {
-            mx = 0.0; bad = 0;
-            if (u == nullptr || u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u)) { return false; }
-            const int64_t m = ggml_nelements(u);
-            if (m <= 0 || m > (int64_t) 8*1024*1024) { return false; }
-            std::vector<float> h((size_t) m);
-            ggml_backend_tensor_get(u, h.data(), 0, (size_t) m*sizeof(float));
-            for (float v : h) {
-                if (std::isnan(v) || std::isinf(v)) { ++bad; }
-                else if (std::fabs(v) > mx) { mx = std::fabs(v); }
-            }
-            return true;
-        };
-        double mx_self = 0.0; int64_t bad_self = 0; absmax(t, mx_self, bad_self);
-        double mx0 = -1.0, mx1 = -1.0; int64_t b0 = -1, b1 = -1;
-        if (!absmax(t->src[0], mx0, b0)) { mx0 = -1.0; b0 = -1; }
-        if (!absmax(t->src[1], mx1, b1)) { mx1 = -1.0; b1 = -1; }
-        fprintf(stderr,
-                "SPD nancheck: FIRST %s op=%s absmax=%.4g | src0=%s type=%d absmax=%.4g bad=%lld | src1=%s type=%d absmax=%.4g bad=%lld\n",
-                t->name, ggml_op_name(t->op), mx_self,
-                t->src[0] ? t->src[0]->name : "-", t->src[0] ? (int) t->src[0]->type : -1, mx0, (long long) b0,
-                t->src[1] ? t->src[1]->name : "-", t->src[1] ? (int) t->src[1]->type : -1, mx1, (long long) b1);
-        // if the source is a Q8_0 weight, read it back and look at the block
-        // scales: a NaN there means the weight memory itself was clobbered
-        if (t->src[0] != nullptr && t->src[0]->type == GGML_TYPE_Q8_0) {
-            const size_t nb = ggml_nbytes(t->src[0]);
-            std::vector<uint8_t> w(nb);
-            ggml_backend_tensor_get(t->src[0], w.data(), 0, nb);
-            const size_t nblk = nb/34;
-            size_t bad_d = 0; size_t first_blk = 0; bool have = false;
-            for (size_t b = 0; b < nblk; ++b) {
-                uint16_t d; std::memcpy(&d, w.data() + b*34, 2);
-                if (((d >> 10) & 0x1f) == 0x1f) {
-                    ++bad_d;
-                    if (!have) { first_blk = b; have = true; }
-                }
-            }
-            fprintf(stderr, "SPD nancheck: weight %s bytes=%zu blocks=%zu bad_scales=%zu first_blk=%zu (row %zu)\n",
-                    t->src[0]->name, nb, nblk, bad_d, first_blk,
-                    t->src[0]->ne[0] > 0 ? first_blk/(size_t) (t->src[0]->ne[0]/32) : 0);
-        }
-    }
-    if (nnan > 0) {
-        ++reported;
-        fprintf(stderr,
-                "SPD nancheck: node %llu name=%s op=%s ne=[%lld,%lld,%lld,%lld] nan=%lld inf=%lld src0=%s src1=%s\n",
-                (unsigned long long) node_seq, t->name, ggml_op_name(t->op),
-                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-                (long long) nnan, (long long) ninf,
-                t->src[0] ? t->src[0]->name : "-",
-                t->src[1] ? t->src[1]->name : "-");
-    }
-    return true;
-}
-
-
 double seconds_since(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
 }
@@ -1215,13 +1102,6 @@ struct common_spd_pipeline::impl {
             // state to full snapshot planes.
             cp.n_rs_seq = light_rollback ? rollback_tokens : 0;
             cp.embeddings = true;
-            {
-                const char * ns = getenv("LLAMA_SPD_NANCHECK_STAGE");
-                if (ns != nullptr && (uint32_t) atoi(ns) == stage) {
-                    cp.cb_eval           = spd_nan_eval_cb;
-                    cp.cb_eval_user_data = nullptr;
-                }
-            }
             stages[stage] = llama_init_from_model(model_target, cp);
             if (stages[stage] == nullptr) {
                 fail("failed to initialize target SPD stage " + std::to_string(stage));
@@ -1269,10 +1149,6 @@ struct common_spd_pipeline::impl {
         // that.
         llama_context_params sp = make_context_params(
                 std::max<uint32_t>(params.n_batch, stage_count + 1), true);
-        if (getenv("LLAMA_SPD_NANCHECK") != nullptr) {
-            sp.cb_eval           = spd_nan_eval_cb;
-            sp.cb_eval_user_data = nullptr;
-        }
         sidecar = llama_init_from_model(model_spd, sp);
         if (sidecar == nullptr) {
             fail("failed to initialize the SPD sidecar context");
@@ -1898,31 +1774,6 @@ struct common_spd_pipeline::impl {
         }
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
-        // [fork, diagnostic] the sidecar's logits go all-NaN/-inf on some steps
-        // and ARGMAX then correctly returns -1. features is already on the host,
-        // so checking the INPUT side costs nothing and says whether the NaN is
-        // produced inside the sidecar or arrives with the stage boundaries.
-        if (getenv("LLAMA_SPD_FEATURE_CHECK")) {
-            size_t n_nan = 0, n_inf = 0;
-            for (float v : features) {
-                if (std::isnan(v)) { ++n_nan; }
-                else if (std::isinf(v)) { ++n_inf; }
-            }
-            if (n_nan || n_inf) {
-                size_t bad_row = 0, bad_blk = 0, first_bad = 0;
-                for (size_t i = 0; i < features.size(); ++i) {
-                    if (std::isnan(features[i]) || std::isinf(features[i])) {
-                        first_bad = i;
-                        bad_row   = i/(size_t) sidecar_n_embd_inp;
-                        bad_blk   = (i % (size_t) sidecar_n_embd_inp)/(size_t) n_embd;
-                        break;
-                    }
-                }
-                fprintf(stderr, "SPD feature-check: rows=%zu n=%zu nan=%zu inf=%zu first=%zu row=%zu anchor_blk=%zu sel=%d\n",
-                        selectors.size(), features.size(), n_nan, n_inf, first_bad, bad_row, bad_blk,
-                        bad_row < selectors.size() ? (int) selectors[bad_row] : -1);
-            }
-        }
         storage.set(selectors, features, sidecar_n_embd_inp, positions);
         if (llama_decode(sidecar, storage.batch) != 0) {
             fail("SPD sidecar decode failed");
@@ -2683,22 +2534,6 @@ struct common_spd_pipeline::impl {
             }
             scope_timer copy_timer(timing.stage_copy[stage]);
             ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
-            if (getenv("LLAMA_SPD_FEATURE_CHECK")) {
-                auto scan = [](ggml_tensor * t, const char * tag, uint32_t st, int pos) {
-                    if (t == nullptr || t->type != GGML_TYPE_F32) { return; }
-                    const int64_t n = ggml_nelements(t);
-                    std::vector<float> h((size_t) n);
-                    ggml_backend_tensor_get(t, h.data(), 0, (size_t) n*sizeof(float));
-                    size_t bad = 0;
-                    for (float v : h) { if (std::isnan(v) || std::isinf(v)) { ++bad; } }
-                    if (bad) {
-                        fprintf(stderr, "SPD peer-check: stage %u pos=%d %s bad=%zu of %lld\n",
-                                st, pos, tag, bad, (long long) n);
-                    }
-                };
-                scan(pb_in->staging_dec[slot], "staging", stage, (int) item.pos);
-                scan(pb_in->inp_dec, "inp_dec", stage, (int) item.pos);
-            }
         }
 
         if (!light_rollback) {
@@ -2730,22 +2565,6 @@ struct common_spd_pipeline::impl {
         llama_set_spd_peer_io(stages[stage], false, false, false);
         if (!decoded) {
             return false;
-        }
-        if (getenv("LLAMA_SPD_FEATURE_CHECK")) {
-            size_t bad_out = 0;
-            for (float v : output) { if (std::isnan(v) || std::isinf(v)) { ++bad_out; } }
-            if (bad_out) {
-                fprintf(stderr, "SPD stage-check: stage %u boundary out bad=%zu of %zu pos=%d peer_in=%d\n",
-                        stage, bad_out, output.size(), (int) item.pos, (int) peer_in);
-            }
-            for (auto & w : wanted) {
-                size_t bad_tap = 0;
-                for (float v : *w.second) { if (std::isnan(v) || std::isinf(v)) { ++bad_tap; } }
-                if (bad_tap) {
-                    fprintf(stderr, "SPD stage-check: stage %u tap anchor %zu bad=%zu of %zu pos=%d\n",
-                            stage, w.first, bad_tap, w.second->size(), (int) item.pos);
-                }
-            }
         }
         if (peer_in && llama_spd_peer_inp_tensor(stages[stage]) != pb_in->inp) {
             // a rebuild would have read a different tensor than the copy

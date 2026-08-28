@@ -3848,14 +3848,6 @@ void llm_graph_context::build_sampling() const {
         }
     }
 
-    if (getenv("LLAMA_SAMPLED_TRACE")) {
-        std::string keys, rows_s;
-        for (const auto & kv : samplers)      { keys   += " " + std::to_string(kv.first); }
-        for (const auto & kv : sampling_rows) { rows_s += " " + std::to_string(kv.first); }
-        fprintf(stderr, "SAMPLED-TRACE build: n_tokens=%u n_rows=%u prev_t_sampled=%zu sampler_seqs=[%s] row_seqs=[%s]\n",
-                ubatch.n_tokens, n_rows, res->t_sampled.size(), keys.c_str(), rows_s.c_str());
-    }
-
     res->t_sampled.resize(n_rows, nullptr);
     res->t_sampled_probs.resize(n_rows, nullptr);
     res->t_sampled_logits.resize(n_rows, nullptr);
