@@ -2942,6 +2942,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         if (has_samplers) {
+            if (getenv("LLAMA_SAMPLING_TRACE") && atoi(getenv("LLAMA_SAMPLING_TRACE")) != 0) {
+                fprintf(stderr, "[smp] decode copy-back: t_sampled=%zu reused=%d n_outputs=%u n_tokens=%u\n",
+                        res->t_sampled.size(), n_reused, (unsigned) n_outputs, (unsigned) ubatch.n_tokens);
+                fflush(stderr);
+            }
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host

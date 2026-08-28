@@ -3829,8 +3829,18 @@ void llm_graph_context::build_pooling(
     ggml_build_forward_expand(gf, cur);
 }
 
+static const bool g_sampling_trace = [] {
+    const char * e = getenv("LLAMA_SAMPLING_TRACE");
+    return e && atoi(e) != 0;
+}();
+
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
+        if (g_sampling_trace && !samplers.empty()) {
+            fprintf(stderr, "[smp] build_sampling EARLY-OUT: t_logits=%p n_tokens=%u\n",
+                    (void *) res->t_logits, (unsigned) ubatch.n_tokens);
+            fflush(stderr);
+        }
         return;
     }
 
@@ -3875,6 +3885,12 @@ void llm_graph_context::build_sampling() const {
         const bool active = it != sampling_rows.end();
         const auto & rows = active ? it->second : dummy_row;
         const int i_out   = active ? 1          : 0;
+
+        if (g_sampling_trace) {
+            fprintf(stderr, "[smp] build seq=%d active=%d rows=%zu n_rows=%u n_tokens=%u\n",
+                    (int) seq_id, (int) active, rows.size(), n_rows, (unsigned) ubatch.n_tokens);
+            fflush(stderr);
+        }
 
         for (uint32_t i = 0; i < rows.size(); ++i) {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], rows[i] * logits_t->nb[1]);
