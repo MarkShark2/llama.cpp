@@ -2985,6 +2985,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+
+            // [fork, diagnostic] LLAMA_SAMPLED_SYNC=1: drain the backend right
+            // where the copy is issued. If this alone makes the NULL sampled
+            // tokens disappear, the copy is fine and the defect is that nothing
+            // between here and the getter actually waits for it.
+            if (getenv("LLAMA_SAMPLED_SYNC") && !res->t_sampled.empty() && res->t_sampled[0]) {
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_sampled[0]);
+                if (b) {
+                    ggml_backend_synchronize(b);
+                }
+                if (getenv("LLAMA_SAMPLED_TRACE")) {
+                    fprintf(stderr, "SAMPLED-TRACE drain: host_after_sync=%d\n",
+                            (int) sampling.sampled.data[n_outputs_prev]);
+                }
+            }
         }
 
         n_outputs_prev += n_outputs;
