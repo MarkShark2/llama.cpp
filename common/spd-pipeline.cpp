@@ -77,6 +77,20 @@ bool spd_nan_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
     }
+    if (is_result && (nnan > 0 || ninf > 0) && t->type == GGML_TYPE_F32) {
+        const float * d = (const float *) buf.data();
+        int64_t first_bad = -1, last_bad = -1, run_ok = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const bool bad = std::isnan(d[i]) || std::isinf(d[i]);
+            if (bad) { if (first_bad < 0) { first_bad = i; } last_bad = i; }
+            else if (first_bad < 0) { ++run_ok; }
+        }
+        fprintf(stderr,
+                "SPD nancheck: %s type=%d n=%lld nan=%lld inf=%lld first_bad=%lld last_bad=%lld leading_ok=%lld v[0]=%g v[%lld]=%g\n",
+                t->name, (int) t->type, (long long) n, (long long) nnan, (long long) ninf,
+                (long long) first_bad, (long long) last_bad, (long long) run_ok,
+                (double) d[0], (long long) (n - 1), (double) d[n - 1]);
+    }
     if (nnan > 0 || (is_result && ninf > 0)) {
         ++reported;
         fprintf(stderr,
