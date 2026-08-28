@@ -1447,6 +1447,11 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     try {
         const int64_t row = output_resolve_row(idx);
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
+        if (getenv("LLAMA_SAMPLED_TRACE")) {
+            fprintf(stderr, "SAMPLED-TRACE read: idx=%d row=%lld size=%zu value=%d\n",
+                    idx, (long long) row, sampling.sampled.size,
+                    (int) sampling.sampled.data[row]);
+        }
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled token id %d, reason: %s\n", __func__, idx, err.what());
@@ -2943,6 +2948,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (has_samplers) {
             const auto stride = n_vocab;
+
+            // [fork, diagnostic] LLAMA_SAMPLED_TRACE=1. Deliberately reads no
+            // device memory: an extra ggml_backend_tensor_get here acts as a
+            // barrier and hides the very defect we are chasing.
+            if (getenv("LLAMA_SAMPLED_TRACE")) {
+                size_t n_set = 0;
+                for (auto * t : res->t_sampled) { n_set += (t != nullptr); }
+                const char * bname = "none";
+                if (!res->t_sampled.empty() && res->t_sampled[0]) {
+                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_sampled[0]);
+                    bname = b ? ggml_backend_name(b) : "NULL-BACKEND";
+                }
+                fprintf(stderr, "SAMPLED-TRACE copy: t_sampled=%zu set=%zu prev=%u n_out=%u dst_size=%zu backend=%s\n",
+                        res->t_sampled.size(), n_set, n_outputs_prev, n_outputs,
+                        sampling.sampled.size, bname);
+            }
 
             // async copy the sampling data from the backend to the host
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
