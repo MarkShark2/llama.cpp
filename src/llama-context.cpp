@@ -1441,12 +1441,25 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
     if (!sampling.sampled.has_data()) {
+        if (getenv("LLAMA_SAMPLING_TRACE") && atoi(getenv("LLAMA_SAMPLING_TRACE")) != 0) {
+            fprintf(stderr, "[smp] read idx=%d NO BUFFER\n", idx);
+            fflush(stderr);
+        }
         return LLAMA_TOKEN_NULL;
     }
 
     try {
         const int64_t row = output_resolve_row(idx);
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
+        if (getenv("LLAMA_SAMPLING_TRACE") && atoi(getenv("LLAMA_SAMPLING_TRACE")) != 0) {
+            const llama_token v = sampling.sampled.data[row];
+            if (v == LLAMA_TOKEN_NULL) {
+                fprintf(stderr, "[smp] read idx=%d -> row=%lld value=NULL size=%zu n_outputs=%u row0=%d\n",
+                        idx, (long long) row, sampling.sampled.size, (unsigned) n_outputs,
+                        (int) sampling.sampled.data[0]);
+                fflush(stderr);
+            }
+        }
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled token id %d, reason: %s\n", __func__, idx, err.what());
