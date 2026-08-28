@@ -2357,6 +2357,13 @@ static void copy_tensor_async_rows(
         GGML_ASSERT((size_t) row * stride + n_elements <= dst.size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+        if (getenv("LLAMA_SAMPLING_TRACE") && atoi(getenv("LLAMA_SAMPLING_TRACE")) != 0) {
+            fprintf(stderr, "[smp] copy row=%u tensor=%s backend=%s buffer=%p\n",
+                    row, ggml_get_name(tensor),
+                    backend ? ggml_backend_name(backend) : "NULL",
+                    (void *) tensor->buffer);
+            fflush(stderr);
+        }
         T * row_ptr = dst.data + (size_t) row * stride;
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
