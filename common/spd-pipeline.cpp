@@ -319,6 +319,7 @@ struct common_spd_pipeline::impl {
     llama_sampler * sidecar_sampler = nullptr;
     bool head_backend_sampling = false;
     bool sidecar_backend_sampling = false;
+    bool sidecar_host_fallback_warned = false;
 
     // --ignore-eos. Every other decode path implements this as a logit bias, so
     // an EOG token is never *selected* and the caller's own end-of-generation
@@ -612,6 +613,11 @@ struct common_spd_pipeline::impl {
     }
 
     void fail(std::string message) {
+        // Log as well as record. This string is returned to the HTTP client and
+        // used to be recorded *only* there, so an aborted generation left the
+        // server log looking like a clean run that simply stopped -- prefill
+        // timings, then nothing. Every SPD abort is now visible in the log.
+        fprintf(stderr, "SPD error: %s\n", message.c_str());
         if (last_error.empty()) {
             last_error = std::move(message);
         }
@@ -1761,11 +1767,26 @@ struct common_spd_pipeline::impl {
         if (sampled != nullptr) {
             if (sidecar_backend_sampling) {
                 *sampled = llama_get_sampled_token_ith(sidecar, -1);
-                if (*sampled == LLAMA_TOKEN_NULL) {
-                    fail("SPD sidecar produced no sampled token");
-                    return false;
+                if (*sampled != LLAMA_TOKEN_NULL) {
+                    return true;
                 }
-                return true;
+                // The backend sampler did not write this output row, so the
+                // context hands back the LLAMA_TOKEN_NULL the buffer was
+                // pre-filled with. This is recoverable and must not fail the
+                // request: the installed chain is logit_bias + greedy, whose
+                // answer is exactly the host argmax below, with the same EOG
+                // mask. Fall through and compute it here.
+                //
+                // This is a *draft* token. Getting it from the host costs one
+                // vocabulary readback on a step that would otherwise abort the
+                // whole generation, and a wrong draft would only cost a
+                // rejected speculation -- but this path is not even wrong, it
+                // is the same token by a slower route.
+                if (!sidecar_host_fallback_warned) {
+                    sidecar_host_fallback_warned = true;
+                    fprintf(stderr, "SPD sidecar: backend sampler produced no token for a %zu-row batch; "
+                            "falling back to host argmax (logged once)\n", selectors.size());
+                }
             }
             const float * logits = llama_get_logits_ith(sidecar, -1);
             if (logits == nullptr) {
