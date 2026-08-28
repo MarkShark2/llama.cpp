@@ -901,14 +901,18 @@ struct common_spd_pipeline::impl {
         // Diagnostic escape hatch: the sidecar is the only context whose batch
         // shape changes every step, so it is the one that exercises graph reuse
         // hardest. LLAMA_SPD_SIDECAR_NO_REUSE=1 takes it out of reuse alone.
-        bool reuse = true;
         if (ctx == sidecar) {
             const char * off = getenv("LLAMA_SPD_SIDECAR_NO_REUSE");
             if (off != nullptr && atoi(off) != 0) {
-                reuse = false;
+                // Leave the context exactly as LLAMA_GRAPH_REUSE_DISABLE left
+                // it. llama_set_graph_reuse(ctx, false) would NOT do this: it
+                // clears graph_reuse_disable only, and graph_reuse_allowed()
+                // still lets single-token decode graphs reuse unless
+                // graph_reuse_disable_all is set, which only the env sets.
+                return;
             }
         }
-        llama_set_graph_reuse(ctx, reuse);
+        llama_set_graph_reuse(ctx, true);
         if (stable_inputs) {
             llama_set_stable_host_inputs(ctx, true);
         }
