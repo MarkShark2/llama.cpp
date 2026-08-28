@@ -320,6 +320,7 @@ struct common_spd_pipeline::impl {
     bool head_backend_sampling = false;
     bool sidecar_backend_sampling = false;
     bool sidecar_host_fallback_warned = false;
+    uint64_t sidecar_host_fallback_count = 0;
 
     // --ignore-eos. Every other decode path implements this as a logit bias, so
     // an EOG token is never *selected* and the caller's own end-of-generation
@@ -897,7 +898,17 @@ struct common_spd_pipeline::impl {
         if (!static_decode_fast_path || ctx == nullptr) {
             return;
         }
-        llama_set_graph_reuse(ctx, true);
+        // Diagnostic escape hatch: the sidecar is the only context whose batch
+        // shape changes every step, so it is the one that exercises graph reuse
+        // hardest. LLAMA_SPD_SIDECAR_NO_REUSE=1 takes it out of reuse alone.
+        bool reuse = true;
+        if (ctx == sidecar) {
+            const char * off = getenv("LLAMA_SPD_SIDECAR_NO_REUSE");
+            if (off != nullptr && atoi(off) != 0) {
+                reuse = false;
+            }
+        }
+        llama_set_graph_reuse(ctx, reuse);
         if (stable_inputs) {
             llama_set_stable_host_inputs(ctx, true);
         }
@@ -1782,6 +1793,7 @@ struct common_spd_pipeline::impl {
                 // whole generation, and a wrong draft would only cost a
                 // rejected speculation -- but this path is not even wrong, it
                 // is the same token by a slower route.
+                ++sidecar_host_fallback_count;
                 if (!sidecar_host_fallback_warned) {
                     sidecar_host_fallback_warned = true;
                     fprintf(stderr, "SPD sidecar: backend sampler produced no token for a %zu-row batch; "
@@ -3162,6 +3174,10 @@ struct common_spd_pipeline::impl {
                     timing.embed, timing.embed_calls,
                     timing.rollback, result.n_rejected,
                     other);
+            if (sidecar_host_fallback_count > 0) {
+                fprintf(stderr, "SPD timing: sidecar host-argmax fallbacks %" PRIu64 "\n",
+                        sidecar_host_fallback_count);
+            }
             fprintf(stderr, "SPD timing: sidecar_run %.2fs/%" PRIu64 " calls (%.1f ms/call)\n",
                     timing.sidecar_run, timing.sidecar_calls,
                     timing.sidecar_calls > 0 ? 1e3*timing.sidecar_run/(double) timing.sidecar_calls : 0.0);
