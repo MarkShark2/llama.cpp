@@ -1170,6 +1170,13 @@ struct common_spd_pipeline::impl {
             // state to full snapshot planes.
             cp.n_rs_seq = light_rollback ? rollback_tokens : 0;
             cp.embeddings = true;
+            {
+                const char * ns = getenv("LLAMA_SPD_NANCHECK_STAGE");
+                if (ns != nullptr && (uint32_t) atoi(ns) == stage) {
+                    cp.cb_eval           = spd_nan_eval_cb;
+                    cp.cb_eval_user_data = nullptr;
+                }
+            }
             stages[stage] = llama_init_from_model(model_target, cp);
             if (stages[stage] == nullptr) {
                 fail("failed to initialize target SPD stage " + std::to_string(stage));
