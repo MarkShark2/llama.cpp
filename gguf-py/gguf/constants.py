@@ -167,6 +167,7 @@ class Keys:
         SELECTOR_RANK                     = "{arch}.selector_rank"
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
+        HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         SPD_CHECKPOINT_VERSION            = "{arch}.checkpoint_version"
         SPD_STAGE_COUNT                   = "{arch}.stage_count"

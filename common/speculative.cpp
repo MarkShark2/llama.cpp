@@ -942,6 +942,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
 
+    // block-internal attention
+    bool causal_attn = false;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
     int32_t         n_layer_tgt        = 0;       // extract id == n_layer_tgt -> "after the last layer"
@@ -981,11 +984,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
             }
+            if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
+                causal_attn = std::strcmp(buf, "true") == 0;
+            }
         }
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+
+        if (is_dspark && this->params.p_min > 0.0f) {
+            char buf[16] = {};
+            const bool has_conf =
+                llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
+                std::strcmp(buf, "true") == 0;
+            if (!has_conf) {
+                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+            }
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f\n", __func__,
@@ -1073,8 +1089,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // generic DFlash drafts use non-causal block attention; Laguna drafters
         // are trained with a causal noise block. DFlash2 is never "laguna", so
-        // it keeps upstream's non-causal default.
-        bool causal = false;
+        // it keeps upstream's non-causal default. Upstream reads the same
+        // decision from `dflash.attention.causal`; the Laguna GGUFs carry the
+        // fork's `dflash.decoder_arch` key instead, so honor either.
+        bool causal = causal_attn;
         {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
