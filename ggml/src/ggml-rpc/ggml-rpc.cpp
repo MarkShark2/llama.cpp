@@ -31,6 +31,8 @@
 #ifndef _WIN32
 #  include <fcntl.h>
 #  include <unistd.h>
+#else
+#  include <process.h>
 #endif
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -3371,6 +3373,10 @@ public:
     // allow_cache=false for lane traffic (activations): skips the pending
     // SET_TENSOR_HASH bookkeeping, which belongs to the main thread only
     bool set_tensor(const std::vector<uint8_t> & input, bool allow_cache = true);
+    // streaming form of set_tensor for the main command socket: the length
+    // prefix is already consumed, the body is still on the wire. Bounds host
+    // RAM to one chunk instead of the whole upload.
+    bool set_tensor_stream(socket_ptr sock, uint64_t msg_size, bool allow_cache = true);
     bool set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache = true);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
@@ -3413,6 +3419,9 @@ private:
     // main command thread runs SET_TENSOR_HASH (lane traffic takes set_tensor
     // with allow_cache=false), so this needs no locking.
     std::vector<uint8_t> cache_read_buf;
+    // staging for the streaming SET_TENSOR receive. Main command thread only,
+    // same as cache_read_buf, so it needs no locking.
+    std::vector<uint8_t> set_recv_buf;
     size_t cache_limit;
     // set on a SET_TENSOR_HASH cache miss; the client's follow-up SET_TENSOR
     // for the same tensor region is the only upload that gets cached. Clients
@@ -3798,60 +3807,291 @@ static size_t rpc_cache_chunk_bytes() {
     return bytes;
 }
 
-// Write a cache entry in bounded chunks, dropping each chunk from the page cache
-// as it lands. The read side has streamed since these UMA boards first hit their
-// memory guard; the write side never did, and one ofs.write() of a whole entry is
-// worse than an unchunked read: the payload is ALREADY resident in the SET_TENSOR
-// input buffer, so the dirty pages the write creates are a SECOND full copy of it.
-// On a BC-250 holding a ~12.9 GiB shard that doubled the largest expert tensor
-// (1.2 GiB) and drove MemAvailable to 62 MiB, under the 64 MiB guard floor, so the
-// daemon was killed mid-load. fdatasync + FADV_DONTNEED per chunk bounds the
-// extra to one chunk. GGML_RPC_CACHE_CHUNK_MIB=0 restores the old behaviour.
-static bool rpc_cache_write_file(const fs::path & path, const void * data, size_t size) {
-    const size_t chunk = rpc_cache_chunk_bytes();
-    const size_t step  = chunk == 0 ? size : chunk;
+// How much of an incoming SET_TENSOR body is held in host RAM at once while it
+// is streamed into the device buffer. The old path received the whole message
+// into one vector before touching the tensor, so a 1.2 GiB expert tensor needed
+// 1.2 GiB of host RAM on top of the ~12.9 GiB shard a BC-250 was already
+// holding -- that, not the cache write, is what put the board under its 64 MiB
+// memory-guard floor and got the daemon killed mid-load. Peak is now one chunk.
+// GGML_RPC_SET_CHUNK_MIB=0 restores the old receive-it-all behaviour.
+static size_t rpc_set_chunk_bytes() {
+    static const size_t bytes = []() -> size_t {
+        const char * e = getenv("GGML_RPC_SET_CHUNK_MIB");
+        if (e == nullptr) {
+            return 32u*1024*1024;
+        }
+        const long mib = strtol(e, nullptr, 10);
+        return mib > 0 ? (size_t) mib*1024*1024 : 0;
+    }();
+    return bytes;
+}
+
+// Writes one cache entry in bounded chunks, dropping each chunk from the page
+// cache as it lands, and only publishes it under its hash name once the whole
+// payload is down.
+//
+// Two problems this solves. First, an unchunked write is worse than an
+// unchunked read: the payload is already resident somewhere, so the dirty pages
+// the write creates are a SECOND full copy of it. On a BC-250 holding a
+// ~12.9 GiB shard that doubled the largest expert tensor (1.2 GiB) and drove
+// MemAvailable to 62 MiB, under the guard floor. fdatasync + FADV_DONTNEED per
+// chunk bounds the extra to one chunk. Second, writing straight to the hash
+// name means a daemon killed mid-write leaves a SHORT file under a valid hash,
+// and open_cached_file trusts whatever length it finds -- silent weight
+// corruption on the next load. Writing to `<hash>.tmp.<pid>` and renaming only
+// on success makes a cache entry either whole or absent.
+// GGML_RPC_CACHE_CHUNK_MIB=0 restores the old unchunked write.
+class rpc_cache_writer {
+public:
+    rpc_cache_writer() = default;
+    ~rpc_cache_writer() { abort(); }
+
+    rpc_cache_writer(const rpc_cache_writer &)             = delete;
+    rpc_cache_writer & operator=(const rpc_cache_writer &) = delete;
+
+    bool active() const { return opened; }
+
+    bool open(const char * cache_dir, uint64_t hash) {
+        char hash_str[17];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+        final_path = fs::path(cache_dir) / hash_str;
+        tmp_path   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp." + std::to_string(rpc_cache_pid()));
 #ifndef _WIN32
-    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
+        fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        opened = fd >= 0;
+#else
+        ofs.open(tmp_path, std::ios::binary | std::ios::trunc);
+        opened = (bool) ofs;
+#endif
+        written = 0;
+        return opened;
+    }
+
+    bool write(const void * data, size_t size) {
+        if (!opened) {
+            return false;
+        }
+        const size_t chunk = rpc_cache_chunk_bytes();
+        const size_t step  = chunk == 0 ? size : chunk;
+        for (size_t done = 0; done < size; ) {
+            const size_t n = std::min(step, size - done);
+#ifndef _WIN32
+            size_t w = 0;
+            while (w < n) {
+                const ssize_t r = ::write(fd, (const char *) data + done + w, n - w);
+                if (r <= 0) {
+                    return false;
+                }
+                w += (size_t) r;
+            }
+            if (chunk != 0) {
+                // land this chunk and drop it, so writeback cannot accumulate
+                fdatasync(fd);
+                posix_fadvise(fd, (off_t) (written + done), (off_t) n, POSIX_FADV_DONTNEED);
+            }
+#else
+            ofs.write((const char *) data + done, (std::streamsize) n);
+            ofs.flush();
+            if (!ofs) {
+                return false;
+            }
+#endif
+            done += n;
+        }
+        written += size;
+        return true;
+    }
+
+    // publish the entry under its hash name; the entry is visible only now
+    bool commit() {
+        if (!opened) {
+            return false;
+        }
+        close_handle();
+        opened = false;
+        std::error_code ec;
+        fs::rename(tmp_path, final_path, ec);
+        if (ec) {
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        return true;
+    }
+
+    void abort() {
+        if (!opened) {
+            return;
+        }
+        close_handle();
+        opened = false;
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+    }
+
+    size_t bytes_written() const { return written; }
+
+private:
+    static long rpc_cache_pid() {
+#ifndef _WIN32
+        return (long) getpid();
+#else
+        return (long) _getpid();
+#endif
+    }
+
+    void close_handle() {
+#ifndef _WIN32
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+#else
+        ofs.close();
+#endif
+    }
+
+    fs::path final_path;
+    fs::path tmp_path;
+    bool     opened  = false;
+    size_t   written = 0;
+#ifndef _WIN32
+    int fd = -1;
+#else
+    std::ofstream ofs;
+#endif
+};
+
+static bool rpc_cache_write_file(const fs::path & path, const void * data, size_t size) {
+    // path is <cache_dir>/<hash>; recover the pieces the writer wants
+    rpc_cache_writer writer;
+    const std::string hash_str = path.filename().string();
+    uint64_t hash = 0;
+    if (sscanf(hash_str.c_str(), "%016" SCNx64, &hash) != 1) {
         return false;
     }
-    bool ok = true;
-    for (size_t done = 0; done < size && ok; ) {
-        const size_t n = std::min(step, size - done);
-        size_t w = 0;
-        while (w < n) {
-            const ssize_t r = write(fd, (const char *) data + done + w, n - w);
-            if (r <= 0) {
-                ok = false;
-                break;
-            }
-            w += (size_t) r;
+    if (!writer.open(path.parent_path().string().c_str(), hash)) {
+        return false;
+    }
+    if (!writer.write(data, size)) {
+        writer.abort();
+        return false;
+    }
+    return writer.commit();
+}
+
+// Streaming SET_TENSOR: pull the body off the socket a chunk at a time and push
+// each chunk straight into the device buffer, instead of materialising the whole
+// upload in host RAM and then copying it. Same wire format as set_tensor() -- the
+// caller has already consumed the u64 length prefix and passes it as msg_size.
+//
+// This is what makes a full-model offload fit on a 16 GiB UMA board: llama.cpp
+// hands weights over in tensor-sized SET_TENSORs, GLM-5.3-Flash's largest expert
+// tensor is 1.2 GiB, and the receive buffer landed on top of the board's ~12.9 GiB
+// shard. Peak host RAM here is one chunk (32 MiB) regardless of tensor size.
+bool rpc_server::set_tensor_stream(socket_ptr sock, uint64_t msg_size, bool allow_cache) {
+    if (msg_size < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+        return false;
+    }
+    const size_t size  = (size_t) (msg_size - sizeof(rpc_tensor) - sizeof(uint64_t));
+    const size_t chunk = rpc_set_chunk_bytes();
+    if (chunk == 0 || size <= chunk) {
+        // small enough to keep the single-buffer path: one recv, one tensor_set
+        std::vector<uint8_t> input;
+        try {
+            input.resize((size_t) msg_size);
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_ERROR("[%s] failed to allocate input buffer of size %" PRIu64 "\n", __func__, msg_size);
+            return false;
         }
-        if (ok && chunk != 0) {
-            // land this chunk and drop it, so writeback cannot accumulate
-            fdatasync(fd);
-            posix_fadvise(fd, (off_t) done, (off_t) n, POSIX_FADV_DONTNEED);
+        if (!sock->recv_data(input.data(), input.size())) {
+            return false;
+        }
+        return set_tensor(input, allow_cache);
+    }
+
+    rpc_tensor in_tensor;
+    uint64_t   offset;
+    if (!sock->recv_data(&in_tensor, sizeof(in_tensor))) {
+        return false;
+    }
+    if (!sock->recv_data(&offset, sizeof(offset))) {
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu (streamed)\n",
+            __func__, (void*)tensor->buffer, tensor->data, offset, size);
+
+    // sanitize tensor->data
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (in_tensor.data + offset < p0 || in_tensor.data + offset >= p1 || size > (p1 - in_tensor.data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor.data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
+    // only cache uploads the client offered a hash for first (see cache_pending)
+    const bool cache_this = allow_cache && cache_pending
+        && memcmp(&cache_pending_tensor, &in_tensor, sizeof(rpc_tensor)) == 0
+        && cache_pending_offset == offset;
+    const uint64_t hash = cache_pending_hash;
+    if (allow_cache) {
+        cache_pending = false;
+    }
+
+    rpc_cache_writer writer;
+    if (cache_dir && cache_this && size > HASH_THRESHOLD) {
+        if (!writer.open(cache_dir, hash)) {
+            GGML_LOG_ERROR("[%s] could not open a cache entry for 0x%" PRIx64 "\n", __func__, hash);
+        }
+    }
+
+    set_recv_buf.resize(chunk);
+    for (size_t done = 0; done < size; ) {
+        const size_t n = std::min(chunk, size - done);
+        if (!sock->recv_data(set_recv_buf.data(), n)) {
+            GGML_LOG_ERROR("[%s] short receive at %zu/%zu\n", __func__, done, size);
+            writer.abort();
+            return false;
+        }
+        ggml_backend_tensor_set(tensor, set_recv_buf.data(), offset + done, n);
+        if (writer.active() && !writer.write(set_recv_buf.data(), n)) {
+            // a failed cache write must never abort the load: drop the partial
+            // entry and keep streaming into the tensor
+            GGML_LOG_ERROR("[%s] failed writing cache entry 0x%" PRIx64 " at %zu/%zu\n", __func__, hash, done, size);
+            writer.abort();
         }
         done += n;
     }
-    close(fd);
-#else
-    std::ofstream ofs(path, std::ios::binary);
-    bool ok = (bool) ofs;
-    for (size_t done = 0; done < size && ok; ) {
-        const size_t n = std::min(step, size - done);
-        ofs.write((const char *) data + done, (std::streamsize) n);
-        ofs.flush();
-        ok = (bool) ofs;
-        done += n;
+
+    if (writer.active()) {
+        if (writer.commit()) {
+            char hash_str[17];
+            snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, hash_str);
+            rpc_cache_enforce_limit(cache_dir, cache_limit);
+            cache_upload_bytes += size;
+        } else {
+            GGML_LOG_ERROR("[%s] failed to publish cache entry 0x%" PRIx64 "\n", __func__, hash);
+        }
     }
-    ofs.close();
-#endif
-    if (!ok) {
-        std::error_code ec;
-        fs::remove(path, ec);
-    }
-    return ok;
+    return true;
 }
 
 bool rpc_server::set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache) {
@@ -5275,11 +5515,13 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                // streamed, not recv_msg'd: weight uploads are tensor-sized and
+                // must not be materialised in host RAM on a 16 GiB UMA board
+                uint64_t msg_size;
+                if (!sock->recv_data(&msg_size, sizeof(msg_size))) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
+                if (!server.set_tensor_stream(sock, msg_size)) {
                     return;
                 }
                 break;
