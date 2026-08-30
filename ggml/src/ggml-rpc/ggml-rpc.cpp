@@ -28,6 +28,10 @@
 #include <ctime>
 #include <cstdarg>
 #include <cstdlib>
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -36,6 +40,9 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 
 namespace fs = std::filesystem;
+
+// defined next to the cache chunk size, used by set_tensor further up
+static bool rpc_cache_write_file(const fs::path & path, const void * data, size_t size);
 
 // macro for nicer error messages on server crash
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
@@ -3730,11 +3737,13 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input, bool allow_cache
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, cache_pending_hash);
         // save to cache_dir/hash_str
         fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
-        rpc_cache_enforce_limit(cache_dir, cache_limit);
-        cache_upload_bytes += size;
+        if (rpc_cache_write_file(cache_file, data, size)) {
+            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+            rpc_cache_enforce_limit(cache_dir, cache_limit);
+            cache_upload_bytes += size;
+        } else {
+            GGML_LOG_ERROR("[%s] failed to write cache entry '%s'\n", __func__, cache_file.string().c_str());
+        }
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -3787,6 +3796,62 @@ static size_t rpc_cache_chunk_bytes() {
         return mib > 0 ? (size_t) mib*1024*1024 : 0;
     }();
     return bytes;
+}
+
+// Write a cache entry in bounded chunks, dropping each chunk from the page cache
+// as it lands. The read side has streamed since these UMA boards first hit their
+// memory guard; the write side never did, and one ofs.write() of a whole entry is
+// worse than an unchunked read: the payload is ALREADY resident in the SET_TENSOR
+// input buffer, so the dirty pages the write creates are a SECOND full copy of it.
+// On a BC-250 holding a ~12.9 GiB shard that doubled the largest expert tensor
+// (1.2 GiB) and drove MemAvailable to 62 MiB, under the 64 MiB guard floor, so the
+// daemon was killed mid-load. fdatasync + FADV_DONTNEED per chunk bounds the
+// extra to one chunk. GGML_RPC_CACHE_CHUNK_MIB=0 restores the old behaviour.
+static bool rpc_cache_write_file(const fs::path & path, const void * data, size_t size) {
+    const size_t chunk = rpc_cache_chunk_bytes();
+    const size_t step  = chunk == 0 ? size : chunk;
+#ifndef _WIN32
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = true;
+    for (size_t done = 0; done < size && ok; ) {
+        const size_t n = std::min(step, size - done);
+        size_t w = 0;
+        while (w < n) {
+            const ssize_t r = write(fd, (const char *) data + done + w, n - w);
+            if (r <= 0) {
+                ok = false;
+                break;
+            }
+            w += (size_t) r;
+        }
+        if (ok && chunk != 0) {
+            // land this chunk and drop it, so writeback cannot accumulate
+            fdatasync(fd);
+            posix_fadvise(fd, (off_t) done, (off_t) n, POSIX_FADV_DONTNEED);
+        }
+        done += n;
+    }
+    close(fd);
+#else
+    std::ofstream ofs(path, std::ios::binary);
+    bool ok = (bool) ofs;
+    for (size_t done = 0; done < size && ok; ) {
+        const size_t n = std::min(step, size - done);
+        ofs.write((const char *) data + done, (std::streamsize) n);
+        ofs.flush();
+        ok = (bool) ofs;
+        done += n;
+    }
+    ofs.close();
+#endif
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
+    return ok;
 }
 
 bool rpc_server::set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache) {
