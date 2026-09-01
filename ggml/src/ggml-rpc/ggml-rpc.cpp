@@ -3496,6 +3496,19 @@ GGML_BACKEND_API int ggml_backend_rpc_reattach(int timeout_ms) {
             }
             GGML_LOG_INFO("[rpc hibernate] %s: resumed %llu buffers\n",
                           endpoint.c_str(), (unsigned long long) rsp.n_buffers);
+            // SESSION_RESUME is a main-connection command, and the server
+            // bumps its ordering counter for every one of those. The client's
+            // mirror (main_enq, zeroed by rpc_lanes_teardown) therefore has to
+            // count it too. Miss it and the server's count stays one ahead
+            // forever: every later lane fence names a target it has already
+            // passed, so full-duplex SET/GET traffic is released one main
+            // command early and lands out of order. Nothing errors - the
+            // model just computes on tensors that arrived too soon.
+            {
+                rpc_ep_lanes * ep = get_ep_lanes(endpoint);
+                std::lock_guard<std::mutex> el(ep->m);
+                ep->main_enq++;
+            }
             done.push_back(endpoint);
             resumed++;
         }
