@@ -155,6 +155,13 @@ struct server_routes {
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 
+    // [fork] fleet hibernation: free the RPC-resident weights, park the
+    // sessions so the hosts can suspend, and bring both back
+    server_http_context::handler_t get_rpc_status;
+    server_http_context::handler_t post_rpc_unload;
+    server_http_context::handler_t post_rpc_detach;
+    server_http_context::handler_t post_rpc_resume;
+
     // to be used in router mode
     json get_model_info() const;
 

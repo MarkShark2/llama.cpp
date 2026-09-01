@@ -90,6 +90,12 @@ struct server_grammar_trigger {
     }
 };
 
+// [fork] the server cannot serve right now but may later - thrown when a
+// request waited out the fleet-hibernation hold. ex_wrapper turns it into 503.
+struct server_unavailable : std::runtime_error {
+    explicit server_unavailable(const std::string & msg) : std::runtime_error(msg) {}
+};
+
 json format_error_response(const std::string & message, const enum error_type type);
 
 //

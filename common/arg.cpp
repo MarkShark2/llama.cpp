@@ -3918,6 +3918,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--rpc-hibernate-hold"}, "SECONDS",
+        string_format("[fork] how long a request waits while the RPC fleet is hibernated before it is "
+                      "answered 503 (default: %d; 0 = wait forever)", params.rpc_hibernate_hold_seconds),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.rpc_hibernate_hold_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--rpc-hibernate-wake"}, "SECONDS",
+        string_format("[fork] how long POST /rpc/resume polls for the RPC hosts to come back "
+                      "(default: %d)", params.rpc_hibernate_wake_seconds),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value: must be positive");
+            }
+            params.rpc_hibernate_wake_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

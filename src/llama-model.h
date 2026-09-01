@@ -758,6 +758,18 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // [fork] fleet hibernation. Free just the weight buffers that live on RPC
+    // endpoints, so those hosts can suspend to disk, and put them back from
+    // each server's own tensor cache. Everything else - the KV cache, the
+    // compute buffers, local weights - is untouched, which is what keeps the
+    // wake cheap. Requires --rpc-cache. See vault/Fork/RPC Hibernation.md.
+    void    rpc_capture_weight_state(llama_model_loader & ml);
+    int32_t rpc_weights_unload();
+    int32_t rpc_weights_reload();
+    bool    rpc_weights_unloaded() const;
+    size_t  rpc_weights_size() const;
+    size_t  rpc_weights_buffers() const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

@@ -129,6 +129,48 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API void llama_set_graph_reuse(struct llama_context * ctx, bool value);
 LLAMA_API void llama_set_stable_host_inputs(struct llama_context * ctx, bool value);
 
+// [fork] Fleet hibernation.
+//
+// The three steps a host suspend needs, in order:
+//
+//   1. llama_model_rpc_weights_unload  - free the model weight buffers that
+//      live on RPC endpoints, so those hosts have RAM free to stage a
+//      suspend image. Everything else (KV cache, compute buffers, local
+//      weights) stays allocated. Requires --rpc-cache: the reload reads the
+//      weights back from each server's own tensor cache, not off the wire.
+//   2. llama_rpc_detach - park every session on its server and close the
+//      connections, so the hosts can go down without the servers tearing
+//      their buffers up. The KV cache survives on the far side.
+//   3. llama_rpc_reattach + llama_model_rpc_weights_reload - dial the hosts
+//      again (polling until they answer), re-adopt the parked sessions, and
+//      refill the weight buffers.
+//
+// All of these must be called with no decode in flight.
+//
+// unload/reload return 0 on success and a negative error code otherwise.
+// detach returns the number of endpoints parked, or a negative count if any
+// session was lost. reattach returns the number resumed, or a negative count
+// of unresolved endpoints; llama_rpc_session_lost distinguishes permanent
+// loss from hosts that are still unreachable.
+LLAMA_API int32_t llama_model_rpc_weights_unload   (struct llama_model * model);
+LLAMA_API int32_t llama_model_rpc_weights_reload   (struct llama_model * model);
+LLAMA_API bool    llama_model_rpc_weights_unloaded (const struct llama_model * model);
+LLAMA_API size_t  llama_model_rpc_weights_size     (const struct llama_model * model);
+LLAMA_API int32_t llama_model_rpc_weight_buffers   (const struct llama_model * model);
+
+LLAMA_API int32_t llama_rpc_detach      (void);
+LLAMA_API int32_t llama_rpc_reattach    (int32_t timeout_ms);
+LLAMA_API bool    llama_rpc_is_detached (void);
+LLAMA_API bool    llama_rpc_session_lost(void);
+// fills out_names/out_connected with up to max entries, returns the total
+LLAMA_API int32_t llama_rpc_endpoints  (const char ** out_names, int32_t * out_connected, int32_t max);
+
+// Drop every cached graph and scheduler split. Must be called after the
+// model's weight buffers have moved (the two calls above): a reused graph
+// still carries the old device pointers, and the RPC server's graph cache is
+// keyed on exactly those pointers.
+LLAMA_API void llama_graphs_invalidate(struct llama_context * ctx);
+
 // [fork, SPD peer boundaries] the last graph's raw (un-narrowed) embd input
 // tensor and embd output tensor -- the device-resident endpoints of a stage
 // boundary. Valid until the context builds a different graph; callers must

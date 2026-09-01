@@ -61,6 +61,10 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             // treat invalid_argument as invalid request (400)
             error = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
+        } catch (const server_unavailable & e) {
+            // the RPC fleet is hibernated (503, retryable)
+            error = ERROR_TYPE_UNAVAILABLE;
+            message = e.what();
         } catch (const std::exception & e) {
             // treat other exceptions as server error (500)
             error = ERROR_TYPE_SERVER;
@@ -282,6 +286,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     // Save & load slots
+    // [fork] fleet hibernation, driven by horde
+    ctx_http.get ("/rpc/status",               ex_wrapper(routes.get_rpc_status));
+    ctx_http.post("/rpc/unload",               ex_wrapper(routes.post_rpc_unload));
+    ctx_http.post("/rpc/detach",               ex_wrapper(routes.post_rpc_detach));
+    ctx_http.post("/rpc/resume",               ex_wrapper(routes.post_rpc_resume));
+
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 

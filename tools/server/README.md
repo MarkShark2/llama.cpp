@@ -934,6 +934,27 @@ To use this endpoint with POST method, you need to start server with `--props`
 
 - None yet
 
+### `/rpc/*`: fleet hibernation (fork)
+
+Lets an orchestrator suspend the RPC hosts to disk without the model being
+reloaded, and without the hosts losing their KV cache. Requires `--rpc-cache`.
+
+- `POST /rpc/unload` — free the model weight buffers that live on RPC
+  endpoints. Everything else (KV cache, compute buffers, local weights) stays.
+  Refused with 503 while any slot is processing. From here arriving requests
+  are **held**, not failed.
+- `POST /rpc/detach` — park each server's session (its buffers survive the
+  disconnect) and close every RPC connection, so the hosts can suspend.
+- `POST /rpc/resume` — dial the hosts again, polling for up to
+  `--rpc-hibernate-wake` seconds, re-adopt the parked sessions, refill the
+  weights, and release the hold.
+- `GET /rpc/status` — state, per-endpoint connectivity, weight byte counts,
+  busy slot count and the last failure. Never blocks and never wakes anything.
+
+Nothing auto-wakes: a request does not trigger a resume, because the hosts may
+still be on their way down when it arrives. Held requests give up after
+`--rpc-hibernate-hold` seconds (default 900) with a 503.
+
 ### POST `/embeddings`: non-OpenAI-compatible embeddings API
 
 This endpoint supports all poolings, including `--pooling none`. When the pooling is `none`, the responses will contain the *unnormalized* embeddings for *all* input tokens. For all other pooling types, only the pooled embeddings are returned, normalized using Euclidean norm.

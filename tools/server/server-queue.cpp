@@ -112,21 +112,34 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
-void server_queue::wait_until_no_sleep() {
+bool server_queue::wait_until_no_sleep(int64_t timeout_ms) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    if (!sleeping) {
-        return;
-    } else {
-        if (!req_stop_sleeping) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (sleeping || hold) {
+        if (!hold && !req_stop_sleeping) {
             QUE_DBG("%s", "requesting to stop sleeping\n");
             req_stop_sleeping = true;
             condition_tasks.notify_one(); // only main thread is waiting on this
         }
-        QUE_DBG("%s", "waiting until no sleep\n");
-        condition_tasks.wait(lock, [&]{
-            return !sleeping;
-        });
+        QUE_DBG("%s", "waiting until the server can serve\n");
+        if (timeout_ms > 0) {
+            if (!condition_tasks.wait_until(lock, deadline, [&]{ return !sleeping && !hold; })) {
+                return false;
+            }
+        } else {
+            condition_tasks.wait(lock, [&]{ return !sleeping && !hold; });
+        }
     }
+    return true;
+}
+
+void server_queue::set_hold(bool value) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    hold = value;
+    // held requests are released here, and the loop's idle timer is reset so a
+    // long hibernation does not put the server straight into an idle sleep
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_all();
 }
 
 void server_queue::terminate() {
@@ -289,6 +302,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
+        if (hold) {
+            // [fork] the RPC fleet is hibernated. The idle-sleep path frees the
+            // llama_context and reloads it on wake, which is exactly what this
+            // whole feature exists to avoid - and it would reload over a fabric
+            // that is not there.
+            return false;
+        }
         if (idle_sleep_ms < 0) {
             return false;
         }

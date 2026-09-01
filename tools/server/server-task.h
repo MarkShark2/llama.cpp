@@ -27,6 +27,17 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_RPC_CONTROL,   // [fork] fleet hibernation
+};
+
+// [fork] what a SERVER_TASK_TYPE_RPC_CONTROL task should do. These run on the
+// main loop thread, which is the only place it is safe to move the model's
+// buffers around or close the fabric out from under a graph.
+enum server_rpc_action {
+    SERVER_RPC_ACTION_STATUS,
+    SERVER_RPC_ACTION_UNLOAD,   // free the RPC-resident model weights
+    SERVER_RPC_ACTION_DETACH,   // park the sessions and close the connections
+    SERVER_RPC_ACTION_RESUME,   // reconnect, refill the weights, serve again
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -176,6 +187,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
+
+    // used by SERVER_TASK_TYPE_RPC_CONTROL
+    server_rpc_action rpc_action = SERVER_RPC_ACTION_STATUS;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -550,6 +564,15 @@ struct server_task_result_control : server_task_result {
             out["message"] = message;
         }
         return out;
+    }
+};
+
+// [fork] fleet hibernation: the body is the /rpc/status object
+struct server_task_result_rpc : server_task_result {
+    json body;
+
+    virtual json to_json() override {
+        return body;
     }
 };
 

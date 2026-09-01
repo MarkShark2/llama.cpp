@@ -41,19 +41,6 @@ struct rpc_manifest {
     bool dirty = false;
 };
 
-struct rpc_cache_api {
-    using enabled_fn_t   = bool   (*)(void);
-    using threshold_fn_t = size_t (*)(void);
-    using query_fn_t      = int    (*)(ggml_backend_buffer_t, ggml_tensor *, size_t, size_t, uint64_t);
-    using upload_fn_t     = bool   (*)(ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t);
-    using endpoint_fn_t   = const char * (*)(ggml_backend_buffer_t);
-
-    query_fn_t    query    = nullptr;
-    upload_fn_t   upload   = nullptr;
-    endpoint_fn_t endpoint = nullptr;
-    size_t threshold = 0;
-};
-
 struct rpc_preload_result {
     std::string device;
     std::vector<const ggml_tensor *> tensors;
@@ -155,7 +142,7 @@ static bool rpc_manifest_save(const rpc_manifest & manifest) {
     return !ec;
 }
 
-static bool rpc_cache_api_for_buffer(ggml_backend_buffer_t buffer, rpc_cache_api & api) {
+static bool rpc_cache_api_for_buffer(ggml_backend_buffer_t buffer, llama_rpc_cache_api & api) {
     if (buffer == nullptr) {
         return false;
     }
@@ -169,11 +156,11 @@ static bool rpc_cache_api_for_buffer(ggml_backend_buffer_t buffer, rpc_cache_api
         return false;
     }
 
-    auto enabled = (rpc_cache_api::enabled_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_get_client_cache");
-    auto threshold = (rpc_cache_api::threshold_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_cache_threshold");
-    api.query = (rpc_cache_api::query_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_cache_query");
-    api.upload = (rpc_cache_api::upload_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_cache_upload");
-    api.endpoint = (rpc_cache_api::endpoint_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_endpoint");
+    auto enabled = (bool (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_get_client_cache");
+    auto threshold = (size_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_cache_threshold");
+    api.query = (llama_rpc_cache_api::query_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_cache_query");
+    api.upload = (llama_rpc_cache_api::upload_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_cache_upload");
+    api.endpoint = (llama_rpc_cache_api::endpoint_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_endpoint");
     if (enabled == nullptr || threshold == nullptr || api.query == nullptr || api.upload == nullptr || api.endpoint == nullptr || !enabled()) {
         return false;
     }
@@ -1902,6 +1889,260 @@ bool llama_model_loader::load_all_data(
     return true;
 }
 
+// Group weight contexts by the RPC endpoint their buffers live on. Contexts
+// whose buffers are not RPC-backed (or whose server has no usable tensor
+// cache) are left out, and reported through `matched` so the caller can load
+// them the ordinary way.
+std::vector<llama_rpc_job> llama_rpc_jobs_for(
+        const std::vector<ggml_context *> & contexts,
+        std::unordered_set<ggml_context *> * matched) {
+    std::vector<llama_rpc_job> jobs;
+    std::unordered_map<std::string, size_t> jobs_by_endpoint;
+
+    for (ggml_context * ctx : contexts) {
+        llama_rpc_cache_api api;
+        ggml_backend_dev_t device = nullptr;
+        std::string endpoint;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+            if (!rpc_cache_api_for_buffer(cur->buffer, api)) {
+                continue;
+            }
+            device   = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            endpoint = api.endpoint(cur->buffer);
+            break;
+        }
+        if (device == nullptr || endpoint.empty()) {
+            continue;
+        }
+        if (matched != nullptr) {
+            matched->insert(ctx);
+        }
+        auto inserted = jobs_by_endpoint.emplace(endpoint, jobs.size());
+        if (inserted.second) {
+            llama_rpc_job job;
+            job.device   = device;
+            job.endpoint = endpoint;
+            job.api      = api;
+            jobs.emplace_back(std::move(job));
+        }
+        jobs.at(inserted.first->second).contexts.push_back(ctx);
+    }
+    return jobs;
+}
+
+// Send the weights of `jobs` to their endpoints, one worker per endpoint,
+// preferring the server's own tensor cache over the wire. `concurrent_work`
+// (may be empty) runs on the calling thread while the workers do, which is how
+// the initial load overlaps local GPU loading with the fabric.
+//
+// This is the path a warm reload rides: with a manifest sidecar beside the
+// GGUF the client never reads the payload at all - it offers the recorded
+// hash, the server streams the tensor out of its own disk cache, and nothing
+// crosses the network but the query.
+bool llama_rpc_upload_weights(
+        const std::vector<llama_rpc_job> & jobs,
+        const std::vector<std::string> & file_paths,
+        const llama_rpc_source_fn & source_of,
+        bool check_tensors,
+        const std::function<bool()> & concurrent_work,
+        std::unordered_set<const ggml_tensor *> * preloaded,
+        std::string & err) {
+    if (jobs.empty()) {
+        return concurrent_work ? concurrent_work() : true;
+    }
+
+    std::vector<rpc_manifest> manifests;
+    manifests.reserve(file_paths.size());
+    for (const auto & path : file_paths) {
+        manifests.emplace_back(rpc_manifest_load(path));
+    }
+    std::vector<std::mutex> manifest_mutexes(manifests.size());
+
+    size_t n_rpc_tensors = 0;
+    size_t n_rpc_bytes   = 0;
+    for (const auto & job : jobs) {
+        for (ggml_context * ctx : job.contexts) {
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+                llama_rpc_weight_source src;
+                if (source_of(ggml_get_name(cur), src)) {
+                    n_rpc_tensors++;
+                    n_rpc_bytes += ggml_nbytes(cur);
+                }
+            }
+        }
+    }
+
+    const int64_t t_start = ggml_time_us();
+    LLAMA_LOG_INFO("%s: RPC cache preflight: %zu endpoints, %zu tensors, %.2f GiB\n",
+            __func__, jobs.size(), n_rpc_tensors, n_rpc_bytes / double(GiB));
+
+    std::vector<std::future<rpc_preload_result>> futures;
+    futures.reserve(jobs.size());
+    for (const auto & job : jobs) {
+        futures.emplace_back(std::async(std::launch::async, [&manifests, &manifest_mutexes, &file_paths, &source_of, check_tensors, job] {
+            rpc_preload_result result;
+            result.device = ggml_backend_dev_name(job.device);
+            const int64_t t_job = ggml_time_us();
+
+            llama_files worker_files;
+            worker_files.reserve(file_paths.size());
+            for (const auto & path : file_paths) {
+                worker_files.emplace_back(new llama_file(path.c_str(), "rb", false));
+            }
+
+            auto read_tensor = [&](const llama_rpc_weight_source & src, size_t size) {
+                std::unique_ptr<uint8_t[]> data(new uint8_t[size]);
+                auto & file = worker_files.at(src.idx);
+                file->seek(src.offs, SEEK_SET);
+                file->read_raw(data.get(), size);
+                return data;
+            };
+
+            for (ggml_context * ctx : job.contexts) {
+                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+                    llama_rpc_weight_source src;
+                    if (!source_of(ggml_get_name(cur), src)) {
+                        continue;
+                    }
+
+                    const size_t size = ggml_nbytes(cur);
+                    if (size <= job.api.threshold) {
+                        auto data = read_tensor(src, size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, data.get(), size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                        ggml_backend_tensor_set(cur, data.get(), 0, size);
+                        result.direct_bytes += size;
+                        result.tensors.push_back(cur);
+                        continue;
+                    }
+
+                    rpc_manifest_entry entry;
+                    bool have_manifest_hash = false;
+                    {
+                        std::lock_guard<std::mutex> lock(manifest_mutexes.at(src.idx));
+                        const auto & manifest = manifests.at(src.idx);
+                        auto found = manifest.entries.find(ggml_get_name(cur));
+                        if (found != manifest.entries.end() &&
+                                found->second.offset == src.offs && found->second.size == size) {
+                            entry = found->second;
+                            have_manifest_hash = true;
+                        }
+                    }
+
+                    std::unique_ptr<uint8_t[]> data;
+                    if (!have_manifest_hash || check_tensors) {
+                        data = read_tensor(src, size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, data.get(), size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                    }
+
+                    if (!have_manifest_hash) {
+                        entry.offset = src.offs;
+                        entry.size = size;
+                        entry.hash = rpc_tensor_hash(data.get(), size);
+                        {
+                            std::lock_guard<std::mutex> lock(manifest_mutexes.at(src.idx));
+                            auto & manifest = manifests.at(src.idx);
+                            manifest.entries[ggml_get_name(cur)] = entry;
+                            manifest.dirty = true;
+                        }
+                        result.computed_hashes++;
+                    } else {
+                        result.manifest_hashes++;
+                    }
+
+                    int cache_result = job.api.query(cur->buffer, cur, 0, size, entry.hash);
+                    if (cache_result < 0) {
+                        throw std::runtime_error(format("RPC cache query failed for tensor '%s'", ggml_get_name(cur)));
+                    }
+                    if (cache_result > 0) {
+                        result.hits++;
+                        result.hit_bytes += size;
+                        result.tensors.push_back(cur);
+                        continue;
+                    }
+
+                    result.misses++;
+                    if (!data) {
+                        data = read_tensor(src, size);
+                    }
+                    if (!job.api.upload(cur->buffer, cur, data.get(), 0, size)) {
+                        throw std::runtime_error(format("RPC cache upload failed for tensor '%s'", ggml_get_name(cur)));
+                    }
+                    result.upload_bytes += size;
+                    result.tensors.push_back(cur);
+                }
+            }
+
+            result.elapsed_us = ggml_time_us() - t_job;
+            return result;
+        }));
+    }
+
+    bool ok = concurrent_work ? concurrent_work() : true;
+
+    std::vector<rpc_preload_result> results;
+    std::string worker_error;
+    for (auto & future : futures) {
+        try {
+            results.emplace_back(future.get());
+        } catch (const std::exception & e) {
+            if (worker_error.empty()) {
+                worker_error = e.what();
+            }
+        } catch (...) {
+            if (worker_error.empty()) {
+                worker_error = "unknown error";
+            }
+        }
+    }
+
+    size_t manifest_save_failures = 0;
+    for (const auto & manifest : manifests) {
+        if (!rpc_manifest_save(manifest)) {
+            manifest_save_failures++;
+        }
+    }
+    if (manifest_save_failures > 0) {
+        LLAMA_LOG_WARN("%s: failed to save %zu RPC cache manifest(s)\n", __func__, manifest_save_failures);
+    }
+
+    size_t hits = 0;
+    size_t misses = 0;
+    size_t hit_bytes = 0;
+    size_t upload_bytes = 0;
+    size_t direct_bytes = 0;
+    size_t manifest_hashes = 0;
+    size_t computed_hashes = 0;
+    for (const auto & result : results) {
+        if (preloaded != nullptr) {
+            preloaded->insert(result.tensors.begin(), result.tensors.end());
+        }
+        hits += result.hits;
+        misses += result.misses;
+        hit_bytes += result.hit_bytes;
+        upload_bytes += result.upload_bytes;
+        direct_bytes += result.direct_bytes;
+        manifest_hashes += result.manifest_hashes;
+        computed_hashes += result.computed_hashes;
+        LLAMA_LOG_DEBUG("%s: %s: hits=%zu, misses=%zu, cached=%.2f GiB, uploaded=%.2f GiB, time=%.2f s\n",
+                __func__, result.device.c_str(), result.hits, result.misses,
+                result.hit_bytes / double(GiB), result.upload_bytes / double(GiB), result.elapsed_us / 1e6);
+    }
+
+    LLAMA_LOG_INFO("%s: RPC cache preflight complete: hits=%zu (%.2f GiB), misses=%zu (%.2f GiB), direct=%.2f GiB, hashes reused/computed=%zu/%zu, time=%.2f s\n",
+            __func__, hits, hit_bytes / double(GiB), misses, upload_bytes / double(GiB),
+            direct_bytes / double(GiB), manifest_hashes, computed_hashes, (ggml_time_us() - t_start) / 1e6);
+
+    if (!worker_error.empty()) {
+        err = worker_error;
+        return false;
+    }
+    return ok;
+}
+
 bool llama_model_loader::load_all_data_parallel(
         llama_ctx_buf_maps & ctx_buf_maps,
         llama_mlocks * lmlocks,
@@ -1927,233 +2168,54 @@ bool llama_model_loader::load_all_data_parallel(
         }
     }
 
-    struct rpc_job {
-        ggml_backend_dev_t device = nullptr;
-        std::string endpoint;
-        rpc_cache_api api;
-        std::vector<ggml_context *> contexts;
-    };
-
-    std::vector<rpc_job> jobs;
-    std::unordered_map<std::string, size_t> jobs_by_endpoint;
-    std::unordered_set<ggml_context *> rpc_contexts;
-    size_t n_rpc_tensors = 0;
-    size_t n_rpc_bytes = 0;
-
+    std::vector<ggml_context *> contexts;
+    contexts.reserve(ctx_buf_maps.size());
     for (auto & item : ctx_buf_maps) {
-        ggml_context * ctx = item.first;
-        rpc_cache_api api;
-        ggml_backend_dev_t device = nullptr;
-        std::string endpoint;
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
-            if (get_weight(ggml_get_name(cur)) == nullptr || !rpc_cache_api_for_buffer(cur->buffer, api)) {
-                continue;
-            }
-            device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
-            endpoint = api.endpoint(cur->buffer);
-            break;
-        }
-        if (device == nullptr || endpoint.empty()) {
-            continue;
-        }
-
-        rpc_contexts.insert(ctx);
-        auto inserted = jobs_by_endpoint.emplace(endpoint, jobs.size());
-        if (inserted.second) {
-            rpc_job job;
-            job.device = device;
-            job.endpoint = endpoint;
-            job.api = api;
-            jobs.emplace_back(std::move(job));
-        }
-        jobs.at(inserted.first->second).contexts.push_back(ctx);
-
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
-            if (get_weight(ggml_get_name(cur)) != nullptr) {
-                n_rpc_tensors++;
-                n_rpc_bytes += ggml_nbytes(cur);
-            }
-        }
+        contexts.push_back(item.first);
     }
 
+    std::unordered_set<ggml_context *> rpc_contexts;
+    const auto jobs = llama_rpc_jobs_for(contexts, &rpc_contexts);
     if (jobs.empty()) {
         return load_sequential();
     }
 
-    std::vector<rpc_manifest> manifests;
-    manifests.reserve(file_paths.size());
-    for (const auto & path : file_paths) {
-        manifests.emplace_back(rpc_manifest_load(path));
-    }
-    std::vector<std::mutex> manifest_mutexes(manifests.size());
-
-    const int64_t t_start = ggml_time_us();
-    LLAMA_LOG_INFO("%s: RPC cache preflight: %zu endpoints, %zu tensors, %.2f GiB\n",
-            __func__, jobs.size(), n_rpc_tensors, n_rpc_bytes / double(GiB));
-
-    std::vector<std::future<rpc_preload_result>> futures;
-    futures.reserve(jobs.size());
-    for (const auto & job : jobs) {
-        futures.emplace_back(std::async(std::launch::async, [this, &manifests, &manifest_mutexes, job] {
-            rpc_preload_result result;
-            result.device = ggml_backend_dev_name(job.device);
-            const int64_t t_job = ggml_time_us();
-
-            llama_files worker_files;
-            worker_files.reserve(file_paths.size());
-            for (const auto & path : file_paths) {
-                worker_files.emplace_back(new llama_file(path.c_str(), "rb", false));
-            }
-
-            auto read_tensor = [&](const llama_tensor_weight & weight, size_t size) {
-                std::unique_ptr<uint8_t[]> data(new uint8_t[size]);
-                auto & file = worker_files.at(weight.idx);
-                file->seek(weight.offs, SEEK_SET);
-                file->read_raw(data.get(), size);
-                return data;
-            };
-
-            for (ggml_context * ctx : job.contexts) {
-                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
-                    const auto * weight = get_weight(ggml_get_name(cur));
-                    if (weight == nullptr) {
-                        continue;
-                    }
-
-                    const size_t size = ggml_nbytes(cur);
-                    if (size <= job.api.threshold) {
-                        auto data = read_tensor(*weight, size);
-                        if (check_tensors && !ggml_validate_row_data(cur->type, data.get(), size)) {
-                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-                        }
-                        ggml_backend_tensor_set(cur, data.get(), 0, size);
-                        result.direct_bytes += size;
-                        result.tensors.push_back(cur);
-                        continue;
-                    }
-
-                    rpc_manifest_entry entry;
-                    bool have_manifest_hash = false;
-                    {
-                        std::lock_guard<std::mutex> lock(manifest_mutexes.at(weight->idx));
-                        const auto & manifest = manifests.at(weight->idx);
-                        auto found = manifest.entries.find(ggml_get_name(cur));
-                        if (found != manifest.entries.end() &&
-                                found->second.offset == weight->offs && found->second.size == size) {
-                            entry = found->second;
-                            have_manifest_hash = true;
-                        }
-                    }
-
-                    std::unique_ptr<uint8_t[]> data;
-                    if (!have_manifest_hash || check_tensors) {
-                        data = read_tensor(*weight, size);
-                        if (check_tensors && !ggml_validate_row_data(cur->type, data.get(), size)) {
-                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-                        }
-                    }
-
-                    if (!have_manifest_hash) {
-                        entry.offset = weight->offs;
-                        entry.size = size;
-                        entry.hash = rpc_tensor_hash(data.get(), size);
-                        {
-                            std::lock_guard<std::mutex> lock(manifest_mutexes.at(weight->idx));
-                            auto & manifest = manifests.at(weight->idx);
-                            manifest.entries[ggml_get_name(cur)] = entry;
-                            manifest.dirty = true;
-                        }
-                        result.computed_hashes++;
-                    } else {
-                        result.manifest_hashes++;
-                    }
-
-                    int cache_result = job.api.query(cur->buffer, cur, 0, size, entry.hash);
-                    if (cache_result < 0) {
-                        throw std::runtime_error(format("RPC cache query failed for tensor '%s'", ggml_get_name(cur)));
-                    }
-                    if (cache_result > 0) {
-                        result.hits++;
-                        result.hit_bytes += size;
-                        result.tensors.push_back(cur);
-                        continue;
-                    }
-
-                    result.misses++;
-                    if (!data) {
-                        data = read_tensor(*weight, size);
-                    }
-                    if (!job.api.upload(cur->buffer, cur, data.get(), 0, size)) {
-                        throw std::runtime_error(format("RPC cache upload failed for tensor '%s'", ggml_get_name(cur)));
-                    }
-                    result.upload_bytes += size;
-                    result.tensors.push_back(cur);
-                }
-            }
-
-            result.elapsed_us = ggml_time_us() - t_job;
-            return result;
-        }));
-    }
-
     bool load_ok = true;
-    for (auto & item : ctx_buf_maps) {
-        if (rpc_contexts.find(item.first) != rpc_contexts.end()) {
-            continue;
-        }
-        if (!load_all_data(item.first, item.second, lmlocks, progress_callback, progress_callback_user_data)) {
-            load_ok = false;
-            break;
-        }
-    }
-
-    std::vector<rpc_preload_result> results;
-    std::exception_ptr worker_error;
-    for (auto & future : futures) {
-        try {
-            results.emplace_back(future.get());
-        } catch (...) {
-            if (!worker_error) {
-                worker_error = std::current_exception();
+    // the local (CUDA/CPU) contexts load on this thread while the endpoints work
+    auto load_local = [&]() {
+        for (auto & item : ctx_buf_maps) {
+            if (rpc_contexts.find(item.first) != rpc_contexts.end()) {
+                continue;
+            }
+            if (!load_all_data(item.first, item.second, lmlocks, progress_callback, progress_callback_user_data)) {
+                return false;
             }
         }
-    }
-    if (worker_error) {
-        std::rethrow_exception(worker_error);
-    }
+        return true;
+    };
 
-    size_t manifest_save_failures = 0;
-    for (const auto & manifest : manifests) {
-        if (!rpc_manifest_save(manifest)) {
-            manifest_save_failures++;
+    auto source_of = [this](const char * name, llama_rpc_weight_source & out) {
+        const auto * weight = get_weight(name);
+        if (weight == nullptr) {
+            return false;
         }
-    }
-    if (manifest_save_failures > 0) {
-        LLAMA_LOG_WARN("%s: failed to save %zu RPC cache manifest(s)\n", __func__, manifest_save_failures);
-    }
+        out.idx  = weight->idx;
+        out.offs = weight->offs;
+        return true;
+    };
 
-    size_t hits = 0;
-    size_t misses = 0;
-    size_t hit_bytes = 0;
-    size_t upload_bytes = 0;
-    size_t direct_bytes = 0;
-    size_t manifest_hashes = 0;
-    size_t computed_hashes = 0;
-    for (const auto & result : results) {
-        rpc_preloaded.insert(result.tensors.begin(), result.tensors.end());
-        hits += result.hits;
-        misses += result.misses;
-        hit_bytes += result.hit_bytes;
-        upload_bytes += result.upload_bytes;
-        direct_bytes += result.direct_bytes;
-        manifest_hashes += result.manifest_hashes;
-        computed_hashes += result.computed_hashes;
-        LLAMA_LOG_DEBUG("%s: %s: hits=%zu, misses=%zu, cached=%.2f GiB, uploaded=%.2f GiB, time=%.2f s\n",
-                __func__, result.device.c_str(), result.hits, result.misses,
-                result.hit_bytes / double(GiB), result.upload_bytes / double(GiB), result.elapsed_us / 1e6);
+    std::string err;
+    if (!llama_rpc_upload_weights(jobs, file_paths, source_of, check_tensors,
+                                  load_local, &rpc_preloaded, err)) {
+        if (!err.empty()) {
+            throw std::runtime_error(err);
+        }
+        load_ok = false;
     }
 
     if (load_ok) {
+        // second pass over the RPC contexts: progress accounting, and anything
+        // the preflight did not cover (rpc_preloaded marks what it did)
         for (auto & item : ctx_buf_maps) {
             if (rpc_contexts.find(item.first) == rpc_contexts.end()) {
                 continue;
@@ -2165,9 +2227,6 @@ bool llama_model_loader::load_all_data_parallel(
         }
     }
 
-    LLAMA_LOG_INFO("%s: RPC cache preflight complete: hits=%zu (%.2f GiB), misses=%zu (%.2f GiB), direct=%.2f GiB, hashes reused/computed=%zu/%zu, time=%.2f s\n",
-            __func__, hits, hit_bytes / double(GiB), misses, upload_bytes / double(GiB),
-            direct_bytes / double(GiB), manifest_hashes, computed_hashes, (ggml_time_us() - t_start) / 1e6);
     return load_ok;
 }
 

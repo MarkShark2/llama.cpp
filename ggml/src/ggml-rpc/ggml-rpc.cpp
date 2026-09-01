@@ -118,6 +118,14 @@ enum rpc_cmd {
     // do the reduction in its own RAM and answer with the accumulator instead,
     // which is token-count independent.
     RPC_CMD_IMATRIX_SQSUM,
+    // fleet hibernation [fork]:
+    // DETACH parks this session's buffers on the server and answers with a
+    // token; the client then closes every connection so the host can suspend to
+    // disk. RESUME re-adopts the parked buffers on a fresh connection. Without
+    // it a disconnect destroys the session -- and with it the remote KV cache,
+    // which is the one thing a hibernation cycle must not have to rebuild.
+    RPC_CMD_SESSION_DETACH,
+    RPC_CMD_SESSION_RESUME,
     RPC_CMD_COUNT,
 };
 
@@ -127,6 +135,8 @@ enum rpc_cmd {
 #define GGML_RPC_PEER_MIN_PATCH 2
 // ...and the server-side imatrix reduction
 #define GGML_RPC_IMAT_MIN_PATCH 3
+// ...and detach/resume of a parked session (fleet hibernation)
+#define GGML_RPC_HIBERNATE_MIN_PATCH 4
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -281,6 +291,21 @@ struct rpc_msg_lane_attach_rsp {
 
 // main-lane barrier: wait until the lanes have fully processed the first
 // wait_set / wait_get commands submitted on them
+struct rpc_msg_session_detach_rsp {
+    uint64_t token;      // 0 = the server refused to park
+    uint64_t n_buffers;
+};
+
+struct rpc_msg_session_resume_req {
+    uint64_t token;
+};
+
+struct rpc_msg_session_resume_rsp {
+    uint32_t ok;
+    uint32_t padding;
+    uint64_t n_buffers;
+};
+
 struct rpc_msg_lane_fence_req {
     uint64_t wait_set;
     uint64_t wait_get;
@@ -371,9 +396,13 @@ struct ggml_backend_rpc_context {
     std::string name;
 };
 
+// note: deliberately holds no socket. A detach has to actually close the
+// connection so the remote host can suspend, and a buffer context that pinned a
+// shared_ptr<socket_t> would keep the fd open for the lifetime of the model.
+// The socket is looked up per call instead - a mutex and a hash lookup against
+// a network round trip.
 struct ggml_backend_rpc_buffer_context {
     std::string endpoint;
-    std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
 };
@@ -680,6 +709,9 @@ static bool rpc_send_must_flush(enum rpc_cmd cmd, size_t input_size) {
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    if (sock == nullptr) {
+        return false;
+    }
     rpc_cmd_stats_add(cmd, input_size);
     rpc_send_queue * q = rpc_send_queue_for(sock.get());
     std::lock_guard<std::mutex> l(q->m);
@@ -690,6 +722,9 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    if (sock == nullptr) {
+        return false;
+    }
     rpc_cmd_stats_add(cmd, input_size);
     // the send and the matching read are one transaction: nothing else may put
     // bytes on this socket between them
@@ -772,19 +807,46 @@ static uint8_t rpc_server_patch(const std::string & endpoint) {
     return it != g_server_patch.end() ? it->second : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Endpoint socket table
+//
+// A strong reference to every endpoint socket is held for the lifetime of the
+// process: the rpc-server serves one client at a time, so reconnecting per
+// operation (what a weak_ptr cache degrades to whenever no buffer holds a
+// strong ref) floods the server with one-shot connections and starves every
+// reconnect attempt while the server is busy with a long request.
+//
+// The table lives at file scope rather than inside get_socket() because fleet
+// hibernation has to walk it: detaching means closing every one of these, and
+// nothing may reopen one behind our back while the hosts are asleep.
+// ---------------------------------------------------------------------------
+static std::mutex g_sockets_m;
+static std::unordered_map<std::string, std::shared_ptr<socket_t>> g_sockets;
+// every endpoint this process has connected to, in first-contact order, so
+// status reporting keeps a stable index even while nothing is connected
+static std::vector<std::string> g_endpoints_seen;
+// set between a detach and a successful reattach. get_socket() refuses to dial
+// while it is set, so a stray buffer free cannot wake a suspended host - or
+// worse, connect to one that is halfway through writing its suspend image.
+static std::atomic<bool> g_rpc_detached{false};
+static std::atomic<bool> g_rpc_session_lost{false};
+
+static void rpc_note_endpoint(const std::string & endpoint) {
+    if (std::find(g_endpoints_seen.begin(), g_endpoints_seen.end(), endpoint) == g_endpoints_seen.end()) {
+        g_endpoints_seen.push_back(endpoint);
+    }
+}
+
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    // hold a strong reference to every endpoint socket for the lifetime of the
-    // process: the rpc-server serves one client at a time, so reconnecting per
-    // operation (what a weak_ptr cache degrades to whenever no buffer holds a
-    // strong ref) floods the server with one-shot connections and starves every
-    // reconnect attempt while the server is busy with a long request
-    static std::unordered_map<std::string, std::shared_ptr<socket_t>> sockets;
+    std::lock_guard<std::mutex> lock(g_sockets_m);
+    auto & sockets = g_sockets;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
         return it->second;
+    }
+    if (g_rpc_detached.load()) {
+        return nullptr;
     }
     std::string host;
     int port;
@@ -827,6 +889,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     sockets[endpoint] = sock;
+    rpc_note_endpoint(endpoint);
     return sock;
 }
 
@@ -994,10 +1057,12 @@ struct rpc_stream {
     }
 };
 
+static std::mutex g_streams_m;
+static std::unordered_map<std::string, std::unique_ptr<rpc_stream>> g_streams;
+
 static rpc_stream * get_stream(const std::string & endpoint) {
-    static std::mutex mutex;
-    static std::unordered_map<std::string, std::unique_ptr<rpc_stream>> streams;
-    std::lock_guard<std::mutex> lock(mutex);
+    auto & streams = g_streams;
+    std::lock_guard<std::mutex> lock(g_streams_m);
     auto it = streams.find(endpoint);
     if (it != streams.end()) {
         return it->second.get();
@@ -1052,10 +1117,12 @@ struct rpc_ep_lanes {
     rpc_stream * get_stream = nullptr;
 };
 
+static std::mutex g_lanes_m;
+static std::unordered_map<std::string, std::unique_ptr<rpc_ep_lanes>> g_lanes;
+
 static rpc_ep_lanes * get_ep_lanes(const std::string & endpoint) {
-    static std::mutex mutex;
-    static std::unordered_map<std::string, std::unique_ptr<rpc_ep_lanes>> lanes;
-    std::lock_guard<std::mutex> lock(mutex);
+    auto & lanes = g_lanes;
+    std::lock_guard<std::mutex> lock(g_lanes_m);
     auto it = lanes.find(endpoint);
     if (it != lanes.end()) {
         return it->second.get();
@@ -1362,8 +1429,18 @@ static void rpc_ping(const std::string & endpoint, uint32_t device) {
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        // detached for host hibernation, or the endpoint is gone. The far side
+        // owns this buffer until its session is discarded, and aborting the
+        // process on the teardown path helps nobody.
+        GGML_LOG_DEBUG("[%s] %s is not connected; leaving the remote buffer to "
+                       "its parked session\n", __func__, ctx->endpoint.c_str());
+        delete ctx;
+        return;
+    }
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd_ordered(ctx->endpoint, sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
     delete ctx;
 }
@@ -1375,7 +1452,7 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     }
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
@@ -1437,7 +1514,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -1455,7 +1532,7 @@ static void ggml_backend_rpc_buffer_memset_tensor(
         /* .size   = */ size,
         /* .value  = */ value,
     };
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd(get_socket(ctx->endpoint), RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1484,14 +1561,14 @@ static bool rpc_buffer_set_tensor_raw(
         rpc_wire_ep_stat * st = rpc_wire_stat(ctx->endpoint);
         rpc_wire_note_set(tensor, input.size());
         const int64_t t0 = ggml_time_us();
-        bool ok = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+        bool ok = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_SET_TENSOR, input.data(), input.size());
         st->set_us    += (uint64_t) (ggml_time_us() - t0);
         st->set_bytes += input.size();
         st->set_n     += 1;
         rpc_wire_trace_tick();
         return ok;
     }
-    return send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    return send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_SET_TENSOR, input.data(), input.size());
 }
 
 int ggml_backend_rpc_buffer_cache_query(
@@ -1504,7 +1581,7 @@ int ggml_backend_rpc_buffer_cache_query(
     request.offset = offset;
     request.hash   = hash;
     rpc_msg_set_tensor_hash_rsp response;
-    if (!send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response))) {
+    if (!send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response))) {
         return -1;
     }
     return response.result ? 1 : 0;
@@ -1559,14 +1636,14 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     bool status;
     if (wire_bf16) {
         std::vector<uint8_t> wire(size / 2);
-        status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_GET_TENSOR_BF16,
+        status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_GET_TENSOR_BF16,
                                       &request, sizeof(request), wire.data(), wire.size());
         if (status) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
                                   (float *) data, size / sizeof(float));
         }
     } else {
-        status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+        status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     }
     if (trace) {
         st->get_us    += (uint64_t) (ggml_time_us() - t0);
@@ -1627,7 +1704,7 @@ GGML_BACKEND_API bool ggml_backend_rpc_imatrix_sqsum(
     const bool trace = rpc_wire_trace_enabled();
     rpc_wire_ep_stat * st = trace ? rpc_wire_stat(ctx->endpoint) : nullptr;
     const int64_t t0 = trace ? ggml_time_us() : 0;
-    const bool ok = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_IMATRIX_SQSUM,
+    const bool ok = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_IMATRIX_SQSUM,
                                          &request, sizeof(request), response.data(), response.size());
     if (trace) {
         st->get_us    += (uint64_t) (ggml_time_us() - t0);
@@ -1658,7 +1735,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src_buffer->context;
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
-        if (src_ctx->sock != dst_ctx->sock) {
+        if (src_ctx->endpoint != dst_ctx->endpoint) {
             return false;
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -1666,7 +1743,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         request.src = serialize_tensor(src);
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
-        bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+        bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
         return response.result;
     }
@@ -1676,7 +1753,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1714,7 +1791,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{buft_ctx->endpoint, sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{buft_ctx->endpoint, nullptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
@@ -3188,6 +3265,297 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     get_device_memory(endpoint, sock, device, free, total);
 }
 
+// ---------------------------------------------------------------------------
+// Fleet hibernation: detach / reattach  [fork]
+//
+// Suspending the RPC hosts to disk means the client connections have to go
+// away: they cannot be relied on to survive minutes or hours of the far end
+// being frozen. But a disconnect is also how the daemon learns to destroy the
+// session, and the session owns the KV cache. So the teardown is explicit -
+// SESSION_DETACH asks the server to park its buffers and hands back a token,
+// and the reattach presents that token on a fresh connection.
+//
+// Everything torn down here is per-connection state: the command socket, the
+// async stream worker, the full-duplex lanes and their counters, the peer
+// route caches. What stays allocated on the far side is exactly the memory
+// that is expensive to rebuild - the KV cache, the compute buffers, and any
+// weights the caller chose not to unload first.
+//
+// Callers must quiesce first. Nothing here interrupts an in-flight graph; it
+// assumes there is none.
+// ---------------------------------------------------------------------------
+
+static std::mutex g_hib_m;
+static std::unordered_map<std::string, uint64_t> g_resume_tokens;
+
+// close the transfer lanes and reset every counter that is scoped to a server
+// session, so a later reattach negotiates fresh lanes against the new session
+static void rpc_lanes_teardown(const std::string & endpoint) {
+    rpc_ep_lanes * ep = nullptr;
+    {
+        std::lock_guard<std::mutex> l(g_lanes_m);
+        auto it = g_lanes.find(endpoint);
+        if (it == g_lanes.end()) {
+            return;
+        }
+        ep = it->second.get();
+    }
+    socket_ptr set_sock, get_sock;
+    rpc_stream * set_stream = nullptr;
+    rpc_stream * get_stream = nullptr;
+    {
+        std::lock_guard<std::mutex> l(ep->m);
+        set_sock.swap(ep->set_sock);
+        get_sock.swap(ep->get_sock);
+        set_stream = ep->set_stream;
+        get_stream = ep->get_stream;
+        ep->set_stream = nullptr;
+        ep->get_stream = nullptr;
+        ep->main_enq = ep->set_enq = ep->get_enq = 0;
+        ep->fenced_set = ep->fenced_get = 0;
+        ep->barrier_set = ep->barrier_get = 0;
+        ep->session_id = 0;
+        ep->state = 0;   // untried: a reattach brings the lanes back up
+    }
+    // the workers own the sockets while they run, so stop them first
+    delete set_stream;
+    delete get_stream;
+    if (set_sock != nullptr) {
+        set_sock->shutdown_rw();
+    }
+    if (get_sock != nullptr) {
+        get_sock->shutdown_rw();
+    }
+}
+
+// peer routes name a (source endpoint, destination session) pair; both are
+// gone once every session is parked, and a stale route degrades silently
+static void rpc_client_reset_peer_state() {
+    {
+        std::lock_guard<std::mutex> l(g_peer_route_m);
+        g_peer_routes.clear();
+    }
+    auto & st = rpc_sync_peer();
+    std::lock_guard<std::mutex> l(st.m);
+    st.session_ids.clear();
+    st.push_lanes.clear();
+    st.push_counts.clear();
+    st.lane_sent.clear();
+    st.lane_acked.clear();
+}
+
+static void rpc_drop_socket(const std::string & endpoint) {
+    // move the stream out under the lock and destroy it outside: the
+    // destructor joins the worker, and a worker task that reached for
+    // get_stream() would deadlock against a held g_streams_m
+    std::unique_ptr<rpc_stream> stream;
+    {
+        std::lock_guard<std::mutex> l(g_streams_m);
+        auto it = g_streams.find(endpoint);
+        if (it != g_streams.end()) {
+            stream = std::move(it->second);
+            g_streams.erase(it);
+        }
+    }
+    stream.reset();
+    std::lock_guard<std::mutex> l(g_sockets_m);
+    g_sockets.erase(endpoint);
+}
+
+// Park every connected endpoint's session and close the connections.
+// Returns the number of endpoints parked, or -1 if any of them refused.
+extern "C" {
+
+GGML_BACKEND_API int ggml_backend_rpc_detach(void) {
+    std::lock_guard<std::mutex> hl(g_hib_m);
+    if (g_rpc_detached.load()) {
+        return g_rpc_session_lost.load() ? -1 : (int) g_resume_tokens.size();
+    }
+
+    g_resume_tokens.clear();
+    g_rpc_session_lost.store(false);
+
+    std::vector<std::pair<std::string, socket_ptr>> live;
+    std::vector<std::string> missing;
+    {
+        std::lock_guard<std::mutex> l(g_sockets_m);
+        for (auto & kv : g_sockets) {
+            live.emplace_back(kv.first, kv.second);
+        }
+        for (const auto & endpoint : g_endpoints_seen) {
+            if (g_sockets.find(endpoint) == g_sockets.end()) {
+                missing.push_back(endpoint);
+            }
+        }
+    }
+
+    int parked  = 0;
+    int refused = (int) missing.size();
+    for (const auto & endpoint : missing) {
+        GGML_LOG_ERROR("[rpc hibernate] %s: no live session to park\n", endpoint.c_str());
+    }
+    if (live.empty() && refused == 0) {
+        GGML_LOG_ERROR("[rpc hibernate] detach: no endpoint is connected\n");
+        refused = 1;
+    }
+
+    for (auto & item : live) {
+        const std::string & endpoint = item.first;
+        const socket_ptr  & sock     = item.second;
+
+        rpc_stream * st = nullptr;
+        {
+            std::lock_guard<std::mutex> l(g_streams_m);
+            auto it = g_streams.find(endpoint);
+            st = it == g_streams.end() ? nullptr : it->second.get();
+        }
+        if (st != nullptr) {
+            st->drain();
+        }
+        rpc_lanes_teardown(endpoint);
+
+        const int patch = (int) rpc_server_patch(endpoint);
+        if (patch < GGML_RPC_HIBERNATE_MIN_PATCH) {
+            GGML_LOG_ERROR("[rpc hibernate] %s: server patch %d cannot park a session "
+                           "(need %d) - its buffers will be lost\n",
+                           endpoint.c_str(), patch, GGML_RPC_HIBERNATE_MIN_PATCH);
+            refused++;
+        } else {
+            rpc_msg_session_detach_rsp rsp = {};
+            if (!send_rpc_cmd(sock, RPC_CMD_SESSION_DETACH, nullptr, 0, &rsp, sizeof(rsp)) || rsp.token == 0) {
+                GGML_LOG_ERROR("[rpc hibernate] %s: SESSION_DETACH failed\n", endpoint.c_str());
+                refused++;
+            } else {
+                g_resume_tokens[endpoint] = rsp.token;
+                parked++;
+                GGML_LOG_INFO("[rpc hibernate] %s: parked %llu buffers (token %llu)\n",
+                              endpoint.c_str(),
+                              (unsigned long long) rsp.n_buffers,
+                              (unsigned long long) rsp.token);
+            }
+        }
+        rpc_drop_socket(endpoint);
+    }
+
+    rpc_client_reset_peer_state();
+    g_rpc_session_lost.store(refused > 0);
+    g_rpc_detached.store(true);
+    GGML_LOG_INFO("[rpc hibernate] detached: %d parked, %d refused\n", parked, refused);
+    return refused > 0 ? -refused : parked;
+}
+
+// Reconnect to every parked endpoint and re-adopt its session. A successful
+// endpoint is removed from g_resume_tokens immediately, so a later retry only
+// touches endpoints that are still parked.
+GGML_BACKEND_API int ggml_backend_rpc_reattach(int timeout_ms) {
+    std::lock_guard<std::mutex> hl(g_hib_m);
+    if (g_rpc_session_lost.load()) {
+        return -1;
+    }
+    if (!g_rpc_detached.load()) {
+        return 0;
+    }
+
+    std::vector<std::string> pending;
+    for (auto & kv : g_resume_tokens) {
+        pending.push_back(kv.first);
+    }
+    if (pending.empty()) {
+        g_rpc_detached.store(false);
+        return 0;
+    }
+
+    g_rpc_detached.store(false);
+
+    const int64_t deadline_us = ggml_time_us() + (int64_t) (timeout_ms > 0 ? timeout_ms : 0) * 1000;
+    int  resumed   = 0;
+    int  lost      = 0;
+    bool announced = false;
+    while (!pending.empty()) {
+        std::vector<std::string> still;
+        std::vector<std::string> done;
+        for (const auto & endpoint : pending) {
+            auto sock = get_socket(endpoint);
+            if (sock == nullptr) {
+                still.push_back(endpoint);
+                continue;
+            }
+            rpc_msg_session_resume_req req = { g_resume_tokens.at(endpoint) };
+            rpc_msg_session_resume_rsp rsp = {};
+            if (!send_rpc_cmd(sock, RPC_CMD_SESSION_RESUME, &req, sizeof(req), &rsp, sizeof(rsp))) {
+                rpc_drop_socket(endpoint);
+                still.push_back(endpoint);
+                continue;
+            }
+            if (!rsp.ok) {
+                GGML_LOG_ERROR("[rpc hibernate] %s: the parked session is gone, "
+                               "its buffers cannot be recovered\n", endpoint.c_str());
+                rpc_drop_socket(endpoint);
+                lost++;
+                continue;
+            }
+            GGML_LOG_INFO("[rpc hibernate] %s: resumed %llu buffers\n",
+                          endpoint.c_str(), (unsigned long long) rsp.n_buffers);
+            done.push_back(endpoint);
+            resumed++;
+        }
+        for (const auto & endpoint : done) {
+            g_resume_tokens.erase(endpoint);
+        }
+        pending.swap(still);
+        if (lost > 0 || pending.empty() || ggml_time_us() >= deadline_us) {
+            break;
+        }
+        if (!announced) {
+            GGML_LOG_INFO("[rpc hibernate] waiting for %d endpoint(s) to come back\n", (int) pending.size());
+            announced = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+
+    if (lost > 0) {
+        g_rpc_session_lost.store(true);
+        g_rpc_detached.store(true);
+        return -(lost + (int) pending.size());
+    }
+    if (!pending.empty()) {
+        for (const auto & endpoint : pending) {
+            GGML_LOG_ERROR("[rpc hibernate] %s: still unreachable\n", endpoint.c_str());
+        }
+        g_rpc_detached.store(true);
+        return -(int) pending.size();
+    }
+    GGML_LOG_INFO("[rpc hibernate] reattached %d endpoint(s)\n", resumed);
+    return resumed;
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_is_detached(void) {
+    return g_rpc_detached.load();
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_session_lost(void) {
+    return g_rpc_session_lost.load();
+}
+
+// Snapshot of every endpoint this process has talked to. Fills out_names and
+// out_connected up to max entries and returns the total, so one probing call
+// is enough to size the caller's buffers.
+GGML_BACKEND_API int ggml_backend_rpc_endpoint_status(const char ** out_names, int * out_connected, int max) {
+    std::lock_guard<std::mutex> l(g_sockets_m);
+    const int total = (int) g_endpoints_seen.size();
+    for (int i = 0; i < total && i < max; i++) {
+        if (out_names != nullptr) {
+            out_names[i] = g_endpoints_seen[i].c_str();
+        }
+        if (out_connected != nullptr) {
+            out_connected[i] = g_sockets.count(g_endpoints_seen[i]) > 0 ? 1 : 0;
+        }
+    }
+    return total;
+}
+
+} // extern "C"
+
 // RPC server-side implementation
 
 // Evict least recently used cache entries until the directory fits within
@@ -3392,6 +3760,11 @@ public:
     // [fork] direct remote->remote transfer
     bool peer_open(const rpc_msg_peer_open_req & request, rpc_msg_peer_open_rsp & response);
     bool push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response);
+    // [fork] fleet hibernation: hand this session's buffers to the parking
+    // slot so the client can disconnect while the host suspends, and take
+    // them back on the connection that returns
+    bool session_detach(rpc_msg_session_detach_rsp & response);
+    bool session_resume(const rpc_msg_session_resume_req & request, rpc_msg_session_resume_rsp & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -3444,6 +3817,111 @@ private:
     // evicts explicitly via GRAPH_FORGET, so lookups on RECOMPUTE never miss.
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
 };
+
+// ---------------------------------------------------------------------------
+// Parked sessions  [fork, fleet hibernation]
+//
+// A session normally dies with its connection, and rpc_server's destructor
+// frees every buffer it owns. That is the right default - a client that
+// vanished is not coming back for its KV cache - but it is exactly wrong when
+// the client is deliberately disconnecting so this host can suspend to disk.
+//
+// SESSION_DETACH therefore moves the durable half of the session (the buffer
+// handle set and the deserialized graph cache) out of the rpc_server and into
+// one process-wide parking slot, leaving the server object with nothing to
+// free. SESSION_RESUME on a later connection moves it back. The device memory
+// is never touched, so the client's remote pointers stay valid across the
+// whole cycle - which is the point: those pointers are the KV cache.
+//
+// Only one slot exists because rpc-server serves one client at a time. If some
+// other client connects and does not present the token, the park is discarded
+// and its buffers freed: the new client needs the memory, and the old one has
+// already lost its right to it.
+// ---------------------------------------------------------------------------
+
+struct rpc_parked_session {
+    uint64_t token = 0;
+    std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::vector<std::unordered_map<uint64_t, rpc_server::stored_graph>> stored_graphs;
+};
+
+static std::mutex        g_parked_m;
+static rpc_parked_session g_parked;
+
+static void rpc_parked_discard_locked() {
+    if (g_parked.token == 0) {
+        return;
+    }
+    GGML_LOG_INFO("[rpc hibernate] discarding parked session %llu (%zu buffers): "
+                  "another client took the device\n",
+                  (unsigned long long) g_parked.token, g_parked.buffers.size());
+    for (auto buffer : g_parked.buffers) {
+        ggml_backend_buffer_free(buffer);
+    }
+    g_parked.buffers.clear();
+    g_parked.stored_graphs.clear();
+    g_parked.token = 0;
+}
+
+static void rpc_parked_discard() {
+    std::lock_guard<std::mutex> l(g_parked_m);
+    rpc_parked_discard_locked();
+}
+
+bool rpc_server::session_detach(rpc_msg_session_detach_rsp & response) {
+    static std::atomic<uint64_t> next_token{1};
+
+    std::lock_guard<std::mutex> pl(g_parked_m);
+    rpc_parked_discard_locked();   // a park nobody ever came back for
+
+    std::lock_guard<std::mutex> bl(buffers_mtx);
+    g_parked.token = next_token.fetch_add(1);
+    g_parked.buffers.swap(buffers);              // the destructor now frees nothing
+    g_parked.stored_graphs.swap(stored_graphs);
+    stored_graphs.resize(backends.size());
+
+    response.token     = g_parked.token;
+    response.n_buffers = g_parked.buffers.size();
+    GGML_LOG_INFO("[rpc hibernate] parked session %llu: %zu buffers held\n",
+                  (unsigned long long) g_parked.token, g_parked.buffers.size());
+    return true;
+}
+
+bool rpc_server::session_resume(const rpc_msg_session_resume_req & request, rpc_msg_session_resume_rsp & response) {
+    response.ok        = 0;
+    response.padding   = 0;
+    response.n_buffers = 0;
+
+    std::lock_guard<std::mutex> pl(g_parked_m);
+    if (g_parked.token == 0 || g_parked.token != request.token) {
+        GGML_LOG_ERROR("[rpc hibernate] resume refused: token %llu does not match the parked session\n",
+                       (unsigned long long) request.token);
+        rpc_parked_discard_locked();
+        return true;   // answered, not a protocol failure - keep the connection
+    }
+
+    std::lock_guard<std::mutex> bl(buffers_mtx);
+    // a resuming connection is brand new, so this set is empty; free anything
+    // that somehow is not, rather than leaking it
+    for (auto buffer : buffers) {
+        ggml_backend_buffer_free(buffer);
+    }
+    buffers.clear();
+    buffers.swap(g_parked.buffers);
+    stored_graphs.swap(g_parked.stored_graphs);
+    if (stored_graphs.size() != backends.size()) {
+        stored_graphs.resize(backends.size());
+    }
+    g_parked.buffers.clear();
+    g_parked.stored_graphs.clear();
+    g_parked.token = 0;
+
+    response.ok        = 1;
+    response.n_buffers = buffers.size();
+    GGML_LOG_INFO("[rpc hibernate] resumed session %llu: %zu buffers restored\n",
+                  (unsigned long long) request.token, buffers.size());
+    return true;
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
@@ -5380,6 +5858,10 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
     uint8_t cmd;
     // the HELLO handshake was already completed by the connection dispatcher
+    // the first command decides the fate of a parked session: anything other
+    // than SESSION_RESUME means this client is not the one that parked it, and
+    // holding its buffers any longer would just deny this client the memory
+    bool first_cmd = true;
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
@@ -5388,6 +5870,27 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
+        }
+        if (first_cmd) {
+            switch (cmd) {
+                // read-only probes: a version check or a device enumeration
+                // must not cost a parked session its buffers
+                case RPC_CMD_DEVICE_COUNT:
+                case RPC_CMD_GET_ALIGNMENT:
+                case RPC_CMD_GET_MAX_SIZE:
+                case RPC_CMD_SESSION_INFO:
+                    break;
+                case RPC_CMD_SESSION_RESUME:
+                    first_cmd = false;
+                    break;
+                default:
+                    // anything else - including GET_DEVICE_MEMORY, which is a
+                    // client about to size a split - means this connection owns
+                    // the device now, and the park is denying it the memory
+                    first_cmd = false;
+                    rpc_parked_discard();
+                    break;
+            }
         }
         switch (cmd) {
             case RPC_CMD_HELLO: {
@@ -5669,6 +6172,33 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 }
                 rpc_msg_session_info_rsp response;
                 response.session_id = session.id;
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SESSION_DETACH: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_session_detach_rsp response;
+                if (!server.session_detach(response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SESSION_RESUME: {
+                rpc_msg_session_resume_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_session_resume_rsp response;
+                if (!server.session_resume(request, response)) {
+                    return;
+                }
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
@@ -6090,6 +6620,21 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_device_endpoint") == 0) {
         return (void *)ggml_backend_rpc_device_get_endpoint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_detach") == 0) {
+        return (void *)ggml_backend_rpc_detach;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_reattach") == 0) {
+        return (void *)ggml_backend_rpc_reattach;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_is_detached") == 0) {
+        return (void *)ggml_backend_rpc_is_detached;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_session_lost") == 0) {
+        return (void *)ggml_backend_rpc_session_lost;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_endpoint_status") == 0) {
+        return (void *)ggml_backend_rpc_endpoint_status;
     }
     return NULL;
 

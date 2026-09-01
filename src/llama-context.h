@@ -149,6 +149,12 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     void set_graph_reuse(bool value);
+
+    // [fork] drop every cached graph and scheduler split. Needed after the
+    // model's weight buffers have moved (RPC hibernation): a reused graph
+    // still carries the old device pointers, and over RPC the server's graph
+    // cache is keyed on exactly those pointers.
+    void invalidate_graphs();
     void set_stable_host_inputs(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

@@ -1117,6 +1117,38 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
     ggml_backend_sched_reset(lane_sched.get());
 }
 
+void llama_context::invalidate_graphs() {
+    auto reset_res = [](llm_graph_result_ptr & res) {
+        if (res) {
+            res->reset();
+        }
+    };
+    auto reset_sched = [](ggml_backend_sched_ptr & s) {
+        if (s) {
+            ggml_backend_sched_reset(s.get());
+        }
+    };
+
+    reset_res(gf_res_prev);
+    reset_res(gf_res_reserve);
+    reset_res(gf_res_pipedec_head);
+    for (auto & res : gf_res_pipedec_body) {
+        reset_res(res);
+    }
+    for (auto & res : gf_res_decode_lane) {
+        reset_res(res);
+    }
+
+    reset_sched(sched);
+    reset_sched(sched_pipedec_head);
+    for (auto & s : sched_pipedec_body) {
+        reset_sched(s);
+    }
+    for (auto & s : sched_decode_lane) {
+        reset_sched(s);
+    }
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -2405,7 +2437,8 @@ static bool pipedec_stage2_eligible(
     }
 
     if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
-         model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4) ||
+         model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
+         model.arch != LLM_ARCH_GLM5NEXT) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||
@@ -5051,6 +5084,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_set_graph_reuse(llama_context * ctx, bool value) {
     ctx->set_graph_reuse(value);
+}
+
+void llama_graphs_invalidate(llama_context * ctx) {
+    ctx->invalidate_graphs();
 }
 
 void llama_set_stable_host_inputs(llama_context * ctx, bool value) {

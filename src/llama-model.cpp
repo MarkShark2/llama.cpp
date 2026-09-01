@@ -1184,6 +1184,20 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // [fork] everything a fleet-hibernation reload needs to put the
+    // RPC-resident weights back (see rpc_weights_unload / rpc_weights_reload)
+    struct rpc_weight_ctx {
+        ggml_context             * ctx      = nullptr;
+        ggml_backend_buffer_type_t buft     = nullptr;
+        size_t                     bufs_idx = 0;   // index into ctxs_bufs
+        size_t                     size     = 0;   // bytes the buffer held
+        std::string                endpoint;
+    };
+    std::vector<rpc_weight_ctx> rpc_weight_ctxs;
+    std::vector<std::string>    rpc_file_paths;
+    std::unordered_map<std::string, llama_rpc_weight_source> rpc_weight_sources;
+    bool rpc_weights_unloaded = false;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1857,6 +1871,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    // [fork] the loader is about to go away; remember where the RPC-resident
+    // weights came from so they can be unloaded and reloaded without it
+    rpc_capture_weight_state(ml);
 
     return true;
 }
@@ -3251,6 +3269,300 @@ int32_t llama_model_desc(const llama_model * model, char * buf, size_t buf_size)
 
 llama_ftype llama_model_ftype(const llama_model * model) {
     return model->ftype();
+}
+
+// ---------------------------------------------------------------------------
+// RPC weight unload / reload  [fork, fleet hibernation]
+//
+// A BC-250 stages its suspend image in the RAM it is *not* already using, so a
+// board holding 10-12 GB of weights cannot hibernate at all. The weights are
+// also the one thing on it that is cheap to put back: each one is already in
+// that board's own rpc-server tensor cache, so a reload is a local disk read
+// on the board rather than a transfer across the fabric.
+//
+// So the unload is deliberately narrow - free only the model weight buffers
+// that live on RPC endpoints. The KV cache, the compute buffers and every
+// local (CUDA/CPU) weight buffer stay exactly where they are, which is what
+// makes the wake cheap: nothing has to be re-planned, re-split or re-reserved.
+//
+// See vault/Fork/RPC Hibernation.md.
+// ---------------------------------------------------------------------------
+
+// the RPC backend's exported entry points, found by walking the registry so
+// none of this depends on the RPC backend being linked in
+static void * llama_rpc_proc(const char * name) {
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (reg == nullptr) {
+            continue;
+        }
+        if (void * fn = ggml_backend_reg_get_proc_address(reg, name)) {
+            return fn;
+        }
+    }
+    return nullptr;
+}
+
+static const char * llama_rpc_buffer_endpoint(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    auto fn = (const char * (*)(ggml_backend_buffer_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_endpoint");
+    return fn != nullptr ? fn(buffer) : nullptr;
+}
+
+static bool llama_rpc_client_cache_enabled() {
+    auto fn = (bool (*)(void)) llama_rpc_proc("ggml_backend_rpc_get_client_cache");
+    return fn != nullptr && fn();
+}
+
+void llama_model::rpc_capture_weight_state(llama_model_loader & ml) {
+    pimpl->rpc_weight_ctxs.clear();
+    pimpl->rpc_weight_sources.clear();
+    pimpl->rpc_file_paths.clear();
+    pimpl->rpc_weights_unloaded = false;
+
+    for (size_t i = 0; i < pimpl->ctxs_bufs.size(); i++) {
+        auto & bufs = pimpl->ctxs_bufs[i].second;
+        if (bufs.size() != 1) {
+            // an RPC context always allocates exactly one buffer; more than
+            // one means a mmap-backed host context, which is not ours
+            continue;
+        }
+        const char * endpoint = llama_rpc_buffer_endpoint(bufs[0].get());
+        if (endpoint == nullptr) {
+            continue;
+        }
+
+        impl::rpc_weight_ctx entry;
+        entry.ctx      = pimpl->ctxs_bufs[i].first.get();
+        entry.buft     = ggml_backend_buffer_get_type(bufs[0].get());
+        entry.bufs_idx = i;
+        entry.size     = ggml_backend_buffer_get_size(bufs[0].get());
+        entry.endpoint = endpoint;
+        pimpl->rpc_weight_ctxs.push_back(std::move(entry));
+    }
+
+    if (pimpl->rpc_weight_ctxs.empty()) {
+        return;
+    }
+
+    pimpl->rpc_file_paths = ml.file_paths;
+    for (const auto & entry : pimpl->rpc_weight_ctxs) {
+        for (ggml_tensor * cur = ggml_get_first_tensor(entry.ctx); cur != nullptr; cur = ggml_get_next_tensor(entry.ctx, cur)) {
+            const auto * weight = ml.get_weight(ggml_get_name(cur));
+            if (weight == nullptr) {
+                continue;
+            }
+            llama_rpc_weight_source src;
+            src.idx  = weight->idx;
+            src.offs = weight->offs;
+            pimpl->rpc_weight_sources.emplace(ggml_get_name(cur), src);
+        }
+    }
+
+    size_t bytes = 0;
+    for (const auto & entry : pimpl->rpc_weight_ctxs) {
+        bytes += entry.size;
+    }
+    LLAMA_LOG_INFO("%s: %zu RPC weight buffer(s), %.2f GiB, can be unloaded for host hibernation\n",
+            __func__, pimpl->rpc_weight_ctxs.size(), bytes / (1024.0*1024.0*1024.0));
+}
+
+size_t llama_model::rpc_weights_size() const {
+    size_t bytes = 0;
+    for (const auto & entry : pimpl->rpc_weight_ctxs) {
+        bytes += entry.size;
+    }
+    return bytes;
+}
+
+size_t llama_model::rpc_weights_buffers() const {
+    return pimpl->rpc_weight_ctxs.size();
+}
+
+bool llama_model::rpc_weights_unloaded() const {
+    return pimpl->rpc_weights_unloaded;
+}
+
+int32_t llama_model::rpc_weights_unload() {
+    if (pimpl->rpc_weights_unloaded) {
+        return 0;
+    }
+    if (pimpl->rpc_weight_ctxs.empty()) {
+        LLAMA_LOG_ERROR("%s: no model weights live on an RPC endpoint\n", __func__);
+        return -1;
+    }
+    if (!llama_rpc_client_cache_enabled()) {
+        // without the cache a reload would pull every byte back across the
+        // wire, which is the thing this whole path exists to avoid
+        LLAMA_LOG_ERROR("%s: --rpc-cache is required to unload RPC weights "
+                        "(the reload reads them from each server's own cache)\n", __func__);
+        return -2;
+    }
+
+    size_t freed = 0;
+    for (const auto & entry : pimpl->rpc_weight_ctxs) {
+        auto & bufs = pimpl->ctxs_bufs[entry.bufs_idx].second;
+        for (auto & buf : bufs) {
+            freed += ggml_backend_buffer_get_size(buf.get());
+        }
+        bufs.clear();   // FREE_BUFFER on the far side; the device memory goes back
+        for (ggml_tensor * cur = ggml_get_first_tensor(entry.ctx); cur != nullptr; cur = ggml_get_next_tensor(entry.ctx, cur)) {
+            cur->data   = nullptr;
+            cur->buffer = nullptr;
+        }
+    }
+
+    pimpl->rpc_weights_unloaded = true;
+    LLAMA_LOG_INFO("%s: freed %.2f GiB of weights across %zu RPC endpoint buffer(s)\n",
+            __func__, freed / (1024.0*1024.0*1024.0), pimpl->rpc_weight_ctxs.size());
+    return 0;
+}
+
+int32_t llama_model::rpc_weights_reload() {
+    if (!pimpl->rpc_weights_unloaded) {
+        return 0;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    auto rollback = [this]() {
+        for (const auto & entry : pimpl->rpc_weight_ctxs) {
+            pimpl->ctxs_bufs[entry.bufs_idx].second.clear();
+            for (ggml_tensor * cur = ggml_get_first_tensor(entry.ctx); cur != nullptr; cur = ggml_get_next_tensor(entry.ctx, cur)) {
+                cur->data   = nullptr;
+                cur->buffer = nullptr;
+            }
+        }
+    };
+
+    // 1. re-allocate. The tensor set and its order are unchanged, so the
+    //    allocator lays the buffer out exactly as it did on the first load -
+    //    only the base address may differ, and every tensor is rebased with it.
+    std::vector<ggml_context *> contexts;
+    contexts.reserve(pimpl->rpc_weight_ctxs.size());
+    for (const auto & entry : pimpl->rpc_weight_ctxs) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(entry.ctx, entry.buft);
+        if (buf == nullptr) {
+            LLAMA_LOG_ERROR("%s: %s: failed to re-allocate %.2f GiB of weights\n",
+                    __func__, entry.endpoint.c_str(), entry.size / (1024.0*1024.0*1024.0));
+            rollback();
+            return -1;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        pimpl->ctxs_bufs[entry.bufs_idx].second.emplace_back(buf);
+        contexts.push_back(entry.ctx);
+    }
+
+    // 2. refill. Each endpoint's own tensor cache holds these bytes already, so
+    //    with a manifest sidecar this is a hash query per tensor and a local
+    //    read on the board - no payload crosses the network.
+    std::unordered_set<ggml_context *> matched;
+    const auto jobs = llama_rpc_jobs_for(contexts, &matched);
+    if (jobs.empty() || matched.size() != contexts.size()) {
+        LLAMA_LOG_ERROR("%s: not every weight buffer has an RPC tensor cache - cannot reload\n", __func__);
+        rollback();
+        return -2;
+    }
+
+    auto source_of = [this](const char * name, llama_rpc_weight_source & out) {
+        auto it = pimpl->rpc_weight_sources.find(name);
+        if (it == pimpl->rpc_weight_sources.end()) {
+            return false;
+        }
+        out = it->second;
+        return true;
+    };
+
+    std::string err;
+    if (!llama_rpc_upload_weights(jobs, pimpl->rpc_file_paths, source_of,
+                                  /* check_tensors  = */ false,
+                                  /* concurrent     = */ {},
+                                  /* preloaded      = */ nullptr, err)) {
+        LLAMA_LOG_ERROR("%s: reload failed: %s\n", __func__, err.empty() ? "unknown error" : err.c_str());
+        rollback();
+        return -3;
+    }
+
+    pimpl->rpc_weights_unloaded = false;
+    LLAMA_LOG_INFO("%s: reloaded %.2f GiB of weights onto %zu endpoint(s) in %.2f s\n",
+            __func__, rpc_weights_size() / (1024.0*1024.0*1024.0), jobs.size(),
+            (ggml_time_us() - t_start) / 1e6);
+    return 0;
+}
+
+//
+// process-wide RPC connection control
+//
+
+int32_t llama_rpc_detach(void) {
+    auto fn = (int (*)(void)) llama_rpc_proc("ggml_backend_rpc_detach");
+    if (fn == nullptr) {
+        LLAMA_LOG_ERROR("%s: the RPC backend is not available\n", __func__);
+        return -1;
+    }
+    return fn();
+}
+
+int32_t llama_rpc_reattach(int32_t timeout_ms) {
+    auto fn = (int (*)(int)) llama_rpc_proc("ggml_backend_rpc_reattach");
+    if (fn == nullptr) {
+        LLAMA_LOG_ERROR("%s: the RPC backend is not available\n", __func__);
+        return -1;
+    }
+    return fn(timeout_ms);
+}
+
+bool llama_rpc_is_detached(void) {
+    auto fn = (bool (*)(void)) llama_rpc_proc("ggml_backend_rpc_is_detached");
+    return fn != nullptr && fn();
+}
+
+bool llama_rpc_session_lost(void) {
+    auto fn = (bool (*)(void)) llama_rpc_proc("ggml_backend_rpc_session_lost");
+    return fn != nullptr && fn();
+}
+
+int32_t llama_rpc_endpoints(const char ** out_names, int32_t * out_connected, int32_t max) {
+    auto fn = (int (*)(const char **, int *, int)) llama_rpc_proc("ggml_backend_rpc_endpoint_status");
+    if (fn == nullptr) {
+        return 0;
+    }
+    return fn(out_names, out_connected, max);
+}
+
+//
+// model-level C API
+//
+
+int32_t llama_model_rpc_weights_unload(llama_model * model) {
+    return model->rpc_weights_unload();
+}
+
+int32_t llama_model_rpc_weights_reload(llama_model * model) {
+    return model->rpc_weights_reload();
+}
+
+bool llama_model_rpc_weights_unloaded(const llama_model * model) {
+    return model->rpc_weights_unloaded();
+}
+
+size_t llama_model_rpc_weights_size(const llama_model * model) {
+    return model->rpc_weights_size();
+}
+
+int32_t llama_model_rpc_weight_buffers(const llama_model * model) {
+    return (int32_t) model->rpc_weights_buffers();
 }
 
 uint64_t llama_model_size(const llama_model * model) {

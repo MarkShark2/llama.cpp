@@ -18,6 +18,10 @@ private:
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
+    // [fork] fleet hibernation: while held, an arriving request waits here
+    // instead of being served. The loop itself keeps running - that is what
+    // lets the /rpc/* control tasks be processed while the fleet is away.
+    bool hold = false;
     int64_t time_last_task = 0;
 
     // queues
@@ -65,9 +69,19 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
-    // if sleeping, request exiting sleep state and wait until it is done
-    // returns immediately if not sleeping
-    void wait_until_no_sleep();
+    // Wait until the server can serve: if sleeping, request exiting the sleep
+    // state; if held (fleet hibernation) just wait, because only an explicit
+    // resume may bring the RPC hosts back and waking here would race the hosts
+    // on their way down. Returns false if timeout_ms elapsed (0 = forever).
+    bool wait_until_no_sleep(int64_t timeout_ms = 0);
+
+    // [fork] fleet hibernation: hold arriving requests / let them through
+    void set_hold(bool value);
+
+    bool is_held() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return hold;
+    }
 
     bool is_sleeping() {
         std::unique_lock<std::mutex> lock(mutex_tasks);

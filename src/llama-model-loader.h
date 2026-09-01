@@ -11,10 +11,12 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 using llama_ctx_buf_maps = std::vector<std::pair<ggml_context *, llama_buf_map>>;
@@ -29,6 +31,57 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+
+// ---------------------------------------------------------------------------
+// RPC weight loading  [fork]
+//
+// Shared by the initial model load and by the fleet-hibernation reload, which
+// has no llama_model_loader to work from: it hands over the same three things
+// a load does - the weight contexts, the model file paths, and a way to look
+// up where a tensor's payload sits in them.
+// ---------------------------------------------------------------------------
+
+// entry points on the RPC backend, resolved by proc address so this code does
+// not depend on the RPC backend being present
+struct llama_rpc_cache_api {
+    using query_fn_t    = int  (*)(ggml_backend_buffer_t, ggml_tensor *, size_t, size_t, uint64_t);
+    using upload_fn_t   = bool (*)(ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t);
+    using endpoint_fn_t = const char * (*)(ggml_backend_buffer_t);
+
+    query_fn_t    query    = nullptr;
+    upload_fn_t   upload   = nullptr;
+    endpoint_fn_t endpoint = nullptr;
+    size_t        threshold = 0;
+};
+
+// the weight contexts that live on one RPC endpoint
+struct llama_rpc_job {
+    ggml_backend_dev_t device = nullptr;
+    std::string endpoint;
+    llama_rpc_cache_api api;
+    std::vector<ggml_context *> contexts;
+};
+
+// where a weight tensor's payload sits in the model files
+struct llama_rpc_weight_source {
+    uint16_t idx  = 0;   // file index
+    size_t   offs = 0;
+};
+
+using llama_rpc_source_fn = std::function<bool(const char * name, llama_rpc_weight_source & out)>;
+
+std::vector<llama_rpc_job> llama_rpc_jobs_for(
+        const std::vector<ggml_context *> & contexts,
+        std::unordered_set<ggml_context *> * matched);
+
+bool llama_rpc_upload_weights(
+        const std::vector<llama_rpc_job> & jobs,
+        const std::vector<std::string> & file_paths,
+        const llama_rpc_source_fn & source_of,
+        bool check_tensors,
+        const std::function<bool()> & concurrent_work,
+        std::unordered_set<const ggml_tensor *> * preloaded,
+        std::string & err);
 
 struct llama_model_loader {
     // Holds information on a model weight

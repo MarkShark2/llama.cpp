@@ -979,6 +979,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;   // [fork] /rpc/status reads the state directly
 
 public:
     // only use these pointers outside of this class:
@@ -1103,6 +1104,194 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+
+    // ------------------------------------------------------------------
+    // Fleet hibernation  [fork]
+    //
+    // Three steps, each driven from outside (horde decides when, because it is
+    // the thing that also suspends and wakes the hosts):
+    //
+    //   POST /rpc/unload   free the RPC-resident model weights, then hold
+    //   POST /rpc/detach   park the sessions and close the connections
+    //   POST /rpc/resume   dial the hosts again, refill the weights, serve
+    //
+    // From the unload onwards the queue is *held*: arriving requests wait in
+    // it instead of waking anything, because the hosts are on their way down
+    // and a wake in the middle of that is exactly the race this has to avoid.
+    // Only /rpc/resume lifts the hold. GET /rpc/status answers throughout - it
+    // never touches the model, so horde can watch the teardown as it happens.
+    // ------------------------------------------------------------------
+
+    enum rpc_hib_state {
+        RPC_HIB_ATTACHED,   // normal service
+        RPC_HIB_UNLOADED,   // weights freed, connections still up
+        RPC_HIB_DETACHED,   // sessions parked, connections closed
+    };
+
+    rpc_hib_state rpc_hib = RPC_HIB_ATTACHED;
+    std::string   rpc_hib_error;   // last failure, reported by /rpc/status
+
+    bool rpc_hibernating() const {
+        return rpc_hib != RPC_HIB_ATTACHED;
+    }
+
+    json rpc_status_json() {
+        json endpoints = json::array();
+        const int32_t n = llama_rpc_endpoints(nullptr, nullptr, 0);
+        if (n > 0) {
+            std::vector<const char *> names(n);
+            std::vector<int32_t>      connected(n);
+            llama_rpc_endpoints(names.data(), connected.data(), n);
+            for (int32_t i = 0; i < n; i++) {
+                endpoints.push_back(json {
+                    { "endpoint",  names[i] ? names[i] : "" },
+                    { "connected", connected[i] != 0 },
+                });
+            }
+        }
+
+        const char * state =
+            rpc_hib == RPC_HIB_ATTACHED ? "attached" :
+            rpc_hib == RPC_HIB_UNLOADED ? "unloaded" : "detached";
+
+        json out = json {
+            { "state",            state },
+            { "held",             queue_tasks.is_held() },
+            { "detached",         llama_rpc_is_detached() },
+            { "session_lost",     llama_rpc_session_lost() },
+            { "endpoints",        endpoints },
+            { "weight_buffers",   model_tgt ? llama_model_rpc_weight_buffers(model_tgt) : 0 },
+            { "weight_bytes",     model_tgt ? (uint64_t) llama_model_rpc_weights_size(model_tgt) : 0 },
+            { "weights_unloaded", model_tgt ? llama_model_rpc_weights_unloaded(model_tgt) : false },
+            { "busy_slots",       n_busy_slots() },
+        };
+        if (!rpc_hib_error.empty()) {
+            out["error"] = rpc_hib_error;
+        }
+        return out;
+    }
+
+    int n_busy_slots() const {
+        int n = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    // free the weights that live on RPC endpoints and stop serving. Runs on the
+    // main loop thread, so nothing is mid-decode.
+    bool rpc_do_unload(std::string & err) {
+        const int busy = n_busy_slots();
+        if (busy > 0) {
+            err = string_format("%d slot(s) are still processing", busy);
+            return false;
+        }
+        if (ctx_tgt == nullptr || model_tgt == nullptr) {
+            err = "no model is loaded";
+            return false;
+        }
+
+        // the cached graphs and scheduler splits carry the device pointers we
+        // are about to invalidate
+        llama_graphs_invalidate(ctx_tgt);
+        if (ctx_dft != nullptr) {
+            llama_graphs_invalidate(ctx_dft);
+        }
+
+        const int32_t rc = llama_model_rpc_weights_unload(model_tgt);
+        if (rc != 0) {
+            err = rc == -1 ? "no model weights live on an RPC endpoint"
+                : rc == -2 ? "--rpc-cache is required: without it the reload would "
+                             "pull every weight back across the wire"
+                           : string_format("llama_model_rpc_weights_unload failed (%d)", rc);
+            rpc_hib_error = err;
+            return false;
+        }
+
+        rpc_hib = RPC_HIB_UNLOADED;
+        rpc_hib_error.clear();
+        // from here nothing may decode, so hold every arriving request
+        queue_tasks.set_hold(true);
+        return true;
+    }
+
+    bool rpc_do_detach(std::string & err) {
+        const int busy = n_busy_slots();
+        if (busy > 0) {
+            err = string_format("%d slot(s) are still processing", busy);
+            return false;
+        }
+
+        const int32_t parked = llama_rpc_detach();
+        if (parked < 0) {
+            err = llama_rpc_session_lost()
+                ? string_format("%d RPC server(s) refused to park their session - "
+                                "the parked KV cache is gone; restart the config", -parked)
+                : string_format("%d RPC server(s) refused to park their session", -parked);
+            rpc_hib_error = err;
+            // the connections are closed either way, so the state is detached
+            rpc_hib = RPC_HIB_DETACHED;
+            queue_tasks.set_hold(true);
+            return false;
+        }
+
+        rpc_hib = RPC_HIB_DETACHED;
+        rpc_hib_error.clear();
+        queue_tasks.set_hold(true);
+        SRV_INF("RPC fleet detached: %d session(s) parked\n", parked);
+        return true;
+    }
+
+    // Reconnect and refill. Runs on the main loop thread, so nothing else can
+    // touch the model while the fabric comes back.
+    bool rpc_do_resume(std::string & err) {
+        const int64_t t_start = ggml_time_ms();
+
+        if (rpc_hib == RPC_HIB_DETACHED) {
+            const int32_t timeout_ms = params_base.rpc_hibernate_wake_seconds * 1000;
+            SRV_INF("waiting for the RPC fleet to come back (up to %d s)\n",
+                    params_base.rpc_hibernate_wake_seconds);
+            const int32_t resumed = llama_rpc_reattach(timeout_ms);
+            if (resumed < 0) {
+                rpc_hib_error = llama_rpc_session_lost()
+                    ? string_format("a parked session was lost on %d endpoint(s) - the KV "
+                                     "cache cannot be recovered; restart the config", -resumed)
+                    : string_format("%d endpoint(s) did not come back within %d s",
+                                    -resumed, params_base.rpc_hibernate_wake_seconds);
+                SRV_ERR("%s\n", rpc_hib_error.c_str());
+                err = rpc_hib_error;
+                return false;   // stays detached and held; /rpc/status says why
+            }
+            rpc_hib = RPC_HIB_UNLOADED;
+        }
+
+        if (rpc_hib == RPC_HIB_UNLOADED) {
+            if (model_tgt != nullptr && llama_model_rpc_weights_unloaded(model_tgt)) {
+                const int32_t rc = llama_model_rpc_weights_reload(model_tgt);
+                if (rc != 0) {
+                    rpc_hib_error = string_format("weight reload failed (%d)", rc);
+                    SRV_ERR("%s\n", rpc_hib_error.c_str());
+                    err = rpc_hib_error;
+                    return false;   // stays unloaded and held
+                }
+            }
+            if (ctx_tgt != nullptr) {
+                llama_graphs_invalidate(ctx_tgt);
+            }
+            if (ctx_dft != nullptr) {
+                llama_graphs_invalidate(ctx_dft);
+            }
+            rpc_hib = RPC_HIB_ATTACHED;
+        }
+
+        rpc_hib_error.clear();
+        queue_tasks.set_hold(false);   // releases every request that was waiting
+        SRV_INF("RPC fleet is back, serving again (%.2f s)\n", (ggml_time_ms() - t_start) / 1e3);
+        return true;
+    }
 
     void destroy() {
         spd_pipeline.reset();
@@ -2853,6 +3042,22 @@ private:
             return false;
         }
 
+        // [fork] the weights or the connections are gone; a decode now would
+        // read freed device memory. This is the guard for the failure path -
+        // a client that waited on the hold never reaches it.
+        if (rpc_hibernating() &&
+                (task.type == SERVER_TASK_TYPE_COMPLETION ||
+                 task.type == SERVER_TASK_TYPE_INFILL     ||
+                 task.type == SERVER_TASK_TYPE_EMBEDDING  ||
+                 task.type == SERVER_TASK_TYPE_RERANK)) {
+            send_error(task,
+                    rpc_hib_error.empty()
+                        ? "the RPC fleet is hibernated; POST /rpc/resume to bring it back"
+                        : "the RPC fleet is hibernated: " + rpc_hib_error,
+                    ERROR_TYPE_UNAVAILABLE);
+            return true;
+        }
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -3164,6 +3369,25 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_RPC_CONTROL:
+                {
+                    std::string err;
+                    bool ok = true;
+                    switch (task.rpc_action) {
+                        case SERVER_RPC_ACTION_UNLOAD: ok = rpc_do_unload(err); break;
+                        case SERVER_RPC_ACTION_DETACH: ok = rpc_do_detach(err); break;
+                        case SERVER_RPC_ACTION_RESUME: ok = rpc_do_resume(err); break;
+                        case SERVER_RPC_ACTION_STATUS: break;
+                    }
+                    if (!ok) {
+                        send_error(task, err, ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_rpc>();
+                    res->id   = task.id;
+                    res->body = rpc_status_json();
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -5714,12 +5938,18 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
     server_response_reader rd;
-    server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
+    server_res_generator(server_queue & queue_tasks, server_response & queue_results, int hold_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
-        // fast path in case sleeping is disabled
-        bypass_sleep |= sleep_idle_seconds < 0;
-        if (!bypass_sleep) {
-            queue_tasks.wait_until_no_sleep();
+        if (bypass_sleep) {
+            return;
+        }
+        // [fork] a held queue means the RPC fleet is hibernated: wait for the
+        // resume rather than failing - but not forever, or a client whose
+        // connection is long gone would pin this thread until the process ends
+        if (!queue_tasks.wait_until_no_sleep((int64_t) hold_seconds * 1000)) {
+            throw server_unavailable(
+                "the RPC fleet is hibernated and did not come back in time; "
+                "POST /rpc/resume brings it back");
         }
     }
     void ok(const json & response_data) {
@@ -6009,7 +6239,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 }
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
-    return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+    return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.rpc_hibernate_hold_seconds, bypass_sleep);
 }
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
@@ -6708,6 +6938,50 @@ void server_routes::init_routes() {
 
         res->ok(root);
         return res;
+    };
+
+    // [fork] fleet hibernation. All four bypass the request hold: they are how
+    // the hold is lifted, and status has to answer while it is on.
+    auto rpc_control = [this](const server_http_req & req, server_rpc_action action) {
+        auto res = create_response(true);
+        {
+            server_task task(SERVER_TASK_TYPE_RPC_CONTROL);
+            task.id         = res->rd.get_new_id();
+            task.rpc_action = action;
+            res->rd.post_task(std::move(task), true);   // ahead of queued work
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());   // connection was closed
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_rpc_status = [this](const server_http_req &) {
+        // answered on this thread rather than through the queue: status must
+        // work while the main loop is busy bringing the fleet back, which is
+        // exactly when it gets asked
+        auto res = create_response(true);
+        res->ok(ctx_server.rpc_status_json());
+        return res;
+    };
+
+    this->post_rpc_unload = [rpc_control](const server_http_req & req) {
+        return rpc_control(req, SERVER_RPC_ACTION_UNLOAD);
+    };
+
+    this->post_rpc_detach = [rpc_control](const server_http_req & req) {
+        return rpc_control(req, SERVER_RPC_ACTION_DETACH);
+    };
+
+    this->post_rpc_resume = [rpc_control](const server_http_req & req) {
+        return rpc_control(req, SERVER_RPC_ACTION_RESUME);
     };
 
     this->get_lora_adapters = [this](const server_http_req & req) {

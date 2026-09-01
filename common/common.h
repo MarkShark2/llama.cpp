@@ -666,6 +666,12 @@ struct common_params {
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
+    // [fork] fleet hibernation (see tools/server /rpc/* endpoints):
+    // how long a request waits while the RPC fleet is hibernated before it is
+    // answered 503, and how long a resume polls for the hosts to come back
+    int rpc_hibernate_hold_seconds = 900;
+    int rpc_hibernate_wake_seconds = 600;
+
     std::vector<std::string> api_keys;
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
