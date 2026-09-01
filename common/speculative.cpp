@@ -1461,6 +1461,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<std::vector<llama_token>>> probe_topk;
 
     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
+    bool dsa_index_share = false;
+    size_t dsa_sel_width = 0;
+    std::vector<std::vector<int32_t>> dsa_sel;
+    std::vector<int32_t> dsa_sel_batch;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1478,6 +1482,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_nextn_heads(llama_get_model(ctx_dft)));
 
         n_cap.assign(n_seq, 0);
+
+        dsa_index_share = llama_set_mtp_dsa_index_share(ctx_dft, true);
+        if (dsa_index_share) {
+            dsa_sel.resize(n_seq);
+        }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1546,6 +1555,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         probe_topk.assign(n_seq, {});
+
+        SPC_TRC("- dsa_index_share=%d\n", (int) dsa_index_share);
     }
 
     const std::vector<llama_token> * dbg_topk(llama_seq_id seq_id, int step) const override {
@@ -1583,11 +1594,72 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         backend_chains.clear();
 
+        if (dsa_index_share && ctx_dft != nullptr) {
+            llama_set_mtp_dsa_index_share(ctx_dft, false);
+        }
+
         if (batch.token != nullptr) {
             free(batch.token);
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+    }
+
+    void reset_dsa_index_share() {
+        if (!dsa_index_share) {
+            return;
+        }
+        llama_set_mtp_dsa_selection(params.ctx_dft, nullptr, 0);
+        dsa_sel_width = 0;
+        dsa_sel_batch.clear();
+        for (auto & row : dsa_sel) {
+            row.clear();
+        }
+    }
+
+    bool capture_dsa_index_share(const llama_batch & current) {
+        size_t n = 0;
+        const int32_t * sel = llama_get_mtp_dsa_selection(params.ctx_dft, &n);
+        if (sel == nullptr || current.n_tokens <= 0 || n == 0 || n % (size_t) current.n_tokens != 0) {
+            return false;
+        }
+
+        const size_t width = n / (size_t) current.n_tokens;
+        for (auto & row : dsa_sel) {
+            row.clear();
+        }
+        for (int32_t k = 0; k < current.n_tokens; ++k) {
+            if (current.n_seq_id[k] != 1) {
+                return false;
+            }
+            const llama_seq_id seq_id = current.seq_id[k][0];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !dsa_sel[seq_id].empty()) {
+                return false;
+            }
+            dsa_sel[seq_id].assign(sel + (size_t) k*width, sel + (size_t) (k + 1)*width);
+        }
+        dsa_sel_width = width;
+        return true;
+    }
+
+    bool stage_dsa_index_share(const llama_batch & current) {
+        if (dsa_sel_width == 0 || current.n_tokens <= 0) {
+            return false;
+        }
+
+        dsa_sel_batch.resize(dsa_sel_width*(size_t) current.n_tokens);
+        for (int32_t k = 0; k < current.n_tokens; ++k) {
+            if (current.n_seq_id[k] != 1) {
+                return false;
+            }
+            const llama_seq_id seq_id = current.seq_id[k][0];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || dsa_sel[seq_id].size() != dsa_sel_width) {
+                return false;
+            }
+            std::copy(dsa_sel[seq_id].begin(), dsa_sel[seq_id].end(), dsa_sel_batch.begin() + (size_t) k*dsa_sel_width);
+        }
+
+        return llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel_batch.data(), dsa_sel_batch.size());
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1639,6 +1711,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+
+        reset_dsa_index_share();
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1729,6 +1803,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        reset_dsa_index_share();
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -1769,6 +1845,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int i = 0;
 
         while (n_drafting > 0) {
+            if (dsa_index_share && i > 0 && dsa_sel_width > 0 && !stage_dsa_index_share(batch)) {
+                reset_dsa_index_share();
+            }
+
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < n_past
             // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
@@ -1789,6 +1869,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
+            }
+
+            if (dsa_index_share && i == 0 && !capture_dsa_index_share(batch)) {
+                reset_dsa_index_share();
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -1886,6 +1970,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             ++i;
         }
+
+        reset_dsa_index_share();
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
