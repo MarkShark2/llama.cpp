@@ -183,6 +183,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
+    // Stage 2 runs the deferred target head on --device-draft. Pinning the
+    // originals there would make every normal prompt/decode graph end in an
+    // RPC -> local split and drain the pipeline inside submission, so retain a
+    // second tail with the last transformer layer for the ordinary graph.
+    if (!mtp_only && params.mtp_dev != nullptr && n_layer > 0) {
+        hc_head_norm_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_NORM, "weight"),
+                { hc_dim }, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        hc_head_down_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"),
+                { hc_dim, hc_lr }, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        hc_head_up_trunk   = create_tensor_on_layer(ml, tn(LLM_TENSOR_HC_HEAD_UP, "weight"),
+                { hc_lr, hc_dim }, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        output_trunk       = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT, "weight"),
+                { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        if (output_trunk == nullptr) {
+            output_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_TOKEN_EMBD, "weight"),
+                    { n_embd, n_vocab }, TENSOR_DUPLICATED, n_layer - 1);
+        }
+    }
+
     // flat [ple_head_dim, n_rows] gather target
     if (hparams.ple_n_heads > 0) {
         // the head ranges are what the gather indexes, so they set the minimum row count
@@ -522,15 +541,22 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         return;
     }
 
-    // the final mixer is the output norm: there is no separate one
+    // the final mixer is the output norm: there is no separate one. Use the
+    // last-stage copies when stage 2 pinned the originals to the draft GPU, so
+    // ordinary prompt/decode graphs still end on the RPC pipeline.
+    const auto & model_qwen = static_cast<const llama_model_qwen4exp &>(model);
+    ggml_tensor * head_norm = model_qwen.hc_head_norm_trunk ? model_qwen.hc_head_norm_trunk : model.hc_head_norm;
+    ggml_tensor * head_down = model_qwen.hc_head_down_trunk ? model_qwen.hc_head_down_trunk : model.hc_head_down;
+    ggml_tensor * head_up   = model_qwen.hc_head_up_trunk   ? model_qwen.hc_head_up_trunk   : model.hc_head_up;
+    ggml_tensor * head_out  = model_qwen.output_trunk       ? model_qwen.output_trunk       : model.output;
+
     ggml_tensor * cur = build_hc_mix(res_hc,
-            model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-            nullptr, nullptr, -1);
+            head_norm, head_down, head_up, nullptr, nullptr, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(head_out, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

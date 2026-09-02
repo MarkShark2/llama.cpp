@@ -1712,7 +1712,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
                               || std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
-        if (((spec_mtp && !params.speculative.has_dft()) || spec_spd || spec_dflash) &&
+        // A separate MTP file normally needs no target-weight pin. Stage-2 is
+        // the exception: its deferred target head should run beside the drafter,
+        // while per-arch duplicates keep the ordinary trunk tail on the last
+        // pipeline stage. The draft device must also appear in --device; the
+        // model loader rejects an override outside that list.
+        const bool pipedec_stage2 = getenv("GGML_PIPEDEC_STAGE2") &&
+                                    atoi(getenv("GGML_PIPEDEC_STAGE2")) != 0;
+        if (((spec_mtp && (!params.speculative.has_dft() || pipedec_stage2)) || spec_spd || spec_dflash) &&
             !params.speculative.draft.devices.empty()) {
             mparams.mtp_dev = params.speculative.draft.devices[0];
         }

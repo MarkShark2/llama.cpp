@@ -2428,6 +2428,14 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // When stage 2 pins the target's output tensors to the draft GPU, these
+    // duplicates keep normal target graphs ending on the last RPC stage.
+    // graph_pipedec_head deliberately uses the originals on the draft GPU.
+    ggml_tensor * hc_head_norm_trunk = nullptr;
+    ggml_tensor * hc_head_down_trunk = nullptr;
+    ggml_tensor * hc_head_up_trunk   = nullptr;
+    ggml_tensor * output_trunk       = nullptr;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
