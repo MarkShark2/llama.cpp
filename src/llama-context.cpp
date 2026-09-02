@@ -5408,7 +5408,7 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     static const bool tree_trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
     if (tree_trace) {
         const int64_t t_sub4 = ggml_time_us();
-        LLAMA_LOG_INFO("[tree] ctx-submit rows=%u balloc=%.2f mem_update=%.2f init_batch=%.2f body=%.2f ms\n",
+        fprintf(stderr, "[tree] ctx-submit rows=%u balloc=%.2f mem_update=%.2f init_batch=%.2f body=%.2f ms\n",
                 n_tokens, (t_sub1 - t_sub0)/1000.0, (t_sub2 - t_sub1)/1000.0, (t_sub3 - t_sub2)/1000.0, (t_sub4 - t_sub3)/1000.0);
     }
 

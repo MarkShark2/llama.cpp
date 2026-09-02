@@ -447,15 +447,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // walk only the cells this sequence holds - a full-cache scan costs ~1 ms per call at 128k cells
+        // and the tree decoder issues several per level on every cache
+        for (uint32_t i : cells.seq_cells_in(seq_id, p0, p1)) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
@@ -523,12 +519,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             p1 = std::numeric_limits<llama_pos>::max();
         }
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id_src)) {
+        for (uint32_t i : cells.seq_cells_in(seq_id_src, p0, p1)) {
+            if (!cells.seq_has(i, seq_id_dst)) {
                 cells.seq_add(i, seq_id_dst);
             }
         }

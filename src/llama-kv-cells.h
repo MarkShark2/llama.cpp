@@ -336,6 +336,24 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    // the cells of sequence seq_id whose position is within [p0, p1), walked from the per-sequence
+    // position index instead of scanning every cell of the cache
+    std::vector<uint32_t> seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        std::vector<uint32_t> res;
+
+        const auto & sp = seq_pos[seq_id];
+
+        auto it = sp.lower_bound({ p0, 0 });
+        for (; it != sp.end() && it->first < p1; ++it) {
+            res.push_back(it->second);
+        }
+
+        return res;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
