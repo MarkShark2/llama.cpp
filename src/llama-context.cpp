@@ -198,6 +198,18 @@ llama_context::llama_context(
         cparams.n_embd_inp_ctx = llama_model_n_embd_spd_boundary(&model);
     }
 
+    // An MTP draft context is fed the target's wide hidden state, not a token
+    // embedding: llm_graph_input_embd_h is built n_embd_out() wide, and decode()
+    // already sizes the embeddings output that way for an MTP batch. The batch
+    // allocator has to agree, or it strides batch.embd at n_embd_inp() while
+    // set_input reads n_embd_out() per row and runs off the end of udata->embd.
+    // Only hyper-connection models notice - everywhere else n_embd_out() is
+    // n_embd - which is why this stayed hidden until a qwen4exp head (hc 4, so
+    // rows 4x too short) drafted from zeros and then from heap garbage.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.n_embd_inp_ctx = hparams.n_embd_out();
+    }
+
     // ... and of one row of the embeddings output. Every SPD stage emits the
     // residual it hands on, including stage 0, which is fed tokens and so has a
     // narrower input than output. The head and embed contexts emit ordinary
