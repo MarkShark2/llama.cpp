@@ -457,6 +457,11 @@ private:
     bool     pipedec_tree_enabled = false;
     std::array<uint32_t, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_rows{};
     std::array<bool,     PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_busy{};
+    // the row GET's read fence: waiting on it proves this lane's graph retired
+    // on the last stage without draining the other lanes' queued work
+    std::array<ggml_backend_t, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_backend{};
+    std::array<uint64_t,       PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_fence{};
+    void pipedec_tree_lane_wait(int32_t lane);
     int64_t  pipedec_tree_t_wait_us = 0;
     int64_t  pipedec_tree_t_head_us = 0;
     ggml_backend_sched_ptr sched_pipedec_copy; // recurrent state copy at commit

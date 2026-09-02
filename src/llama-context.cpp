@@ -5339,9 +5339,7 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     const uint32_t n_tokens = batch_inp.n_tokens;
 
     // a discarded level may still run here; its graph inputs are rewritten below
-    if (sched_pipedec_body[lane]) {
-        ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
-    }
+    pipedec_tree_lane_wait(lane);
 
     const int64_t t_sub0 = ggml_time_us();
     if (!balloc->init(batch_inp, model.vocab, memory.get(), cparams.n_embd_inp_ctx, n_seq_max(), false)) {
@@ -5401,6 +5399,13 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     GGML_ASSERT(backend_h != nullptr);
 
     ggml_backend_tensor_get_async(backend_h, t_h, pipedec_tree_row(lane, 0), 0, (size_t) n_tokens * n_embd * sizeof(float));
+
+    // snapshot the read fence right after the GET: the daemon FIFO orders the
+    // read after the graph that produced the rows, so a completed read is the
+    // lane's completion - endpoint-global synchronize would also drain every
+    // other level in flight and serialize the pipeline
+    pipedec_tree_lane_backend[lane] = backend_h;
+    pipedec_tree_lane_fence[lane]   = ggml_backend_is_rpc(backend_h) ? ggml_backend_rpc_read_ordinal(backend_h) : 0;
 
     pipedec_tree_lane_rows[lane] = n_tokens;
     pipedec_tree_lane_busy[lane] = true;
@@ -5485,6 +5490,22 @@ int32_t llama_context::pipedec_run_head(const float * rows, uint32_t n_rows) {
     return 0;
 }
 
+void llama_context::pipedec_tree_lane_wait(int32_t lane) {
+    ggml_backend_t b = pipedec_tree_lane_backend[lane];
+    if (b == nullptr) {
+        return; // nothing of this lane is in flight
+    }
+    if (ggml_backend_is_rpc(b)) {
+        if (pipedec_tree_lane_fence[lane] != 0) {
+            ggml_backend_rpc_read_wait(b, pipedec_tree_lane_fence[lane]);
+        }
+    } else {
+        ggml_backend_synchronize(b);
+    }
+    pipedec_tree_lane_backend[lane] = nullptr;
+    pipedec_tree_lane_fence[lane]   = 0;
+}
+
 int32_t llama_context::pipedec_tree_close(int32_t lane, int32_t row) {
     if (!pipedec_tree_enabled || lane < 0 || lane >= (int32_t) PIPEDEC_STAGE2_MAX_LANES) {
         return -1;
@@ -5495,7 +5516,7 @@ int32_t llama_context::pipedec_tree_close(int32_t lane, int32_t row) {
     }
 
     const int64_t t0 = ggml_time_us();
-    ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+    pipedec_tree_lane_wait(lane);
     pipedec_tree_lane_busy[lane] = false;
     const int64_t t1 = ggml_time_us();
 
