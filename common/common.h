@@ -174,7 +174,6 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // Multi-token prediction, adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_SPD,           // Speculative Pipeline Decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
@@ -182,18 +181,17 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,             // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT                    // number of types, unknown type
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
-// draft-mtp and draft-mtp-adaptive differ only in how the draft depth is chosen;
-// every other code path treats them the same. Matching just one of them silently
-// skips MTP setup -- which is how the draft context lost its
+// Five call sites decide "is this an MTP run?", and missing one silently skips
+// MTP setup rather than failing: that is how the draft context lost its
 // LLAMA_CONTEXT_TYPE_MTP under --fit, leaving the fit pass to build a trunk graph
-// for a draft-only file and dereference the trunk tensors it does not have.
+// for a draft-only file and dereference the trunk tensors it does not have. Keep
+// them all on this one predicate.
 inline bool common_spec_has_mtp(const std::vector<common_speculative_type> & types) {
-    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP)          != types.end() ||
-           std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
 }
 
 // Grammar type enumeration
@@ -338,7 +336,6 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
-    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -410,7 +407,6 @@ struct common_params_speculative {
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
