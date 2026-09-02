@@ -462,6 +462,10 @@ private:
     std::array<ggml_backend_t, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_backend{};
     std::array<uint64_t,       PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_fence{};
     void pipedec_tree_lane_wait(int32_t lane);
+    // set by close(): the logits came from the head, which already waited on
+    // its device, so synchronize() (llama_get_logits_ith calls it) must not
+    // drain the fabric behind the levels still in flight
+    bool     pipedec_tree_logits_fresh = false;
     int64_t  pipedec_tree_t_wait_us = 0;
     int64_t  pipedec_tree_t_head_us = 0;
     ggml_backend_sched_ptr sched_pipedec_copy; // recurrent state copy at commit

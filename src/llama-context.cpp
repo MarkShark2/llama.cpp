@@ -910,6 +910,14 @@ void llama_context::synchronize() {
         return;
     }
 
+    // [fork, PipeDec tree] the only thing a caller can be after here is the
+    // head's logits, and close() already waited for those on the head device.
+    // An RPC synchronize is an endpoint-global drain, so going through the
+    // lane schedulers would stall behind every level still in flight.
+    if (pipedec_tree_logits_fresh) {
+        return;
+    }
+
     ggml_backend_sched_synchronize(sched.get());
     for (auto & lane_sched : sched_pipedec_body) {
         if (lane_sched) {
@@ -2490,6 +2498,7 @@ static bool pipedec_stage2_eligible(
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    pipedec_tree_logits_fresh = false;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -5338,6 +5347,8 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
 
     const uint32_t n_tokens = batch_inp.n_tokens;
 
+    pipedec_tree_logits_fresh = false;
+
     // a discarded level may still run here; its graph inputs are rewritten below
     pipedec_tree_lane_wait(lane);
 
@@ -5544,6 +5555,7 @@ int32_t llama_context::pipedec_tree_close(int32_t lane, int32_t row) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
     output_ids[0] = 0;
     output_swaps.clear();
+    pipedec_tree_logits_fresh = true;
 
     return 0;
 }
