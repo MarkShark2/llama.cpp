@@ -7,6 +7,7 @@
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
+#include "debug.h"
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "speculative-adaptive.h"
@@ -2740,6 +2741,21 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // [fork] LLAMA_SPEC_DEBUG=<regex> installs common/debug.cpp's tensor printer on the
+    // draft graph only. The target runs over the RPC fabric, where a scheduler eval callback
+    // would drag every intermediate back across the network one tensor at a time; the draft
+    // is local and small, so this is the one place a NaN walk is affordable inside
+    // llama-server. LLAMA_SPEC_DEBUG_ABORT=1 stops at the first NaN.
+    if (const char * dbg_pattern = getenv("LLAMA_SPEC_DEBUG")) {
+        static common_params             dbg_params;
+        static common_debug_cb_user_data dbg_data(dbg_params, { dbg_pattern },
+                getenv("LLAMA_SPEC_DEBUG_ABORT") != nullptr);
+        (void) dbg_data;
+        cparams.cb_eval           = dbg_params.cb_eval;
+        cparams.cb_eval_user_data = dbg_params.cb_eval_user_data;
+        LOG_INF("%s: draft tensor debug enabled, filter '%s'\n", __func__, dbg_pattern);
+    }
 
     std::string model_path;
     if (has_draft) {
