@@ -351,20 +351,31 @@ int32_t common_spec_tree::submit_next() {
     // the level's rows take the lane's seq block, ascending: the recurrent cache
     // wants one contiguous cell run per ubatch
     common_batch_clear(batch_tgt);
+    int64_t t_seq_rm = 0, t_seq_tgt = 0, t_seq_dft = 0;
     for (size_t i = 0; i < pending.size(); ++i) {
         auto & n = nodes[pending[i]];
         n.seq  = params.seq_base + lane * params.width + (llama_seq_id) i;
         n.lane = lane;
         n.row  = (int32_t) i;
 
+        int64_t ta = ggml_time_us();
         free_seq(n.seq);
+        int64_t tb = ggml_time_us();
         llama_memory_seq_cp(llama_get_memory(params.ctx_tgt), n.parent_seq, n.seq, -1, -1);
+        int64_t tc = ggml_time_us();
         llama_memory_seq_cp(llama_get_memory(params.ctx_dft), n.parent_seq, n.seq, -1, -1);
+        int64_t td = ggml_time_us();
+        t_seq_rm += tb - ta; t_seq_tgt += tc - tb; t_seq_dft += td - tc;
 
         common_batch_add(batch_tgt, n.tok, n.pos, { n.seq }, true);
     }
 
+    const int64_t t1 = ggml_time_us();
     const int32_t rc = llama_pipedec_tree_submit(params.ctx_tgt, &batch_tgt, lane);
+    const int64_t t2 = ggml_time_us();
+    TREE_TRC("submit-cost rows=%zu seq_rm=%.2f seq_cp_tgt=%.2f seq_cp_dft=%.2f ctx_submit=%.2f ms
+",
+            pending.size(), t_seq_rm/1000.0, t_seq_tgt/1000.0, t_seq_dft/1000.0, (t2 - t1)/1000.0);
     if (rc != 0) {
         LOG_ERR("%s: level submit failed rc=%d (lane=%d rows=%zu depth=%d)\n", __func__, rc, lane, pending.size(), pending_depth);
         for (int32_t id : pending) {

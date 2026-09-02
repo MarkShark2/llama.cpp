@@ -5343,6 +5343,7 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
         ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
     }
 
+    const int64_t t_sub0 = ggml_time_us();
     if (!balloc->init(batch_inp, model.vocab, memory.get(), cparams.n_embd_inp_ctx, n_seq_max(), false)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -5354,12 +5355,15 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     }
     n_queued_tokens += n_tokens;
 
+    const int64_t t_sub1 = ggml_time_us();
     memory_update(false);
+    const int64_t t_sub2 = ggml_time_us();
 
     auto mctx = memory->init_batch_token_lanes(*balloc, n_tokens, false);
     if (!mctx) {
         return -2;
     }
+    const int64_t t_sub3 = ggml_time_us();
     if (mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
         LLAMA_LOG_WARN("%s: failed to find a memory slot for a level of %u tokens (status %d)\n",
                 __func__, n_tokens, (int) mctx->get_status());
@@ -5400,6 +5404,13 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
 
     pipedec_tree_lane_rows[lane] = n_tokens;
     pipedec_tree_lane_busy[lane] = true;
+
+    static const bool tree_trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
+    if (tree_trace) {
+        const int64_t t_sub4 = ggml_time_us();
+        LLAMA_LOG_INFO("[tree] ctx-submit rows=%u balloc=%.2f mem_update=%.2f init_batch=%.2f body=%.2f ms\n",
+                n_tokens, (t_sub1 - t_sub0)/1000.0, (t_sub2 - t_sub1)/1000.0, (t_sub3 - t_sub2)/1000.0, (t_sub4 - t_sub3)/1000.0);
+    }
 
     return 0;
 }
