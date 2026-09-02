@@ -1757,7 +1757,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    // [fork, PipeDec tree] every tree node in flight owns a seq id
+    cparams.n_seq_max         = params.n_parallel + params.speculative.tree_n_seq();
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
@@ -1785,6 +1786,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+
+    // [fork, PipeDec tree] branches share their prefix cells by seq_cp, which
+    // is metadata only on a unified cache and a full copy per stream otherwise
+    if (params.speculative.tree_enabled()) {
+        cparams.kv_unified = true;
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

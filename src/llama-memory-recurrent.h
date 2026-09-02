@@ -54,6 +54,15 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_static_cells(bool value) override;
+    bool seq_state_copy_build(ggml_context * ctx, ggml_cgraph * gf, llama_seq_id seq_src, llama_seq_id seq_dst) override;
+
+    // [fork, PipeDec tree] seq s always lives in cell s. seq_cp gives the dst its
+    // own cell with a lazy copy from the src cell (no tail sharing), so a cell is
+    // never relabeled or moved while a token lane that reads or writes it is
+    // still in flight. Requires n_rs_seq == 0 and size >= n_seq_max.
+    bool static_cells = false;
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there

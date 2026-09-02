@@ -4261,6 +4261,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-tree-width"}, "N",
+        string_format("PipeDec tree: max nodes per tree level, 0 = off (default: %d). "
+                      "--spec-draft-n-max is the depth (levels in flight)", params.speculative.tree_width),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 8) {
+                throw std::invalid_argument("invalid value (0..8)");
+            }
+            params.speculative.tree_width = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TREE_WIDTH"));
+    add_opt(common_arg(
+        {"--spec-tree-branch"}, "N",
+        string_format("PipeDec tree: max children per node, 0 = same as width (default: %d)", params.speculative.tree_branch),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 8) {
+                throw std::invalid_argument("invalid value (0..8)");
+            }
+            params.speculative.tree_branch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TREE_BRANCH"));
+    add_opt(common_arg(
+        {"--spec-tree-lanes"}, "N",
+        string_format("PipeDec tree: in-flight level ring size, needs depth + 2 (default: %d)", params.speculative.tree_lanes),
+        [](common_params & params, int value) {
+            if (value < 3 || value > 16) {
+                throw std::invalid_argument("invalid value (3..16)");
+            }
+            params.speculative.tree_lanes = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TREE_LANES"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

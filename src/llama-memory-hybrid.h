@@ -71,6 +71,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_static_cells(bool value) override;
+    bool seq_state_copy_build(ggml_context * ctx, ggml_cgraph * gf, llama_seq_id seq_src, llama_seq_id seq_dst) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

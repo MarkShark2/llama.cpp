@@ -259,6 +259,27 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    if (static_cells && (uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
+        // [fork, PipeDec tree] the dst seq takes its own cell now and gathers
+        // the src state in its next graph (src0 = the src cell). No tail is
+        // shared, so the src cell is never moved when the dst is placed.
+        const int32_t tail_src = cells[seq_id_src].tail;
+        if (tail_src < 0) {
+            return;
+        }
+        if (cells[seq_id_dst].tail >= 0) {
+            seq_rm(seq_id_dst, -1, -1);
+        }
+        auto & cell_dst = cells[seq_id_dst];
+        GGML_ASSERT(cell_dst.is_empty() && "static cell of the dst seq is in use");
+        cell_dst.pos = cells[tail_src].pos;
+        cell_dst.src = tail_src;
+        cell_dst.seq_id.insert(seq_id_dst);
+        cells[seq_id_dst].tail = seq_id_dst;
+        used++;
+        return;
+    }
+
     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
@@ -281,6 +302,66 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             tail_dst.tail = tail_src.tail;
         }
     }
+}
+
+void llama_memory_recurrent::set_static_cells(bool value) {
+    if (value) {
+        GGML_ASSERT(n_rs_seq == 0 && "static cells do not carry rollback planes");
+        GGML_ASSERT(size >= n_seq_max && "static cells need one cell per seq");
+    }
+    static_cells = value;
+}
+
+bool llama_memory_recurrent::seq_state_copy_build(ggml_context * ctx, ggml_cgraph * gf, llama_seq_id seq_src, llama_seq_id seq_dst) {
+    GGML_ASSERT(static_cells);
+    GGML_ASSERT((uint32_t) seq_src < size && (uint32_t) seq_dst < size);
+
+    const int32_t cs = cells[seq_src].tail;
+    if (cs < 0) {
+        return false;
+    }
+    const int32_t cd = seq_dst;
+
+    if (cs == cd) {
+        return false;
+    }
+
+    // the dst owns its cell from here on, holding the src state in place
+    if (cells[seq_dst].tail >= 0 && cells[seq_dst].tail != cd) {
+        seq_rm(seq_dst, -1, -1);
+    }
+    auto & cell_dst = cells[cd];
+    if (cell_dst.is_empty()) {
+        used++;
+    }
+    cell_dst.pos  = cells[cs].pos;
+    cell_dst.src  = cd;
+    cell_dst.src0 = cd;
+    cell_dst.seq_id.clear();
+    cell_dst.seq_id.insert(seq_dst);
+    cells[seq_dst].tail = cd;
+
+    auto copy_row = [&](ggml_tensor * t) {
+        if (t == nullptr) {
+            return;
+        }
+        const size_t row_size = ggml_row_size(t->type, t->ne[0]);
+        ggml_tensor * src = ggml_view_1d(ctx, t, t->ne[0], (size_t) cs * row_size);
+        ggml_tensor * dst = ggml_view_1d(ctx, t, t->ne[0], (size_t) cd * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+    };
+
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        copy_row(r_l[il]);
+    }
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        copy_row(s_l[il]);
+    }
+    for (size_t il = 0; il < p_l.size(); ++il) {
+        copy_row(p_l[il]);
+    }
+
+    return true;
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
@@ -598,6 +679,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cell.seq_id.size() == 1) { has_cell = true; }
         }
         if (!has_cell) {
+            // [fork, PipeDec tree] static mode: a seq without a cell takes its own
+            if (static_cells) {
+                next_empty_cell = seq_id;
+                GGML_ASSERT(cells[next_empty_cell].is_empty() && "static cell in use by another seq");
+            }
             auto & empty_cell = cells[next_empty_cell];
             GGML_ASSERT(empty_cell.is_empty());
             // copy old tail into the empty cell
@@ -611,7 +697,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
             seq_meta.tail = next_empty_cell;
             // find next empty cell
-            if (s + 1 < n_seqs) {
+            if (!static_cells && s + 1 < n_seqs) {
                 for (uint32_t j = 0; j < size; ++j) {
                     next_empty_cell += 1;
                     if (next_empty_cell >= size) { next_empty_cell -= size; }
@@ -622,6 +708,13 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
         if (min > seq_meta.tail) { min = seq_meta.tail; }
         if (max < seq_meta.tail) { max = seq_meta.tail; }
+    }
+
+    // [fork, PipeDec tree] the re-order below moves cell metadata, which is only
+    // safe when no earlier graph still runs on those cells. Static mode never
+    // moves a cell: the caller must give each ubatch consecutive seq ids.
+    if (static_cells) {
+        GGML_ASSERT((uint32_t) (max - min + 1) == n_seqs && "static cells need consecutive seq ids per ubatch");
     }
 
     // gather and re-order

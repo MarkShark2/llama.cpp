@@ -100,6 +100,18 @@ struct llama_memory_i {
         return init_batch(balloc, n_ubatch, embd_all);
     }
 
+    // [fork, PipeDec tree] recurrent memories: pin every seq to the cell with
+    // its own index and never move cells between seqs. Token lanes then stay in
+    // flight while later levels are placed. No-op for memories without state.
+    virtual void set_static_cells(bool /*value*/) {}
+
+    // [fork, PipeDec tree] add ops to gf that copy the recurrent state of
+    // seq_src into the cell of seq_dst and make seq_dst own that cell. Returns
+    // false when there is no recurrent state to copy. The caller runs gf.
+    virtual bool seq_state_copy_build(ggml_context * /*ctx*/, ggml_cgraph * /*gf*/, llama_seq_id /*seq_src*/, llama_seq_id /*seq_dst*/) {
+        return false;
+    }
+
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 

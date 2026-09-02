@@ -182,6 +182,10 @@ struct common_speculative_impl {
     // [fork, PipeDec probe] top candidates the draft sampler saw at draft step `step`
     // of the most recent draft() for this seq, best first. nullptr if unavailable.
     virtual const std::vector<llama_token> * dbg_topk(llama_seq_id /*seq_id*/, int /*step*/) const { return nullptr; }
+
+    // [fork, PipeDec tree] draft-mtp carry-over hidden row (see speculative.h)
+    virtual const float * mtp_pending_h(llama_seq_id /*seq_id*/) const { return nullptr; }
+    virtual void mtp_set_pending_h(llama_seq_id /*seq_id*/, const float * /*h*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1550,6 +1554,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return nullptr;
         }
         return &probe_topk[seq_id][step];
+    }
+
+    const float * mtp_pending_h(llama_seq_id seq_id) const override {
+        if (seq_id < 0 || (size_t) seq_id >= pending_h.size()) {
+            return nullptr;
+        }
+        return pending_h[seq_id].data();
+    }
+
+    void mtp_set_pending_h(llama_seq_id seq_id, const float * h) override {
+        if (seq_id < 0 || (size_t) seq_id >= pending_h.size() || h == nullptr) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), h, (size_t) n_embd * sizeof(float));
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -3050,6 +3068,23 @@ void common_speculative_draft(common_speculative * spec) {
 const std::vector<llama_token> * common_speculative_dbg_topk(common_speculative * spec, llama_seq_id seq_id, int step) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
     return impl ? impl->dbg_topk(seq_id, step) : nullptr;
+}
+
+const float * common_speculative_mtp_pending_h(common_speculative * spec, llama_seq_id seq_id) {
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return impl->mtp_pending_h(seq_id);
+        }
+    }
+    return nullptr;
+}
+
+void common_speculative_mtp_set_pending_h(common_speculative * spec, llama_seq_id seq_id, const float * h) {
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            impl->mtp_set_pending_h(seq_id, h);
+        }
+    }
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

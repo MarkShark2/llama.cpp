@@ -101,6 +101,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // step `step` of the most recent draft for this seq; nullptr if unavailable
 const std::vector<llama_token> * common_speculative_dbg_topk(common_speculative * spec, llama_seq_id seq_id, int step);
 
+// [fork, PipeDec tree] the draft-mtp implementation's carry-over hidden row for
+// seq_id: the target's h at the last position process() saw, the row that pairs
+// with the next token. nullptr without a draft-mtp implementation. set_ replaces it.
+const float * common_speculative_mtp_pending_h    (common_speculative * spec, llama_seq_id seq_id);
+void          common_speculative_mtp_set_pending_h(common_speculative * spec, llama_seq_id seq_id, const float * h);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

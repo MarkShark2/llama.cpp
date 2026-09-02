@@ -244,6 +244,31 @@ LLAMA_API void     llama_pipedec_defer  (struct llama_context * ctx);
 LLAMA_API void     llama_pipedec_abort  (struct llama_context * ctx);
 LLAMA_API uint32_t llama_pipedec_group_n(struct llama_context * ctx);
 
+// [PipeDec tree] the paper's pipeline: one prediction-tree level per lane, many
+// levels in flight, pruned by the target's token as each level completes.
+//
+// A level is a batch of tokens at ONE position, each in its own seq id, with
+// consecutive ascending seq ids (the recurrent cache pins seq s to cell s).
+// The caller shares each node's prefix into its seq with llama_memory_seq_cp
+// before submitting. submit runs the decoder body of the level on lane `lane`
+// and returns without waiting; close waits for that lane, runs the LM head on
+// the one row the caller names, and leaves its logits at llama_get_logits_ith(0);
+// discard frees a lane whose level died without running anything; h returns a
+// closed (or drained) level's target hidden row; commit copies the trunk seq's
+// state (KV cells and recurrent cells) into another seq after every lane is
+// drained. enable switches the recurrent cache to static cells and sizes the
+// row buffers; n_lanes/n_rows_max report the limits.
+LLAMA_API int32_t       llama_pipedec_tree_enable (struct llama_context * ctx, bool value);
+LLAMA_API int32_t       llama_pipedec_tree_submit (struct llama_context * ctx, const struct llama_batch * batch, int32_t lane);
+LLAMA_API int32_t       llama_pipedec_tree_close  (struct llama_context * ctx, int32_t lane, int32_t row);
+LLAMA_API void          llama_pipedec_tree_discard(struct llama_context * ctx, int32_t lane);
+LLAMA_API const float * llama_pipedec_tree_h      (struct llama_context * ctx, int32_t lane, int32_t row);
+LLAMA_API int32_t       llama_pipedec_tree_commit (struct llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst);
+LLAMA_API int32_t       llama_pipedec_tree_n_lanes(void);
+LLAMA_API int32_t       llama_pipedec_tree_n_rows_max(void);
+// close timing of the last llama_pipedec_tree_close: wait for the lane, head graph
+LLAMA_API void          llama_pipedec_tree_close_timing(struct llama_context * ctx, int64_t * t_wait_us, int64_t * t_head_us);
+
 //
 // model/context data extraction
 //

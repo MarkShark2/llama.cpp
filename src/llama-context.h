@@ -212,6 +212,20 @@ struct llama_context {
     void     pipedec_abort_group(); // drain + discard in-flight group rows (no head)
     uint32_t pipedec_group_n() const { return pipedec_group_tokens; }
 
+    // [fork, PipeDec tree] see llama-ext.h
+    int32_t       pipedec_tree_enable (bool value);
+    int32_t       pipedec_tree_submit (const llama_batch & batch, int32_t lane);
+    int32_t       pipedec_tree_close  (int32_t lane, int32_t row);
+    void          pipedec_tree_discard(int32_t lane);
+    const float * pipedec_tree_h      (int32_t lane, int32_t row);
+    int32_t       pipedec_tree_commit (llama_seq_id seq_src, llama_seq_id seq_dst);
+    // one LM-head graph over n_rows host rows; logits land in rows [0, n_rows)
+    int32_t       pipedec_run_head    (const float * rows, uint32_t n_rows);
+    static constexpr uint32_t pipedec_tree_max_lanes() { return PIPEDEC_STAGE2_MAX_LANES; }
+    static constexpr uint32_t pipedec_tree_max_rows () { return PIPEDEC_TREE_MAX_ROWS; }
+    int64_t pipedec_tree_wait_us() const { return pipedec_tree_t_wait_us; }
+    int64_t pipedec_tree_head_us() const { return pipedec_tree_t_head_us; }
+
     //
     // state save/load
     //
@@ -433,8 +447,21 @@ private:
 
     ggml_backend_sched_ptr sched;
 
-    static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 8;
+    static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 16;
+    static constexpr uint32_t PIPEDEC_TREE_MAX_ROWS    = 8;
     std::array<ggml_backend_sched_ptr, PIPEDEC_STAGE2_MAX_LANES> sched_pipedec_body;
+
+    // [fork, PipeDec tree] one level per lane. rows = tokens the lane carries,
+    // busy = its body graph or row GETs may still run. Rows stay readable after
+    // close until the lane is reused.
+    bool     pipedec_tree_enabled = false;
+    std::array<uint32_t, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_rows{};
+    std::array<bool,     PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_busy{};
+    int64_t  pipedec_tree_t_wait_us = 0;
+    int64_t  pipedec_tree_t_head_us = 0;
+    ggml_backend_sched_ptr sched_pipedec_copy; // recurrent state copy at commit
+
+    float * pipedec_tree_row(int32_t lane, int32_t row);
 
     // [fork] decode lane pool, grown lazily to the number of decode-group
     // ubatches per step (see process_ubatch_decode_lane)

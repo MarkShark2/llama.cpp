@@ -16,6 +16,7 @@
 #include "sampling.h"
 #include "server-spd-collect.h"
 #include "spd-pipeline.h"
+#include "spec-tree.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -50,6 +51,11 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+
+    // [fork, PipeDec tree] a level's draft decode emits one row per node
+    if (params.speculative.tree_enabled()) {
+        result.total = std::max<int32_t>(result.total, params.speculative.tree_width);
+    }
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -283,6 +289,11 @@ struct server_slot {
     // deferred group from inside the draft loop (on_draft_token); the closing
     // decode carries only spec_draft[spec_deferred_drafts..]
     int32_t   spec_deferred_drafts = 0;
+
+    // [fork, PipeDec tree] generation runs on the prediction tree; the classic
+    // per-iteration decode path stays off this slot until the tree is finished
+    bool tree_active = false;
+    std::function<void(server_slot &)> callback_on_tree_finish;
 
     // `spec_draft` currently holds tokens the target already accepted, kept only to be re-evaluated
     // after a checkpoint restore [TAG_SPEC_AVOID_DRAFT_REEVAL]. They are not a draft: they are
@@ -682,6 +693,11 @@ struct server_slot {
     }
 
     void release() {
+        // [fork, PipeDec tree] fold the tree's trunk back into this slot's seq
+        if (tree_active && callback_on_tree_finish) {
+            callback_on_tree_finish(*this);
+        }
+
         // [fork, PipeDec] never leave a deferred verify group in flight
         if (spec_deferred) {
             llama_pipedec_abort(ctx_tgt);
@@ -1042,6 +1058,9 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // [fork, PipeDec tree] the dynamic prediction tree, single slot
+    std::unique_ptr<common_spec_tree> spec_tree;
 
     bool spd_mode = false;
     std::unique_ptr<common_spd_pipeline> spd_pipeline;
@@ -1695,6 +1714,41 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        // [fork, PipeDec tree] the prediction tree needs the draft-mtp head,
+        // a single slot, and the lane pipeline (checked inside enable)
+        if (params_base.speculative.tree_enabled()) {
+            const auto & sp = params_base.speculative;
+            if (!spec || !ctx_dft || !common_spec_has_mtp(sp.types)) {
+                SRV_ERR("%s", "--spec-tree-width needs --spec-type draft-mtp with a draft head\n");
+                return false;
+            }
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("PipeDec tree requires exactly one server slot (--parallel 1), got %d\n", params_base.n_parallel);
+                return false;
+            }
+            const int32_t depth = std::max(1, sp.draft.n_max);
+            if (sp.tree_lanes < depth + 2) {
+                SRV_ERR("--spec-tree-lanes (%d) must be at least --spec-draft-n-max + 2 (%d)\n", sp.tree_lanes, depth + 2);
+                return false;
+            }
+            if (llama_pipedec_tree_enable(ctx_tgt, true) != 0) {
+                SRV_ERR("%s", "failed to enable PipeDec tree lanes on the target context\n");
+                return false;
+            }
+
+            common_spec_tree_params tp;
+            tp.ctx_tgt  = ctx_tgt;
+            tp.ctx_dft  = ctx_dft;
+            tp.depth    = depth;
+            tp.width    = sp.tree_width;
+            tp.branch   = sp.tree_branch;
+            tp.lanes    = sp.tree_lanes;
+            tp.seq_base = params_base.n_parallel;
+            tp.p_min    = sp.draft.p_min;
+            spec_tree = std::make_unique<common_spec_tree>(tp);
+            SRV_INF("PipeDec tree enabled: depth=%d width=%d branch=%d lanes=%d\n", tp.depth, tp.width, tp.branch, tp.lanes);
+        }
+
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else if (!spec_spd) {
@@ -1767,6 +1821,10 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+            };
+
+            slot.callback_on_tree_finish = [this](server_slot & s) {
+                tree_finish(s);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -3785,6 +3843,11 @@ private:
         // generating, service one cohort per iteration and skip the classic
         // batched round entirely. Falls through (after flushing in-flight
         // cohorts) as soon as prompt or other non-chainable work appears.
+        // [fork, PipeDec tree] one timestep per iteration while a slot runs on the tree
+        if (tree_step()) {
+            return;
+        }
+
         if (chain_step()) {
             return;
         }
@@ -5183,6 +5246,183 @@ private:
 
     // one cohort serviced per update_slots iteration, so streaming responses
     // and the task queue keep flowing between steps
+    //
+    // [fork, PipeDec tree] generation on the dynamic prediction tree
+    //
+
+    // the first sampled token becomes the root; the target's hidden row at the
+    // last prompt position is the draft input for the root's children
+    void tree_begin(server_slot & slot, llama_token id) {
+        if (!spec_tree || slot.tree_active || slot.state != SLOT_STATE_GENERATING) {
+            return;
+        }
+        if (!slot.task->need_sampling() || !slot.has_next_token) {
+            return;
+        }
+
+        const float * h = common_speculative_mtp_pending_h(spec.get(), slot.id);
+        if (h == nullptr) {
+            SLT_WRN(slot, "%s", "no draft-mtp hidden row - the tree stays off for this task\n");
+            return;
+        }
+
+        const llama_pos pos = slot.prompt.tokens.pos_next();
+        if (!spec_tree->begin(id, pos, slot.id, h)) {
+            return;
+        }
+
+        slot.tree_active = true;
+        SLT_DBG(slot, "tree begin: root=%d pos=%d\n", id, pos);
+    }
+
+    // fold the trunk back into the slot's seq so the cache, checkpoints and the
+    // next request see the plain single-seq state they expect
+    void tree_finish(server_slot & slot) {
+        if (!slot.tree_active) {
+            return;
+        }
+        slot.tree_active = false;
+
+        llama_pos     trunk_pos = -1;
+        const float * trunk_h   = nullptr;
+        const llama_seq_id trunk = spec_tree->finish(&trunk_pos, &trunk_h);
+
+        if (trunk >= 0 && trunk != slot.id) {
+            if (llama_pipedec_tree_commit(ctx_tgt, trunk, slot.id) != 0) {
+                SLT_ERR(slot, "%s", "failed to commit the tree trunk into the slot seq\n");
+            }
+            llama_memory_seq_cp(llama_get_memory(ctx_dft), trunk, slot.id, -1, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), trunk, -1, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), trunk, -1, -1);
+        }
+
+        if (trunk_h) {
+            common_speculative_mtp_set_pending_h(spec.get(), slot.id, trunk_h);
+        }
+
+        // the cache holds the state through trunk_pos; emitted tokens past it
+        // (at most the last sampled one) stay pending like a classic `sampled`
+        if (trunk_pos >= 0) {
+            const int32_t drop = (slot.prompt.tokens.pos_next() - 1) - trunk_pos;
+            if (drop > 0 && drop <= (int32_t) slot.prompt.tokens.size()) {
+                slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - drop);
+            }
+        }
+
+        SLT_INF(slot, "%s\n", spec_tree->summary().c_str());
+    }
+
+    // one pipeline timestep: keep the pipeline full up to the depth, wait for
+    // the oldest level, sample the root's token, prune, emit
+    bool tree_step() {
+        if (!spec_tree) {
+            return false;
+        }
+
+        server_slot * ts = nullptr;
+        for (auto & s : slots) {
+            if (s.tree_active) {
+                ts = &s;
+                break;
+            }
+        }
+        if (ts == nullptr) {
+            return false;
+        }
+        server_slot & slot = *ts;
+
+        if (slot.state != SLOT_STATE_GENERATING) {
+            tree_finish(slot);
+            return false;
+        }
+
+        // every node in flight needs a cell; stop before the context is full
+        const int32_t n_reserve = spec_tree->depth() * params_base.speculative.tree_width + 2;
+        if (slot.prompt.n_tokens() + n_reserve >= slot.n_ctx) {
+            SLT_WRN(slot, "context nearly full (n_tokens=%d, n_ctx=%d) - stopping\n", slot.prompt.n_tokens(), slot.n_ctx);
+            slot.truncated      = true;
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.has_next_token = false;
+            tree_finish(slot);
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+            return true;
+        }
+
+        int rc = 0;
+        {
+            scoped_timer timer(t_spec_verif, n_spec_verif);
+            queue_tasks.yield_to_queue([&]() {
+                while (spec_tree->can_submit()) {
+                    const int32_t r = spec_tree->submit_next();
+                    if (r < 0) {
+                        rc = -1;
+                        return;
+                    }
+                    if (r == 0) {
+                        break;
+                    }
+                }
+                if (spec_tree->n_inflight() == 0) {
+                    rc = -2;
+                    return;
+                }
+                if (spec_tree->close_oldest() != 0) {
+                    rc = -1;
+                }
+            });
+        }
+
+        if (rc != 0) {
+            SLT_ERR(slot, "tree step failed (%d)\n", rc);
+            send_error(slot, "PipeDec tree failure");
+            slot.release();
+            return true;
+        }
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, 0);
+        }
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const auto adv = spec_tree->advance(id);
+
+        slot.stats.n_draft_tokens += adv.n_children;
+        slot.update_spec_stats(adv.hit ? 1 : 0, common_speculative_n_max(&params_base.speculative));
+
+        slot.stats.n_gen += 1;
+        slot.stats.update_gen_last();
+
+        // the committed token takes its position now; tree_finish trims any
+        // token whose state is not in the cache yet
+        slot.prompt.tokens.push_back(id);
+
+        const bool special = params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(id) != slot.task->params.sampling.preserved_tokens.end();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, id, special);
+        result.prob         = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, 0);
+        }
+
+        if (!process_token(result, slot)) {
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release(); // finishes the tree through callback_on_tree_finish
+            return true;
+        }
+
+        slot.print_timings_tg();
+        return true;
+    }
+
     bool chain_step() {
         const int32_t G = chain_group_size();
         if (G <= 0) {
@@ -5557,6 +5797,10 @@ private:
             }
 
             slot.print_timings_tg();
+
+            // [fork, PipeDec tree] from the first sampled token on, the slot
+            // generates on the tree (update_slots -> tree_step)
+            tree_begin(slot, id);
         });
 
         // speculative decoding - main model sample and accept

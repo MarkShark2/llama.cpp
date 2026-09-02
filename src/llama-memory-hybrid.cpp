@@ -154,6 +154,14 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+void llama_memory_hybrid::set_static_cells(bool value) {
+    mem_recr->set_static_cells(value);
+}
+
+bool llama_memory_hybrid::seq_state_copy_build(ggml_context * ctx, ggml_cgraph * gf, llama_seq_id seq_src, llama_seq_id seq_dst) {
+    return mem_recr->seq_state_copy_build(ctx, gf, seq_src, seq_dst);
+}
+
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

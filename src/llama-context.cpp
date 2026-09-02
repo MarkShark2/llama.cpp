@@ -5232,6 +5232,393 @@ uint32_t llama_pipedec_group_n(llama_context * ctx) {
     return ctx->pipedec_group_n();
 }
 
+//
+// [fork, PipeDec tree] lane ring: one prediction-tree level per lane
+//
+
+// A level is one ubatch: tokens at one position, one seq per token, seq ids
+// consecutive and ascending so the recurrent cache sees a contiguous cell run.
+static bool pipedec_tree_batch_ok(
+        const llama_model   & model,
+        const llama_cparams & cparams,
+        const llama_batch   & batch,
+        bool                  has_samplers,
+        uint32_t              max_rows) {
+    const char * pipedec = getenv("GGML_PIPEDEC");
+    const char * stage2  = getenv("GGML_PIPEDEC_STAGE2");
+    if (!pipedec || atoi(pipedec) == 0 || !stage2 || atoi(stage2) == 0) {
+        LLAMA_LOG_ERROR("%s: needs GGML_PIPEDEC=1 and GGML_PIPEDEC_STAGE2=1\n", __func__);
+        return false;
+    }
+
+    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
+         model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
+         model.arch != LLM_ARCH_GLM5NEXT && model.arch != LLM_ARCH_QWEN4EXP) ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+        !cparams.causal_attn ||
+        cparams.embeddings ||
+        !cparams.embeddings_nextn ||
+        cparams.embeddings_nextn_masked ||
+        cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
+        has_samplers ||
+        (model.arch != LLM_ARCH_QWEN4EXP && model.hparams.n_embd != model.hparams.n_embd_out())) {
+        LLAMA_LOG_ERROR("%s: context is not stage-2 eligible\n", __func__);
+        return false;
+    }
+
+    const uint32_t n_tokens = batch.n_tokens;
+    if (n_tokens < 1 || n_tokens > max_rows ||
+        !batch.token || batch.embd || !batch.pos || !batch.logits || !batch.n_seq_id || !batch.seq_id) {
+        LLAMA_LOG_ERROR("%s: bad level batch (n_tokens=%u)\n", __func__, n_tokens);
+        return false;
+    }
+
+    const llama_seq_id seq_0 = batch.seq_id[0][0];
+    const llama_pos    pos_0 = batch.pos[0];
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (batch.logits[i] == 0 || batch.n_seq_id[i] != 1 ||
+            batch.seq_id[i][0] != seq_0 + (llama_seq_id) i || batch.pos[i] != pos_0) {
+            LLAMA_LOG_ERROR("%s: level rows must share one position and use consecutive seq ids\n", __func__);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+float * llama_context::pipedec_tree_row(int32_t lane, int32_t row) {
+    return pipedec_group_h.data() + ((size_t) lane * PIPEDEC_TREE_MAX_ROWS + row) * model.hparams.n_embd_out();
+}
+
+int32_t llama_context::pipedec_tree_enable(bool value) {
+    if (value) {
+        if (!memory) {
+            LLAMA_LOG_ERROR("%s: context has no memory\n", __func__);
+            return -1;
+        }
+        if (cparams.n_rs_seq != 0) {
+            LLAMA_LOG_ERROR("%s: tree mode needs n_rs_seq == 0 (got %u)\n", __func__, cparams.n_rs_seq);
+            return -1;
+        }
+        if (!cparams.kv_unified) {
+            LLAMA_LOG_ERROR("%s: tree mode needs a unified KV cache\n", __func__);
+            return -1;
+        }
+        memory->set_static_cells(true);
+        pipedec_group_h.assign((size_t) PIPEDEC_STAGE2_MAX_LANES * PIPEDEC_TREE_MAX_ROWS * model.hparams.n_embd_out(), 0.0f);
+        pipedec_tree_lane_rows.fill(0);
+        pipedec_tree_lane_busy.fill(false);
+        LLAMA_LOG_INFO("%s: PipeDec tree lanes enabled: %u lanes x %u rows, static recurrent cells\n",
+                __func__, PIPEDEC_STAGE2_MAX_LANES, PIPEDEC_TREE_MAX_ROWS);
+    } else if (memory) {
+        memory->set_static_cells(false);
+    }
+    pipedec_tree_enabled = value;
+    return 0;
+}
+
+int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_t lane) {
+    if (!pipedec_tree_enabled) {
+        LLAMA_LOG_ERROR("%s: tree mode is not enabled\n", __func__);
+        return -1;
+    }
+    if (lane < 0 || lane >= (int32_t) PIPEDEC_STAGE2_MAX_LANES) {
+        LLAMA_LOG_ERROR("%s: bad lane %d\n", __func__, lane);
+        return -1;
+    }
+    if (pipedec_tree_lane_busy[lane]) {
+        LLAMA_LOG_ERROR("%s: lane %d is still in flight\n", __func__, lane);
+        return -1;
+    }
+
+    const bool has_samplers = !sampling.samplers.empty();
+    if (!pipedec_tree_batch_ok(model, cparams, batch_inp, has_samplers, PIPEDEC_TREE_MAX_ROWS)) {
+        return -1;
+    }
+
+    const uint32_t n_tokens = batch_inp.n_tokens;
+
+    // a discarded level may still run here; its graph inputs are rewritten below
+    if (sched_pipedec_body[lane]) {
+        ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+    }
+
+    if (!balloc->init(batch_inp, model.vocab, memory.get(), cparams.n_embd_inp_ctx, n_seq_max(), false)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -1;
+    }
+    GGML_ASSERT(balloc->get_n_tokens() == n_tokens);
+
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens;
+
+    memory_update(false);
+
+    auto mctx = memory->init_batch_token_lanes(*balloc, n_tokens, false);
+    if (!mctx) {
+        return -2;
+    }
+    if (mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_WARN("%s: failed to find a memory slot for a level of %u tokens (status %d)\n",
+                __func__, n_tokens, (int) mctx->get_status());
+        return 1;
+    }
+
+    const auto & ubatch = mctx->get_ubatch();
+    if (ubatch.n_tokens != n_tokens) {
+        LLAMA_LOG_ERROR("%s: level was split (%u of %u tokens in the first ubatch)\n", __func__, ubatch.n_tokens, n_tokens);
+        return -1;
+    }
+
+    n_outputs = n_tokens;
+
+    ggml_status status;
+    const auto * res = process_ubatch_pipedec_body(ubatch, mctx.get(), (uint32_t) lane, 0, status);
+    if (!res) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            memory->seq_rm(batch_inp.seq_id[i][0], batch_inp.pos[i], -1);
+        }
+        return status == GGML_STATUS_ABORTED ? 2 : -3;
+    }
+    GGML_ASSERT(!mctx->next());
+
+    auto * t_h = res->get_h_nextn();
+    if (!t_h) {
+        LLAMA_LOG_ERROR("%s: body lane produced no hidden rows\n", __func__);
+        return -3;
+    }
+
+    const uint32_t n_embd = model.hparams.n_embd_out();
+    GGML_ASSERT(ggml_nelements(t_h) == (int64_t) n_tokens * n_embd);
+
+    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_pipedec_body[lane].get(), t_h);
+    GGML_ASSERT(backend_h != nullptr);
+
+    ggml_backend_tensor_get_async(backend_h, t_h, pipedec_tree_row(lane, 0), 0, (size_t) n_tokens * n_embd * sizeof(float));
+
+    pipedec_tree_lane_rows[lane] = n_tokens;
+    pipedec_tree_lane_busy[lane] = true;
+
+    return 0;
+}
+
+int32_t llama_context::pipedec_run_head(const float * rows, uint32_t n_rows) {
+    llama_ubatch head_ubatch = {};
+    head_ubatch.b_equal_seqs = false;
+    head_ubatch.n_tokens     = n_rows;
+    head_ubatch.n_seq_tokens = n_rows;
+    head_ubatch.n_seqs       = 1;
+    head_ubatch.n_seqs_unq   = 1;
+    head_ubatch.n_pos        = 1;
+    head_ubatch.embd         = const_cast<float *>(rows);
+
+    n_outputs = n_rows;
+
+    if (!sched_pipedec_head) {
+        const size_t max_nodes = graph_max_nodes(std::max<uint32_t>(8, n_rows));
+        sched_pipedec_head.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes, false, cparams.op_offload));
+        gf_res_pipedec_head.reset(new llm_graph_result(max_nodes));
+    }
+
+    auto * head_res = gf_res_pipedec_head.get();
+    auto * head_gf  = head_res->get_gf();
+    const auto head_params = graph_params(
+            head_res, head_ubatch, nullptr, LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD,
+            sched_pipedec_head.get());
+
+    if (graph_reuse_allowed(head_ubatch) && head_res->can_reuse(head_params)) {
+        n_reused++;
+    } else {
+        head_res->reset();
+        ggml_backend_sched_reset(sched_pipedec_head.get());
+        ggml_backend_sched_set_eval_callback(
+                sched_pipedec_head.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        head_gf = model.build_graph(head_params);
+        if (!head_gf) {
+            LLAMA_LOG_ERROR("%s: failed to build the PipeDec head graph\n", __func__);
+            return -3;
+        }
+        if (!ggml_backend_sched_alloc_graph(sched_pipedec_head.get(), head_gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the PipeDec head graph\n", __func__);
+            return -2;
+        }
+    }
+
+    head_res->set_inputs(&head_ubatch);
+    const ggml_status head_status = ggml_backend_sched_graph_compute_async(
+            sched_pipedec_head.get(), head_res->get_gf());
+    if (head_status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute the PipeDec head graph, status: %d\n", __func__, (int) head_status);
+        return head_status == GGML_STATUS_ABORTED ? 2 : -3;
+    }
+
+    auto * t_logits = head_res->get_logits();
+    if (!t_logits || !logits.data) {
+        LLAMA_LOG_ERROR("%s: PipeDec head produced no logits\n", __func__);
+        return -3;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_pipedec_head.get(), t_logits);
+    GGML_ASSERT(backend_res != nullptr);
+    GGML_ASSERT((int64_t) n_rows*n_vocab <= (int64_t) logits.size);
+    GGML_ASSERT(ggml_nelements(t_logits) == (int64_t) n_rows*n_vocab);
+    ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, (size_t) n_rows*n_vocab*sizeof(float));
+    ggml_backend_sched_synchronize(sched_pipedec_head.get());
+
+    return 0;
+}
+
+int32_t llama_context::pipedec_tree_close(int32_t lane, int32_t row) {
+    if (!pipedec_tree_enabled || lane < 0 || lane >= (int32_t) PIPEDEC_STAGE2_MAX_LANES) {
+        return -1;
+    }
+    if (!pipedec_tree_lane_busy[lane] || row < 0 || (uint32_t) row >= pipedec_tree_lane_rows[lane]) {
+        LLAMA_LOG_ERROR("%s: lane %d row %d is not in flight\n", __func__, lane, row);
+        return -1;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+    pipedec_tree_lane_busy[lane] = false;
+    const int64_t t1 = ggml_time_us();
+
+    if (output_reserve(1) < 1) {
+        LLAMA_LOG_ERROR("%s: could not reserve the output row\n", __func__);
+        return -2;
+    }
+
+    const int32_t ret = pipedec_run_head(pipedec_tree_row(lane, row), 1);
+    if (ret != 0) {
+        return ret;
+    }
+
+    pipedec_tree_t_wait_us = t1 - t0;
+    pipedec_tree_t_head_us = ggml_time_us() - t1;
+
+    n_outputs = 1;
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    output_ids[0] = 0;
+    output_swaps.clear();
+
+    return 0;
+}
+
+void llama_context::pipedec_tree_discard(int32_t lane) {
+    if (lane < 0 || lane >= (int32_t) PIPEDEC_STAGE2_MAX_LANES) {
+        return;
+    }
+    // no wait: the lane retires on its own, submit() drains it before reuse
+    pipedec_tree_lane_busy[lane] = false;
+    pipedec_tree_lane_rows[lane] = 0;
+}
+
+const float * llama_context::pipedec_tree_h(int32_t lane, int32_t row) {
+    if (lane < 0 || lane >= (int32_t) PIPEDEC_STAGE2_MAX_LANES || row < 0 ||
+        (uint32_t) row >= pipedec_tree_lane_rows[lane]) {
+        return nullptr;
+    }
+    if (pipedec_tree_lane_busy[lane]) {
+        ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        pipedec_tree_lane_busy[lane] = false;
+    }
+    return pipedec_tree_row(lane, row);
+}
+
+int32_t llama_context::pipedec_tree_commit(llama_seq_id seq_src, llama_seq_id seq_dst) {
+    if (!pipedec_tree_enabled || !memory) {
+        return -1;
+    }
+
+    // a dead lane may still write cells this copy reads: retire every lane first
+    for (uint32_t lane = 0; lane < PIPEDEC_STAGE2_MAX_LANES; ++lane) {
+        if (sched_pipedec_body[lane]) {
+            ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        }
+        pipedec_tree_lane_busy[lane] = false;
+    }
+
+    // KV cells: metadata only on the unified cache. The recurrent part of this
+    // call only stages a lazy copy, which the graph below turns into a real one.
+    memory->seq_cp(seq_src, seq_dst, -1, -1);
+
+    const size_t max_nodes = 4096;
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx0 = ggml_init(ip);
+    ggml_cgraph *  gf   = ggml_new_graph_custom(ctx0, max_nodes, false);
+
+    int32_t ret = 0;
+    if (memory->seq_state_copy_build(ctx0, gf, seq_src, seq_dst)) {
+        if (!sched_pipedec_copy) {
+            sched_pipedec_copy.reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, false, cparams.op_offload));
+        }
+        ggml_backend_sched_reset(sched_pipedec_copy.get());
+        if (!ggml_backend_sched_alloc_graph(sched_pipedec_copy.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the state copy graph\n", __func__);
+            ret = -2;
+        } else {
+            const ggml_status st = ggml_backend_sched_graph_compute(sched_pipedec_copy.get(), gf);
+            ggml_backend_sched_synchronize(sched_pipedec_copy.get());
+            if (st != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: state copy graph failed, status %d\n", __func__, (int) st);
+                ret = -3;
+            }
+        }
+    }
+
+    ggml_free(ctx0);
+
+    return ret;
+}
+
+int32_t llama_pipedec_tree_enable(llama_context * ctx, bool value) {
+    return ctx->pipedec_tree_enable(value);
+}
+
+int32_t llama_pipedec_tree_submit(llama_context * ctx, const llama_batch * batch, int32_t lane) {
+    return ctx->pipedec_tree_submit(*batch, lane);
+}
+
+int32_t llama_pipedec_tree_close(llama_context * ctx, int32_t lane, int32_t row) {
+    return ctx->pipedec_tree_close(lane, row);
+}
+
+void llama_pipedec_tree_discard(llama_context * ctx, int32_t lane) {
+    ctx->pipedec_tree_discard(lane);
+}
+
+const float * llama_pipedec_tree_h(llama_context * ctx, int32_t lane, int32_t row) {
+    return ctx->pipedec_tree_h(lane, row);
+}
+
+int32_t llama_pipedec_tree_commit(llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst) {
+    return ctx->pipedec_tree_commit(seq_src, seq_dst);
+}
+
+int32_t llama_pipedec_tree_n_lanes(void) {
+    return (int32_t) llama_context::pipedec_tree_max_lanes();
+}
+
+int32_t llama_pipedec_tree_n_rows_max(void) {
+    return (int32_t) llama_context::pipedec_tree_max_rows();
+}
+
+void llama_pipedec_tree_close_timing(llama_context * ctx, int64_t * t_wait_us, int64_t * t_head_us) {
+    if (t_wait_us) { *t_wait_us = ctx->pipedec_tree_wait_us(); }
+    if (t_head_us) { *t_head_us = ctx->pipedec_tree_head_us(); }
+}
+
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 

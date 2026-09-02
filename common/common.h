@@ -404,7 +404,32 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
+    // [fork, PipeDec tree] dynamic prediction tree over the lane pipeline.
+    // width  = max nodes per tree level (0 = tree mode off)
+    // branch = max children per node (0 = width)
+    // lanes  = in-flight level ring size (levels in flight + 2 at least)
+    // draft.n_max is the depth: levels in flight, i.e. how far the tree runs
+    // ahead of the last verified token.
+    int32_t tree_width  = 0;
+    int32_t tree_branch = 0;
+    int32_t tree_lanes  = 8;
+
+    bool tree_enabled() const {
+        return tree_width > 0;
+    }
+
+    // seq ids the tree needs on top of the slots: one per node in flight
+    uint32_t tree_n_seq() const {
+        return tree_enabled() ? (uint32_t) tree_lanes * (uint32_t) std::min(tree_width, 8) : 0u;
+    }
+
     uint32_t need_n_rs_seq() const {
+        // the tree never rolls a seq back: every node owns its seq and a dead
+        // branch is simply dropped, so no snapshot planes are needed
+        if (tree_enabled()) {
+            return 0u;
+        }
+
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||

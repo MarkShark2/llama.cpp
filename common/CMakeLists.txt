@@ -100,6 +100,8 @@ add_library(${TARGET}
     reasoning-budget.h
     sampling.cpp
     sampling.h
+    spec-tree.cpp
+    spec-tree.h
     speculative.cpp
     speculative.h
     spd-pipeline.cpp
