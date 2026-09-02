@@ -867,6 +867,12 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // Non-zero only for a PipeDec token-body graph. Recurrent models use these
+    // to place the lane's post-token state in the rollback plane that represents
+    // its distance from the end of the verification group.
+    uint32_t pipedec_lane;
+    uint32_t pipedec_total;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -905,7 +911,8 @@ struct llm_graph_params {
             return false;
         }
 
-        if (n_outputs != other.n_outputs) {
+        if (n_outputs != other.n_outputs ||
+            pipedec_lane != other.pipedec_lane || pipedec_total != other.pipedec_total) {
             return false;
         }
 
@@ -1079,6 +1086,8 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const uint32_t pipedec_lane;
+    const uint32_t pipedec_total;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

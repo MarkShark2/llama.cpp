@@ -67,7 +67,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
 
-llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(
+        llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    return init_batch_impl(balloc, n_ubatch, embd_all, false);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_idx::init_batch_token_lanes(
+        llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    return init_batch_impl(balloc, n_ubatch, embd_all, true);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_idx::init_batch_impl(
+        llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all, bool token_lanes) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
         balloc.split_reset();
@@ -90,7 +101,12 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // A normal recurrent graph must hold the whole rollback window
+                // together so it can emit all snapshots. PipeDec token lanes
+                // instead write one current state plus their one lane-indexed
+                // snapshot, so forcing the tail together would defeat the split.
+                const uint32_t n_keep_tail = token_lanes ? 0 : (n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_keep_tail);
             }
 
             if (ubatch.n_tokens == 0) {

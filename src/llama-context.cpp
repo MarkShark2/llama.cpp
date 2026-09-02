@@ -2059,7 +2059,8 @@ static bool pipedec_step_trace() {
     } while (0)
 
 llm_graph_result * llama_context::process_ubatch_pipedec_body(
-        const llama_ubatch & ubatch, llama_memory_context_i * mctx, uint32_t lane, ggml_status & ret) {
+        const llama_ubatch & ubatch, llama_memory_context_i * mctx,
+        uint32_t lane, uint32_t total, ggml_status & ret) {
     PIPEDEC_STEP("body lane=%u enter\n", lane);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -2087,7 +2088,8 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     auto * res = lane_res.get();
     auto * gf  = res->get_gf();
     const auto gparams = graph_params(
-            res, ubatch, mctx, LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY, lane_sched.get());
+            res, ubatch, mctx, LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY,
+            lane_sched.get(), lane, total);
 
     if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
         n_reused++;
@@ -2461,6 +2463,9 @@ static bool pipedec_stage2_eligible(
         // qwen4exp deliberately carries its n_embd_out()-wide HC residual into
         // graph_pipedec_head; every older stage-2 head still requires flat rows.
         (model.arch != LLM_ARCH_QWEN4EXP && model.hparams.n_embd != model.hparams.n_embd_out()) ||
+        // The qwen4exp recurrent snapshots are indexed from the known end of
+        // one complete verification group; deferred groups do not know it yet.
+        (model.arch == LLM_ARCH_QWEN4EXP && allow_single) ||
         n_tokens < (allow_single ? 1u : 2u) || n_tokens > max_tokens ||
         n_outputs != n_tokens ||
         !batch.token || batch.embd || !batch.pos || !batch.logits ||
@@ -2576,8 +2581,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 __func__, pipedec_group_tokens);
         pipedec_abort_group();
     }
+    const uint32_t pipedec_total_planned = pipedec_stage2 ? pipedec_group_tokens + n_tokens_all : 0;
     if (pipedec_stage2) {
-        GGML_ASSERT(pipedec_group_tokens + n_tokens_all <= PIPEDEC_STAGE2_MAX_LANES);
+        GGML_ASSERT(pipedec_total_planned <= PIPEDEC_STAGE2_MAX_LANES);
         if (pipedec_group_h.empty()) {
             pipedec_group_h.resize((size_t) PIPEDEC_STAGE2_MAX_LANES * model.hparams.n_embd_out());
         }
@@ -2659,7 +2665,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, pipedec_stage2 ? 1 : cparams.n_ubatch, output_all);
+        mctx = pipedec_stage2
+                ? memory->init_batch_token_lanes(*balloc, 1, output_all)
+                : memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -2790,7 +2798,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         const auto * res = pipedec_stage2
-                ? process_ubatch_pipedec_body(ubatch, mctx.get(), pipedec_lane, status)
+                ? process_ubatch_pipedec_body(
+                        ubatch, mctx.get(), pipedec_lane, pipedec_total_planned, status)
                 : decode_lane >= 0
                 ? process_ubatch_decode_lane(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), (uint32_t) decode_lane, status)
                 : process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -3739,7 +3748,9 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
-                ggml_backend_sched_t       sched_override) const {
+                ggml_backend_sched_t       sched_override,
+                           uint32_t         pipedec_lane,
+                           uint32_t         pipedec_total) const {
     ggml_backend_sched_t sched_use = sched_override ? sched_override : sched.get();
     return {
         /*.arch        =*/ model.arch,
@@ -3753,9 +3764,11 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(sched_use),
+        /*.samplers      =*/ sampling.samplers,
+        /*.n_outputs     =*/ n_outputs,
+        /*.pipedec_lane  =*/ pipedec_lane,
+        /*.pipedec_total =*/ pipedec_total,
+        /*.cb            =*/ graph_get_cb(sched_use),
         /*.res         =*/ res,
     };
 }

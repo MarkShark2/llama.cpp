@@ -185,6 +185,7 @@ struct llama_context {
                 const llama_ubatch & ubatch,
             llama_memory_context_i * mctx,
                            uint32_t   lane,
+                           uint32_t   total,
                        ggml_status & ret);
 
     // [fork] decode lane pool (LLAMA_DECODE_LANES): one persistent scheduler +
@@ -337,7 +338,9 @@ private:
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
-                ggml_backend_sched_t       sched_override = nullptr) const;
+                ggml_backend_sched_t       sched_override = nullptr,
+                           uint32_t         pipedec_lane = 0,
+                           uint32_t         pipedec_total = 0) const;
 
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_override = nullptr) const;
 

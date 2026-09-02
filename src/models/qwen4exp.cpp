@@ -1466,20 +1466,50 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+    if (pipedec_total > 0) {
+        GGML_ASSERT(ubatch.n_seq_tokens == 1);
+        GGML_ASSERT(pipedec_lane < pipedec_total);
+        GGML_ASSERT(pipedec_total <= (uint32_t) n_slots);
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, s_idx));
+        // Token lanes chain through slot 0. Preserve the post-token state once
+        // more in the rollback plane that corresponds to this lane's distance
+        // from the end of the complete verification group.
+        const int64_t rollback = pipedec_total - pipedec_lane - 1;
+        const int64_t slots[2] = { 0, rollback };
+        const int n_write = rollback == 0 ? 1 : 2;
 
-        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-                state_cols * channels, n_seqs,
-                conv_states_all->nb[1],
-                (slot * mem_size + kv_head) * row_size);
+        for (int i = 0; i < n_write; ++i) {
+            const int64_t slot = slots[i];
+            const int64_t s_idx = conv_input->ne[0] - state_cols;
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+            ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
+
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs,
+                    conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        }
+    } else {
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+
+            ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
+
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs,
+                    conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        }
     }
 
     return conv_input;

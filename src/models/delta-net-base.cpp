@@ -607,5 +607,24 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
+    if (pipedec_total > 0) {
+        GGML_ASSERT(n_seq_tokens == 1);
+        GGML_ASSERT(pipedec_lane < pipedec_total);
+        GGML_ASSERT(pipedec_total <= (uint32_t) K);
+
+        // A batched GDN writes all rollback planes at once. A token lane writes
+        // the current state to plane 0 for the next lane, then duplicates it to
+        // the one plane representing this token's distance from the group end.
+        const uint32_t rollback = pipedec_total - pipedec_lane - 1;
+        if (rollback > 0) {
+            ggml_tensor * dst_rollback = ggml_view_3d(ctx0, ssm_states_all,
+                D, n_seqs, 1,
+                ssm_states_all->nb[1],
+                (size_t) mem_size * row_size,
+                ((size_t) rollback * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst_rollback));
+        }
+    }
+
     return output;
 }

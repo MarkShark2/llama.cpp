@@ -52,6 +52,11 @@ public:
             uint32_t n_ubatch,
             bool embd_all) override;
 
+    llama_memory_context_ptr init_batch_token_lanes(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all) override;
+
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
@@ -76,6 +81,12 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    llama_memory_context_ptr init_batch_impl(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all,
+            bool token_lanes);
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:

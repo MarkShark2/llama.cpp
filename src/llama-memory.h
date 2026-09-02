@@ -90,6 +90,16 @@ struct llama_memory_i {
             uint32_t n_ubatch,
             bool embd_all) = 0;
 
+    // PipeDec stage 2 needs one ubatch per token. Most memories can use their
+    // ordinary splitter; recurrent memories may override this to bypass the
+    // normal requirement that every rollback snapshot stay in one ubatch.
+    virtual llama_memory_context_ptr init_batch_token_lanes(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all) {
+        return init_batch(balloc, n_ubatch, embd_all);
+    }
+
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
