@@ -2278,35 +2278,23 @@ static inline uint64_t rpc_fp_tensor(uint64_t h, const ggml_tensor * t) {
     return rpc_fp_mix(h, &remote, sizeof(remote));
 }
 
-// a tensor plus its view chain (a leaf view of a weight, a view of a view)
-static inline uint64_t rpc_fp_chain(uint64_t h, const ggml_tensor * t) {
-    for (int d = 0; t != nullptr && d < 8; d++) {
-        h = rpc_fp_tensor(h, t);
-        t = t->view_src;
-    }
-    return h;
-}
-
+// What a stored graph computes on recompute is fixed by its nodes and their
+// direct srcs (op, params, shapes, strides, device data pointers): deeper
+// tensors reach the wire only as leaf descriptors the server never executes.
+// So the fingerprint covers exactly node + srcs. Two graphs that serialize
+// differently further up (a view chain, an input's own producers) but agree
+// here compute the same thing, and hashing 13 structs per node instead of
+// ~3 cost 0.6 ms per split - as much as the walk it was meant to replace.
 static uint64_t rpc_graph_quick_fp(const ggml_cgraph * cgraph) {
     uint64_t h = 0x243F6A8885A308D3ull;
     const uint64_t n = cgraph->n_nodes;
     h = rpc_fp_mix(h, &n, sizeof(n));
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        h = rpc_fp_chain(h, node);
+        h = rpc_fp_tensor(h, node);
         for (int k = 0; k < GGML_MAX_SRC; k++) {
-            const ggml_tensor * src = node->src[k];
-            if (src == nullptr) {
-                continue;
-            }
-            h = rpc_fp_chain(h, src);
-            // one level further: a split input that is itself a node of an
-            // earlier split on this endpoint carries its own srcs into the
-            // serialized set
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                if (src->src[j] != nullptr) {
-                    h = rpc_fp_chain(h, src->src[j]);
-                }
+            if (node->src[k] != nullptr) {
+                h = rpc_fp_tensor(h, node->src[k]);
             }
         }
     }
