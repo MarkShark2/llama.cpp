@@ -1117,6 +1117,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         // [fork] DSV4's DSA compressor state is a ring addressed by pos % state_size
         // whose rows are pure overwrites, so re-walking a discarded suffix restores it
         // exactly - as long as the ring carries n_rs_seq rows of slack over the block
@@ -1165,6 +1166,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_QWEN4EXP:   // TODO: fix test-llama-archs
             return false;
         default:
             return true;
