@@ -301,20 +301,25 @@ void common_spec_tree::select() {
 
     const int32_t depth = levels.back().depth + 1;
     for (const auto & p : picks) {
-        auto & parent = nodes[p.parent];
-        parent.cands[p.k].used = true;
+        nodes[p.parent].cands[p.k].used = true;
+
+        // new_node() may grow the vector: copy what the child needs first
+        const llama_token  tok        = nodes[p.parent].cands[p.k].tok;
+        const llama_pos    pos        = nodes[p.parent].pos + 1;
+        const llama_seq_id parent_seq = nodes[p.parent].seq;
+        const std::vector<float> h_in = nodes[p.parent].h_in;
 
         const int32_t id = new_node();
         auto & c = nodes[id];
-        c.tok        = parent.cands[p.k].tok;
-        c.pos        = parent.pos + 1;
+        c.tok        = tok;
+        c.pos        = pos;
         c.parent     = p.parent;
         c.level      = depth;
-        c.parent_seq = parent.seq;
+        c.parent_seq = parent_seq;
         c.logp       = p.logp;
-        c.h_in       = parent.h_in;
+        c.h_in       = h_in;
 
-        parent.children.push_back(id);
+        nodes[p.parent].children.push_back(id);
         pending.push_back(id);
     }
     pending_depth = depth;
