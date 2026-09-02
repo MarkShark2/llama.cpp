@@ -186,6 +186,16 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT                    // number of types, unknown type
 };
 
+// draft-mtp and draft-mtp-adaptive differ only in how the draft depth is chosen;
+// every other code path treats them the same. Matching just one of them silently
+// skips MTP setup -- which is how the draft context lost its
+// LLAMA_CONTEXT_TYPE_MTP under --fit, leaving the fit pass to build a trunk graph
+// for a draft-only file and dereference the trunk tensors it does not have.
+inline bool common_spec_has_mtp(const std::vector<common_speculative_type> & types) {
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP)          != types.end() ||
+           std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
+}
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set

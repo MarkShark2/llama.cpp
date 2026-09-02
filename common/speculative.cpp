@@ -2720,12 +2720,7 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = std::find(params.speculative.types.begin(),
-                                    params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
-                          std::find(params.speculative.types.begin(),
-                                    params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+    const bool spec_mtp = common_spec_has_mtp(params.speculative.types);
     const bool spec_spd = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_SPD) != params.speculative.types.end();
