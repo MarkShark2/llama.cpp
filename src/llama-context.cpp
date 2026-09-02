@@ -5485,7 +5485,14 @@ int32_t llama_context::pipedec_run_head(const float * rows, uint32_t n_rows) {
     GGML_ASSERT((int64_t) n_rows*n_vocab <= (int64_t) logits.size);
     GGML_ASSERT(ggml_nelements(t_logits) == (int64_t) n_rows*n_vocab);
     ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, (size_t) n_rows*n_vocab*sizeof(float));
-    ggml_backend_sched_synchronize(sched_pipedec_head.get());
+    // the head lives on one device: wait for that device's read only. The
+    // scheduler holds every backend, and an RPC backend's synchronize is an
+    // endpoint-global drain that would stall behind every body level in flight.
+    if (ggml_backend_is_rpc(backend_res)) {
+        ggml_backend_rpc_read_wait(backend_res, ggml_backend_rpc_read_ordinal(backend_res));
+    } else {
+        ggml_backend_synchronize(backend_res);
+    }
 
     return 0;
 }

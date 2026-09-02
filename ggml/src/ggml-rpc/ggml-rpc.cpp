@@ -380,6 +380,8 @@ struct ggml_backend_rpc_device_context {
     // uids of graphs the server holds deserialized for this device
     // (client-side LRU view, front = most recently used)
     std::vector<uint64_t> known_graph_uids;
+    // [fork] struct-fingerprint -> content uid, see rpc_graph_quick_fp()
+    std::unordered_map<uint64_t, uint64_t> quick_uids;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -2242,6 +2244,75 @@ static uint64_t graph_content_uid(const std::vector<ggml_tensor *> & nodes,
     return h == 0 ? 1 : h; // uid 0 means "do not cache" in the protocol
 }
 
+// [fork] The content uid above is exact but costs a DFS + ~1300 descriptor
+// serializations per split -- ~1 ms, ten splits per token on the nine-board
+// House, so a pipelined decode paid ~10 ms of client CPU per level just to
+// discover that the graph was the one it shipped last time. This fingerprint
+// hashes the raw ggml_tensor structs of everything serialize_collected reads
+// (each node, its srcs, and their view chains, plus the RPC buffer's remote id
+// that serialize_tensor dereferences) without allocating. Equal fingerprints
+// mean byte-identical serialized graphs, so the uid can be looked up instead
+// of recomputed; a fingerprint never seen (or evicted) falls back to the exact
+// path, so a false miss only costs time, never correctness.
+static inline uint64_t rpc_fp_mix(uint64_t h, const void * p, size_t bytes) {
+    const uint64_t * w = (const uint64_t *) p;
+    for (size_t i = 0; i < bytes/sizeof(uint64_t); i++) {
+        h = (h ^ w[i]) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
+static inline uint64_t rpc_fp_tensor(uint64_t h, const ggml_tensor * t) {
+    const uint64_t ptr = (uint64_t) (uintptr_t) t;
+    h = rpc_fp_mix(h, &ptr, sizeof(ptr));
+    if (t == nullptr) {
+        return h;
+    }
+    h = rpc_fp_mix(h, t, sizeof(*t));
+    uint64_t remote = 0;
+    if (t->buffer && ggml_backend_buffer_is_rpc(t->buffer)) {
+        auto * ctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
+        remote = ctx ? ctx->remote_ptr : 0;
+    }
+    return rpc_fp_mix(h, &remote, sizeof(remote));
+}
+
+// a tensor plus its view chain (a leaf view of a weight, a view of a view)
+static inline uint64_t rpc_fp_chain(uint64_t h, const ggml_tensor * t) {
+    for (int d = 0; t != nullptr && d < 8; d++) {
+        h = rpc_fp_tensor(h, t);
+        t = t->view_src;
+    }
+    return h;
+}
+
+static uint64_t rpc_graph_quick_fp(const ggml_cgraph * cgraph) {
+    uint64_t h = 0x243F6A8885A308D3ull;
+    const uint64_t n = cgraph->n_nodes;
+    h = rpc_fp_mix(h, &n, sizeof(n));
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        h = rpc_fp_chain(h, node);
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const ggml_tensor * src = node->src[k];
+            if (src == nullptr) {
+                continue;
+            }
+            h = rpc_fp_chain(h, src);
+            // one level further: a split input that is itself a node of an
+            // earlier split on this endpoint carries its own srcs into the
+            // serialized set
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (src->src[j] != nullptr) {
+                    h = rpc_fp_chain(h, src->src[j]);
+                }
+            }
+        }
+    }
+    return h == 0 ? 1 : h;
+}
+
 static void serialize_collected(uint32_t device, uint64_t uid,
                                 const std::vector<ggml_tensor *> & nodes,
                                 const std::vector<rpc_tensor> & tensors,
@@ -2311,9 +2382,25 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     std::vector<ggml_tensor *> nodes;
     std::vector<rpc_tensor>    tensors;
     uint64_t uid = cgraph->uid;
+    bool collected = false;
     if (stable_uid) {
-        collect_graph(endpoint, cgraph, nodes, tensors);
-        uid = graph_content_uid(nodes, tensors);
+        static const bool quick_off = getenv("GGML_RPC_QUICK_UID_OFF") != nullptr;
+        auto & quick = rpc_dev_ctx->quick_uids;
+        const uint64_t fp = quick_off ? 0 : rpc_graph_quick_fp(cgraph);
+        auto it = fp != 0 ? quick.find(fp) : quick.end();
+        if (it != quick.end()) {
+            uid = it->second;
+        } else {
+            collect_graph(endpoint, cgraph, nodes, tensors);
+            uid = graph_content_uid(nodes, tensors);
+            collected = true;
+            if (fp != 0) {
+                if (quick.size() >= 4096) {
+                    quick.clear();
+                }
+                quick[fp] = uid;
+            }
+        }
     }
 
     // LRU over the uids the server holds deserialized for this device. A hit
@@ -2375,6 +2462,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_trace_xdev(endpoint, cgraph);
         std::vector<uint8_t> input;
         if (stable_uid) {
+            if (!collected) {
+                // fingerprint hit on a uid the server has since evicted
+                collect_graph(endpoint, cgraph, nodes, tensors);
+                GGML_ASSERT(graph_content_uid(nodes, tensors) == uid);
+            }
             serialize_collected(device, uid, nodes, tensors, input);
         } else {
             serialize_graph(device, uid, endpoint, cgraph, input);
