@@ -2644,7 +2644,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+    // [fork, PipeDec tree] the draft context also carries one seq per tree node
+    // and its output buffers are sized by n_seq_max
+    result.n_outputs_max = params.n_parallel + (int32_t) params.speculative.tree_n_seq();
     result.n_outputs_max_per_seq = 1;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
