@@ -2423,9 +2423,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-// Stage 2 currently targets the linear Step-3.5 MTP verification group. Keeping
-// the eligibility test deliberately narrow makes every unsupported batch fall
-// through to the established decoder path without changing its behavior.
+// Stage 2 is intentionally arch-gated: each supported model supplies a body
+// boundary and matching deferred output head. Unsupported batches fall through
+// to the established decoder path without changing behavior.
 static bool pipedec_stage2_eligible(
         const llama_model   & model,
         const llama_cparams & cparams,
@@ -2450,7 +2450,7 @@ static bool pipedec_stage2_eligible(
 
     if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
          model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
-         model.arch != LLM_ARCH_GLM5NEXT) ||
+         model.arch != LLM_ARCH_GLM5NEXT && model.arch != LLM_ARCH_QWEN4EXP) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||
@@ -2458,7 +2458,9 @@ static bool pipedec_stage2_eligible(
         cparams.embeddings_nextn_masked ||
         cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
         has_samplers ||
-        model.hparams.n_embd != model.hparams.n_embd_out() ||
+        // qwen4exp deliberately carries its n_embd_out()-wide HC residual into
+        // graph_pipedec_head; every older stage-2 head still requires flat rows.
+        (model.arch != LLM_ARCH_QWEN4EXP && model.hparams.n_embd != model.hparams.n_embd_out()) ||
         n_tokens < (allow_single ? 1u : 2u) || n_tokens > max_tokens ||
         n_outputs != n_tokens ||
         !batch.token || batch.embd || !batch.pos || !batch.logits ||
@@ -3026,7 +3028,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // The hidden-state GETs above are ordered after their body graphs. Drain
         // once after all bodies have been submitted, then reuse those host rows
-        // as the input to a single output norm/LM-head graph on CUDA0.
+        // as the input to one arch-specific deferred output-head graph.
         PIPEDEC_STEP("group-close: drain %u lanes\n", pipedec_total);
         for (uint32_t lane = 0; lane < pipedec_total; ++lane) {
             GGML_ASSERT(sched_pipedec_body[lane]);

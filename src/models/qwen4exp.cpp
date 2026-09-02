@@ -309,6 +309,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
+        return std::make_unique<graph_pipedec_head>(*this, params);
+    }
+
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
@@ -412,8 +416,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 "the indexer cache must track the attention cache cell for cell");
     }
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    // PipeDec body lanes are one token wide and return every row as the wide HC
+    // residual consumed by the MTP head. Do not register an unused out_ids input:
+    // unused graph inputs are not allocated, but set_inputs() would still fill it.
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+            ? nullptr
+            : build_inp_out_ids();
 
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
@@ -500,7 +510,52 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
     }
 
+    // Stage 2 queues one target-body graph per verification token. Unlike the
+    // older flat-residual arches, qwen4exp must carry all HC streams across the
+    // body/head boundary: that same wide row is both the MTP target feature and
+    // the input to the deferred final mixer. The shared PipeDec group buffer is
+    // sized by n_embd_out(), so no second staging buffer or lossy collapse is
+    // needed here.
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
+        GGML_ASSERT(cparams.embeddings_nextn && !cparams.embeddings_nextn_masked);
+        ggml_build_forward_expand(gf, res_hc);
+        return;
+    }
+
     // the final mixer is the output norm: there is no separate one
+    ggml_tensor * cur = build_hc_mix(res_hc,
+            model.hc_head_norm, model.hc_head_down, model.hc_head_up,
+            nullptr, nullptr, -1);
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// Deferred PipeDec verification head. Body lanes export the complete wide HC
+// residual [n_embd * hc, rows]; one batched graph applies the target's final HC
+// mixer and LM head after the body pipeline drains.
+llama_model_qwen4exp::graph_pipedec_head::graph_pipedec_head(
+        const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, no_build_t{}) {
+    const int64_t hc     = hparams.dsv4_hc_mult;
+    const int64_t hc_dim = hc * n_embd;
+
+    auto inp = std::make_unique<llm_graph_input_embd>(hc_dim);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_set_input(inp->embd);
+    cb(inp->embd, "pipedec_h_input", -1);
+
+    ggml_tensor * res_hc = ggml_reshape_3d(ctx0, inp->embd, n_embd, hc, n_tokens);
+    res->add_input(std::move(inp));
+
+    // qwen4exp has no separate output norm; its learned HC mixer performs the
+    // normalization, gates the streams, and collapses them to n_embd.
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
