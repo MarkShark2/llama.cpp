@@ -52,9 +52,11 @@ static common_speculative_output_limits server_output_limits(const common_params
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
 
-    // [fork, PipeDec tree] a level's draft decode emits one row per node
+    // [fork, PipeDec tree] a level's draft decode emits one row per node, and
+    // the output buffers are sized by n_seq_max, which the tree seqs raise
     if (params.speculative.tree_enabled()) {
         result.total = std::max<int32_t>(result.total, params.speculative.tree_width);
+        result.total = std::max<int32_t>(result.total, params.n_parallel + (int32_t) params.speculative.tree_n_seq());
     }
 
     result.total   = std::max<int32_t>(1, result.total);
