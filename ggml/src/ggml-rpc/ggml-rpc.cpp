@@ -2263,19 +2263,31 @@ static inline uint64_t rpc_fp_mix(uint64_t h, const void * p, size_t bytes) {
     return h;
 }
 
+// only the fields serialize_tensor reads: the name and the CPU-side fields
+// (extra, padding) never reach the wire, and at ~730 nodes x 3 structs per
+// split every byte hashed is paid ten times per token
 static inline uint64_t rpc_fp_tensor(uint64_t h, const ggml_tensor * t) {
     const uint64_t ptr = (uint64_t) (uintptr_t) t;
     h = rpc_fp_mix(h, &ptr, sizeof(ptr));
     if (t == nullptr) {
         return h;
     }
-    h = rpc_fp_mix(h, t, sizeof(*t));
     uint64_t remote = 0;
     if (t->buffer && ggml_backend_buffer_is_rpc(t->buffer)) {
         auto * ctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
         remote = ctx ? ctx->remote_ptr : 0;
     }
-    return rpc_fp_mix(h, &remote, sizeof(remote));
+    const uint64_t head[4] = {
+        ((uint64_t) (uint32_t) t->type << 32) | (uint64_t) (uint32_t) t->op,
+        (uint64_t) (uintptr_t) t->buffer, remote, (uint64_t) (uintptr_t) t->data,
+    };
+    h = rpc_fp_mix(h, head, sizeof(head));
+    h = rpc_fp_mix(h, t->ne, sizeof(t->ne));
+    h = rpc_fp_mix(h, t->nb, sizeof(t->nb));
+    h = rpc_fp_mix(h, t->op_params, sizeof(t->op_params));
+    h = rpc_fp_mix(h, t->src, sizeof(t->src));
+    const uint64_t tail[3] = { (uint64_t) (uint32_t) t->flags, (uint64_t) (uintptr_t) t->view_src, (uint64_t) t->view_offs };
+    return rpc_fp_mix(h, tail, sizeof(tail));
 }
 
 // What a stored graph computes on recompute is fixed by its nodes and their
