@@ -373,8 +373,7 @@ int32_t common_spec_tree::submit_next() {
     const int64_t t1 = ggml_time_us();
     const int32_t rc = llama_pipedec_tree_submit(params.ctx_tgt, &batch_tgt, lane);
     const int64_t t2 = ggml_time_us();
-    TREE_TRC("submit-cost rows=%zu seq_rm=%.2f seq_cp_tgt=%.2f seq_cp_dft=%.2f ctx_submit=%.2f ms
-",
+    TREE_TRC("submit-cost rows=%zu seq_rm=%.2f seq_cp_tgt=%.2f seq_cp_dft=%.2f ctx_submit=%.2f ms\n",
             pending.size(), t_seq_rm/1000.0, t_seq_tgt/1000.0, t_seq_dft/1000.0, (t2 - t1)/1000.0);
     if (rc != 0) {
         LOG_ERR("%s: level submit failed rc=%d (lane=%d rows=%zu depth=%d)\n", __func__, rc, lane, pending.size(), pending_depth);
