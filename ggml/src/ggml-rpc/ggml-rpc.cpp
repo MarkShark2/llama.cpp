@@ -1123,6 +1123,15 @@ struct rpc_ep_lanes {
     uint64_t barrier_set = 0, barrier_get = 0;
     int      state = 0;   // 0 = untried, 1 = active, -1 = unavailable
     uint64_t session_id = 0;
+    // Read ordinals handed out by ggml_backend_rpc_read_ordinal() are stream
+    // task counts, but a detach/reattach destroys the streams and the new ones
+    // count from zero - while the fences captured from the old ones live on in
+    // llama_context (pipedec_tree_lane_fence). These bases keep the ordinals
+    // monotonic across that: a teardown folds the retired stream's count in
+    // here, so an ordinal at or below the base names a read on a stream that
+    // is gone. Deliberately NOT reset by rpc_lanes_teardown.
+    uint64_t get_seq_base  = 0;   // retired GET-lane streams
+    uint64_t main_seq_base = 0;   // retired main streams (rpc_drop_socket)
     socket_ptr   set_sock, get_sock;
     rpc_stream * set_stream = nullptr;
     rpc_stream * get_stream = nullptr;
@@ -2758,9 +2767,15 @@ GGML_RPC_SYNC_PEER_API uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t bac
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
     rpc_ep_lanes * ep = rpc_lanes_get_active(rpc_ctx->endpoint);
     if (ep != nullptr) {
-        return ep->get_stream->submitted_seq();
+        std::lock_guard<std::mutex> l(ep->m);
+        return ep->get_seq_base + (ep->get_stream ? ep->get_stream->submitted_seq() : 0);
     }
-    return get_stream(rpc_ctx->endpoint)->submitted_seq();
+    // resolve the stream before taking ep->m: rpc_drop_socket takes g_streams_m
+    // and ep->m in that order, so never nest them the other way round here
+    const uint64_t seq = get_stream(rpc_ctx->endpoint)->submitted_seq();
+    rpc_ep_lanes * base_ep = get_ep_lanes(rpc_ctx->endpoint);
+    std::lock_guard<std::mutex> l(base_ep->m);
+    return base_ep->main_seq_base + seq;
 }
 
 GGML_RPC_SYNC_PEER_API void ggml_backend_rpc_read_wait(ggml_backend_t backend, uint64_t ordinal) {
@@ -2768,12 +2783,40 @@ GGML_RPC_SYNC_PEER_API void ggml_backend_rpc_read_wait(ggml_backend_t backend, u
         return;
     }
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    // An ordinal at or below the base was issued on a stream that has since
+    // been torn down. A teardown only happens after the stream is drained
+    // (ggml_backend_rpc_detach drains, and rpc_lanes_teardown documents that
+    // the caller has quiesced), so that read has already completed and there
+    // is nothing to wait for. Comparing it against the replacement stream's
+    // counter - which restarts at 0 - would block forever: that is the
+    // hibernate/resume deadlock, where pipedec_tree_lane_wait() waited on a
+    // pre-sleep fence and the only thread that could advance the new stream
+    // was the one waiting.
     rpc_ep_lanes * ep = rpc_lanes_get_active(rpc_ctx->endpoint);
     if (ep != nullptr) {
-        ep->get_stream->wait_completed(ordinal);
+        rpc_stream * st = nullptr;
+        uint64_t base = 0;
+        {
+            std::lock_guard<std::mutex> l(ep->m);
+            base = ep->get_seq_base;
+            st   = ep->get_stream;
+        }
+        if (st == nullptr || ordinal <= base) {
+            return;
+        }
+        st->wait_completed(ordinal - base);
         return;
     }
-    get_stream(rpc_ctx->endpoint)->wait_completed(ordinal);
+    rpc_ep_lanes * base_ep = get_ep_lanes(rpc_ctx->endpoint);
+    uint64_t base = 0;
+    {
+        std::lock_guard<std::mutex> l(base_ep->m);
+        base = base_ep->main_seq_base;
+    }
+    if (ordinal <= base) {
+        return;
+    }
+    get_stream(rpc_ctx->endpoint)->wait_completed(ordinal - base);
 }
 
 // Learn the consumer endpoint's session id. Call from the thread that owns
@@ -3452,6 +3495,12 @@ static void rpc_lanes_teardown(const std::string & endpoint) {
         get_sock.swap(ep->get_sock);
         set_stream = ep->set_stream;
         get_stream = ep->get_stream;
+        // Fold the retiring GET stream's task count into the base, so read
+        // ordinals stay monotonic across the reattach. Everything it counted
+        // has completed: callers quiesce before a teardown.
+        if (get_stream != nullptr) {
+            ep->get_seq_base += get_stream->submitted_seq();
+        }
         ep->set_stream = nullptr;
         ep->get_stream = nullptr;
         ep->main_enq = ep->set_enq = ep->get_enq = 0;
@@ -3499,6 +3548,13 @@ static void rpc_drop_socket(const std::string & endpoint) {
             stream = std::move(it->second);
             g_streams.erase(it);
         }
+    }
+    if (stream != nullptr) {
+        // same reason as the GET lane in rpc_lanes_teardown: the replacement
+        // stream counts from zero, so fold this one's total into the base
+        rpc_ep_lanes * ep = get_ep_lanes(endpoint);
+        std::lock_guard<std::mutex> el(ep->m);
+        ep->main_seq_base += stream->submitted_seq();
     }
     stream.reset();
     std::lock_guard<std::mutex> l(g_sockets_m);
