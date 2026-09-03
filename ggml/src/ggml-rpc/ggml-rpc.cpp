@@ -382,6 +382,9 @@ struct ggml_backend_rpc_device_context {
     std::vector<uint64_t> known_graph_uids;
     // [fork] struct-fingerprint -> content uid, see rpc_graph_quick_fp()
     std::unordered_map<uint64_t, uint64_t> quick_uids;
+    // [fork] split-instance uid (ggml_cgraph::uid, assigned fresh by every
+    // ggml_backend_sched_split_graph) -> content uid, see graph_compute
+    std::unordered_map<uint64_t, uint64_t> split_uids;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -519,6 +522,9 @@ struct rpc_wire_ep_stat {
     std::atomic<uint64_t> set_n{0}, set_us{0}, set_bytes{0};
     std::atomic<uint64_t> get_n{0}, get_us{0}, get_bytes{0};
     std::atomic<uint64_t> gc_n{0},  gc_us{0};
+    // [fork] submit split: key_us = time to decide the uid (split cache /
+    // fingerprint / content hash), full_n = graphs shipped in full
+    std::atomic<uint64_t> gc_key_us{0}, gc_full_n{0}, gc_split_hit{0};
 };
 
 static std::mutex g_wire_stat_m;
@@ -584,13 +590,16 @@ static void rpc_wire_trace_tick() {
         const uint64_t set_n = s.set_n.exchange(0), set_us = s.set_us.exchange(0), set_b = s.set_bytes.exchange(0);
         const uint64_t get_n = s.get_n.exchange(0), get_us = s.get_us.exchange(0), get_b = s.get_bytes.exchange(0);
         const uint64_t gc_n  = s.gc_n.exchange(0),  gc_us  = s.gc_us.exchange(0);
+        const uint64_t gc_key = s.gc_key_us.exchange(0), gc_full = s.gc_full_n.exchange(0), gc_hit = s.gc_split_hit.exchange(0);
         if (set_n == 0 && get_n == 0 && gc_n == 0) {
             continue;
         }
-        fprintf(stderr, "[rpc wire] %-22s win=%.1fs | set n=%llu %.2fms %.1fMB | submit n=%llu %.2fms | get n=%llu %.2fms %.1fMB\n",
+        fprintf(stderr, "[rpc wire] %-22s win=%.1fs | set n=%llu %.2fms %.1fMB | submit n=%llu %.3fms key=%.3fms split-hit=%llu full=%llu | get n=%llu %.2fms %.1fMB\n",
                 kv.first.c_str(), window_s,
                 (unsigned long long) set_n, set_n ? set_us/1e3/(double) set_n : 0.0, set_b/1e6,
                 (unsigned long long) gc_n,  gc_n  ? gc_us /1e3/(double) gc_n  : 0.0,
+                gc_n ? gc_key/1e3/(double) gc_n : 0.0,
+                (unsigned long long) gc_hit, (unsigned long long) gc_full,
                 (unsigned long long) get_n, get_n ? get_us/1e3/(double) get_n : 0.0, get_b/1e6);
     }
     if (rpc_wire_trace_level() >= 2 && !g_wire_names.empty()) {
@@ -2384,22 +2393,56 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     uint64_t uid = cgraph->uid;
     bool collected = false;
     if (stable_uid) {
+        // [fork] A split's ggml_cgraph::uid is assigned fresh by every
+        // ggml_backend_sched_split_graph, and every mutation of the split's
+        // node/tensor structs (src rewiring, gallocr data pointers) happens in
+        // that same ggml_backend_sched_alloc_graph before the first compute.
+        // A graph the scheduler re-submits unchanged (llama's reuse path:
+        // set_inputs writes tensor DATA only) therefore carries the same
+        // split uid and the same content uid, so the content uid can be
+        // looked up by split uid instead of re-fingerprinting ~730 nodes x 4
+        // structs per split -- which on a ten-split pipelined decode level was
+        // most of the submit cost (~0.3 ms per split on the Xeon 6138 head).
+        // The fingerprint below stays as the fallback for a split instance
+        // seen for the first time, so a rebuilt-but-identical graph still
+        // resolves to the uid the server already holds.
+        static const bool split_off = getenv("GGML_RPC_SPLIT_UID_OFF") != nullptr;
         static const bool quick_off = getenv("GGML_RPC_QUICK_UID_OFF") != nullptr;
-        auto & quick = rpc_dev_ctx->quick_uids;
-        const uint64_t fp = quick_off ? 0 : rpc_graph_quick_fp(cgraph);
-        auto it = fp != 0 ? quick.find(fp) : quick.end();
-        if (it != quick.end()) {
-            uid = it->second;
-        } else {
-            collect_graph(endpoint, cgraph, nodes, tensors);
-            uid = graph_content_uid(nodes, tensors);
-            collected = true;
-            if (fp != 0) {
-                if (quick.size() >= 4096) {
-                    quick.clear();
-                }
-                quick[fp] = uid;
+        const int64_t t_key0 = wire_trace ? ggml_time_us() : 0;
+        auto & split_map = rpc_dev_ctx->split_uids;
+        const uint64_t split_key = split_off ? 0 : cgraph->uid;
+        auto sit = split_key != 0 ? split_map.find(split_key) : split_map.end();
+        if (sit != split_map.end()) {
+            uid = sit->second;
+            if (wire_st != nullptr) {
+                wire_st->gc_split_hit += 1;
             }
+        } else {
+            auto & quick = rpc_dev_ctx->quick_uids;
+            const uint64_t fp = quick_off ? 0 : rpc_graph_quick_fp(cgraph);
+            auto it = fp != 0 ? quick.find(fp) : quick.end();
+            if (it != quick.end()) {
+                uid = it->second;
+            } else {
+                collect_graph(endpoint, cgraph, nodes, tensors);
+                uid = graph_content_uid(nodes, tensors);
+                collected = true;
+                if (fp != 0) {
+                    if (quick.size() >= 4096) {
+                        quick.clear();
+                    }
+                    quick[fp] = uid;
+                }
+            }
+            if (split_key != 0) {
+                if (split_map.size() >= 4096) {
+                    split_map.clear();
+                }
+                split_map[split_key] = uid;
+            }
+        }
+        if (wire_st != nullptr) {
+            wire_st->gc_key_us += (uint64_t) (ggml_time_us() - t_key0);
         }
     }
 
@@ -2459,6 +2502,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
+        if (wire_st != nullptr) {
+            wire_st->gc_full_n += 1;
+        }
         rpc_trace_xdev(endpoint, cgraph);
         std::vector<uint8_t> input;
         if (stable_uid) {
