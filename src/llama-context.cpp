@@ -778,8 +778,10 @@ void llama_context::sched_reserve() {
     // Any change that invalidates the primary graph topology (LoRA, samplers,
     // attention settings, etc.) invalidates the PipeDec graph caches as well.
     for (uint32_t lane = 0; lane < PIPEDEC_STAGE2_MAX_LANES; ++lane) {
-        gf_res_pipedec_body[lane].reset();
-        sched_pipedec_body[lane].reset();
+        for (uint32_t shape = 0; shape < PIPEDEC_TREE_MAX_ROWS; ++shape) {
+            gf_res_pipedec_body[lane][shape].reset();
+            sched_pipedec_body[lane][shape].reset();
+        }
     }
     gf_res_pipedec_head.reset();
     sched_pipedec_head.reset();
@@ -919,9 +921,11 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
-    for (auto & lane_sched : sched_pipedec_body) {
-        if (lane_sched) {
-            ggml_backend_sched_synchronize(lane_sched.get());
+    for (auto & lane_scheds : sched_pipedec_body) {
+        for (auto & lane_sched : lane_scheds) {
+            if (lane_sched) {
+                ggml_backend_sched_synchronize(lane_sched.get());
+            }
         }
     }
     if (sched_pipedec_head) {
@@ -1152,8 +1156,10 @@ void llama_context::invalidate_graphs() {
     reset_res(gf_res_prev);
     reset_res(gf_res_reserve);
     reset_res(gf_res_pipedec_head);
-    for (auto & res : gf_res_pipedec_body) {
-        reset_res(res);
+    for (auto & lane_res : gf_res_pipedec_body) {
+        for (auto & res : lane_res) {
+            reset_res(res);
+        }
     }
     for (auto & res : gf_res_decode_lane) {
         reset_res(res);
@@ -1161,8 +1167,10 @@ void llama_context::invalidate_graphs() {
 
     reset_sched(sched);
     reset_sched(sched_pipedec_head);
-    for (auto & s : sched_pipedec_body) {
-        reset_sched(s);
+    for (auto & lane_scheds : sched_pipedec_body) {
+        for (auto & s : lane_scheds) {
+            reset_sched(s);
+        }
     }
     for (auto & s : sched_decode_lane) {
         reset_sched(s);
@@ -2077,12 +2085,22 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     }
 
     GGML_ASSERT(lane < PIPEDEC_STAGE2_MAX_LANES);
+    GGML_ASSERT(ubatch.n_tokens >= 1 && ubatch.n_tokens <= PIPEDEC_TREE_MAX_ROWS);
 
-    auto & lane_sched = sched_pipedec_body[lane];
-    auto & lane_res   = gf_res_pipedec_body[lane];
+    // one scheduler per (lane, rows): the lane's graph for this shape stays
+    // allocated while the lane runs other shapes, so every level reuses
+    const uint32_t shape = ubatch.n_tokens - 1;
+
+    auto & lane_sched = sched_pipedec_body[lane][shape];
+    auto & lane_res   = gf_res_pipedec_body[lane][shape];
+
+    static const bool tree_trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
+    const int64_t t_b0 = ggml_time_us();
+    int64_t t_build = 0, t_alloc = 0;
+    bool reused = false;
 
     if (!lane_sched) {
-        const size_t max_nodes = graph_max_nodes(1);
+        const size_t max_nodes = graph_max_nodes(ubatch.n_tokens);
         // Each lane owns a token-sized graph and activation buffers. Four Step
         // MTP lanes together remain tiny compared with a prompt graph, while
         // avoiding graph mutation and buffer reuse during asynchronous work.
@@ -2101,6 +2119,7 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
 
     if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
         n_reused++;
+        reused = true;
     } else {
         res->reset();
         ggml_backend_sched_reset(lane_sched.get());
@@ -2113,12 +2132,16 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        const int64_t t_b1 = ggml_time_us();
         PIPEDEC_STEP("body lane=%u built (n_nodes=%d)\n", lane, ggml_graph_n_nodes(gf));
         if (!ggml_backend_sched_alloc_graph(lane_sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        const int64_t t_b2 = ggml_time_us();
+        t_build = t_b1 - t_b0;
+        t_alloc = t_b2 - t_b1;
         PIPEDEC_STEP("body lane=%u alloced\n", lane);
 
         LLAMA_LOG_INFO("%s: initialized token-body lane %u\n", __func__, lane);
@@ -2134,7 +2157,9 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     }
 
     PIPEDEC_STEP("body lane=%u set_inputs\n", lane);
+    const int64_t t_b3 = ggml_time_us();
     res->set_inputs(&ubatch);
+    const int64_t t_b4 = ggml_time_us();
 
     PIPEDEC_STEP("body lane=%u compute_async\n", lane);
     ret = ggml_backend_sched_graph_compute_async(lane_sched.get(), res->get_gf());
@@ -2143,6 +2168,11 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
         return nullptr;
     }
     PIPEDEC_STEP("body lane=%u submitted status=%d\n", lane, (int) ret);
+    if (tree_trace && pipedec_tree_enabled) {
+        const int64_t t_b5 = ggml_time_us();
+        fprintf(stderr, "[tree] body lane=%u rows=%u reused=%d build=%.2f alloc=%.2f inputs=%.2f compute=%.2f ms\n",
+                lane, ubatch.n_tokens, (int) reused, t_build/1000.0, t_alloc/1000.0, (t_b4 - t_b3)/1000.0, (t_b5 - t_b4)/1000.0);
+    }
 
     return res;
 }
@@ -2959,7 +2989,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // taps into the stable group buffers (a shared embd_layer_inp write
             // would be overwritten by the next lane while GETs are in flight)
             PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u begin\n", pipedec_lane);
-            extract_layer_inputs_pipedec(res, sched_pipedec_body[pipedec_lane].get(), pipedec_lane);
+            extract_layer_inputs_pipedec(res, sched_pipedec_body[pipedec_lane][0].get(), pipedec_lane);
             PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u end\n", pipedec_lane);
         } else {
             extract_layer_inputs(res,
@@ -2993,7 +3023,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(
-                        pipedec_stage2 ? sched_pipedec_body[pipedec_lane].get() : sched.get(), t_h_nextn);
+                        pipedec_stage2 ? sched_pipedec_body[pipedec_lane][0].get() : sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd = hparams.n_embd_out();
@@ -3049,9 +3079,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // as the input to one arch-specific deferred output-head graph.
         PIPEDEC_STEP("group-close: drain %u lanes\n", pipedec_total);
         for (uint32_t lane = 0; lane < pipedec_total; ++lane) {
-            GGML_ASSERT(sched_pipedec_body[lane]);
+            GGML_ASSERT(sched_pipedec_body[lane][0]);
             PIPEDEC_STEP("group-close: sync lane=%u\n", lane);
-            ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+            ggml_backend_sched_synchronize(sched_pipedec_body[lane][0].get());
         }
         PIPEDEC_STEP("group-close: drained\n");
         const int64_t body_drain_us = ggml_time_us() - body_drain_t0;
@@ -5221,8 +5251,8 @@ void llama_context::pipedec_abort_group() {
     // drain so the in-flight hidden-row GETs into pipedec_group_h complete
     // before the buffer rows are reused
     for (uint32_t lane = 0; lane < pipedec_group_tokens; ++lane) {
-        if (sched_pipedec_body[lane]) {
-            ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        if (sched_pipedec_body[lane][0]) {
+            ggml_backend_sched_synchronize(sched_pipedec_body[lane][0].get());
         }
     }
     pipedec_group_tokens = 0;
@@ -5406,7 +5436,7 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     const uint32_t n_embd = model.hparams.n_embd_out();
     GGML_ASSERT(ggml_nelements(t_h) == (int64_t) n_tokens * n_embd);
 
-    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_pipedec_body[lane].get(), t_h);
+    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_pipedec_body[lane][n_tokens - 1].get(), t_h);
     GGML_ASSERT(backend_h != nullptr);
 
     ggml_backend_tensor_get_async(backend_h, t_h, pipedec_tree_row(lane, 0), 0, (size_t) n_tokens * n_embd * sizeof(float));
@@ -5575,7 +5605,7 @@ const float * llama_context::pipedec_tree_h(int32_t lane, int32_t row) {
         return nullptr;
     }
     if (pipedec_tree_lane_busy[lane]) {
-        ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        pipedec_tree_lane_wait(lane);
         pipedec_tree_lane_busy[lane] = false;
     }
     return pipedec_tree_row(lane, row);
@@ -5588,8 +5618,10 @@ int32_t llama_context::pipedec_tree_commit(llama_seq_id seq_src, llama_seq_id se
 
     // a dead lane may still write cells this copy reads: retire every lane first
     for (uint32_t lane = 0; lane < PIPEDEC_STAGE2_MAX_LANES; ++lane) {
-        if (sched_pipedec_body[lane]) {
-            ggml_backend_sched_synchronize(sched_pipedec_body[lane].get());
+        for (auto & lane_sched : sched_pipedec_body[lane]) {
+            if (lane_sched) {
+                ggml_backend_sched_synchronize(lane_sched.get());
+            }
         }
         pipedec_tree_lane_busy[lane] = false;
     }

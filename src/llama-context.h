@@ -449,7 +449,12 @@ private:
 
     static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 16;
     static constexpr uint32_t PIPEDEC_TREE_MAX_ROWS    = 8;
-    std::array<ggml_backend_sched_ptr, PIPEDEC_STAGE2_MAX_LANES> sched_pipedec_body;
+    // [fork] one scheduler per (lane, level rows). A graph is reused only for
+    // its own ubatch shape, and a tree lane alternates 1-row restart levels
+    // with width-row levels: one scheduler per lane rebuilt and reallocated
+    // the whole split graph on every shape change (~9 ms per level).
+    // Classic stage-2 lanes are one token wide and live in slot 0.
+    std::array<std::array<ggml_backend_sched_ptr, PIPEDEC_TREE_MAX_ROWS>, PIPEDEC_STAGE2_MAX_LANES> sched_pipedec_body;
 
     // [fork, PipeDec tree] one level per lane. rows = tokens the lane carries,
     // busy = its body graph or row GETs may still run. Rows stay readable after
@@ -550,7 +555,7 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
-    std::array<llm_graph_result_ptr, PIPEDEC_STAGE2_MAX_LANES> gf_res_pipedec_body;
+    std::array<std::array<llm_graph_result_ptr, PIPEDEC_TREE_MAX_ROWS>, PIPEDEC_STAGE2_MAX_LANES> gf_res_pipedec_body;
     llm_graph_result_ptr gf_res_pipedec_head;
     std::vector<llm_graph_result_ptr> gf_res_decode_lane; // [fork] decode lane pool
 
