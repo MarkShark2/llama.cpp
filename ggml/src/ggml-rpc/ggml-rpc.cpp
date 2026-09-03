@@ -2370,6 +2370,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     const bool wire_trace = rpc_wire_trace_enabled();
     rpc_wire_ep_stat * wire_st = wire_trace ? rpc_wire_stat(endpoint) : nullptr;
     const int64_t wire_t0 = wire_trace ? ggml_time_us() : 0;
+    if (wire_trace) {
+        // a pipelined decode may go a long time with no traced set/get (its
+        // inputs and reads take the async paths), so flush from here too
+        rpc_wire_trace_tick();
+    }
     struct wire_submit_scope {
         rpc_wire_ep_stat * st; int64_t t0;
         ~wire_submit_scope() {

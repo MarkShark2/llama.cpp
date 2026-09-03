@@ -1876,6 +1876,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // [fork, PipeDec] optional walk trace: where the submission thread spends its time
     static const bool pd_trace = getenv("GGML_PIPEDEC_TRACE") != NULL && atoi(getenv("GGML_PIPEDEC_TRACE")) != 0;
     int64_t pd_t0 = 0, pd_inp = 0, pd_moe_ids = 0, pd_moe_cpy = 0, pd_fallback = 0, pd_submit = 0;
+    // [fork] per-backend share of pd_submit (which backend's compute_async the
+    // submission thread is spending its time in)
+    int64_t pd_submit_by[GGML_SCHED_MAX_BACKENDS] = { 0 };
     if (pd_trace) {
         pd_t0 = ggml_time_us();
     }
@@ -2116,7 +2119,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const int64_t pd_t_sub = pd_trace ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (pd_trace) {
-                pd_submit += ggml_time_us() - pd_t_sub;
+                const int64_t pd_d = ggml_time_us() - pd_t_sub;
+                pd_submit += pd_d;
+                pd_submit_by[split_backend_id] += pd_d;
             }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2174,9 +2179,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->n_splits, sched->graph.n_nodes,
                 (ggml_time_us() - pd_t0) * ms, pd_inp * ms, pd_moe_ids * ms, pd_moe_cpy * ms, pd_fallback * ms, pd_submit * ms);
         // [fork] raw stderr mirror (server log filter hides lib INFO lines)
-        fprintf(stderr, "[pd walk] splits=%d n_nodes=%d total=%.1fms inp=%.1f moe_ids=%.1f moe_cpy=%.1f fallback=%.1f submit=%.1f\n",
+        fprintf(stderr, "[pd walk] splits=%d n_nodes=%d total=%.1fms inp=%.1f moe_ids=%.1f moe_cpy=%.1f fallback=%.1f submit=%.1f",
                 sched->n_splits, sched->graph.n_nodes,
                 (ggml_time_us() - pd_t0) * ms, pd_inp * ms, pd_moe_ids * ms, pd_moe_cpy * ms, pd_fallback * ms, pd_submit * ms);
+        for (int i = 0; i < sched->n_backends; i++) {
+            if (pd_submit_by[i] != 0) {
+                fprintf(stderr, " %s=%.2f", ggml_backend_name(sched->backends[i]), pd_submit_by[i] * ms);
+            }
+        }
+        fprintf(stderr, "\n");
         fflush(stderr);
     }
 
