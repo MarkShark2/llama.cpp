@@ -6,6 +6,11 @@
 #include <algorithm>
 #include <cinttypes>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -1392,6 +1397,37 @@ public:
     std::vector<llama_token> prev;
 };
 
+// [fork] The n-gram table is TENSOR_READ_LAZY: 28.8 GB of hashed rows mapped
+// MADV_RANDOM, so a row not yet in the page cache is a cold disk read, and the
+// CPU get_rows walks its rows on one thread, one fault at a time. That put
+// 16 rows x ~190 us (dm-crypt on shredder's NVMe) = 3 ms of serial page
+// faults on every pipelined decode level -- the whole CPU split of a tree
+// level, and most of the client submit cost. Asking the kernel for every
+// row's page up front lets the reads overlap: 16 cold pages measured 2983 ->
+// 525 us. A cached page costs the advise syscall only.
+// LLAMA_PLE_PREFETCH_OFF=1 restores the serial faults for A/B.
+static void ple_prefetch_rows(const ggml_tensor * table, const std::vector<int32_t> & idx) {
+#ifndef _WIN32
+    static const bool off = getenv("LLAMA_PLE_PREFETCH_OFF") != nullptr;
+    if (off || table == nullptr || table->data == nullptr || table->buffer == nullptr ||
+        !ggml_backend_buffer_is_host(table->buffer)) {
+        return;
+    }
+    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const size_t    row_bytes = table->nb[1];
+    const uintptr_t base      = (uintptr_t) table->data;
+    for (int32_t r : idx) {
+        const uintptr_t row = base + (uintptr_t) r * row_bytes;
+        const uintptr_t beg = row & ~(page - 1);
+        const uintptr_t end = (row + row_bytes + page - 1) & ~(page - 1);
+        posix_madvise((void *) beg, (size_t) (end - beg), POSIX_MADV_WILLNEED);
+    }
+#else
+    GGML_UNUSED(table);
+    GGML_UNUSED(idx);
+#endif
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1451,6 +1487,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    ple_prefetch_rows(pmodel.per_layer_tok_embd, idx);
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
