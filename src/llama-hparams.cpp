@@ -72,20 +72,28 @@ uint32_t llama_hparams::n_ff(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_ff_exp(uint32_t il) const {
-    // Return per-layer value when available, else fall back to the scalar impl.
-    // Out-of-range il (e.g. nextn layers not yet counted) returns impl safely.
     if (il < n_layer_all) {
-        return n_ff_exp_arr[il] != 0 ? n_ff_exp_arr[il] : n_ff_exp_impl;
+        return n_ff_exp_arr[il];
     }
-    return n_ff_exp_impl;
+
+    GGML_ABORT("fatal error");
 }
 
 uint32_t llama_hparams::n_expert_used(uint32_t il) const {
-    // Return per-layer value when available, else fall back to the scalar impl.
     if (il < n_layer_all) {
-        return n_expert_used_arr[il] != 0 ? n_expert_used_arr[il] : n_expert_used_impl;
+        return n_expert_used_arr[il];
     }
-    return n_expert_used_impl;
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used_max() const {
+    uint32_t val = 0;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        val = std::max(val, n_expert_used(il));
+    }
+
+    return val;
 }
 
 uint32_t llama_hparams::n_gqa(uint32_t il) const {

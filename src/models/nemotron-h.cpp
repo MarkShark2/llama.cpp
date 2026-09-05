@@ -27,13 +27,8 @@ void llama_model_nemotron_h::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps); // MTP head final_layernorm
 
-    // Load n_ff_exp as scalar-OR-array; per-layer values are accessible via hparams.n_ff_exp(il).
+    // Puzzle models set a different expert FFN size per layer
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
-    // Also derive the scalar fallback (for existing uniform GGUFs and other arches).
-    hparams.n_ff_exp_impl = 0;
-    for (uint32_t _il = 0; _il < hparams.n_layer_all; ++_il) {
-        hparams.n_ff_exp_impl = std::max(hparams.n_ff_exp_impl, hparams.n_ff_exp_arr[_il]);
-    }
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp,      false);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
@@ -176,7 +171,7 @@ void llama_model_nemotron_h::load_arch_tensors(llama_model_loader & ml) {
         const int64_t n_head_i       = hparams.n_head(i);
         const int64_t n_embd_k_gqa_i = hparams.n_embd_k_gqa(i);
         const int64_t n_embd_v_gqa_i = hparams.n_embd_v_gqa(i);
-        const int64_t n_ff_exp       = hparams.n_ff_exp_impl ? hparams.n_ff_exp_impl : n_ff / n_expert_used;
+        const int64_t n_ff_exp       = hparams.n_ff_exp(i) ? (int64_t)hparams.n_ff_exp(i) : n_ff / (int64_t)hparams.n_expert_used(i);
         const int64_t n_ff_shexp     = hparams.n_ff_shexp;
 
         // NextN input-fusion tensors
@@ -328,9 +323,9 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(llm_graph_context &
                     nullptr, // no gate
                     model.layers[il].ffn_down_exps,
                     model.layers[il].ffn_exp_probs_b,
-                    self.n_expert, (int64_t)self.hparams.n_expert_used(il),
-                    LLM_FFN_RELU_SQR, self.hparams.expert_weights_norm,
-                    self.hparams.expert_weights_scale,
+                    n_expert, (int64_t)hparams.n_expert_used(il),
+                    LLM_FFN_RELU_SQR, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
                     il,
                     router_logits, nullptr,

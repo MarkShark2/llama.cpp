@@ -203,6 +203,7 @@ class NemotronHModel(GraniteHybridModel):
     is_moe: bool = False
     _experts: list[dict[str, Tensor]] | None = None
     supports_mtp_export = True
+    _experts: list[dict[str, Tensor]] | None = None
 
     _SSM_LAYER_TYPES = {"mamba", "linear_attention"}
     _ATTN_LAYER_TYPES = {"attention", "full_attention"}
@@ -518,6 +519,7 @@ class NemotronHModel(GraniteHybridModel):
 
 
 @ModelBase.register("NemotronHPuzzleForCausalLM")
+@ModelBase.example("nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16")
 class NemotronHPuzzleModel(NemotronHModel):
     """NVIDIA Puzzle: NemotronH with a per-block MoE config (block_configs) and an
     MTP draft head (mtp.safetensors) appended as two extra blocks."""
@@ -579,6 +581,16 @@ class NemotronHPuzzleModel(NemotronHModel):
         self.gguf_writer.add_nextn_predict_layers(len(self.mtp_block_configs))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # The official BF16 checkpoint (NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16)
+        # names the trunk "model.*" (model.layers.*, model.embeddings, model.norm_f)
+        # where the original release used the NemotronH-style "backbone.*", and spells
+        # the router bias "e_score_correction_bias" instead of "e_score_correction.bias";
+        # normalize so both convert identically.
+        if name.startswith("model."):
+            name = "backbone." + name[len("model."):]
+        if name.endswith("mixer.gate.e_score_correction_bias"):
+            name = name[: -len("e_score_correction_bias")] + "e_score_correction.bias"
+
         if name.startswith("mtp."):
             assert bid is not None and bid in (0, 1), f"Unexpected MTP tensor: {name}"
             mtp_bid = self.n_layer_trunk + bid
