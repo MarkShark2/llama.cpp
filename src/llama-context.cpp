@@ -2559,7 +2559,7 @@ static bool pipedec_stage2_eligible(
 
     if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
          model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
-         model.arch != LLM_ARCH_QWEN4EXP) ||
+         model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_GLM5_NEXT) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||
@@ -5408,7 +5408,7 @@ static bool pipedec_tree_batch_ok(
 
     if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
          model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
-         model.arch != LLM_ARCH_QWEN4EXP) ||
+         model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_GLM5_NEXT) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||

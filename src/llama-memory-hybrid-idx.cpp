@@ -217,6 +217,7 @@ bool llama_memory_hybrid_idx::seq_trim(llama_seq_id seq_id, llama_pos p0) {
 
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, -1);
+        mem_idx_stale = true;
     }
 
     return true;

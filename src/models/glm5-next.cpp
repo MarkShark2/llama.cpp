@@ -77,26 +77,51 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
         mtp_flags |= TENSOR_SKIP;
     }
 
+    // [fork] the draft head may also ship as its own GGUF (--model-draft + --device-draft):
+    // blk.<n_layer>.* plus token_embd / output / output_norm and none of the trunk, so it
+    // can be quantized apart from the trunk and pinned to the draft GPU. Both halves
+    // declare nextn in their metadata, so probe for the tensors as qwen4exp does.
+    const bool mtp_only    = (n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    if (mtp_only) {
+        LLAMA_LOG_INFO("%s: draft-only GGUF, the trunk is absent\n", __func__);
+    }
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
+    // [fork, PipeDec] when the output head is pinned to the draft GPU (--device-draft),
+    // the output norm and lm_head would follow it off the pipeline. A graph only
+    // pipelines if it ends on an RPC backend: a local tail makes every split-input
+    // copy fall back to synchronize + blocking copy, which drains the endpoint inside
+    // the submission of the current graph. Duplicate both onto the last transformer
+    // layer and use them in the trunk/body graphs so the whole trunk stays on the
+    // pipeline, exactly as when there is no drafter at all. The deferred head graph
+    // keeps the originals on the draft GPU by design.
+    if (!mtp_only && params.mtp_dev != nullptr && n_layer > 0) {
+        output_norm_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        output_trunk      = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+    }
+
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
 
-        const int flags = (i >= n_layer) ? mtp_flags : 0;
+        const int flags = (i >= n_layer) ? mtp_flags : trunk_flags;
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
 
         if (i < n_layer) {
-            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc*n_embd, hc_mix_dim}, 0);
-            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
-            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
-            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc*n_embd, hc_mix_dim}, 0);
-            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, 0);
-            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
+            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc*n_embd, hc_mix_dim}, trunk_flags);
+            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, trunk_flags);
+            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, trunk_flags);
+            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc*n_embd, hc_mix_dim}, trunk_flags);
+            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, trunk_flags);
+            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, trunk_flags);
         }
 
         const int64_t head_dim = hparams.n_embd_head_kda;
@@ -106,25 +131,25 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
         if (hparams.is_recr(i)) {
             auto conv = [&](llm_tensor tid) {
                 ggml_tensor * t = create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner, 1}, TENSOR_NOT_REQUIRED);
-                return t ? t : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, 0);
+                return t ? t : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, trunk_flags);
             };
             layer.ssm_q_conv = conv(LLM_TENSOR_SSM_CONV1D_Q);
             layer.ssm_k_conv = conv(LLM_TENSOR_SSM_CONV1D_K);
             layer.ssm_v_conv = conv(LLM_TENSOR_SSM_CONV1D_V);
 
-            create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, 0);
+            create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, trunk_flags);
 
-            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd, head_dim}, 0);
-            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner}, 0);
-            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
+            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd, head_dim}, trunk_flags);
+            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner}, trunk_flags);
+            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, trunk_flags);
 
-            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {n_head}, 0);
-            layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, 0);
+            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {n_head}, trunk_flags);
+            layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, trunk_flags);
 
-            layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd, head_dim}, 0);
-            layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner}, 0);
-            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, 0);
-            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, 0);
+            layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd, head_dim}, trunk_flags);
+            layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner}, trunk_flags);
+            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, trunk_flags);
+            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, trunk_flags);
         } else {
             const int64_t q_lora_rank      = hparams.n_lora_q;
             const int64_t kv_lora_rank     = hparams.n_lora_kv;
@@ -161,9 +186,9 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
         }
 
         if (i < (int) hparams.n_layer_dense_lead) {
-            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
-            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, trunk_flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, trunk_flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, trunk_flags);
         } else {
             const int64_t n_ff_exp        = hparams.n_ff_exp(i);
             const int64_t n_expert_shared = hparams.n_expert_shared;
@@ -192,6 +217,10 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
+        return std::make_unique<graph_pipedec_head>(*this, params);
+    }
+
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         if (!mtp_ready) {
             throw std::runtime_error("MTP graph requested but the NextN tensors are not loaded");
@@ -397,7 +426,11 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_attn  = inp_hyb->get_attn();
     auto * inp_kpool = build_inp_kpool(mctx_hyb);
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // [fork, PipeDec] a body lane returns every hidden row and never gathers output
+    // rows, so it must not register an out_ids input that set_inputs() would fill
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+            ? nullptr
+            : build_inp_out_ids();
 
     const int64_t n_head_kda   = hparams.n_head();
     const int64_t head_dim     = hparams.n_embd_head_kda;
@@ -497,15 +530,55 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     cur = build_hc_mean(inpL);
     cb(cur, "hc_head", -1);
 
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    // [fork, PipeDec] with the head pinned to --device-draft, the last layer carries
+    // duplicates of the tail so the trunk graph keeps ending on the pipeline
+    const auto & model_glm = static_cast<const llama_model_glm5_next &>(model);
+
+    cur = build_norm(cur, model_glm.output_norm_trunk ? model_glm.output_norm_trunk : model.output_norm,
+            nullptr, LLM_NORM_RMS, -1);
 
     // the post-norm hidden state feeds the draft head
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    // [fork, PipeDec] stage 2 queues token-sized trunk graphs across the layer
+    // devices. The body ends at the post-output-norm hidden state; those rows are
+    // copied out and fed to one batched graph_pipedec_head (lm_head only) after the
+    // body pipeline drains. Stopping here also keeps the body graph on the pipeline:
+    // the lm_head would otherwise drag the tail to the draft GPU.
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     if (inp_out_ids && !narrow_early) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model_glm.output_trunk ? model_glm.output_trunk : model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// [fork, PipeDec] deferred verification head: the body lanes stop at the post-norm
+// hidden state, so all that is left here is the lm_head over the batched rows
+// gathered from every lane in the group. Runs on the draft GPU by design.
+llama_model_glm5_next::graph_pipedec_head::graph_pipedec_head(
+        const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    cb(inp->embd, "pipedec_h_input", -1);
+
+    ggml_tensor * cur = inp->embd;
+    res->add_input(std::move(inp));
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

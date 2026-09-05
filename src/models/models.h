@@ -2701,6 +2701,12 @@ struct llama_model_glm5_next : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // [fork, PipeDec] last-layer copies of the tail tensors, created only when
+    // the output head is pinned to the draft GPU (--device-draft), so the trunk
+    // and body graphs end on the pipeline instead of the local backend
+    ggml_tensor * output_norm_trunk = nullptr;
+    ggml_tensor * output_trunk      = nullptr;
+
     // k-pool indexer inputs on top of the generic hybrid input
     class llm_graph_input_kpool;
 
@@ -2734,6 +2740,12 @@ struct llama_model_glm5_next : public llama_model_base {
     // Draft head, the Nextn block as a non hyper connected DSA layer
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // [fork, PipeDec] deferred verification head: lm_head over rows already normed
+    // by the body lanes; runs on the draft GPU where the head tensors live
+    struct graph_pipedec_head : public llm_graph_context {
+        graph_pipedec_head(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
