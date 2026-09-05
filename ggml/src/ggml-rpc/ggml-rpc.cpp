@@ -5,16 +5,13 @@
 #include "transport.h"
 
 #include <array>
-#include <atomic>
-#include <chrono>
 #include <cinttypes>
-#include <condition_variable>
-#include <deque>
-#include <functional>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
+#include <queue>
+#include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -22,9 +19,14 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
-#include <future>
 #include <algorithm>
+#include <atomic>
 #include <thread>
+// [fork]
+#include <chrono>
+#include <deque>
+#include <functional>
+#include <map>
 #include <ctime>
 #include <cstdarg>
 #include <cstdlib>
@@ -43,7 +45,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 namespace fs = std::filesystem;
 
-// defined next to the cache chunk size, used by set_tensor further up
+// [fork] defined next to the cache chunk size, used by set_tensor further up
 static bool rpc_cache_write_file(const fs::path & path, const void * data, size_t size);
 
 // macro for nicer error messages on server crash
@@ -92,33 +94,36 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_NONE,
+    // ---- [fork] everything below is fork protocol; see RPC_PROTO_PATCH_VERSION ----
+    // multi-slot server graph cache: explicit eviction of a cached graph
     RPC_CMD_GRAPH_FORGET,
     // bf16 wire compression for f32 activations (GGML_RPC_WIRE_BF16=1):
     // same semantics as SET_TENSOR / GET_TENSOR but the wire payload is bf16
     // (half the bytes); the server expands/truncates at the buffer edge.
     RPC_CMD_SET_TENSOR_BF16,
     RPC_CMD_GET_TENSOR_BF16,
-    // full-duplex transfer lanes (GGML_RPC_FULL_DUPLEX=1) [fork]:
+    // full-duplex transfer lanes (GGML_RPC_FULL_DUPLEX=1):
     // SESSION_INFO returns the id of the server session so extra "lane"
     // connections can attach to it with LANE_ATTACH; LANE_FENCE orders the
     // main command stream after lane traffic (see the client lane section).
     RPC_CMD_SESSION_INFO,
     RPC_CMD_LANE_ATTACH,
     RPC_CMD_LANE_FENCE,
-    // direct remote->remote activation transfer (GGML_RPC_PEER=1) [fork]:
+    // direct remote->remote activation transfer (GGML_RPC_PEER=1):
     // PEER_OPEN tells a server to attach a peer lane to another server's
     // session; PUSH_TENSOR then makes it read one of its own tensors and ship
     // it straight down that lane, so a stage boundary never touches the client.
     RPC_CMD_PEER_OPEN,
     RPC_CMD_PUSH_TENSOR,
-    // imatrix collection without dragging the activations home [fork]:
+    // imatrix collection without dragging the activations home:
     // llama-imatrix only ever wants sum(x^2) per column (per expert, for
     // MUL_MAT_ID) of a matmul's src1. Reading that tensor back over the wire
     // costs ~10 GB per 512-token chunk on a 27-layer RPC split; the server can
     // do the reduction in its own RAM and answer with the accumulator instead,
     // which is token-count independent.
     RPC_CMD_IMATRIX_SQSUM,
-    // fleet hibernation [fork]:
+    // fleet hibernation:
     // DETACH parks this session's buffers on the server and answers with a
     // token; the client then closes every connection so the host can suspend to
     // disk. RESUME re-adopts the parked buffers on a fresh connection. Without
@@ -129,7 +134,9 @@ enum rpc_cmd {
     RPC_CMD_COUNT,
 };
 
-// minimum server RPC_PROTO_PATCH_VERSION that understands the lane commands
+static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+
+// [fork] minimum server RPC_PROTO_PATCH_VERSION that understands the lane commands
 #define GGML_RPC_FDX_MIN_PATCH 1
 // ...and the peer (remote->remote) commands
 #define GGML_RPC_PEER_MIN_PATCH 2
@@ -146,8 +153,6 @@ enum rpc_lane_id : uint8_t {
 
 // endpoint strings ("host:port") as carried on the wire
 #define RPC_ENDPOINT_MAX 128
-
-static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -266,6 +271,8 @@ struct rpc_msg_get_device_memory_rsp {
     uint64_t total_mem;
 };
 
+// [fork] the multi-slot graph cache addresses cached graphs by uid, so both
+// GRAPH_COMPUTE (see serialize_collected) and GRAPH_RECOMPUTE carry one
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
     uint64_t uid;
@@ -289,8 +296,6 @@ struct rpc_msg_lane_attach_rsp {
     uint8_t ok;
 };
 
-// main-lane barrier: wait until the lanes have fully processed the first
-// wait_set / wait_get commands submitted on them
 struct rpc_msg_session_detach_rsp {
     uint64_t token;      // 0 = the server refused to park
     uint64_t n_buffers;
@@ -306,6 +311,8 @@ struct rpc_msg_session_resume_rsp {
     uint64_t n_buffers;
 };
 
+// main-lane barrier: wait until the lanes have fully processed the first
+// wait_set / wait_get commands submitted on them
 struct rpc_msg_lane_fence_req {
     uint64_t wait_set;
     uint64_t wait_get;
@@ -377,7 +384,7 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
-    // uids of graphs the server holds deserialized for this device
+    // [fork] uids of graphs the server holds deserialized for this device
     // (client-side LRU view, front = most recently used)
     std::vector<uint64_t> known_graph_uids;
     // [fork] struct-fingerprint -> content uid, see rpc_graph_quick_fp()
@@ -395,29 +402,24 @@ struct ggml_backend_rpc_buffer_type_context {
     size_t      max_size;
 };
 
+class rpc_dispatcher;
 struct ggml_backend_rpc_context {
-    std::string endpoint;
-    uint32_t    device;
-    std::string name;
+    std::shared_ptr<rpc_dispatcher> dispatcher;
+    uint32_t                        device;
+    std::string                     name;
 };
 
-// note: deliberately holds no socket. A detach has to actually close the
-// connection so the remote host can suspend, and a buffer context that pinned a
-// shared_ptr<socket_t> would keep the fd open for the lifetime of the model.
-// The socket is looked up per call instead - a mutex and a hash lookup against
-// a network round trip.
 struct ggml_backend_rpc_buffer_context {
-    std::string endpoint;
-    void * base_ptr;
-    uint64_t remote_ptr;
+    std::shared_ptr<rpc_dispatcher>   dispatcher;
+    void                            * base_ptr;
+    uint64_t                          remote_ptr;
 };
 
 // RPC helper functions
 
 // Computes FNV-1a hash of the data
-static uint64_t fnv_hash(const uint8_t * data, size_t len) {
+static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf29ce484222325ULL) {
     const uint64_t fnv_prime = 0x100000001b3ULL;
-    uint64_t hash = 0xcbf29ce484222325ULL;
 
     for (size_t i = 0; i < len; ++i) {
         hash ^= data[i];
@@ -475,273 +477,29 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
-// per-command wire accounting (client-side), enabled with GGML_RPC_CMD_STATS=1;
-// printed every ~5s from whichever thread sends next
-static void rpc_cmd_stats_add(enum rpc_cmd cmd, size_t bytes) {
-    static const bool enabled = []{
-        const char * e = std::getenv("GGML_RPC_CMD_STATS");
-        return e && atoi(e) != 0;
-    }();
-    if (!enabled) {
-        return;
-    }
-    static std::atomic<uint64_t> counts[RPC_CMD_COUNT] = {};
-    static std::atomic<uint64_t> sizes[RPC_CMD_COUNT] = {};
-    static std::atomic<int64_t> t_print{0};
-    counts[cmd] += 1;
-    sizes[cmd] += bytes;
-    const int64_t now = ggml_time_us();
-    int64_t prev = t_print.load();
-    if (now - prev > 5*1000*1000 && t_print.compare_exchange_strong(prev, now)) {
-        char buf[1024];
-        size_t off = 0;
-        for (int i = 0; i < RPC_CMD_COUNT && off < sizeof(buf) - 64; i++) {
-            const uint64_t n = counts[i].exchange(0);
-            const uint64_t s = sizes[i].exchange(0);
-            if (n == 0) {
-                continue;
-            }
-            off += (size_t) snprintf(buf + off, sizeof(buf) - off, " cmd%d n=%llu %.1fMB",
-                    i, (unsigned long long) n, (double) s/1e6);
-        }
-        fprintf(stderr, "[rpc cmd stats]%s\n", buf);
-        fflush(stderr);
-    }
-}
-
-// [fork] per-endpoint wall accounting for the decode hot path, GGML_RPC_WIRE_TRACE=1.
-//
-// In the synchronous path (GGML_RPC_ASYNC=0) a stage's llama_decode is three
-// distinct things on one ordered socket: upload the graph inputs (SET), submit
-// the graph (fire-and-forget, no response), then read the output back (GET).
-// Only the GET blocks, and it blocks across the whole remote compute -- so
-// splitting set/submit/get separates "we are talking to the device" from "the
-// device is working", which the per-stage timers upstack cannot distinguish.
-// Bytes ride along so wire time can be divided out against the link rate.
-struct rpc_wire_ep_stat {
-    std::atomic<uint64_t> set_n{0}, set_us{0}, set_bytes{0};
-    std::atomic<uint64_t> get_n{0}, get_us{0}, get_bytes{0};
-    std::atomic<uint64_t> gc_n{0},  gc_us{0};
-    // [fork] submit split: key_us = time to decide the uid (split cache /
-    // fingerprint / content hash), full_n = graphs shipped in full
-    std::atomic<uint64_t> gc_key_us{0}, gc_full_n{0}, gc_split_hit{0};
-};
-
-static std::mutex g_wire_stat_m;
-static std::map<std::string, std::unique_ptr<rpc_wire_ep_stat>> g_wire_stats;
-
-static int rpc_wire_trace_level() {
-    static const int level = []{
-        const char * e = std::getenv("GGML_RPC_WIRE_TRACE");
-        return e ? atoi(e) : 0;
-    }();
-    return level;
-}
-
-static bool rpc_wire_trace_enabled() {
-    return rpc_wire_trace_level() != 0;
-}
-
-// level 2: which tensors are being re-uploaded. A cache-hit graph should be
-// staging almost nothing per eval, so the per-name breakdown is what says
-// whether an input can be made cache-resident (the cache_k_rot pattern).
-struct rpc_wire_name_stat {
-    uint64_t n = 0, bytes = 0;
-};
-static std::map<std::string, rpc_wire_name_stat> g_wire_names;
-
-static void rpc_wire_note_set(const ggml_tensor * tensor, size_t size) {
-    if (rpc_wire_trace_level() < 2) {
-        return;
-    }
-    char key[96];
-    snprintf(key, sizeof(key), "%s [%s %lldx%lld]", tensor->name, ggml_type_name(tensor->type),
-             (long long) tensor->ne[0], (long long) tensor->ne[1]);
-    std::lock_guard<std::mutex> l(g_wire_stat_m);
-    rpc_wire_name_stat & s = g_wire_names[key];
-    s.n     += 1;
-    s.bytes += size;
-}
-
-static rpc_wire_ep_stat * rpc_wire_stat(const std::string & endpoint) {
-    std::lock_guard<std::mutex> l(g_wire_stat_m);
-    auto it = g_wire_stats.find(endpoint);
-    if (it != g_wire_stats.end()) {
-        return it->second.get();
-    }
-    auto s = std::make_unique<rpc_wire_ep_stat>();
-    rpc_wire_ep_stat * ptr = s.get();
-    g_wire_stats[endpoint] = std::move(s);
-    return ptr;
-}
-
-// printed every ~5s from whichever thread finishes an op next
-static void rpc_wire_trace_tick() {
-    static std::atomic<int64_t> t_print{0};
-    const int64_t now = ggml_time_us();
-    int64_t prev = t_print.load();
-    if (now - prev <= 5*1000*1000 || !t_print.compare_exchange_strong(prev, now)) {
-        return;
-    }
-    const double window_s = prev == 0 ? 0.0 : (now - prev)/1e6;
-    std::lock_guard<std::mutex> l(g_wire_stat_m);
-    for (auto & kv : g_wire_stats) {
-        rpc_wire_ep_stat & s = *kv.second;
-        const uint64_t set_n = s.set_n.exchange(0), set_us = s.set_us.exchange(0), set_b = s.set_bytes.exchange(0);
-        const uint64_t get_n = s.get_n.exchange(0), get_us = s.get_us.exchange(0), get_b = s.get_bytes.exchange(0);
-        const uint64_t gc_n  = s.gc_n.exchange(0),  gc_us  = s.gc_us.exchange(0);
-        const uint64_t gc_key = s.gc_key_us.exchange(0), gc_full = s.gc_full_n.exchange(0), gc_hit = s.gc_split_hit.exchange(0);
-        if (set_n == 0 && get_n == 0 && gc_n == 0) {
-            continue;
-        }
-        fprintf(stderr, "[rpc wire] %-22s win=%.1fs | set n=%llu %.2fms %.1fMB | submit n=%llu %.3fms key=%.3fms split-hit=%llu full=%llu | get n=%llu %.2fms %.1fMB\n",
-                kv.first.c_str(), window_s,
-                (unsigned long long) set_n, set_n ? set_us/1e3/(double) set_n : 0.0, set_b/1e6,
-                (unsigned long long) gc_n,  gc_n  ? gc_us /1e3/(double) gc_n  : 0.0,
-                gc_n ? gc_key/1e3/(double) gc_n : 0.0,
-                (unsigned long long) gc_hit, (unsigned long long) gc_full,
-                (unsigned long long) get_n, get_n ? get_us/1e3/(double) get_n : 0.0, get_b/1e6);
-    }
-    if (rpc_wire_trace_level() >= 2 && !g_wire_names.empty()) {
-        std::vector<std::pair<std::string, rpc_wire_name_stat>> rows(g_wire_names.begin(), g_wire_names.end());
-        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
-            return a.second.bytes > b.second.bytes;
-        });
-        for (const auto & row : rows) {
-            fprintf(stderr, "[rpc set-by-name] %-44s n=%llu %.1fMB (%.0f B each)\n",
-                    row.first.c_str(), (unsigned long long) row.second.n, row.second.bytes/1e6,
-                    row.second.n ? (double) row.second.bytes/(double) row.second.n : 0.0);
-        }
-        g_wire_names.clear();
-    }
-    fflush(stderr);
-}
-
-// [fork] Client-side write coalescing on the ordered command socket.
-//
-// A command frame is three send_data() calls -- cmd byte, size, payload -- so a
-// DSV4 SPD stage graph, which stages ~23 inputs per eval (about 20 of them 1x1
-// index scalars costing ~308 bytes each), spends ~70 blocking socket writes and
-// the same number of reads in the server's command loop to move ~100 KB. The
-// cost of a per-eval upload is dominated by the *command*, not the bytes:
-// removing one 64 KiB constant was worth 2.3 ms of stage latency against 0.56 ms
-// of link time, and 3.7 ms on a loopback stage that has no network at all.
-//
-// Frames that expect no response are appended to a per-socket buffer and leave
-// as one write. Ordering is exact: bytes are appended in call order, and the
-// buffer is flushed before anything reads from the socket. Graph submissions
-// append and flush immediately -- they are fire-and-forget, so a pending one
-// would leave the remote idle until some unrelated call happened along.
-//
-// Set GGML_RPC_SEND_COALESCE=0 to send frame-per-write again (the A/B control).
-static constexpr size_t RPC_SEND_COALESCE_MAX_PAYLOAD = 256*1024;
-static constexpr size_t RPC_SEND_COALESCE_FLUSH_AT    = 1024*1024;
-
-struct rpc_send_queue {
-    std::mutex m;
-    std::vector<uint8_t> pending;
-};
-
-static std::mutex g_send_queue_map_m;
-static std::unordered_map<socket_t *, std::unique_ptr<rpc_send_queue>> g_send_queues;
-
-// This sits on the path of every command, so it must not take a process-global
-// lock in the common case: a stage thread talks to one endpoint, so a one-entry
-// thread-local cache hits essentially always. Entries are never erased, and the
-// map is node-based, so the raw pointer stays valid for the process lifetime.
-static rpc_send_queue * rpc_send_queue_for(socket_t * key) {
-    static thread_local socket_t       * last_key = nullptr;
-    static thread_local rpc_send_queue * last_q   = nullptr;
-    if (key == last_key && last_q != nullptr) {
-        return last_q;
-    }
-    std::lock_guard<std::mutex> l(g_send_queue_map_m);
-    auto & slot = g_send_queues[key];
-    if (slot == nullptr) {
-        slot = std::make_unique<rpc_send_queue>();
-    }
-    last_key = key;
-    last_q   = slot.get();
-    return last_q;
-}
-
-static bool rpc_send_coalesce_enabled() {
-    static const bool enabled = []{
-        const char * e = std::getenv("GGML_RPC_SEND_COALESCE");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    return enabled;
-}
-
-// caller holds q.m
-static bool rpc_send_flush_locked(const socket_ptr & sock, rpc_send_queue & q) {
-    if (q.pending.empty()) {
-        return true;
-    }
-    const bool ok = sock->send_data(q.pending.data(), q.pending.size());
-    q.pending.clear();
-    // message boundary: the RDMA transport posts its trailing partial frame
-    // only on flush() (no-op on TCP)
-    return ok && sock->flush();
-}
-
-// caller holds q.m -- appends one frame and sends the buffer when it must not
-// be left pending
-static bool rpc_send_frame_locked(
-        const socket_ptr & sock, rpc_send_queue & q,
-        enum rpc_cmd cmd, const void * input, size_t input_size, bool flush) {
-    const uint8_t cmd_byte = cmd;
-    const uint64_t size64  = input_size;
-    const size_t   base    = q.pending.size();
-    q.pending.resize(base + sizeof(cmd_byte) + sizeof(size64) + input_size);
-    uint8_t * dst = q.pending.data() + base;
-    memcpy(dst, &cmd_byte, sizeof(cmd_byte));
-    dst += sizeof(cmd_byte);
-    memcpy(dst, &size64, sizeof(size64));
-    dst += sizeof(size64);
-    if (input_size > 0) {
-        memcpy(dst, input, input_size);
-    }
-    if (flush || q.pending.size() >= RPC_SEND_COALESCE_FLUSH_AT) {
-        return rpc_send_flush_locked(sock, q);
-    }
-    return true;
-}
-
-// a frame that must go out now: everything the remote could be left waiting on,
-// plus anything too large to be worth staging through the buffer
-static bool rpc_send_must_flush(enum rpc_cmd cmd, size_t input_size) {
-    return !rpc_send_coalesce_enabled() ||
-           input_size > RPC_SEND_COALESCE_MAX_PAYLOAD ||
-           cmd == RPC_CMD_GRAPH_COMPUTE ||
-           cmd == RPC_CMD_GRAPH_RECOMPUTE;
-}
-
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     if (sock == nullptr) {
         return false;
     }
-    rpc_cmd_stats_add(cmd, input_size);
-    rpc_send_queue * q = rpc_send_queue_for(sock.get());
-    std::lock_guard<std::mutex> l(q->m);
-    return rpc_send_frame_locked(sock, *q, cmd, input, input_size,
-            rpc_send_must_flush(cmd, input_size));
+    uint8_t cmd_byte = cmd;
+    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+        return false;
+    }
+    if (!sock->send_data(&input_size, sizeof(input_size))) {
+        return false;
+    }
+    if (!sock->send_data(input, input_size)) {
+        return false;
+    }
+    return sock->flush();
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (sock == nullptr) {
-        return false;
-    }
-    rpc_cmd_stats_add(cmd, input_size);
-    // the send and the matching read are one transaction: nothing else may put
-    // bytes on this socket between them
-    rpc_send_queue * q = rpc_send_queue_for(sock.get());
-    std::lock_guard<std::mutex> l(q->m);
-    if (!rpc_send_frame_locked(sock, *q, cmd, input, input_size, /*flush =*/ true)) {
+    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
     uint64_t out_size;
@@ -759,10 +517,10 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC client-side implementation
 
-// When enabled, large tensor uploads are hashed and offered to the server's
-// local tensor cache (SET_TENSOR_HASH). The server only writes new cache
-// entries for uploads that went through this path, so this flag effectively
-// controls per-client whether the model gets cached on the server.
+// [fork] When enabled, large tensor uploads are hashed and offered to the
+// server's local tensor cache (SET_TENSOR_HASH). The server only writes new
+// cache entries for uploads that went through this path, so this flag
+// effectively controls per-client whether the model gets cached on the server.
 static std::atomic<bool> g_rpc_client_cache{false};
 
 void ggml_backend_rpc_set_client_cache(bool enabled) {
@@ -780,6 +538,9 @@ size_t ggml_backend_rpc_cache_threshold(void) {
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
+// [fork] reports the server's patch level and fails soft instead of aborting:
+// the connection may have been accepted and dropped (server busy with another
+// client) and the caller retries.
 static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * out_patch = nullptr) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
@@ -788,8 +549,6 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * ou
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     if (!status) {
-        // do not abort here: the connection may have been accepted and dropped
-        // (e.g. server busy with another client) - let the caller retry
         GGML_LOG_WARN("[%s] HELLO handshake failed\n", __func__);
         return false;
     }
@@ -807,114 +566,12 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * ou
     return true;
 }
 
-// server patch version per endpoint, recorded when the main socket handshakes;
-// gates the full-duplex lane attach so new clients keep working on old daemons
-static std::mutex g_server_patch_mutex;
-static std::unordered_map<std::string, uint8_t> g_server_patch;
-
-static uint8_t rpc_server_patch(const std::string & endpoint) {
-    std::lock_guard<std::mutex> lock(g_server_patch_mutex);
-    auto it = g_server_patch.find(endpoint);
-    return it != g_server_patch.end() ? it->second : 0;
-}
-
-// ---------------------------------------------------------------------------
-// Endpoint socket table
-//
-// A strong reference to every endpoint socket is held for the lifetime of the
-// process: the rpc-server serves one client at a time, so reconnecting per
-// operation (what a weak_ptr cache degrades to whenever no buffer holds a
-// strong ref) floods the server with one-shot connections and starves every
-// reconnect attempt while the server is busy with a long request.
-//
-// The table lives at file scope rather than inside get_socket() because fleet
-// hibernation has to walk it: detaching means closing every one of these, and
-// nothing may reopen one behind our back while the hosts are asleep.
-// ---------------------------------------------------------------------------
-static std::mutex g_sockets_m;
-static std::unordered_map<std::string, std::shared_ptr<socket_t>> g_sockets;
-// every endpoint this process has connected to, in first-contact order, so
-// status reporting keeps a stable index even while nothing is connected
-static std::vector<std::string> g_endpoints_seen;
-// set between a detach and a successful reattach. get_socket() refuses to dial
-// while it is set, so a stray buffer free cannot wake a suspended host - or
-// worse, connect to one that is halfway through writing its suspend image.
-static std::atomic<bool> g_rpc_detached{false};
-static std::atomic<bool> g_rpc_session_lost{false};
-
-static void rpc_note_endpoint(const std::string & endpoint) {
-    if (std::find(g_endpoints_seen.begin(), g_endpoints_seen.end(), endpoint) == g_endpoints_seen.end()) {
-        g_endpoints_seen.push_back(endpoint);
-    }
-}
-
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
-    std::lock_guard<std::mutex> lock(g_sockets_m);
-    auto & sockets = g_sockets;
-
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
-        return it->second;
-    }
-    if (g_rpc_detached.load()) {
-        return nullptr;
-    }
-    std::string host;
-    int port;
-    if (!parse_endpoint(endpoint, host, port)) {
-        GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
-        return nullptr;
-    }
-
-    if (!rpc_transport_init()) {
-        return nullptr;
-    }
-    // the rpc-server handles one client at a time, so transient connect
-    // failures are expected when several clients/probes hit the same
-    // endpoint - retry with backoff before giving up
-    constexpr int max_attempts = 5;
-    std::shared_ptr<socket_t> sock;
-    uint8_t server_patch = 0;
-    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-        sock = socket_t::connect(host.c_str(), port);
-        if (sock != nullptr && negotiate_hello(sock, &server_patch)) {
-            break;
-        }
-        sock = nullptr;
-        if (attempt < max_attempts) {
-            int delay_ms = 250 * attempt;
-            GGML_LOG_WARN("[%s] connect to %s failed (attempt %d/%d), retrying in %d ms\n",
-                          __func__, endpoint.c_str(), attempt, max_attempts, delay_ms);
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-        } else {
-            GGML_LOG_ERROR("[%s] connect to %s failed after %d attempts\n",
-                           __func__, endpoint.c_str(), max_attempts);
-        }
-    }
-    if (sock == nullptr) {
-        return nullptr;
-    }
-    {
-        std::lock_guard<std::mutex> plock(g_server_patch_mutex);
-        g_server_patch[endpoint] = server_patch;
-    }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
-    rpc_note_endpoint(endpoint);
-    return sock;
-}
-
-// ---------------------------------------------------------------------------
-// Async RPC streams + events  [fork, PipeDec Phase 1]
-//
-// Opt-in via GGML_RPC_ASYNC=1. Each endpoint's persistent socket is already a
-// strictly in-order command stream (the server serves one client, FIFO). We
-// drive it from a dedicated worker thread so the scheduler thread can hand work
-// to several endpoints without blocking on any single one - which is what lets
-// ggml_backend_sched overlap the pipeline stages of a layer-split model and
-// fill the decode "bubble". Client-only: the rpc-server is unchanged.
-// ---------------------------------------------------------------------------
-
+// [fork] GGML_RPC_ASYNC=1 runs every endpoint's socket from its dispatcher
+// worker thread, which is what lets ggml_backend_sched overlap the pipeline
+// stages of a layer-split model. Off (the default), the dispatcher executes
+// each message inline on the calling thread: the SPD stage pipeline drives one
+// endpoint per thread itself and measured 2.65x slower on decode with the
+// async scheduler behaviour enabled.
 static bool rpc_async_enabled() {
     static const bool enabled = []{
         const char * e = std::getenv("GGML_RPC_ASYNC");
@@ -923,169 +580,48 @@ static bool rpc_async_enabled() {
     return enabled;
 }
 
-// one-shot data-ready gate used to hand a tensor payload between two streams
-struct rpc_gate {
-    std::mutex m;
-    std::condition_variable cv;
-    bool ready = false;
-    void set()  { std::lock_guard<std::mutex> l(m); ready = true; cv.notify_all(); }
-    void wait() { std::unique_lock<std::mutex> l(m); cv.wait(l, [&]{ return ready; }); }
+template <typename T>
+class message_queue {
+public:
+    message_queue() {}
+
+    bool push(const T &value) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (interrupted) {
+            return false;
+        }
+        queue.push(value);
+        cvar.notify_all();
+        return true;
+    }
+
+    bool pop(T* out) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cvar.wait(lock, [this] { return !queue.empty() || interrupted; });
+        if (interrupted) {
+            return false;
+        }
+        *out = queue.front();
+        queue.pop();
+        return true;
+    }
+
+    void interrupt() {
+        std::unique_lock<std::mutex> lock(mutex);
+        interrupted = true;
+        lock.unlock();
+        cvar.notify_all();
+    }
+
+private:
+    bool interrupted = false;
+    std::queue<T> queue;
+    std::mutex mutex;
+    std::condition_variable cvar;
 };
-
-// reusable event: monotonic "record" generation vs highest "completed" generation.
-// A gen counter (rather than a bool) is robust to the scheduler reusing one event
-// object across n_copies iterations while an older completion is still in flight.
-struct rpc_event {
-    std::mutex m;
-    std::condition_variable cv;
-    uint64_t last = 0;   // gen assigned by the most recent record
-    uint64_t done = 0;   // highest gen the stream has completed
-    uint64_t record() { std::lock_guard<std::mutex> l(m); return ++last; }
-    uint64_t peek()   { std::lock_guard<std::mutex> l(m); return last; }
-    void complete(uint64_t g) { std::lock_guard<std::mutex> l(m); if (g > done) { done = g; } cv.notify_all(); }
-    void wait_for(uint64_t target) { std::unique_lock<std::mutex> l(m); cv.wait(l, [&]{ return done >= target; }); }
-};
-
-// per-endpoint worker thread that owns socket IO for that endpoint
-struct rpc_stream {
-    std::string endpoint;
-    std::thread worker;
-    std::mutex m;
-    std::condition_variable cv;       // tasks available / stop
-    std::condition_variable cv_done;  // completed == submitted
-    std::deque<std::function<void()>> tasks;
-    uint64_t submitted = 0;
-    uint64_t completed = 0;
-    // barrier bookkeeping: a synchronize() only needs the server round-trip ping
-    // when work was enqueued after the last completed ping. dirty_seq = submitted
-    // index of the newest task needing a barrier; barrier_seq = highest submitted
-    // index known to be server-drained.
-    uint64_t dirty_seq   = 0;
-    uint64_t barrier_seq = 0;
-    bool stop = false;
-
-    explicit rpc_stream(std::string ep) : endpoint(std::move(ep)) {
-        worker = std::thread([this]{ run(); });
-    }
-
-    ~rpc_stream() {
-        {
-            std::lock_guard<std::mutex> l(m);
-            stop = true;
-        }
-        cv.notify_one();
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-
-    void enqueue(std::function<void()> fn) {
-        std::lock_guard<std::mutex> l(m);
-        tasks.push_back(std::move(fn));
-        submitted++;
-        dirty_seq = submitted;
-        cv.notify_one();
-    }
-
-    // enqueue a barrier ping; returns the submitted index it covers. Does NOT
-    // mark the stream dirty (the ping itself needs no later barrier).
-    uint64_t enqueue_barrier(std::function<void()> fn) {
-        std::lock_guard<std::mutex> l(m);
-        tasks.push_back(std::move(fn));
-        submitted++;
-        cv.notify_one();
-        return submitted;
-    }
-
-    bool needs_barrier() {
-        std::lock_guard<std::mutex> l(m);
-        return dirty_seq > barrier_seq;
-    }
-
-    void mark_barrier(uint64_t covered) {
-        std::lock_guard<std::mutex> l(m);
-        if (covered > barrier_seq) {
-            barrier_seq = covered;
-        }
-    }
-
-    // Run a response-bearing operation in FIFO order on this endpoint. The
-    // caller remains synchronous, but only the stream worker touches the
-    // socket while async RPC is enabled.
-    bool call(std::function<bool()> fn) {
-        if (std::this_thread::get_id() == worker.get_id()) {
-            return fn();
-        }
-        auto result = std::make_shared<std::promise<bool>>();
-        auto future = result->get_future();
-        enqueue([fn = std::move(fn), result] {
-            try {
-                result->set_value(fn());
-            } catch (...) {
-                result->set_exception(std::current_exception());
-            }
-        });
-        return future.get();
-    }
-
-    // block the calling (host) thread until every enqueued task has finished
-    void drain() {
-        std::unique_lock<std::mutex> l(m);
-        cv_done.wait(l, [&]{ return completed == submitted; });
-    }
-
-    // [fork, chained decode] ordinal-scoped wait: block only until tasks
-    // enqueued at snapshot time have finished, not the whole stream
-    uint64_t submitted_seq() {
-        std::lock_guard<std::mutex> l(m);
-        return submitted;
-    }
-
-    void wait_completed(uint64_t target) {
-        std::unique_lock<std::mutex> l(m);
-        cv_done.wait(l, [&]{ return completed >= target; });
-    }
-
-    void run() {
-        for (;;) {
-            std::function<void()> fn;
-            {
-                std::unique_lock<std::mutex> l(m);
-                cv.wait(l, [&]{ return stop || !tasks.empty(); });
-                if (stop && tasks.empty()) {
-                    return;
-                }
-                fn = std::move(tasks.front());
-                tasks.pop_front();
-            }
-            fn();
-            {
-                std::lock_guard<std::mutex> l(m);
-                completed++;
-                cv_done.notify_all();
-            }
-        }
-    }
-};
-
-static std::mutex g_streams_m;
-static std::unordered_map<std::string, std::unique_ptr<rpc_stream>> g_streams;
-
-static rpc_stream * get_stream(const std::string & endpoint) {
-    auto & streams = g_streams;
-    std::lock_guard<std::mutex> lock(g_streams_m);
-    auto it = streams.find(endpoint);
-    if (it != streams.end()) {
-        return it->second.get();
-    }
-    auto s = std::make_unique<rpc_stream>(endpoint);
-    rpc_stream * ptr = s.get();
-    streams[endpoint] = std::move(s);
-    return ptr;
-}
 
 // ---------------------------------------------------------------------------
-// Full-duplex transfer lanes  [fork, pipeline-prefill Phase 2]
+// Full-duplex transfer lanes  [fork]
 //
 // With a single socket per endpoint, the daemon cannot drain the next ubatch's
 // input SET (or send the previous ubatch's output GET response) while its
@@ -1103,7 +639,509 @@ static rpc_stream * get_stream(const std::string & endpoint) {
 // counts it carries - this reconstructs the exact single-socket execution
 // order, but the wire transfers (and the daemon-side deserialization) overlap
 // with compute instead of serializing against it.
+//
+// Each lane is its own rpc_dispatcher (own socket, own worker), adopted onto a
+// LANE_ATTACHed connection; the counters live on the endpoint's main
+// dispatcher because that is the one the fences are sent on.
 // ---------------------------------------------------------------------------
+struct rpc_lanes {
+    std::mutex m;
+    // client-side wire-command counts per lane since HELLO, in submission order
+    uint64_t main_enq = 0, set_enq = 0, get_enq = 0;
+    // lane counts covered by the most recent LANE_FENCE enqueued on the main lane
+    uint64_t fenced_set = 0, fenced_get = 0;
+    int      state = 0;   // 0 = untried, 1 = active, -1 = unavailable
+    uint64_t session_id = 0;
+    // the lane dispatchers are created once and outlive their sockets: a
+    // detach/reattach re-adopts new connections onto the same objects, so the
+    // task counters read ordinals are built on stay monotonic
+    std::shared_ptr<rpc_dispatcher> set_lane, get_lane;
+};
+
+class rpc_dispatcher {
+public:
+    explicit rpc_dispatcher(std::string endpoint) : endpoint(std::move(endpoint)) {
+    }
+
+    bool send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
+    bool send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
+    void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+
+    ggml_backend_event_t event_new(ggml_backend_dev_t dev);
+    void event_free(ggml_backend_event_t event);
+    void event_synchronize(ggml_backend_event_t event);
+    void event_record(ggml_backend_event_t event);
+    // [fork] order this dispatcher's later work after an event recorded on
+    // another dispatcher (the scheduler's cross-backend dependency)
+    void event_wait(ggml_backend_event_t event);
+    void synchronize();
+
+    // [fork] dial the endpoint (with retry + HELLO) and start the worker.
+    // Returns false instead of aborting so a busy or absent server surfaces as
+    // a clean error at the caller; a dispatcher that already has a socket
+    // returns true immediately. Refuses to dial while the client is detached
+    // for hibernation.
+    bool start();
+    // [fork] lanes: run on a connection somebody else established
+    void adopt(socket_ptr sock);
+    // [fork] close the connection but keep the worker and its counters: the
+    // dispatcher is per-endpoint state for the life of the process
+    void disconnect();
+    bool connected();
+    socket_ptr get_sock();
+    void work();
+
+    // [fork] closure messages. `task` is the fire-and-forget form (send_async
+    // analogue), `call` the response-bearing one (send analogue) - it runs
+    // inline when invoked from the worker thread itself, so a task may nest a
+    // call at the socket's current position. `n_cmds` is how many wire
+    // commands the closure sends on the main connection; the lane fences count
+    // them (see enqueue_counted).
+    using task_fn = std::function<bool(const socket_ptr &)>;
+    void task(task_fn fn);
+    bool call(task_fn fn);
+    // fence-counted variants for the main connection of an endpoint with lanes
+    void enqueue_counted(uint32_t n_cmds, task_fn fn);
+    bool call_counted(task_fn fn);
+
+    // [fork] drain: block until every message submitted so far has executed
+    void drain();
+    // [fork, chained decode] ordinal-scoped waits: the submission count at a
+    // point in time, and a wait for the executor to pass it
+    uint64_t submitted_seq();
+    void wait_completed(uint64_t target);
+
+    ~rpc_dispatcher();
+
+    const std::string endpoint;
+    // server RPC_PROTO_PATCH_VERSION learnt at HELLO; gates the fork commands
+    uint8_t   patch = 0;
+    rpc_lanes lanes;
+
+private:
+    struct rpc_msg {
+        rpc_cmd                       cmd = RPC_CMD_NONE;
+        std::shared_ptr<const void>   input;
+        size_t                        input_size = 0;
+        void                        * output = nullptr;
+        size_t                        output_size = 0;
+        task_fn                       task;       // [fork] closure form
+        bool                          ok = true;  // [fork] result of the send / task
+        std::promise<void>            completion;
+    };
+    using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
+    using rpc_msg_queue = message_queue<rpc_msg_ptr>;
+    struct rpc_event {
+        rpc_msg_ptr              msg;
+        std::shared_future<void> sf;
+    };
+
+    // execute one message against the socket on the current thread
+    void exec(rpc_msg & msg);
+    // enqueue (async mode) or execute inline (direct mode); returns the message
+    rpc_msg_ptr submit(rpc_msg_ptr msg);
+    void ensure_worker();
+
+    rpc_msg_queue    queue;
+    std::mutex       sock_m;    // guards `sock` handoffs (start/adopt/disconnect)
+    socket_ptr       sock;
+    std::atomic_bool running{false};
+    std::thread      thread;
+    // [fork] direct mode serializes callers on the socket instead of a worker;
+    // recursive so a task may nest a call on the same dispatcher
+    std::recursive_mutex io_m;
+    // [fork] start() may be raced by several threads reaching one endpoint
+    std::mutex       start_m;
+    // [fork] submission/completion counters (read ordinals, drain)
+    std::mutex              seq_m;
+    std::condition_variable seq_cv;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+};
+
+static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
+{
+    dispatcher->work();
+}
+
+// set between a detach and a successful reattach. start() refuses to dial
+// while it is set, so a stray buffer free cannot wake a suspended host - or
+// worse, connect to one that is halfway through writing its suspend image.
+static std::atomic<bool> g_rpc_detached{false};
+static std::atomic<bool> g_rpc_session_lost{false};
+
+void rpc_dispatcher::exec(rpc_msg & msg) {
+    socket_ptr s;
+    {
+        std::lock_guard<std::mutex> l(sock_m);
+        s = sock;
+    }
+    if (msg.task) {
+        msg.ok = msg.task(s);
+        return;
+    }
+    if (msg.cmd == RPC_CMD_NONE) {
+        return;
+    }
+    if (s == nullptr) {
+        // detached for host hibernation, or the endpoint is gone
+        GGML_LOG_ERROR("[rpc] %s is not connected; command %d dropped\n", endpoint.c_str(), (int) msg.cmd);
+        msg.ok = false;
+        return;
+    }
+    if (msg.output) {
+        msg.ok = send_rpc_cmd(s, msg.cmd, msg.input.get(), msg.input_size, msg.output, msg.output_size);
+    } else {
+        msg.ok = send_rpc_cmd(s, msg.cmd, msg.input.get(), msg.input_size);
+    }
+}
+
+rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
+    {
+        std::lock_guard<std::mutex> l(seq_m);
+        submitted++;
+    }
+    if (!rpc_async_enabled()) {
+        // direct mode: the calling thread owns the wire for the whole message
+        {
+            std::lock_guard<std::recursive_mutex> l(io_m);
+            exec(*msg);
+        }
+        msg->completion.set_value();
+        {
+            std::lock_guard<std::mutex> l(seq_m);
+            completed++;
+        }
+        seq_cv.notify_all();
+        return msg;
+    }
+    ensure_worker();
+    GGML_ASSERT(queue.push(msg));
+    return msg;
+}
+
+bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = nullptr;
+    msg->output_size = 0;
+    auto future = msg->completion.get_future();
+    submit(msg);
+    future.wait();
+    return msg->ok;
+}
+
+void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = nullptr;
+    msg->output_size = 0;
+    submit(msg);
+}
+
+bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = output;
+    msg->output_size = output_size;
+    auto future = msg->completion.get_future();
+    submit(msg);
+    future.wait();
+    return msg->ok;
+}
+
+void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = output;
+    msg->output_size = output_size;
+    submit(msg);
+}
+
+void rpc_dispatcher::task(task_fn fn) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->task = std::move(fn);
+    submit(msg);
+}
+
+bool rpc_dispatcher::call(task_fn fn) {
+    if (rpc_async_enabled() && running && std::this_thread::get_id() == thread.get_id()) {
+        // nested from a task on this very worker: run at the socket's current position
+        socket_ptr s;
+        {
+            std::lock_guard<std::mutex> l(sock_m);
+            s = sock;
+        }
+        return fn(s);
+    }
+    auto msg = std::make_shared<rpc_msg>();
+    msg->task = std::move(fn);
+    auto future = msg->completion.get_future();
+    submit(msg);
+    future.wait();
+    return msg->ok;
+}
+
+ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
+    rpc_event * ev = new rpc_event;
+    ev->msg = std::make_shared<rpc_msg>();
+    ev->msg->cmd = RPC_CMD_NONE;
+    ev->sf = ev->msg->completion.get_future().share();
+    submit(ev->msg);
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ ev,
+    };
+}
+
+void rpc_dispatcher::event_free(ggml_backend_event_t event) {
+    rpc_event * ev = (rpc_event *)event->context;
+    delete ev;
+}
+
+void rpc_dispatcher::event_synchronize(ggml_backend_event_t event) {
+    rpc_event * ev = (rpc_event *)event->context;
+    ev->sf.wait();
+}
+
+void rpc_dispatcher::event_record(ggml_backend_event_t event) {
+    rpc_event * ev = (rpc_event *)event->context;
+    ev->msg = std::make_shared<rpc_msg>();
+    ev->msg->cmd = RPC_CMD_NONE;
+    ev->sf = ev->msg->completion.get_future().share();
+    submit(ev->msg);
+}
+
+void rpc_dispatcher::event_wait(ggml_backend_event_t event) {
+    if (!rpc_async_enabled()) {
+        return; // direct mode: the record already completed inline
+    }
+    // snapshot the future now: the scheduler issues record -> wait in program
+    // order on one thread, and a later record must not move this wait's target
+    rpc_event * ev = (rpc_event *)event->context;
+    std::shared_future<void> sf = ev->sf;
+    task([sf](const socket_ptr &) {
+        sf.wait();
+        return true;
+    });
+}
+
+void rpc_dispatcher::synchronize() {
+    if (!rpc_async_enabled()) {
+        return; // every message already executed inline
+    }
+    // to ensure all messages are processed, submit dummy message and wait for it to complete
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = RPC_CMD_NONE;
+    auto future = msg->completion.get_future();
+    submit(msg);
+    future.wait();
+}
+
+void rpc_dispatcher::drain() {
+    if (!rpc_async_enabled()) {
+        return;
+    }
+    std::unique_lock<std::mutex> l(seq_m);
+    seq_cv.wait(l, [&]{ return completed == submitted; });
+}
+
+uint64_t rpc_dispatcher::submitted_seq() {
+    std::lock_guard<std::mutex> l(seq_m);
+    return submitted;
+}
+
+void rpc_dispatcher::wait_completed(uint64_t target) {
+    std::unique_lock<std::mutex> l(seq_m);
+    seq_cv.wait(l, [&]{ return completed >= target; });
+}
+
+void rpc_dispatcher::ensure_worker() {
+    if (running) {
+        return;
+    }
+    running = true;
+    thread = std::thread(rpc_dispatcher_trampoline, this);
+}
+
+bool rpc_dispatcher::start() {
+    std::lock_guard<std::mutex> sl(start_m);
+    {
+        std::lock_guard<std::mutex> l(sock_m);
+        if (sock != nullptr) {
+            return true;
+        }
+    }
+    if (g_rpc_detached.load()) {
+        return false;
+    }
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
+        return false;
+    }
+    if (!rpc_transport_init()) {
+        GGML_LOG_ERROR("RPC transport initialization failed\n");
+        return false;
+    }
+
+    // the rpc-server handles one client at a time, so transient connect
+    // failures are expected when several clients/probes hit the same
+    // endpoint - retry with backoff before giving up
+    constexpr int max_attempts = 5;
+    socket_ptr s;
+    uint8_t server_patch = 0;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        s = socket_t::connect(host.c_str(), port);
+        if (s != nullptr && negotiate_hello(s, &server_patch)) {
+            break;
+        }
+        s = nullptr;
+        if (attempt < max_attempts) {
+            int delay_ms = 250 * attempt;
+            GGML_LOG_WARN("[%s] connect to %s failed (attempt %d/%d), retrying in %d ms\n",
+                          __func__, endpoint.c_str(), attempt, max_attempts, delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        } else {
+            GGML_LOG_ERROR("[%s] connect to %s failed after %d attempts\n",
+                           __func__, endpoint.c_str(), max_attempts);
+        }
+    }
+    if (s == nullptr) {
+        return false;
+    }
+    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    {
+        std::lock_guard<std::mutex> l(sock_m);
+        sock  = s;
+        patch = server_patch;
+    }
+    if (rpc_async_enabled()) {
+        ensure_worker();
+    }
+    return true;
+}
+
+void rpc_dispatcher::adopt(socket_ptr s) {
+    {
+        std::lock_guard<std::mutex> l(sock_m);
+        sock = std::move(s);
+    }
+    if (rpc_async_enabled()) {
+        ensure_worker();
+    }
+}
+
+void rpc_dispatcher::disconnect() {
+    socket_ptr s;
+    {
+        std::lock_guard<std::mutex> l(sock_m);
+        s.swap(sock);
+    }
+    if (s != nullptr) {
+        // wake anything blocked in recv on this connection before the fd goes
+        s->shutdown_rw();
+    }
+}
+
+bool rpc_dispatcher::connected() {
+    std::lock_guard<std::mutex> l(sock_m);
+    return sock != nullptr;
+}
+
+socket_ptr rpc_dispatcher::get_sock() {
+    std::lock_guard<std::mutex> l(sock_m);
+    return sock;
+}
+
+void rpc_dispatcher::work() {
+    while (running) {
+        rpc_msg_ptr msg_ptr;
+        if (!queue.pop(&msg_ptr)) {
+            break;
+        }
+        exec(*msg_ptr);
+        msg_ptr->completion.set_value();
+        {
+            std::lock_guard<std::mutex> l(seq_m);
+            completed++;
+        }
+        seq_cv.notify_all();
+    }
+}
+
+rpc_dispatcher::~rpc_dispatcher() {
+    running = false;
+    queue.interrupt();
+    {
+        std::lock_guard<std::mutex> l(sock_m);
+        sock = nullptr;
+    }
+    if (thread.joinable()) {
+        thread.join();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint dispatcher table
+//
+// [fork] A strong reference to every endpoint dispatcher is held for the
+// lifetime of the process: the rpc-server serves one client at a time, so
+// reconnecting per operation (what a weak_ptr cache degrades to whenever no
+// buffer holds a strong ref) floods the server with one-shot connections and
+// starves every reconnect attempt while the server is busy with a long
+// request. Fleet hibernation walks this table too: detaching means closing
+// every connection, and nothing may reopen one behind our back while the
+// hosts are asleep.
+// ---------------------------------------------------------------------------
+static std::mutex g_dispatchers_m;
+static std::unordered_map<std::string, std::shared_ptr<rpc_dispatcher>> g_dispatchers;
+// every endpoint this process has connected to, in first-contact order, so
+// status reporting keeps a stable index even while nothing is connected
+static std::vector<std::string> g_endpoints_seen;
+
+// the endpoint's dispatcher, connected. nullptr when the endpoint cannot be
+// reached (or the client is detached) - callers fail soft.
+static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
+    std::shared_ptr<rpc_dispatcher> dispatcher;
+    {
+        std::lock_guard<std::mutex> lock(g_dispatchers_m);
+        auto it = g_dispatchers.find(endpoint);
+        if (it != g_dispatchers.end()) {
+            dispatcher = it->second;
+        } else {
+            dispatcher = std::make_shared<rpc_dispatcher>(endpoint);
+            g_dispatchers[endpoint] = dispatcher;
+        }
+    }
+    if (!dispatcher->connected()) {
+        if (!dispatcher->start()) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(g_dispatchers_m);
+        if (std::find(g_endpoints_seen.begin(), g_endpoints_seen.end(), endpoint) == g_endpoints_seen.end()) {
+            g_endpoints_seen.push_back(endpoint);
+        }
+    }
+    return dispatcher;
+}
+
+// the endpoint's dispatcher if one exists, connected or not; never dials
+static std::shared_ptr<rpc_dispatcher> find_dispatcher(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_dispatchers_m);
+    auto it = g_dispatchers.find(endpoint);
+    return it == g_dispatchers.end() ? nullptr : it->second;
+}
 
 static bool rpc_fdx_enabled() {
     static const bool enabled = []{
@@ -1113,51 +1151,13 @@ static bool rpc_fdx_enabled() {
     return enabled;
 }
 
-struct rpc_ep_lanes {
-    std::mutex m;
-    // client-side wire-command counts per lane since HELLO, in submission order
-    uint64_t main_enq = 0, set_enq = 0, get_enq = 0;
-    // lane counts covered by the most recent LANE_FENCE enqueued on the main lane
-    uint64_t fenced_set = 0, fenced_get = 0;
-    // lane counts covered by the last completed synchronize barrier
-    uint64_t barrier_set = 0, barrier_get = 0;
-    int      state = 0;   // 0 = untried, 1 = active, -1 = unavailable
-    uint64_t session_id = 0;
-    // Read ordinals handed out by ggml_backend_rpc_read_ordinal() are stream
-    // task counts, but a detach/reattach destroys the streams and the new ones
-    // count from zero - while the fences captured from the old ones live on in
-    // llama_context (pipedec_tree_lane_fence). These bases keep the ordinals
-    // monotonic across that: a teardown folds the retired stream's count in
-    // here, so an ordinal at or below the base names a read on a stream that
-    // is gone. Deliberately NOT reset by rpc_lanes_teardown.
-    uint64_t get_seq_base  = 0;   // retired GET-lane streams
-    uint64_t main_seq_base = 0;   // retired main streams (rpc_drop_socket)
-    socket_ptr   set_sock, get_sock;
-    rpc_stream * set_stream = nullptr;
-    rpc_stream * get_stream = nullptr;
-};
-
-static std::mutex g_lanes_m;
-static std::unordered_map<std::string, std::unique_ptr<rpc_ep_lanes>> g_lanes;
-
-static rpc_ep_lanes * get_ep_lanes(const std::string & endpoint) {
-    auto & lanes = g_lanes;
-    std::lock_guard<std::mutex> lock(g_lanes_m);
-    auto it = lanes.find(endpoint);
-    if (it != lanes.end()) {
-        return it->second.get();
-    }
-    auto l = std::make_unique<rpc_ep_lanes>();
-    rpc_ep_lanes * ptr = l.get();
-    lanes[endpoint] = std::move(l);
-    return ptr;
-}
-
 // lane wire framing: | cmd (1) | size (8) = 16 + payload | wait_a (8) | wait_b (8) | payload |
 // wait_a is always the main-lane count; wait_b is the opposite lane's count.
 static bool send_lane_cmd(const socket_ptr & sock, enum rpc_cmd cmd,
                           uint64_t wait_a, uint64_t wait_b, const void * data, size_t size) {
-    rpc_cmd_stats_add(cmd, size);
+    if (sock == nullptr) {
+        return false;
+    }
     uint8_t cmd_byte = cmd;
     uint64_t total = 2*sizeof(uint64_t) + size;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
@@ -1172,58 +1172,57 @@ static bool send_lane_cmd(const socket_ptr & sock, enum rpc_cmd cmd,
     if (!sock->send_data(&wait_b, sizeof(wait_b))) {
         return false;
     }
-    return sock->send_data(data, size);
+    return sock->send_data(data, size) && sock->flush();
 }
 
-// Enqueue a main-lane task that sends n_cmds wire commands. When lane traffic
-// advanced since the last fence, a LANE_FENCE is sent first so the server
-// orders this command after every lane command submitted before it.
-static void rpc_main_enqueue_counted(const std::string & endpoint, rpc_stream * st,
-                                     uint32_t n_cmds, std::function<void()> fn) {
-    rpc_ep_lanes * ep = get_ep_lanes(endpoint);
-    std::lock_guard<std::mutex> l(ep->m);
-    const bool fence = ep->state == 1 && (ep->set_enq != ep->fenced_set || ep->get_enq != ep->fenced_get);
+// Enqueue a main-connection task that sends n_cmds wire commands. When lane
+// traffic advanced since the last fence, a LANE_FENCE is sent first so the
+// server orders this command after every lane command submitted before it.
+void rpc_dispatcher::enqueue_counted(uint32_t n_cmds, task_fn fn) {
+    rpc_lanes & ep = lanes;
+    std::lock_guard<std::mutex> l(ep.m);
+    const bool fence = ep.state == 1 && (ep.set_enq != ep.fenced_set || ep.get_enq != ep.fenced_get);
     if (!fence) {
-        ep->main_enq += n_cmds;
-        st->enqueue(std::move(fn));
+        ep.main_enq += n_cmds;
+        task(std::move(fn));
         return;
     }
-    rpc_msg_lane_fence_req freq = { ep->set_enq, ep->get_enq };
-    ep->fenced_set = ep->set_enq;
-    ep->fenced_get = ep->get_enq;
-    ep->main_enq += n_cmds + 1;
-    st->enqueue([endpoint, freq, fn = std::move(fn)] {
-        auto sock = get_socket(endpoint);
-        if (sock != nullptr) {
-            send_rpc_cmd(sock, RPC_CMD_LANE_FENCE, &freq, sizeof(freq));
+    rpc_msg_lane_fence_req freq = { ep.set_enq, ep.get_enq };
+    ep.fenced_set = ep.set_enq;
+    ep.fenced_get = ep.get_enq;
+    ep.main_enq += n_cmds + 1;
+    task([freq, fn = std::move(fn)](const socket_ptr & s) {
+        if (s != nullptr) {
+            send_rpc_cmd(s, RPC_CMD_LANE_FENCE, &freq, sizeof(freq));
         }
-        fn();
+        return fn(s);
     });
 }
 
-// Run a response-bearing main-lane operation in FIFO order, counted for the
-// lane fences. Mirrors rpc_stream::call - a nested call from the stream worker
-// itself runs inline at the socket's current position (counting it then only
-// makes later fence targets conservative, never too early).
-static bool rpc_main_call_counted(const std::string & endpoint, rpc_stream * st, std::function<bool()> fn) {
-    rpc_ep_lanes * ep = get_ep_lanes(endpoint);
-    if (std::this_thread::get_id() == st->worker.get_id()) {
+// Run a response-bearing main-connection operation in FIFO order, counted for
+// the lane fences. Mirrors call() - a nested call from the worker itself runs
+// inline at the socket's current position (counting it then only makes later
+// fence targets conservative, never too early).
+bool rpc_dispatcher::call_counted(task_fn fn) {
+    if (rpc_async_enabled() && running && std::this_thread::get_id() == thread.get_id()) {
         {
-            std::lock_guard<std::mutex> l(ep->m);
-            ep->main_enq++;
+            std::lock_guard<std::mutex> l(lanes.m);
+            lanes.main_enq++;
         }
-        return fn();
+        return call(std::move(fn));
     }
-    auto result = std::make_shared<std::promise<bool>>();
-    auto future = result->get_future();
-    rpc_main_enqueue_counted(endpoint, st, 1, [fn = std::move(fn), result] {
-        try {
-            result->set_value(fn());
-        } catch (...) {
-            result->set_exception(std::current_exception());
-        }
+    auto msg = std::make_shared<rpc_msg>();
+    msg->task = std::move(fn);
+    auto future = msg->completion.get_future();
+    enqueue_counted(1, [msg](const socket_ptr & s) {
+        // the outer task reports the inner's result; the message we hold is
+        // completed by the closure so the caller's wait returns
+        msg->ok = msg->task(s);
+        msg->completion.set_value();
+        return msg->ok;
     });
-    return future.get();
+    future.wait();
+    return msg->ok;
 }
 
 static socket_ptr rpc_lane_connect(const std::string & endpoint, uint64_t session_id, uint8_t lane) {
@@ -1245,35 +1244,33 @@ static socket_ptr rpc_lane_connect(const std::string & endpoint, uint64_t sessio
     return sock;
 }
 
-// Bring up the transfer lanes for an endpoint (tried once); returns the lane
-// state when active, nullptr when unavailable (callers fall back to the main
-// lane - mixed routing stays correct because the fences only count commands).
-static rpc_ep_lanes * rpc_lanes_get_active(const std::string & endpoint) {
-    if (!rpc_async_enabled() || !rpc_fdx_enabled()) {
+// Bring up the transfer lanes for an endpoint (tried once per session);
+// returns the lane state when active, nullptr when unavailable (callers fall
+// back to the main connection - mixed routing stays correct because the
+// fences only count commands).
+static rpc_lanes * rpc_lanes_get_active(const std::shared_ptr<rpc_dispatcher> & disp) {
+    if (disp == nullptr || !rpc_async_enabled() || !rpc_fdx_enabled()) {
         return nullptr;
     }
-    rpc_ep_lanes * ep = get_ep_lanes(endpoint);
+    rpc_lanes & ep = disp->lanes;
     {
-        std::lock_guard<std::mutex> l(ep->m);
-        if (ep->state == 1) {
-            return ep;
+        std::lock_guard<std::mutex> l(ep.m);
+        if (ep.state == 1) {
+            return &ep;
         }
-        if (ep->state != 0) {
+        if (ep.state != 0) {
             return nullptr;
         }
-        ep->state = -1;   // claim; flipped to 1 only if the whole setup succeeds
+        ep.state = -1;   // claim; flipped to 1 only if the whole setup succeeds
     }
-    if (rpc_server_patch(endpoint) < GGML_RPC_FDX_MIN_PATCH) {
+    const std::string & endpoint = disp->endpoint;
+    if (disp->patch < GGML_RPC_FDX_MIN_PATCH) {
         GGML_LOG_WARN("[rpc fdx] %s: server too old for transfer lanes, staying single-socket\n", endpoint.c_str());
         return nullptr;
     }
-    auto sock = get_socket(endpoint);
-    if (sock == nullptr) {
-        return nullptr;
-    }
     rpc_msg_session_info_rsp info = {};
-    bool ok = rpc_main_call_counted(endpoint, get_stream(endpoint), [sock, &info] {
-        return send_rpc_cmd(sock, RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info));
+    bool ok = disp->call_counted([&info](const socket_ptr & s) {
+        return send_rpc_cmd(s, RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info));
     });
     if (!ok) {
         GGML_LOG_WARN("[rpc fdx] %s: SESSION_INFO failed, staying single-socket\n", endpoint.c_str());
@@ -1286,16 +1283,20 @@ static rpc_ep_lanes * rpc_lanes_get_active(const std::string & endpoint) {
         return nullptr;
     }
     {
-        std::lock_guard<std::mutex> l(ep->m);
-        ep->session_id = info.session_id;
-        ep->set_sock   = set_sock;
-        ep->get_sock   = get_sock;
-        ep->set_stream = new rpc_stream(endpoint + "/set");
-        ep->get_stream = new rpc_stream(endpoint + "/get");
-        ep->state      = 1;
+        std::lock_guard<std::mutex> l(ep.m);
+        ep.session_id = info.session_id;
+        if (ep.set_lane == nullptr) {
+            ep.set_lane = std::make_shared<rpc_dispatcher>(endpoint + "/set");
+        }
+        if (ep.get_lane == nullptr) {
+            ep.get_lane = std::make_shared<rpc_dispatcher>(endpoint + "/get");
+        }
+        ep.set_lane->adopt(set_sock);
+        ep.get_lane->adopt(get_sock);
+        ep.state = 1;
     }
     GGML_LOG_INFO("[rpc fdx] %s: transfer lanes active (session %" PRIu64 ")\n", endpoint.c_str(), info.session_id);
-    return ep;
+    return &ep;
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,9 +1327,8 @@ static bool rpc_peer_enabled() {
 // GGML_RPC_PEER_MAP="<client endpoint>=<peer endpoint>,..." rewrites the
 // address a producer dials for a destination. The client reaches the nodes on
 // whatever network it shares with them, which is not necessarily the fastest
-// link *between* them: here the boards sit on a 10 GbE fabric the Windows head
-// is not even attached to, so without this the peer traffic would take the
-// management LAN. Unmapped endpoints are dialed exactly as the client has them.
+// link *between* them. Unmapped endpoints are dialed exactly as the client
+// has them.
 static const std::string & rpc_peer_addr(const std::string & endpoint) {
     static const std::unordered_map<std::string, std::string> map = []{
         std::unordered_map<std::string, std::string> m;
@@ -1363,14 +1363,16 @@ static const std::string & rpc_peer_addr(const std::string & endpoint) {
 static std::mutex g_peer_route_m;
 static std::unordered_map<std::string, bool> g_peer_routes;   // "src>dst" -> usable
 
-// Ask `src_endpoint` to open a peer lane into `dst_endpoint`'s session. Tried
-// once per ordered pair; a failure is remembered so the pair quietly keeps
-// using the hairpin (routing is per-pair, so a fabric that only connects some
-// of the nodes still gets the benefit on the pairs that do).
-static bool rpc_peer_route_ready(const std::string & src_endpoint,
-                                 const std::string & dst_endpoint,
-                                 uint64_t dst_session_id) {
-    const std::string key = src_endpoint + ">" + dst_endpoint;
+// Ask the producer to open a peer lane into the consumer's session. Tried once
+// per ordered pair; a failure is remembered so the pair quietly keeps using
+// the hairpin (routing is per-pair, so a fabric that only connects some of
+// the nodes still gets the benefit on the pairs that do). `counted` picks the
+// fence-counted ordered send (async client) or a plain send on the caller's
+// thread (the sync-client SPD path, where the caller owns the socket).
+static bool rpc_peer_route_ready(const std::shared_ptr<rpc_dispatcher> & src,
+                                 const std::shared_ptr<rpc_dispatcher> & dst,
+                                 uint64_t dst_session_id, bool counted) {
+    const std::string key = src->endpoint + ">" + dst->endpoint;
     {
         std::lock_guard<std::mutex> l(g_peer_route_m);
         auto it = g_peer_routes.find(key);
@@ -1378,33 +1380,29 @@ static bool rpc_peer_route_ready(const std::string & src_endpoint,
             return it->second;
         }
     }
-    const std::string & via = rpc_peer_addr(dst_endpoint);
+    const std::string & via = rpc_peer_addr(dst->endpoint);
     bool ok = false;
     if (via.size() >= RPC_ENDPOINT_MAX) {
         GGML_LOG_WARN("[rpc peer] endpoint '%s' too long to route\n", via.c_str());
-    } else if (rpc_server_patch(src_endpoint) < GGML_RPC_PEER_MIN_PATCH ||
-               rpc_server_patch(dst_endpoint) < GGML_RPC_PEER_MIN_PATCH) {
+    } else if (src->patch < GGML_RPC_PEER_MIN_PATCH || dst->patch < GGML_RPC_PEER_MIN_PATCH) {
         GGML_LOG_WARN("[rpc peer] %s -> %s: server too old for peer transfer\n",
-                      src_endpoint.c_str(), dst_endpoint.c_str());
+                      src->endpoint.c_str(), dst->endpoint.c_str());
     } else {
         rpc_msg_peer_open_req req = {};
         req.session_id = dst_session_id;
         memcpy(req.endpoint, via.c_str(), via.size());
         rpc_msg_peer_open_rsp rsp = { 0 };
-        auto sock = get_socket(src_endpoint);
-        if (sock != nullptr) {
-            const bool sent = rpc_main_call_counted(src_endpoint, get_stream(src_endpoint),
-                                                    [&sock, &req, &rsp] {
-                return send_rpc_cmd(sock, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
-            });
-            ok = sent && rsp.ok != 0;
-        }
+        auto fn = [&req, &rsp](const socket_ptr & s) {
+            return send_rpc_cmd(s, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
+        };
+        const bool sent = counted ? src->call_counted(fn) : fn(src->get_sock());
+        ok = sent && rsp.ok != 0;
         if (ok) {
-            GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer\n",
-                          src_endpoint.c_str(), dst_endpoint.c_str());
+            GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer%s\n",
+                          src->endpoint.c_str(), dst->endpoint.c_str(), counted ? "" : " (sync client)");
         } else {
             GGML_LOG_WARN("[rpc peer] %s -> %s: peer lane refused, using the client hairpin\n",
-                          src_endpoint.c_str(), dst_endpoint.c_str());
+                          src->endpoint.c_str(), dst->endpoint.c_str());
         }
     }
     std::lock_guard<std::mutex> l(g_peer_route_m);
@@ -1412,56 +1410,20 @@ static bool rpc_peer_route_ready(const std::string & src_endpoint,
     return ok;
 }
 
-static bool send_rpc_cmd_ordered(
-        const std::string & endpoint, socket_ptr sock, enum rpc_cmd cmd,
-        const void * input, size_t input_size) {
-    if (!rpc_async_enabled()) {
-        return send_rpc_cmd(sock, cmd, input, input_size);
-    }
-    return rpc_main_call_counted(endpoint, get_stream(endpoint), [sock, cmd, input, input_size] {
-        return send_rpc_cmd(sock, cmd, input, input_size);
-    });
-}
-
-static bool send_rpc_cmd_ordered(
-        const std::string & endpoint, socket_ptr sock, enum rpc_cmd cmd,
-        const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!rpc_async_enabled()) {
-        return send_rpc_cmd(sock, cmd, input, input_size, output, output_size);
-    }
-    return rpc_main_call_counted(endpoint, get_stream(endpoint), [sock, cmd, input, input_size, output, output_size] {
-        return send_rpc_cmd(sock, cmd, input, input_size, output, output_size);
-    });
-}
-
-// cheap round-trip that returns only after the server has drained all prior
-// in-order commands on this socket (so a preceding fire-and-forget GRAPH_COMPUTE
-// is known to have finished). Used as the async synchronize() barrier.
-static void rpc_ping(const std::string & endpoint, uint32_t device) {
-    auto sock = get_socket(endpoint);
-    if (sock == nullptr) {
-        return;
-    }
-    rpc_msg_get_alignment_req request = {device};
-    rpc_msg_get_alignment_rsp response;
-    send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
-}
-
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    auto sock = get_socket(ctx->endpoint);
-    if (sock == nullptr) {
-        // detached for host hibernation, or the endpoint is gone. The far side
-        // owns this buffer until its session is discarded, and aborting the
-        // process on the teardown path helps nobody.
+    if (!ctx->dispatcher->connected()) {
+        // [fork] detached for host hibernation, or the endpoint is gone. The
+        // far side owns this buffer until its session is discarded, and
+        // aborting the process on the teardown path helps nobody.
         GGML_LOG_DEBUG("[%s] %s is not connected; leaving the remote buffer to "
-                       "its parked session\n", __func__, ctx->endpoint.c_str());
+                       "its parked session\n", __func__, ctx->dispatcher->endpoint.c_str());
         delete ctx;
         return;
     }
-    rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    auto request = std::make_shared<rpc_msg_free_buffer_req>();
+    request->remote_ptr = ctx->remote_ptr;
+    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
     delete ctx;
 }
 
@@ -1470,9 +1432,10 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
-    rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
+    auto request = std::make_shared<rpc_msg_buffer_get_base_req>();
+    request->remote_ptr = ctx->remote_ptr;
     rpc_msg_buffer_get_base_rsp response;
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+    bool status = ctx->dispatcher->send(RPC_CMD_BUFFER_GET_BASE, request, sizeof(*request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
@@ -1482,7 +1445,7 @@ static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
 }
 
-static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
+static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared_ptr<rpc_dispatcher> & dispatcher = nullptr) {
     rpc_tensor result;
     if (!tensor) {
         memset(&result, 0, sizeof(result));
@@ -1494,8 +1457,14 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
         ggml_backend_buffer_t buffer = tensor->buffer;
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-        result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
-        result.data = reinterpret_cast<uint64_t>(tensor->data);
+        // ref: https://github.com/ggml-org/llama.cpp/pull/26500
+        if (ctx != nullptr && (dispatcher == nullptr || ctx->dispatcher == dispatcher)) {
+            result.buffer = ctx->remote_ptr;
+            result.data = reinterpret_cast<uint64_t>(tensor->data);
+        } else {
+            result.buffer = 0;
+            result.data = 0;
+        }
     } else {
         result.buffer = 0;
         result.data   = 0;
@@ -1523,6 +1492,15 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     return result;
 }
 
+// [fork] the dispatcher a tensor's data lives on, or nullptr for non-RPC tensors
+static std::shared_ptr<rpc_dispatcher> rpc_tensor_dispatcher(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_rpc_buffer_context *) tensor->buffer->context;
+    return ctx ? ctx->dispatcher : nullptr;
+}
+
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
 
@@ -1530,78 +1508,56 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     // Due to bandwidth constraints, we only call the server init tensor functions if necessary.
     // In particular, only quantized tensors need padding
     if (ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr)) {
-        rpc_msg_init_tensor_req request;
-
-        request.tensor = serialize_tensor(tensor);
-
-        bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        auto request = std::make_shared<rpc_msg_init_tensor_req>();
+        request->tensor = serialize_tensor(tensor);
+        bool status = ctx->dispatcher->send(RPC_CMD_INIT_TENSOR, request, sizeof(*request));
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
 }
 
-// [fork note] the fill is described, never transferred: DeepSeek-V4's DSA KV cache
-// memsets a per-stream slice on every sequence clear (llama-kv-cache-dsv4.cpp), and
-// the fork's old emulation shipped that whole slice as SET_TENSOR payload.
 static void ggml_backend_rpc_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_memset_tensor_req request = {
-        /* .tensor = */ serialize_tensor(tensor),
-        /* .offset = */ offset,
-        /* .size   = */ size,
-        /* .value  = */ value,
-    };
-    bool status = send_rpc_cmd(get_socket(ctx->endpoint), RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0);
+    auto request = std::make_shared<rpc_msg_memset_tensor_req>();
+    request->tensor = serialize_tensor(tensor);
+    request->offset = offset;
+    request->size   = size;
+    request->value  = value;
+    bool status = ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
     RPC_STATUS_ASSERT(status);
 }
 
+// [fork] the upload proper, shared by the plain path and the cache-aware loader
 static bool rpc_buffer_set_tensor_raw(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    {
-        static const int stats_level = []{
-            const char * e = std::getenv("GGML_RPC_CMD_STATS");
-            return e ? atoi(e) : 0;
-        }();
-        if (stats_level >= 2 && size >= 32*1024) {
-            fprintf(stderr, "[rpc set_tensor] %s type=%s size=%zu\n",
-                    tensor->name, ggml_type_name(tensor->type), size);
-        }
-    }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    if (rpc_wire_trace_enabled()) {
-        rpc_wire_ep_stat * st = rpc_wire_stat(ctx->endpoint);
-        rpc_wire_note_set(tensor, input.size());
-        const int64_t t0 = ggml_time_us();
-        bool ok = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_SET_TENSOR, input.data(), input.size());
-        st->set_us    += (uint64_t) (ggml_time_us() - t0);
-        st->set_bytes += input.size();
-        st->set_n     += 1;
-        rpc_wire_trace_tick();
-        return ok;
-    }
-    return send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_SET_TENSOR, input.data(), input.size());
+    uint8_t * input = new uint8_t[input_size]();
+    memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
+    memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
+    memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
+    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+    return ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
 }
 
+// [fork] loader helpers: ask whether the server's cache already holds this
+// payload (1 hit, 0 miss, -1 transport error) and upload after a miss without
+// a second hash or query
 int ggml_backend_rpc_buffer_cache_query(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         size_t offset, size_t size, uint64_t hash) {
     GGML_UNUSED(size);
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
-    rpc_msg_set_tensor_hash_req request;
-    request.tensor = serialize_tensor(tensor);
-    request.offset = offset;
-    request.hash   = hash;
+    auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
+    request->tensor = serialize_tensor(tensor);
+    request->offset = offset;
+    request->hash   = hash;
     rpc_msg_set_tensor_hash_rsp response;
-    if (!send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response))) {
+    if (!ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response))) {
         return -1;
     }
     return response.result ? 1 : 0;
@@ -1620,57 +1576,60 @@ const char * ggml_backend_rpc_buffer_endpoint(ggml_backend_buffer_t buffer) {
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // [fork] hashing is opt-in per client (--rpc-cache): only then are large
+    // tensors offered to the server cache, and only then does the server write
+    // new entries
     if (size > HASH_THRESHOLD && g_rpc_client_cache.load(std::memory_order_relaxed)) {
         int result = ggml_backend_rpc_buffer_cache_query(buffer, tensor, offset, size, fnv_hash((const uint8_t *) data, size));
         RPC_STATUS_ASSERT(result >= 0);
         if (result > 0) {
+            // the server has the same data, no need to send it
             return;
         }
     }
     RPC_STATUS_ASSERT(rpc_buffer_set_tensor_raw(buffer, tensor, data, offset, size));
 }
 
-// defined with the other wire-bf16 helpers, further down next to the async lanes
-static bool rpc_wire_bf16_ok(const ggml_tensor * tensor, uint64_t offset, size_t size);
+// bf16 wire compression (GGML_RPC_WIRE_BF16=1) [fork]: halves the wire bytes
+// of f32 activation traffic - pipeline stage-boundary activations, INPUT
+// staging (KQ masks), deferred tap/embedding reads and the synchronous
+// boundary reads of the SPD stage pipeline. Load-time weight uploads never
+// take this path. bf16 keeps the f32 exponent (8 mantissa bits), so large
+// activations can never overflow the way IEEE f16 would.
+static bool rpc_wire_bf16_enabled() {
+    static const bool on = []() {
+        const char * e = std::getenv("GGML_RPC_WIRE_BF16");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
+static bool rpc_wire_bf16_ok(const ggml_tensor * tensor, uint64_t offset, size_t size) {
+    return rpc_wire_bf16_enabled()
+        && tensor->type == GGML_TYPE_F32
+        && offset % sizeof(float) == 0
+        && size   % sizeof(float) == 0
+        && size >= 4096; // tiny messages are latency-bound, not bandwidth-bound
+}
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_get_tensor_req request;
-    request.tensor = serialize_tensor(tensor);
-    request.offset = offset;
-    request.size = size;
-    // this is the blocking point of a synchronous stage decode: the server
-    // answers only after every command queued ahead of it -- including the
-    // graph -- has run, so this call's wall time is remote compute + wire.
-    const bool trace = rpc_wire_trace_enabled();
-    rpc_wire_ep_stat * st = trace ? rpc_wire_stat(ctx->endpoint) : nullptr;
-    const int64_t t0 = trace ? ggml_time_us() : 0;
-    // [fork] GGML_RPC_WIRE_BF16 used to reach only the async lanes, so the one
-    // path that needs it most never saw it: SPD requires GGML_RPC_ASYNC=0, and
-    // then set/get_tensor_async both fall back here. On a 9-stage split every
-    // board answers its boundary read within about a millisecond of the others,
-    // so ~512 KiB lands on the head's single gigabit NIC in a burst each step --
-    // and board compute is steady to p99 while the step time is not. The server
-    // side of GET_TENSOR_BF16 has been deployed since the wire-bf16 branch.
-    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
-    bool status;
-    if (wire_bf16) {
+    auto request = std::make_shared<rpc_msg_get_tensor_req>();
+    request->tensor = serialize_tensor(tensor);
+    request->offset = offset;
+    request->size = size;
+    // [fork] this is the blocking point of a synchronous stage decode: on a
+    // 9-stage split every board answers its boundary read within about a
+    // millisecond of the others, so the head's single NIC sees the reads as a
+    // burst - halving them is what the bf16 wire is for
+    if (rpc_wire_bf16_ok(tensor, offset, size)) {
         std::vector<uint8_t> wire(size / 2);
-        status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_GET_TENSOR_BF16,
-                                      &request, sizeof(request), wire.data(), wire.size());
-        if (status) {
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
-                                  (float *) data, size / sizeof(float));
-        }
-    } else {
-        status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+        bool status = ctx->dispatcher->send(RPC_CMD_GET_TENSOR_BF16, request, sizeof(*request), wire.data(), wire.size());
+        RPC_STATUS_ASSERT(status);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(), (float *) data, size / sizeof(float));
+        return;
     }
-    if (trace) {
-        st->get_us    += (uint64_t) (ggml_time_us() - t0);
-        st->get_bytes += wire_bf16 ? size / 2 : size;
-        st->get_n     += 1;
-        rpc_wire_trace_tick();
-    }
+    bool status = ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1688,51 +1647,34 @@ GGML_BACKEND_API bool ggml_backend_rpc_imatrix_sqsum(
         int64_t                    src0_ne3,
         float                    * sums,
         int64_t                  * counts) {
-    if (src1 == nullptr || src1->buffer == nullptr || !ggml_backend_buffer_is_rpc(src1->buffer)) {
+    auto disp = rpc_tensor_dispatcher(src1);
+    if (disp == nullptr) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 || n_mat <= 0 || sums == nullptr) {
         return false;
     }
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) src1->buffer->context;
-    if (rpc_server_patch(ctx->endpoint) < GGML_RPC_IMAT_MIN_PATCH) {
+    if (disp->patch < GGML_RPC_IMAT_MIN_PATCH) {
         return false;
     }
-    if (ids != nullptr && (ids->buffer == nullptr || !ggml_backend_buffer_is_rpc(ids->buffer))) {
+    if (ids != nullptr && rpc_tensor_dispatcher(ids) != disp) {
         return false; // ids must be readable by the same daemon
     }
-    if (ids != nullptr) {
-        ggml_backend_rpc_buffer_context * ictx = (ggml_backend_rpc_buffer_context *) ids->buffer->context;
-        if (ictx->endpoint != ctx->endpoint) {
-            return false;
-        }
-    }
 
-    rpc_msg_imatrix_sqsum_req request = {};
-    request.src1     = serialize_tensor(src1);
-    request.n_mat    = (uint32_t) n_mat;
-    request.has_ids  = ids != nullptr ? 1u : 0u;
-    request.src0_ne2 = (uint32_t) (src0_ne2 > 0 ? src0_ne2 : 1);
-    request.src0_ne3 = (uint32_t) (src0_ne3 > 0 ? src0_ne3 : 1);
+    auto request = std::make_shared<rpc_msg_imatrix_sqsum_req>();
+    memset(request.get(), 0, sizeof(*request));
+    request->src1     = serialize_tensor(src1);
+    request->n_mat    = (uint32_t) n_mat;
+    request->has_ids  = ids != nullptr ? 1u : 0u;
+    request->src0_ne2 = (uint32_t) (src0_ne2 > 0 ? src0_ne2 : 1);
+    request->src0_ne3 = (uint32_t) (src0_ne3 > 0 ? src0_ne3 : 1);
     if (ids != nullptr) {
-        request.ids = serialize_tensor(ids);
+        request->ids = serialize_tensor(ids);
     }
 
     const int64_t ne0 = src1->ne[0];
     std::vector<uint8_t> response(sizeof(uint64_t)*n_mat + sizeof(float)*ne0*n_mat);
-
-    const bool trace = rpc_wire_trace_enabled();
-    rpc_wire_ep_stat * st = trace ? rpc_wire_stat(ctx->endpoint) : nullptr;
-    const int64_t t0 = trace ? ggml_time_us() : 0;
-    const bool ok = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_IMATRIX_SQSUM,
-                                         &request, sizeof(request), response.data(), response.size());
-    if (trace) {
-        st->get_us    += (uint64_t) (ggml_time_us() - t0);
-        st->get_bytes += response.size();
-        st->get_n     += 1;
-        rpc_wire_trace_tick();
-    }
-    if (!ok) {
+    if (!disp->send(RPC_CMD_IMATRIX_SQSUM, request, sizeof(*request), response.data(), response.size())) {
         return false;
     }
 
@@ -1755,15 +1697,15 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src_buffer->context;
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
-        if (src_ctx->endpoint != dst_ctx->endpoint) {
+        if (src_ctx->dispatcher != dst_ctx->dispatcher) {
             return false;
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-        rpc_msg_copy_tensor_req request;
-        request.src = serialize_tensor(src);
-        request.dst = serialize_tensor(dst);
+        auto request = std::make_shared<rpc_msg_copy_tensor_req>();
+        request->src = serialize_tensor(src);
+        request->dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
-        bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+        bool status = ctx->dispatcher->send(RPC_CMD_COPY_TENSOR, request, sizeof(*request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
         return response.result;
     }
@@ -1772,8 +1714,10 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
-    bool status = send_rpc_cmd_ordered(ctx->endpoint, get_socket(ctx->endpoint), RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+    auto request = std::make_shared<rpc_msg_buffer_clear_req>();
+    request->remote_ptr = ctx->remote_ptr;
+    request->value = value;
+    bool status = ctx->dispatcher->send(RPC_CMD_BUFFER_CLEAR, request, sizeof(*request));
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1798,20 +1742,23 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-    rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
+    auto request = std::make_shared<rpc_msg_alloc_buffer_req>();
+    request->device = buft_ctx->device;
+    request->size = size;
     rpc_msg_alloc_buffer_rsp response;
-    auto sock = get_socket(buft_ctx->endpoint);
-    if (sock == nullptr) {
-        // report as an allocation failure so the caller errors out cleanly
+
+    auto dispatcher = get_dispatcher(buft_ctx->endpoint);
+    if (dispatcher == nullptr) {
+        // [fork] report as an allocation failure so the caller errors out cleanly
         GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, buft_ctx->endpoint.c_str());
         return nullptr;
     }
-    bool status = send_rpc_cmd_ordered(buft_ctx->endpoint, sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+    bool status = dispatcher->send(RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{buft_ctx->endpoint, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{dispatcher, nullptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
@@ -1819,10 +1766,11 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     }
 }
 
-static size_t get_alignment(const std::string & endpoint, const std::shared_ptr<socket_t> & sock, uint32_t device) {
-    rpc_msg_get_alignment_req request = {device};
+static size_t get_alignment(const std::shared_ptr<rpc_dispatcher> & dispatcher, uint32_t device) {
+    auto request = std::make_shared<rpc_msg_get_alignment_req>();
+    request->device = device;
     rpc_msg_get_alignment_rsp response;
-    bool status = send_rpc_cmd_ordered(endpoint, sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
+    bool status = dispatcher->send(RPC_CMD_GET_ALIGNMENT, request, sizeof(*request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     return response.alignment;
 }
@@ -1832,10 +1780,11 @@ static size_t ggml_backend_rpc_buffer_type_get_alignment(ggml_backend_buffer_typ
     return buft_ctx->alignment;
 }
 
-static size_t get_max_size(const std::string & endpoint, const std::shared_ptr<socket_t> & sock, uint32_t device) {
-    rpc_msg_get_max_size_req request = {device};
+static size_t get_max_size(const std::shared_ptr<rpc_dispatcher> & dispatcher, uint32_t device) {
+    auto request = std::make_shared<rpc_msg_get_max_size_req>();
+    request->device = device;
     rpc_msg_get_max_size_rsp response;
-    bool status = send_rpc_cmd_ordered(endpoint, sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
+    bool status = dispatcher->send(RPC_CMD_GET_MAX_SIZE, request, sizeof(*request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     return response.max_size;
 }
@@ -1852,81 +1801,76 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     // See comments in init_tensor.
     rpc_get |= ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr);
 
-    // ops that require additional memory for fleeting data on certain backends
+    // [TAG_ALLOC_SIZE_EXPAND]
+    // ops that may require additional memory for fleeting data on certain backends
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966
     rpc_get |= ggml_op_alloc_size_may_expand(tensor->op);
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
 
-        // [fork, pipeline-prefill] cache the remote responses, keyed by shapes.
-        // galloc asks for every FLASH_ATTN_EXT / MUL_MAT_ID node on every graph
-        // allocation, and the ordered round trip queues behind in-flight compute
-        // on the endpoint's socket - under pipeline parallelism that serialized
-        // prefill to one full pipeline drain per ubatch. Shapes repeat across
-        // ubatches, so the steady state becomes fully local.
-        static std::mutex alloc_size_cache_mutex;
-        static std::unordered_map<std::string, uint64_t> alloc_size_cache;
-
-        std::string key;
-        key.reserve(512);
-        key += buft_ctx->endpoint;
-        {
-            char dev_buf[16];
-            snprintf(dev_buf, sizeof(dev_buf), "#%u", buft_ctx->device);
-            key += dev_buf;
-        }
-        auto append_tensor = [&key](const ggml_tensor * t) {
-            if (t == nullptr) {
-                key += "|-";
-                return;
-            }
-            char buf[192];
-            snprintf(buf, sizeof(buf), "|%d:%d:%lld,%lld,%lld,%lld:%zu,%zu,%zu,%zu",
-                     (int) t->type, (int) t->op,
-                     (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-                     t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
-            key += buf;
+        // Cache key for calls to read the alloc_size.
+        // We deliberately exclude src tensor dimensions from the key because:
+        // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
+        // 2. For GPU backends, the reservation graph uses max dimensions, so the
+        //    cached value from reservation is always >= any subsequent request
+        // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
+        //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        struct alloc_size_cache_key {
+            uint32_t device;
+            uint32_t type;
+            uint32_t op;
+            int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+            uint32_t ne[GGML_MAX_DIMS];
         };
-        append_tensor(tensor);
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            append_tensor(tensor->src[i]);
+
+        alloc_size_cache_key key = {};
+        key.device = buft_ctx->device;
+        key.type = tensor->type;
+        key.op = tensor->op;
+        memcpy(key.op_params, tensor->op_params, sizeof(key.op_params));
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            key.ne[i] = (uint32_t)tensor->ne[i];
         }
 
+        uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
+        cache_hash = fnv_hash((const uint8_t *)buft_ctx->endpoint.data(), buft_ctx->endpoint.size(), cache_hash);
+
+        // alloc sizes are immutable for a given tensor configuration
+        static std::mutex cache_mutex;
+        static std::unordered_map<uint64_t, size_t> cache;
+
         {
-            std::lock_guard<std::mutex> lock(alloc_size_cache_mutex);
-            auto it = alloc_size_cache.find(key);
-            if (it != alloc_size_cache.end()) {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            auto it = cache.find(cache_hash);
+            if (it != cache.end()) {
                 return it->second;
             }
         }
 
-        auto sock = get_socket(buft_ctx->endpoint);
-        if (sock == nullptr) {
-            // best-effort fallback; a dead endpoint will fail the subsequent
-            // alloc with a clean error anyway
-            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, buft_ctx->endpoint.c_str());
-            return ggml_nbytes(tensor);
-        }
-
-        rpc_msg_get_alloc_size_req request = {
-            /*.device =*/ buft_ctx->device,
-            /*.tensor =*/ serialize_tensor(tensor),
-            /*.srcs   =*/ {},
-        };
+        auto request = std::make_shared<rpc_msg_get_alloc_size_req>();
+        request->device = buft_ctx->device;
+        request->tensor = serialize_tensor(tensor);
 
         // .get_alloc_size could be a function of the tensor's srcs, so we must serialize them as well
         for (int i = 0; i < GGML_MAX_SRC; i++) {
-            request.srcs[i] = serialize_tensor(tensor->src[i]);
+            request->srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
         rpc_msg_get_alloc_size_rsp response;
-        bool status = send_rpc_cmd_ordered(buft_ctx->endpoint, sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+        auto dispatcher = get_dispatcher(buft_ctx->endpoint);
+        if (dispatcher == nullptr) {
+            // [fork] best-effort fallback; a dead endpoint will fail the
+            // subsequent alloc with a clean error anyway
+            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, buft_ctx->endpoint.c_str());
+            return ggml_nbytes(tensor);
+        }
+        bool status = dispatcher->send(RPC_CMD_GET_ALLOC_SIZE, request, sizeof(*request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
 
         {
-            std::lock_guard<std::mutex> lock(alloc_size_cache_mutex);
-            alloc_size_cache.emplace(key, response.alloc_size);
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            cache[cache_hash] = response.alloc_size;
         }
 
         return response.alloc_size;
@@ -1956,102 +1900,16 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
-    // NOTE: do not flush the coalescing buffer here. It looks like the natural
-    // place ("synchronize means everything I asked for has been sent") and it
-    // is not needed -- a buffered frame is always followed by a graph submit or
-    // a response-bearing command, both of which flush. It is also on the decode
-    // hot path: get_socket() and the queue map are both process-global, and
-    // taking them per synchronize across nine concurrent stage threads cost
-    // 9.10 -> 8.1 t/s on the DSV4 SPD split (measured 2026-07-31, with the
-    // buffering itself disabled, which is how it was isolated).
-    if (!rpc_async_enabled()) {
-        // legacy path: graph_compute is a blocking send and there are no async
-        // ops in flight, so nothing to wait for
-        return;
-    }
-    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    const std::string endpoint = rpc_ctx->endpoint;
-    const uint32_t device = rpc_ctx->device;
-    // full-duplex lanes: drain the lane workers first so every lane command is
-    // on the wire, then let the main-lane barrier below cover their counts via
-    // a LANE_FENCE + ping (the fence makes the server wait until both lanes
-    // fully processed everything submitted so far, the ping proves it did).
-    rpc_ep_lanes * ep = get_ep_lanes(endpoint);
-    rpc_stream * lane_set_st = nullptr;
-    rpc_stream * lane_get_st = nullptr;
-    uint64_t lane_set_cnt = 0, lane_get_cnt = 0;
-    bool lanes_dirty = false;
-    {
-        std::lock_guard<std::mutex> l(ep->m);
-        if (ep->state == 1) {
-            lane_set_st  = ep->set_stream;
-            lane_get_st  = ep->get_stream;
-            lane_set_cnt = ep->set_enq;
-            lane_get_cnt = ep->get_enq;
-            lanes_dirty  = lane_set_cnt > ep->barrier_set || lane_get_cnt > ep->barrier_get;
-        }
-    }
-    if (lane_set_st != nullptr) {
-        lane_set_st->drain();
-    }
-    if (lane_get_st != nullptr) {
-        lane_get_st->drain();
-    }
-    rpc_stream * stream = get_stream(endpoint);
-    // make sure the server has drained every in-order command (incl. the last
-    // fire-and-forget GRAPH_COMPUTE), then wait for all worker tasks to finish.
-    // when nothing was enqueued since the last completed ping the socket is
-    // quiescent and the round-trip is skipped - llama_context::synchronize()
-    // fires per sched x per backend and would otherwise storm the LAN with
-    // redundant pings (the dominant stage-2 spec_proc overhead).
-    if (stream->needs_barrier() || lanes_dirty) {
-        uint64_t covered;
-        {
-            // fence accounting mirrors rpc_main_enqueue_counted, but the task
-            // goes through enqueue_barrier so the ping does not mark the
-            // stream dirty again
-            std::lock_guard<std::mutex> l(ep->m);
-            const bool fence = ep->state == 1 && (ep->set_enq != ep->fenced_set || ep->get_enq != ep->fenced_get);
-            rpc_msg_lane_fence_req freq = { ep->set_enq, ep->get_enq };
-            if (fence) {
-                ep->fenced_set = ep->set_enq;
-                ep->fenced_get = ep->get_enq;
-                ep->main_enq++;
-            }
-            ep->main_enq++;
-            covered = stream->enqueue_barrier([endpoint, device, fence, freq]{
-                if (fence) {
-                    auto sock = get_socket(endpoint);
-                    if (sock != nullptr) {
-                        send_rpc_cmd(sock, RPC_CMD_LANE_FENCE, &freq, sizeof(freq));
-                    }
-                }
-                rpc_ping(endpoint, device);
-            });
-        }
-        stream->drain();
-        stream->mark_barrier(covered);
-        {
-            std::lock_guard<std::mutex> l(ep->m);
-            if (lane_set_cnt > ep->barrier_set) {
-                ep->barrier_set = lane_set_cnt;
-            }
-            if (lane_get_cnt > ep->barrier_get) {
-                ep->barrier_get = lane_get_cnt;
-            }
-        }
-    } else {
-        stream->drain();
-    }
-}
+// ---------------------------------------------------------------------------
+// Graph submission  [fork, PipeDec]
+// ---------------------------------------------------------------------------
 
-static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const std::shared_ptr<rpc_dispatcher> & dispatcher, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
     if (tensor == nullptr) {
         return;
     }
-    // iterative post-order DFS: recursing per src/view_src overflows the stack
-    // on graphs whose longest dependency chain spans thousands of tensors
+    // [fork] iterative post-order DFS: recursing per src/view_src overflows the
+    // stack on graphs whose longest dependency chain spans thousands of tensors
     // (e.g. recurrent-state models under --split-mode tensor)
     std::vector<std::pair<ggml_tensor *, bool>> stack;
     stack.push_back({tensor, false});
@@ -2059,7 +1917,7 @@ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::ve
         auto [t, expanded] = stack.back();
         stack.pop_back();
         if (expanded) {
-            rpc_tensor result = serialize_tensor(t);
+            rpc_tensor result = serialize_tensor(t, dispatcher);
             const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, t);
             if (hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
                 result.use_count = cgraph->use_counts[hash_pos];
@@ -2080,101 +1938,40 @@ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::ve
     }
 }
 
-// Diagnostic: flag any leaf in a subgraph bound for `endpoint` whose data lives
-// in an RPC buffer owned by a DIFFERENT endpoint. The server rejects such a
-// tensor with "[create_node] invalid data ptr" (buffer==null && data!=null)
-// because RPC is star-only: there is no remote<->remote path, so a board can
-// never dereference another board's buffer. Gated by LLAMA_RPC_TRACE_XDEV.
-static const char * rpc_xdev_ep(const ggml_tensor * t) {
-    if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_rpc(t->buffer)) {
-        return nullptr;
-    }
-    auto * bctx = (ggml_backend_rpc_buffer_context *) t->buffer->context;
-    return bctx ? bctx->endpoint.c_str() : nullptr;
-}
-
-static void rpc_trace_xdev(const std::string & endpoint, const ggml_cgraph * cgraph) {
-    static const bool on = getenv("LLAMA_RPC_TRACE_XDEV") != nullptr;
-    if (!on) {
-        return;
-    }
-    // The nodes in cgraph->nodes[] are exactly what serialize_graph ships to the
-    // server. A node (or any of its srcs) whose buffer belongs to a different RPC
-    // endpoint is what the server rejects as "invalid data ptr". Report each with
-    // its view_src root so we can see whether it is a foreign VIEW, a foreign real
-    // src, or an orphan foreign node with no in-graph consumer.
-    std::unordered_set<const ggml_tensor *> consumed; // referenced as some node's src
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        for (int j = 0; j < GGML_MAX_SRC; j++) {
-            if (n->src[j]) consumed.insert(n->src[j]);
-        }
-    }
-    auto root_of = [](const ggml_tensor * t) {
-        while (t->view_src) t = t->view_src;
-        return t;
-    };
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        const char * nep = rpc_xdev_ep(n);
-        if (nep && endpoint != nep) {
-            const ggml_tensor * r = root_of(n);
-            GGML_LOG_ERROR("[rpc xdev] target=%s node[%d] '%s' (op=%s) FOREIGN@%s%s"
-                           " view_root='%s'@%s ne=[%lld,%lld]\n",
-                endpoint.c_str(), i, n->name, ggml_op_name(n->op), nep,
-                consumed.count(n) ? "" : " ORPHAN(no-consumer)",
-                r->name, rpc_xdev_ep(r) ? rpc_xdev_ep(r) : "local",
-                (long long)n->ne[0], (long long)n->ne[1]);
-        }
-        for (int j = 0; j < GGML_MAX_SRC; j++) {
-            const ggml_tensor * s = n->src[j];
-            const char * sep = rpc_xdev_ep(s);
-            if (sep && endpoint != sep) {
-                const ggml_tensor * r = root_of(s);
-                GGML_LOG_ERROR("[rpc xdev] target=%s node[%d] '%s' (op=%s) has FOREIGN src[%d] '%s'"
-                               " (op=%s)@%s view_root='%s'@%s\n",
-                    endpoint.c_str(), i, n->name, ggml_op_name(n->op), j, s->name,
-                    ggml_op_name(s->op), sep, r->name, rpc_xdev_ep(r) ? rpc_xdev_ep(r) : "local");
-            }
-        }
-    }
-}
-
 // True when the tensor's data lives in an RPC buffer owned by a DIFFERENT
 // endpoint than the one we are serializing this subgraph for.
-static bool rpc_node_is_foreign(const ggml_tensor * t, const std::string & endpoint) {
-    const char * ep = rpc_xdev_ep(t);
-    return ep != nullptr && endpoint != ep;
+static bool rpc_node_is_foreign(const ggml_tensor * t, const std::shared_ptr<rpc_dispatcher> & dispatcher) {
+    auto d = rpc_tensor_dispatcher(t);
+    return d != nullptr && d != dispatcher;
 }
 
 // [fork] Collect and emit are split so the caller can gather the node/tensor set
 // once, derive a content uid from it, and only pay for the payload on a miss.
-static void collect_graph(const std::string & endpoint, const ggml_cgraph * cgraph,
+static void collect_graph(const std::shared_ptr<rpc_dispatcher> & dispatcher, const ggml_cgraph * cgraph,
                           std::vector<ggml_tensor *> & nodes, std::vector<rpc_tensor> & tensors) {
     // Drop nodes whose data lives on a different RPC endpoint before shipping the
-    // subgraph. RPC is star-only — there is no remote<->remote memory path — so a
-    // board can never dereference another board's buffer; serializing such a node
-    // makes the server reject it ("[create_node] invalid data ptr": data!=0,
-    // buffer==null) and abort. These nodes are always dead here: the backend
-    // scheduler (ggml_backend_sched pass 5) already rewired every LIVE consumer to
-    // a host-routed cross-backend copy, leaving only orphaned view nodes — e.g.
-    // DeepSeek-V4's per-stream HC residual slices (build_hc_pre/post view the
-    // previous board's l_out) that fall inside this board's contiguous split range.
-    // Skipping them is loss-free (nothing kept references them) and keeps the graph
-    // uid -> filtered-node-set mapping deterministic, so the server's graph cache
-    // stays consistent across recompute.
+    // subgraph. A board can never dereference another board's buffer; serializing
+    // such a node makes the server reject it ("[create_node] invalid data ptr")
+    // and abort. These nodes are always dead here: the backend scheduler already
+    // rewired every LIVE consumer to a host-routed cross-backend copy, leaving
+    // only orphaned view nodes - e.g. DeepSeek-V4's per-stream HC residual slices
+    // that fall inside this board's contiguous split range. Skipping them is
+    // loss-free (nothing kept references them) and keeps the graph uid ->
+    // filtered-node-set mapping deterministic, so the server's graph cache stays
+    // consistent across recompute. (Upstream #26500 blanks the descriptor
+    // instead; serialize_tensor does that too for any foreign leaf that remains.)
     nodes.clear();
     tensors.clear();
     nodes.reserve(cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (rpc_node_is_foreign(cgraph->nodes[i], endpoint)) {
+        if (rpc_node_is_foreign(cgraph->nodes[i], dispatcher)) {
             continue;
         }
         nodes.push_back(cgraph->nodes[i]);
     }
     std::unordered_set<ggml_tensor*> visited;
     for (size_t i = 0; i < nodes.size(); i++) {
-        add_tensor(nodes[i], cgraph, tensors, visited);
+        add_tensor(nodes[i], cgraph, dispatcher, tensors, visited);
     }
 }
 
@@ -2338,7 +2135,7 @@ static void serialize_collected(uint32_t device, uint64_t uid,
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
-    int output_size = 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+    size_t output_size = 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
     output.resize(output_size, 0);
     uint8_t * dest = output.data();
     memcpy(dest, &device, sizeof(device));
@@ -2357,41 +2154,14 @@ static void serialize_collected(uint32_t device, uint64_t uid,
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 }
 
-static void serialize_graph(uint32_t device, uint64_t uid, const std::string & endpoint,
-                            const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
-    std::vector<ggml_tensor *> nodes;
-    std::vector<rpc_tensor>    tensors;
-    collect_graph(endpoint, cgraph, nodes, tensors);
-    serialize_collected(device, uid, nodes, tensors, output);
-}
-
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
-    const std::string endpoint = rpc_ctx->endpoint;
+    const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
     const uint32_t device = rpc_ctx->device;
-    const bool async = rpc_async_enabled();
-
-    const bool wire_trace = rpc_wire_trace_enabled();
-    rpc_wire_ep_stat * wire_st = wire_trace ? rpc_wire_stat(endpoint) : nullptr;
-    const int64_t wire_t0 = wire_trace ? ggml_time_us() : 0;
-    if (wire_trace) {
-        // a pipelined decode may go a long time with no traced set/get (its
-        // inputs and reads take the async paths), so flush from here too
-        rpc_wire_trace_tick();
-    }
-    struct wire_submit_scope {
-        rpc_wire_ep_stat * st; int64_t t0;
-        ~wire_submit_scope() {
-            if (st != nullptr) {
-                st->gc_us += (uint64_t) (ggml_time_us() - t0);
-                st->gc_n  += 1;
-            }
-        }
-    } wire_scope { wire_st, wire_t0 };
 
     // [fork] see graph_content_uid(): a content-derived uid lets a rebuilt but
     // structurally identical graph hit the server cache, which is what a
@@ -2419,33 +2189,25 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         // The fingerprint below stays as the fallback for a split instance
         // seen for the first time, so a rebuilt-but-identical graph still
         // resolves to the uid the server already holds.
-        static const bool split_off = getenv("GGML_RPC_SPLIT_UID_OFF") != nullptr;
-        static const bool quick_off = getenv("GGML_RPC_QUICK_UID_OFF") != nullptr;
-        const int64_t t_key0 = wire_trace ? ggml_time_us() : 0;
         auto & split_map = rpc_dev_ctx->split_uids;
-        const uint64_t split_key = split_off ? 0 : cgraph->uid;
+        const uint64_t split_key = cgraph->uid;
         auto sit = split_key != 0 ? split_map.find(split_key) : split_map.end();
         if (sit != split_map.end()) {
             uid = sit->second;
-            if (wire_st != nullptr) {
-                wire_st->gc_split_hit += 1;
-            }
         } else {
             auto & quick = rpc_dev_ctx->quick_uids;
-            const uint64_t fp = quick_off ? 0 : rpc_graph_quick_fp(cgraph);
-            auto it = fp != 0 ? quick.find(fp) : quick.end();
+            const uint64_t fp = rpc_graph_quick_fp(cgraph);
+            auto it = quick.find(fp);
             if (it != quick.end()) {
                 uid = it->second;
             } else {
-                collect_graph(endpoint, cgraph, nodes, tensors);
+                collect_graph(disp, cgraph, nodes, tensors);
                 uid = graph_content_uid(nodes, tensors);
                 collected = true;
-                if (fp != 0) {
-                    if (quick.size() >= 4096) {
-                        quick.clear();
-                    }
-                    quick[fp] = uid;
+                if (quick.size() >= 4096) {
+                    quick.clear();
                 }
+                quick[fp] = uid;
             }
             if (split_key != 0) {
                 if (split_map.size() >= 4096) {
@@ -2453,9 +2215,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 }
                 split_map[split_key] = uid;
             }
-        }
-        if (wire_st != nullptr) {
-            wire_st->gc_key_us += (uint64_t) (ggml_time_us() - t_key0);
         }
     }
 
@@ -2495,78 +2254,49 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = device;
         request.uid    = uid;
-        if (async) {
-            // enqueue on the endpoint's stream so the scheduler thread does not block
-            rpc_main_enqueue_counted(endpoint, get_stream(endpoint), 1, [endpoint, request]{
-                auto sock = get_socket(endpoint);
-                if (sock == nullptr) {
-                    GGML_LOG_ERROR("[rpc graph_recompute] lost connection to %s\n", endpoint.c_str());
-                    return;
-                }
-                send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-            });
-            return GGML_STATUS_SUCCESS;
-        }
-        auto sock = get_socket(endpoint);
-        if (sock == nullptr) {
-            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, endpoint.c_str());
-            return GGML_STATUS_FAILED;
-        }
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-        RPC_STATUS_ASSERT(status);
+        // fence-counted: the graph must land after every lane upload it reads
+        disp->enqueue_counted(1, [request](const socket_ptr & s) {
+            if (s == nullptr) {
+                GGML_LOG_ERROR("[rpc graph_recompute] not connected\n");
+                return false;
+            }
+            RPC_STATUS_ASSERT(send_rpc_cmd(s, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request)));
+            return true;
+        });
     } else {
-        if (wire_st != nullptr) {
-            wire_st->gc_full_n += 1;
-        }
-        rpc_trace_xdev(endpoint, cgraph);
-        std::vector<uint8_t> input;
+        auto input = std::make_shared<std::vector<uint8_t>>();
         if (stable_uid) {
             if (!collected) {
                 // fingerprint hit on a uid the server has since evicted
-                collect_graph(endpoint, cgraph, nodes, tensors);
+                collect_graph(disp, cgraph, nodes, tensors);
                 GGML_ASSERT(graph_content_uid(nodes, tensors) == uid);
             }
-            serialize_collected(device, uid, nodes, tensors, input);
         } else {
-            serialize_graph(device, uid, endpoint, cgraph, input);
+            collect_graph(disp, cgraph, nodes, tensors);
         }
+        serialize_collected(device, uid, nodes, tensors, *input);
         rpc_msg_graph_forget_req forget = { device, evicted_uid };
-        if (async) {
-            auto in = std::make_shared<std::vector<uint8_t>>(std::move(input));
-            const uint32_t n_cmds = forget.uid != 0 ? 2 : 1;
-            rpc_main_enqueue_counted(endpoint, get_stream(endpoint), n_cmds, [endpoint, in, forget]{
-                auto sock = get_socket(endpoint);
-                if (sock == nullptr) {
-                    GGML_LOG_ERROR("[rpc graph_compute] lost connection to %s\n", endpoint.c_str());
-                    return;
-                }
-                if (forget.uid != 0) {
-                    send_rpc_cmd(sock, RPC_CMD_GRAPH_FORGET, &forget, sizeof(forget));
-                }
-                send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, in->data(), in->size());
-            });
-            return GGML_STATUS_SUCCESS;
-        }
-        auto sock = get_socket(endpoint);
-        if (sock == nullptr) {
-            GGML_LOG_ERROR("[%s] lost connection to %s\n", __func__, endpoint.c_str());
-            return GGML_STATUS_FAILED;
-        }
-        if (forget.uid != 0) {
-            bool fstatus = send_rpc_cmd(sock, RPC_CMD_GRAPH_FORGET, &forget, sizeof(forget));
-            RPC_STATUS_ASSERT(fstatus);
-        }
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
+        const uint32_t n_cmds = forget.uid != 0 ? 2 : 1;
+        disp->enqueue_counted(n_cmds, [input, forget](const socket_ptr & s) {
+            if (s == nullptr) {
+                GGML_LOG_ERROR("[rpc graph_compute] not connected\n");
+                return false;
+            }
+            if (forget.uid != 0) {
+                RPC_STATUS_ASSERT(send_rpc_cmd(s, RPC_CMD_GRAPH_FORGET, &forget, sizeof(forget)));
+            }
+            RPC_STATUS_ASSERT(send_rpc_cmd(s, RPC_CMD_GRAPH_COMPUTE, input->data(), input->size()));
+            return true;
+        });
     }
     return GGML_STATUS_SUCCESS;
 }
 
-// --- async backend ops [fork, PipeDec Phase 1] ---
+// --- async backend ops [fork, PipeDec] ---
 //
 // Tasks must capture everything they need BY VALUE at enqueue time: the graph
 // tensor structs they reference live in scheduler/graph memory that may be
-// rewritten for the next ubatch before the task runs on the stream worker.
+// rewritten for the next ubatch before the task runs on the dispatcher worker.
 
 // serialized SET_TENSOR wire message: | rpc_tensor | offset (8) | payload (size) |
 // built on the enqueuing thread; the payload may be filled in later by a task
@@ -2584,28 +2314,6 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor(
     return msg;
 }
 
-// bf16 wire compression (GGML_RPC_WIRE_BF16=1): halves the wire bytes of
-// ASYNC f32 tensor traffic - pipeline stage-boundary activations, INPUT
-// staging (KQ masks), and deferred tap/embedding reads. Load-time weight
-// uploads go through the synchronous buffer interface and are never
-// compressed. bf16 keeps the f32 exponent (8 mantissa bits), so large
-// activations can never overflow the way IEEE f16 would.
-static bool rpc_wire_bf16_enabled() {
-    static const bool on = []() {
-        const char * e = std::getenv("GGML_RPC_WIRE_BF16");
-        return e != nullptr && *e != '\0' && *e != '0';
-    }();
-    return on;
-}
-
-static bool rpc_wire_bf16_ok(const ggml_tensor * tensor, uint64_t offset, size_t size) {
-    return rpc_wire_bf16_enabled()
-        && tensor->type == GGML_TYPE_F32
-        && offset % sizeof(float) == 0
-        && size   % sizeof(float) == 0
-        && size >= 4096; // tiny messages are latency-bound, not bandwidth-bound
-}
-
 static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
         const ggml_tensor * tensor, const void * data, uint64_t offset, size_t size) {
     rpc_tensor rt = serialize_tensor(tensor);
@@ -2618,6 +2326,470 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
                               size / sizeof(float));
     }
     return msg;
+}
+
+// pool of events recorded on a source backend at enqueue time (i.e. in submission
+// order, right after that backend's graph_compute was submitted) so a dispatcher
+// worker can wait for the source's async compute to finish before reading its
+// output buffer. Without this, reading e.g. a CUDA tensor on the worker races
+// the CUDA stream.
+struct rpc_src_events {
+    std::mutex mtx;
+    std::unordered_map<ggml_backend_dev_t, std::vector<ggml_backend_event_t>> pool;
+    static rpc_src_events & instance() { static rpc_src_events p; return p; }
+};
+
+static ggml_backend_event_t rpc_src_event_record(ggml_backend_t backend_src) {
+    ggml_backend_dev_t dev = backend_src->device;
+    if (dev == nullptr || backend_src->iface.event_record == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.caps.events) {
+        return nullptr;
+    }
+    auto & p = rpc_src_events::instance();
+    ggml_backend_event_t ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(p.mtx);
+        auto & pool = p.pool[dev];
+        if (!pool.empty()) {
+            ev = pool.back();
+            pool.pop_back();
+        }
+    }
+    if (ev == nullptr) {
+        ev = ggml_backend_event_new(dev);
+        if (ev == nullptr) {
+            return nullptr;
+        }
+    }
+    ggml_backend_event_record(ev, backend_src);
+    return ev;
+}
+
+static void rpc_src_event_release(ggml_backend_event_t ev) {
+    auto & p = rpc_src_events::instance();
+    std::lock_guard<std::mutex> lock(p.mtx);
+    p.pool[ev->device].push_back(ev);
+}
+
+static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!rpc_async_enabled()) {
+        ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
+    // snapshot the full wire message now: the caller may reuse `data` (and the graph
+    // may rewrite `tensor`) once we return
+    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
+    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(tensor, data, offset, size)
+                         : rpc_prepare_set_tensor(tensor, data, offset, size);
+    const enum rpc_cmd cmd = wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
+    rpc_lanes * ep = rpc_lanes_get_active(disp);
+    if (ep != nullptr) {
+        std::lock_guard<std::mutex> l(ep->m);
+        const uint64_t wait_main = ep->main_enq;
+        const uint64_t wait_get  = ep->get_enq;
+        ep->set_enq++;
+        const std::string endpoint = disp->endpoint;
+        ep->set_lane->task([endpoint, cmd, wait_main, wait_get, msg](const socket_ptr & lane) {
+            if (!send_lane_cmd(lane, cmd, wait_main, wait_get, msg->data(), msg->size())) {
+                GGML_ABORT("[rpc fdx] SET lane to %s lost", endpoint.c_str());
+            }
+            return true;
+        });
+        return;
+    }
+    disp->enqueue_counted(1, [msg, cmd](const socket_ptr & s) {
+        return send_rpc_cmd(s, cmd, msg->data(), msg->size());
+    });
+}
+
+static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (!rpc_async_enabled()) {
+        ggml_backend_rpc_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
+    // Truly asynchronous: per the get_tensor_async contract, `data` is only
+    // guaranteed valid after the caller synchronizes this backend - which drains
+    // the dispatcher, and the server's FIFO orders the read after any in-flight
+    // graph on this endpoint. Blocking here instead would serialize the pipeline
+    // (e.g. the per-ubatch MTP nextn-embedding read from the LAST stage would
+    // stall every prefill ubatch).
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
+    rpc_msg_get_tensor_req request;
+    request.tensor = serialize_tensor(tensor);
+    request.offset = offset;
+    request.size   = size;
+    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
+    rpc_lanes * ep = rpc_lanes_get_active(disp);
+    if (ep != nullptr) {
+        std::lock_guard<std::mutex> l(ep->m);
+        const uint64_t wait_main = ep->main_enq;
+        const uint64_t wait_set  = ep->set_enq;
+        ep->get_enq++;
+        const std::string endpoint = disp->endpoint;
+        ep->get_lane->task([endpoint, request, data, size, wire_bf16, wait_main, wait_set](const socket_ptr & lane) {
+            bool ok;
+            if (wire_bf16) {
+                std::vector<uint8_t> wire(size / 2);
+                ok = send_lane_cmd(lane, RPC_CMD_GET_TENSOR_BF16, wait_main, wait_set, &request, sizeof(request))
+                  && recv_msg(lane, wire.data(), wire.size());
+                if (ok) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
+                                          (float *) data, size / sizeof(float));
+                }
+            } else {
+                ok = send_lane_cmd(lane, RPC_CMD_GET_TENSOR, wait_main, wait_set, &request, sizeof(request))
+                  && recv_msg(lane, data, size);
+            }
+            if (!ok) {
+                GGML_ABORT("[rpc fdx] GET lane to %s lost", endpoint.c_str());
+            }
+            return true;
+        });
+        return;
+    }
+    disp->enqueue_counted(1, [request, data, size, wire_bf16](const socket_ptr & s) {
+        if (s == nullptr) {
+            return false;
+        }
+        if (wire_bf16) {
+            std::vector<uint8_t> wire(size / 2);
+            if (!send_rpc_cmd(s, RPC_CMD_GET_TENSOR_BF16, &request, sizeof(request), wire.data(), wire.size())) {
+                return false;
+            }
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(), (float *) data, size / sizeof(float));
+            return true;
+        }
+        return send_rpc_cmd(s, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    });
+}
+
+// one-shot data-ready gate used to hand a tensor payload between two dispatchers
+struct rpc_gate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool ready = false;
+    void set()  { std::lock_guard<std::mutex> l(m); ready = true; cv.notify_all(); }
+    void wait() { std::unique_lock<std::mutex> l(m); cv.wait(l, [&]{ return ready; }); }
+};
+
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!rpc_async_enabled()) {
+        return false; // let the scheduler fall back to its synchronous copy
+    }
+    if (!ggml_backend_buffer_is_rpc(dst->buffer)) {
+        return false; // RPC -> non-RPC copies use the scheduler's synchronous fallback
+    }
+    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
+    const std::shared_ptr<rpc_dispatcher> & ddisp = dst_ctx->dispatcher;
+    const size_t size = ggml_nbytes(src);
+
+    // [fork] direct remote->remote: hand the whole transfer to the producing
+    // node so the payload never crosses the client's NIC at all
+    if (rpc_peer_enabled() && ggml_backend_buffer_is_rpc(src->buffer)) {
+        ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
+        const std::shared_ptr<rpc_dispatcher> & sdisp = src_ctx->dispatcher;
+        rpc_lanes * sep = sdisp == ddisp ? nullptr : rpc_lanes_get_active(sdisp);
+        rpc_lanes * dep = sep == nullptr ? nullptr : rpc_lanes_get_active(ddisp);
+        if (dep != nullptr && rpc_peer_route_ready(sdisp, ddisp, dep->session_id, /*counted =*/ true)) {
+            rpc_msg_push_tensor_req req = {};
+            // must be the address peer_open registered the link under, i.e. the
+            // mapped one -- it is the key into the producer's link table
+            const std::string & via = rpc_peer_addr(ddisp->endpoint);
+            memcpy(req.endpoint, via.c_str(), via.size());
+            req.src        = serialize_tensor(src);
+            req.dst        = serialize_tensor(dst);
+            req.src_offset = 0;
+            req.dst_offset = 0;
+            req.size       = size;
+            req.bf16       = (rpc_wire_bf16_ok(src, 0, size) && dst->type == GGML_TYPE_F32) ? 1 : 0;
+            // take the destination's SET slot: the peer's message applies in
+            // the same ordered position a client-side SET would have
+            {
+                std::lock_guard<std::mutex> l(dep->m);
+                req.wait_main = dep->main_enq;
+                req.wait_get  = dep->get_enq;
+                dep->set_enq++;
+            }
+            // ...and issue the read on the source's GET lane, after its compute
+            std::lock_guard<std::mutex> l(sep->m);
+            const uint64_t wait_main = sep->main_enq;
+            const uint64_t wait_set  = sep->set_enq;
+            sep->get_enq++;
+            const std::string src_endpoint = sdisp->endpoint;
+            const std::string dst_endpoint = ddisp->endpoint;
+            sep->get_lane->task([src_endpoint, dst_endpoint, req, wait_main, wait_set](const socket_ptr & lane) {
+                rpc_msg_push_tensor_rsp rsp = { 0 };
+                const bool ok = send_lane_cmd(lane, RPC_CMD_PUSH_TENSOR, wait_main, wait_set,
+                                              &req, sizeof(req))
+                             && recv_msg(lane, &rsp, sizeof(rsp));
+                if (!ok) {
+                    GGML_ABORT("[rpc peer] GET lane to %s lost during a push", src_endpoint.c_str());
+                }
+                if (!rsp.ok) {
+                    GGML_ABORT("[rpc peer] %s could not deliver a push to %s",
+                               src_endpoint.c_str(), dst_endpoint.c_str());
+                }
+                return true;
+            });
+            return true;
+        }
+    }
+
+    // bf16 wire: the boundary payload stays 2-byte end-to-end through the
+    // star hairpin (GET_BF16 from the source lands directly in the SET_BF16
+    // message) - both legs halve with no client-side conversion at all
+    const bool wire_bf16 = rpc_wire_bf16_ok(src, 0, size) && dst->type == GGML_TYPE_F32;
+    // snapshot the SET message header now; the payload is filled in by the tasks below
+    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(dst, nullptr, 0, size)
+                         : rpc_prepare_set_tensor(dst, nullptr, 0, size);
+    const enum rpc_cmd set_cmd = wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
+
+    // `prep` runs on the dst worker (lane or main dispatcher) right before the
+    // SET is sent and must leave the payload filled in at msg + RPC_SET_TENSOR_HDR
+    std::function<void()> prep;
+
+    if (ggml_backend_buffer_is_rpc(src->buffer)) {
+        // RPC -> RPC (star topology): read on the source's GET lane (or its
+        // main dispatcher when lanes are off - either way the fences/FIFO order
+        // the read after the source's compute), hand the payload to the dst worker
+        ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
+        const std::shared_ptr<rpc_dispatcher> & sdisp = src_ctx->dispatcher;
+        rpc_msg_get_tensor_req get_req;
+        get_req.tensor = serialize_tensor(src);
+        get_req.offset = 0;
+        get_req.size   = size;
+        auto gate = std::make_shared<rpc_gate>();
+        const size_t wire_size = wire_bf16 ? size / 2 : size;
+        const enum rpc_cmd get_cmd = wire_bf16 ? RPC_CMD_GET_TENSOR_BF16 : RPC_CMD_GET_TENSOR;
+        rpc_lanes * sep = rpc_lanes_get_active(sdisp);
+        if (sep != nullptr) {
+            std::lock_guard<std::mutex> l(sep->m);
+            const uint64_t wait_main = sep->main_enq;
+            const uint64_t wait_set  = sep->set_enq;
+            sep->get_enq++;
+            const std::string src_endpoint = sdisp->endpoint;
+            sep->get_lane->task([src_endpoint, get_cmd, get_req, msg, wire_size, gate, wait_main, wait_set](const socket_ptr & lane) {
+                bool ok = send_lane_cmd(lane, get_cmd, wait_main, wait_set, &get_req, sizeof(get_req))
+                       && recv_msg(lane, msg->data() + RPC_SET_TENSOR_HDR, wire_size);
+                if (!ok) {
+                    GGML_ABORT("[rpc fdx] GET lane to %s lost", src_endpoint.c_str());
+                }
+                gate->set();
+                return true;
+            });
+        } else {
+            sdisp->enqueue_counted(1, [get_cmd, get_req, msg, wire_size, gate](const socket_ptr & s) {
+                const bool ok = send_rpc_cmd(s, get_cmd, &get_req, sizeof(get_req), msg->data() + RPC_SET_TENSOR_HDR, wire_size);
+                if (!ok) {
+                    GGML_LOG_ERROR("[rpc cpy_tensor_async] source read failed\n");
+                }
+                gate->set();
+                return ok;
+            });
+        }
+        prep = [gate]{ gate->wait(); };
+    } else if (wire_bf16) {
+        // host-visible source with bf16 wire: stage the f32 read separately,
+        // truncate to bf16 on the dst worker after the source compute is done
+        auto staging = std::make_shared<std::vector<uint8_t>>(size);
+        ggml_backend_tensor_get_async(backend_src, src, staging->data(), 0, size);
+        ggml_backend_event_t ev = rpc_src_event_record(backend_src);
+        prep = [msg, staging, size, ev, backend_src]() {
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize(ev);
+                rpc_src_event_release(ev);
+            } else if (backend_src->iface.synchronize != nullptr) {
+                ggml_backend_synchronize(backend_src);
+            }
+            ggml_fp32_to_bf16_row((const float *) staging->data(),
+                                  (ggml_bf16_t *) (msg->data() + RPC_SET_TENSOR_HDR),
+                                  size / sizeof(float));
+        };
+    } else {
+        // host-visible source (CUDA/CPU): the payload must be read on the SOURCE
+        // backend's ordered timeline. Reading it later (from the dst worker's
+        // thread, gated only on a completion event) is racy whenever another
+        // graph is submitted to the source backend in the meantime: under
+        // pipelined prefill (n_copies > 1) the next ubatch's graph reuses the
+        // same compute-buffer address and overwrites the boundary tensor,
+        // tearing the copy mid-payload (measured: warm pipelined prefill
+        // nondeterminism with a CUDA first stage). Enqueue the D2H on the
+        // source stream NOW - submission order puts it before any later
+        // graph's kernels - then let the dst worker wait until the source has
+        // actually produced it before shipping.
+        ggml_backend_tensor_get_async(backend_src, src, msg->data() + RPC_SET_TENSOR_HDR, 0, size);
+        ggml_backend_event_t ev = rpc_src_event_record(backend_src);
+        prep = [ev, backend_src]() {
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize(ev);
+                rpc_src_event_release(ev);
+            } else if (backend_src->iface.synchronize != nullptr) {
+                ggml_backend_synchronize(backend_src);
+            }
+        };
+    }
+
+    rpc_lanes * dep = rpc_lanes_get_active(ddisp);
+    if (dep != nullptr) {
+        std::lock_guard<std::mutex> l(dep->m);
+        const uint64_t wait_main = dep->main_enq;
+        const uint64_t wait_get  = dep->get_enq;
+        dep->set_enq++;
+        const std::string dst_endpoint = ddisp->endpoint;
+        dep->set_lane->task([dst_endpoint, set_cmd, wait_main, wait_get, msg, prep = std::move(prep)](const socket_ptr & lane) {
+            prep();
+            if (!send_lane_cmd(lane, set_cmd, wait_main, wait_get, msg->data(), msg->size())) {
+                GGML_ABORT("[rpc fdx] SET lane to %s lost", dst_endpoint.c_str());
+            }
+            return true;
+        });
+    } else {
+        ddisp->enqueue_counted(1, [set_cmd, msg, prep = std::move(prep)](const socket_ptr & s) {
+            prep();
+            return send_rpc_cmd(s, set_cmd, msg->data(), msg->size());
+        });
+    }
+    return true;
+}
+
+static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
+    // [fork] full-duplex lanes: drain the lane workers first so every lane
+    // command is on the wire (a later main command orders itself behind them
+    // with its LANE_FENCE), then drain the main dispatcher. The server's FIFO
+    // means a drained dispatcher has every read's response in hand, which is
+    // the contract synchronize has to deliver.
+    std::shared_ptr<rpc_dispatcher> set_lane, get_lane;
+    {
+        std::lock_guard<std::mutex> l(disp->lanes.m);
+        if (disp->lanes.state == 1) {
+            set_lane = disp->lanes.set_lane;
+            get_lane = disp->lanes.get_lane;
+        }
+    }
+    if (set_lane != nullptr) {
+        set_lane->drain();
+    }
+    if (get_lane != nullptr) {
+        get_lane->drain();
+    }
+    disp->synchronize();
+}
+
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_ctx->dispatcher->event_record(event);
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    // [fork] not a no-op: an event recorded on another endpoint's dispatcher
+    // orders this endpoint's later work behind it (the scheduler's
+    // cross-backend dependency under pipeline parallelism)
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_ctx->dispatcher->event_wait(event);
+}
+
+static ggml_backend_i ggml_backend_rpc_interface = {
+    /* .get_name                = */ ggml_backend_rpc_name,
+    /* .free                    = */ ggml_backend_rpc_free,
+    /* .set_tensor_async        = */ ggml_backend_rpc_set_tensor_async,
+    /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
+    /* .synchronize             = */ ggml_backend_rpc_synchronize,
+    /* .graph_plan_create       = */ NULL,
+    /* .graph_plan_free         = */ NULL,
+    /* .graph_plan_update       = */ NULL,
+    /* .graph_plan_compute      = */ NULL,
+    /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
+    /* .graph_optimize          = */ NULL,
+};
+
+ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::string buft_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
+    // NOTE: buffer types are allocated and never freed; this is by design
+    static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
+    auto it = buft_map.find(buft_name);
+    if (it != buft_map.end()) {
+        return it->second;
+    }
+    auto dispatcher = get_dispatcher(endpoint);
+    if (dispatcher == nullptr) {
+        GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
+        return nullptr;
+    }
+    size_t alignment = get_alignment(dispatcher, device);
+    size_t max_size = get_max_size(dispatcher, device);
+    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
+        /* .endpoint  = */ endpoint,
+        /* .device    = */ device,
+        /* .name      = */ buft_name,
+        /* .alignment = */ alignment,
+        /* .max_size  = */ max_size
+    };
+    auto reg = ggml_backend_rpc_add_server(endpoint);
+    ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
+        /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(reg, device),
+        /* .context = */ buft_ctx
+    };
+    buft_map[buft_name] = buft;
+    return buft;
+}
+
+ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
+    std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
+    auto dispatcher = get_dispatcher(endpoint);
+    if (dispatcher == nullptr) {
+        GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
+        return nullptr;
+    }
+    ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {
+        /* .dispatcher = */ dispatcher,
+        /* .device     = */ device,
+        /* .name       = */ dev_name,
+    };
+    auto reg = ggml_backend_rpc_add_server(endpoint);
+    ggml_backend_t backend = new ggml_backend {
+        /* .guid    = */ ggml_backend_rpc_guid(),
+        /* .iface   = */ ggml_backend_rpc_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(reg, device),
+        /* .context = */ ctx
+    };
+    return backend;
+}
+
+bool ggml_backend_is_rpc(ggml_backend_t backend) {
+    return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
+}
+
+void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
+    auto dispatcher = get_dispatcher(endpoint);
+    if (dispatcher == nullptr) {
+        *free = 0;
+        *total = 0;
+        return;
+    }
+    auto request = std::make_shared<rpc_msg_get_device_memory_req>();
+    request->device = device;
+    rpc_msg_get_device_memory_rsp response;
+    bool status = dispatcher->send(RPC_CMD_GET_DEVICE_MEMORY, request, sizeof(*request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    *free = response.free_mem;
+    *total = response.total_mem;
 }
 
 // ---------------------------------------------------------------------------
@@ -2644,7 +2816,8 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
 //     the following COPY_TENSOR reads the delivered payload.
 // Threading contract: prepare/fence run on the thread that owns the consumer
 // endpoint's main socket, push on the thread that owns the producer's. The
-// push lane is a dedicated GET-lane connection used for nothing else.
+// push lane is a dedicated GET-lane connection used for nothing else. In
+// direct mode the dispatcher executes each of these inline on the caller.
 // ---------------------------------------------------------------------------
 
 struct rpc_sync_peer_state {
@@ -2666,83 +2839,25 @@ static rpc_sync_peer_state & rpc_sync_peer() {
     return st;
 }
 
-static const char * rpc_tensor_endpoint(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
-        return nullptr;
-    }
-    auto * ctx = (ggml_backend_rpc_buffer_context *) tensor->buffer->context;
-    return ctx->endpoint.c_str();
-}
-
-// SESSION_INFO over the endpoint's main socket; memoized. Must be called from
-// the thread that owns that socket.
-static bool rpc_sync_session_for(const std::string & endpoint, uint64_t & out) {
+// SESSION_INFO over the endpoint's main connection; memoized.
+static bool rpc_sync_session_for(const std::shared_ptr<rpc_dispatcher> & disp, uint64_t & out) {
     auto & st = rpc_sync_peer();
     {
         std::lock_guard<std::mutex> l(st.m);
-        auto it = st.session_ids.find(endpoint);
+        auto it = st.session_ids.find(disp->endpoint);
         if (it != st.session_ids.end()) {
             out = it->second;
             return true;
         }
     }
-    auto sock = get_socket(endpoint);
-    if (sock == nullptr) {
-        return false;
-    }
     rpc_msg_session_info_rsp info = {};
-    if (!send_rpc_cmd(sock, RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info))) {
+    if (!disp->send(RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info))) {
         return false;
     }
     std::lock_guard<std::mutex> l(st.m);
-    st.session_ids[endpoint] = info.session_id;
+    st.session_ids[disp->endpoint] = info.session_id;
     out = info.session_id;
     return true;
-}
-
-// PEER_OPEN from the producer's main socket, plain sync send (the async
-// rpc_peer_route_ready goes through the endpoint stream, which in sync mode
-// would race the caller thread's own traffic on that socket). Shares the
-// per-pair memo with the async path.
-static bool rpc_sync_peer_route_ready(const std::string & src_endpoint,
-                                      const std::string & dst_endpoint,
-                                      uint64_t dst_session_id) {
-    const std::string key = src_endpoint + ">" + dst_endpoint;
-    {
-        std::lock_guard<std::mutex> l(g_peer_route_m);
-        auto it = g_peer_routes.find(key);
-        if (it != g_peer_routes.end()) {
-            return it->second;
-        }
-    }
-    const std::string & via = rpc_peer_addr(dst_endpoint);
-    bool ok = false;
-    if (via.size() >= RPC_ENDPOINT_MAX) {
-        GGML_LOG_WARN("[rpc peer] endpoint '%s' too long to route\n", via.c_str());
-    } else if (rpc_server_patch(src_endpoint) < GGML_RPC_PEER_MIN_PATCH ||
-               rpc_server_patch(dst_endpoint) < GGML_RPC_PEER_MIN_PATCH) {
-        GGML_LOG_WARN("[rpc peer] %s -> %s: server too old for peer transfer\n",
-                      src_endpoint.c_str(), dst_endpoint.c_str());
-    } else {
-        rpc_msg_peer_open_req req = {};
-        req.session_id = dst_session_id;
-        memcpy(req.endpoint, via.c_str(), via.size());
-        rpc_msg_peer_open_rsp rsp = { 0 };
-        auto sock = get_socket(src_endpoint);
-        if (sock != nullptr) {
-            ok = send_rpc_cmd(sock, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.ok != 0;
-        }
-        if (ok) {
-            GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer (sync client)\n",
-                          src_endpoint.c_str(), dst_endpoint.c_str());
-        } else {
-            GGML_LOG_WARN("[rpc peer] %s -> %s: peer lane refused, using the client hairpin\n",
-                          src_endpoint.c_str(), dst_endpoint.c_str());
-        }
-    }
-    std::lock_guard<std::mutex> l(g_peer_route_m);
-    g_peer_routes[key] = ok;
-    return ok;
 }
 
 #if defined(_WIN32)
@@ -2758,23 +2873,21 @@ static bool rpc_sync_peer_route_ready(const std::string & src_endpoint,
 // server FIFO orders a read after the graph that produced its tensor, so a
 // completed read also proves that graph retired. Snapshot the ordinal right
 // after issuing the reads, wait on it later; work submitted after the
-// snapshot is never waited on.
+// snapshot is never waited on. Dispatchers (lane ones included) live for the
+// whole process, so the counters stay monotonic across a detach/reattach and
+// an ordinal issued before a hibernation cycle is simply already complete.
 GGML_RPC_SYNC_PEER_API uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t backend) {
     if (!rpc_async_enabled()) {
         return 0; // reads were synchronous; nothing to wait for
     }
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
-    rpc_ep_lanes * ep = rpc_lanes_get_active(rpc_ctx->endpoint);
+    const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
+    rpc_lanes * ep = rpc_lanes_get_active(disp);
     if (ep != nullptr) {
         std::lock_guard<std::mutex> l(ep->m);
-        return ep->get_seq_base + (ep->get_stream ? ep->get_stream->submitted_seq() : 0);
+        return ep->get_lane ? ep->get_lane->submitted_seq() : 0;
     }
-    // resolve the stream before taking ep->m: rpc_drop_socket takes g_streams_m
-    // and ep->m in that order, so never nest them the other way round here
-    const uint64_t seq = get_stream(rpc_ctx->endpoint)->submitted_seq();
-    rpc_ep_lanes * base_ep = get_ep_lanes(rpc_ctx->endpoint);
-    std::lock_guard<std::mutex> l(base_ep->m);
-    return base_ep->main_seq_base + seq;
+    return disp->submitted_seq();
 }
 
 GGML_RPC_SYNC_PEER_API void ggml_backend_rpc_read_wait(ggml_backend_t backend, uint64_t ordinal) {
@@ -2782,51 +2895,31 @@ GGML_RPC_SYNC_PEER_API void ggml_backend_rpc_read_wait(ggml_backend_t backend, u
         return;
     }
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
-    // An ordinal at or below the base was issued on a stream that has since
-    // been torn down. A teardown only happens after the stream is drained
-    // (ggml_backend_rpc_detach drains, and rpc_lanes_teardown documents that
-    // the caller has quiesced), so that read has already completed and there
-    // is nothing to wait for. Comparing it against the replacement stream's
-    // counter - which restarts at 0 - would block forever: that is the
-    // hibernate/resume deadlock, where pipedec_tree_lane_wait() waited on a
-    // pre-sleep fence and the only thread that could advance the new stream
-    // was the one waiting.
-    rpc_ep_lanes * ep = rpc_lanes_get_active(rpc_ctx->endpoint);
+    const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
+    rpc_lanes * ep = rpc_lanes_get_active(disp);
     if (ep != nullptr) {
-        rpc_stream * st = nullptr;
-        uint64_t base = 0;
+        std::shared_ptr<rpc_dispatcher> lane;
         {
             std::lock_guard<std::mutex> l(ep->m);
-            base = ep->get_seq_base;
-            st   = ep->get_stream;
+            lane = ep->get_lane;
         }
-        if (st == nullptr || ordinal <= base) {
-            return;
+        if (lane != nullptr) {
+            lane->wait_completed(ordinal);
         }
-        st->wait_completed(ordinal - base);
         return;
     }
-    rpc_ep_lanes * base_ep = get_ep_lanes(rpc_ctx->endpoint);
-    uint64_t base = 0;
-    {
-        std::lock_guard<std::mutex> l(base_ep->m);
-        base = base_ep->main_seq_base;
-    }
-    if (ordinal <= base) {
-        return;
-    }
-    get_stream(rpc_ctx->endpoint)->wait_completed(ordinal - base);
+    disp->wait_completed(ordinal);
 }
 
 // Learn the consumer endpoint's session id. Call from the thread that owns
 // that endpoint's main socket (in SPD: the consuming stage's worker).
 GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_prepare(const struct ggml_tensor * dst_probe) {
-    const char * ep = rpc_tensor_endpoint(dst_probe);
-    if (ep == nullptr || !rpc_peer_enabled() || rpc_async_enabled()) {
+    auto disp = rpc_tensor_dispatcher(dst_probe);
+    if (disp == nullptr || !rpc_peer_enabled() || rpc_async_enabled()) {
         return false;
     }
     uint64_t session = 0;
-    return rpc_sync_session_for(ep, session);
+    return rpc_sync_session_for(disp, session);
 }
 
 // Ship `src` (whole tensor) from its server straight into `dst` on another
@@ -2837,16 +2930,16 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_prepare(const struct ggml
 // the hairpin) or on a transfer error.
 GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
         const struct ggml_tensor * src, const struct ggml_tensor * dst, uint64_t * ordinal_out) {
-    const char * src_ep_c = rpc_tensor_endpoint(src);
-    const char * dst_ep_c = rpc_tensor_endpoint(dst);
-    if (src_ep_c == nullptr || dst_ep_c == nullptr || !rpc_peer_enabled() || rpc_async_enabled()) {
+    auto sdisp = rpc_tensor_dispatcher(src);
+    auto ddisp = rpc_tensor_dispatcher(dst);
+    if (sdisp == nullptr || ddisp == nullptr || !rpc_peer_enabled() || rpc_async_enabled()) {
         return false;
     }
-    const std::string src_ep(src_ep_c);
-    const std::string dst_ep(dst_ep_c);
-    if (src_ep == dst_ep) {
+    if (sdisp == ddisp) {
         return false;
     }
+    const std::string & src_ep = sdisp->endpoint;
+    const std::string & dst_ep = ddisp->endpoint;
     const size_t size = ggml_nbytes(src);
     if (size == 0 || size != ggml_nbytes(dst)) {
         return false;
@@ -2862,7 +2955,7 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
         }
         dst_session = it->second;
     }
-    if (!rpc_sync_peer_route_ready(src_ep, dst_ep, dst_session)) {
+    if (!rpc_peer_route_ready(sdisp, ddisp, dst_session, /*counted =*/ false)) {
         return false;
     }
 
@@ -2878,7 +2971,7 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
     }
     if (lane == nullptr) {
         uint64_t src_session = 0;
-        if (!rpc_sync_session_for(src_ep, src_session)) {
+        if (!rpc_sync_session_for(sdisp, src_session)) {
             return false;
         }
         lane = rpc_lane_connect(src_ep, src_session, RPC_LANE_GET);
@@ -2958,26 +3051,24 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
 // thread that owns the producer's main socket, before submitting work that
 // could overwrite a pushed source tensor.
 GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_guard(const struct ggml_tensor * src_probe) {
-    const char * ep = rpc_tensor_endpoint(src_probe);
-    if (ep == nullptr) {
+    auto disp = rpc_tensor_dispatcher(src_probe);
+    if (disp == nullptr) {
         return false;
     }
     uint64_t sent;
     {
         auto & st = rpc_sync_peer();
         std::lock_guard<std::mutex> l(st.m);
-        auto it = st.lane_sent.find(ep);
+        auto it = st.lane_sent.find(disp->endpoint);
         sent = it == st.lane_sent.end() ? 0 : it->second;
     }
     if (sent == 0) {
         return true;
     }
-    auto sock = get_socket(ep);
-    if (sock == nullptr) {
-        return false;
-    }
-    rpc_msg_lane_fence_req req = { 0, sent };
-    return send_rpc_cmd(sock, RPC_CMD_LANE_FENCE, &req, sizeof(req));
+    auto req = std::make_shared<rpc_msg_lane_fence_req>();
+    req->wait_set = 0;
+    req->wait_get = sent;
+    return disp->send(RPC_CMD_LANE_FENCE, req, sizeof(*req));
 }
 
 // Stall the consumer's main command loop until `ordinal` pushes have been
@@ -2987,467 +3078,14 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_guard(const struct ggml_t
 // socket.
 GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_fence(
         const struct ggml_tensor * dst_probe, uint64_t ordinal) {
-    const char * ep = rpc_tensor_endpoint(dst_probe);
-    if (ep == nullptr) {
+    auto disp = rpc_tensor_dispatcher(dst_probe);
+    if (disp == nullptr) {
         return false;
     }
-    auto sock = get_socket(ep);
-    if (sock == nullptr) {
-        return false;
-    }
-    rpc_msg_lane_fence_req req = { ordinal, 0 };
-    return send_rpc_cmd(sock, RPC_CMD_LANE_FENCE, &req, sizeof(req));
-}
-
-// pool of events recorded on a source backend at enqueue time (i.e. in submission
-// order, right after that backend's graph_compute was submitted) so a stream worker
-// can wait for the source's async compute to finish before reading its output buffer.
-// Without this, reading e.g. a CUDA tensor on the worker races the CUDA stream.
-struct rpc_src_events {
-    std::mutex mtx;
-    std::unordered_map<ggml_backend_dev_t, std::vector<ggml_backend_event_t>> pool;
-    static rpc_src_events & instance() { static rpc_src_events p; return p; }
-};
-
-static ggml_backend_event_t rpc_src_event_record(ggml_backend_t backend_src) {
-    ggml_backend_dev_t dev = backend_src->device;
-    if (dev == nullptr || backend_src->iface.event_record == nullptr) {
-        return nullptr;
-    }
-    ggml_backend_dev_props props;
-    ggml_backend_dev_get_props(dev, &props);
-    if (!props.caps.events) {
-        return nullptr;
-    }
-    auto & p = rpc_src_events::instance();
-    ggml_backend_event_t ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(p.mtx);
-        auto & pool = p.pool[dev];
-        if (!pool.empty()) {
-            ev = pool.back();
-            pool.pop_back();
-        }
-    }
-    if (ev == nullptr) {
-        ev = ggml_backend_event_new(dev);
-        if (ev == nullptr) {
-            return nullptr;
-        }
-    }
-    ggml_backend_event_record(ev, backend_src);
-    return ev;
-}
-
-static void rpc_src_event_release(ggml_backend_event_t ev) {
-    auto & p = rpc_src_events::instance();
-    std::lock_guard<std::mutex> lock(p.mtx);
-    p.pool[ev->device].push_back(ev);
-}
-
-static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    if (!rpc_async_enabled()) {
-        ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
-        return;
-    }
-    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    // snapshot the full wire message now: the caller may reuse `data` (and the graph
-    // may rewrite `tensor`) once we return
-    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
-    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(tensor, data, offset, size)
-                         : rpc_prepare_set_tensor(tensor, data, offset, size);
-    const std::string endpoint = rpc_ctx->endpoint;
-    const enum rpc_cmd cmd = wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
-    rpc_ep_lanes * ep = rpc_lanes_get_active(endpoint);
-    if (ep != nullptr) {
-        std::lock_guard<std::mutex> l(ep->m);
-        const uint64_t wait_main = ep->main_enq;
-        const uint64_t wait_get  = ep->get_enq;
-        ep->set_enq++;
-        socket_ptr lane = ep->set_sock;
-        ep->set_stream->enqueue([endpoint, lane, cmd, wait_main, wait_get, msg]{
-            if (!send_lane_cmd(lane, cmd, wait_main, wait_get, msg->data(), msg->size())) {
-                GGML_ABORT("[rpc fdx] SET lane to %s lost", endpoint.c_str());
-            }
-        });
-        return;
-    }
-    rpc_main_enqueue_counted(endpoint, get_stream(endpoint), 1, [endpoint, msg, cmd]{
-        auto sock = get_socket(endpoint);
-        if (sock == nullptr) {
-            GGML_LOG_ERROR("[rpc set_tensor_async] lost connection to %s\n", endpoint.c_str());
-            return;
-        }
-        send_rpc_cmd(sock, cmd, msg->data(), msg->size());
-    });
-}
-
-static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    if (!rpc_async_enabled()) {
-        ggml_backend_rpc_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
-        return;
-    }
-    // route the read through the endpoint stream: the worker may be mid-send on this
-    // socket (e.g. the scheduler reads MoE router ids while pipelined graphs are still
-    // being submitted), so a direct socket read would corrupt the wire protocol.
-    // Truly asynchronous: per the get_tensor_async contract, `data` is only guaranteed
-    // valid after the caller synchronizes this backend - which drains the stream, and
-    // the server's FIFO orders the read after any in-flight graph on this endpoint.
-    // Blocking here instead would serialize the pipeline (e.g. the per-ubatch MTP
-    // nextn-embedding read from the LAST stage would stall every prefill ubatch).
-    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    rpc_msg_get_tensor_req request;
-    request.tensor = serialize_tensor(tensor);
-    request.offset = offset;
-    request.size   = size;
-    const std::string endpoint = rpc_ctx->endpoint;
-    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
-    rpc_ep_lanes * ep = rpc_lanes_get_active(endpoint);
-    if (ep != nullptr) {
-        std::lock_guard<std::mutex> l(ep->m);
-        const uint64_t wait_main = ep->main_enq;
-        const uint64_t wait_set  = ep->set_enq;
-        ep->get_enq++;
-        socket_ptr lane = ep->get_sock;
-        ep->get_stream->enqueue([endpoint, lane, request, data, size, wire_bf16, wait_main, wait_set]{
-            bool ok;
-            if (wire_bf16) {
-                std::vector<uint8_t> wire(size / 2);
-                ok = send_lane_cmd(lane, RPC_CMD_GET_TENSOR_BF16, wait_main, wait_set, &request, sizeof(request))
-                  && recv_msg(lane, wire.data(), wire.size());
-                if (ok) {
-                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
-                                          (float *) data, size / sizeof(float));
-                }
-            } else {
-                ok = send_lane_cmd(lane, RPC_CMD_GET_TENSOR, wait_main, wait_set, &request, sizeof(request))
-                  && recv_msg(lane, data, size);
-            }
-            if (!ok) {
-                GGML_ABORT("[rpc fdx] GET lane to %s lost", endpoint.c_str());
-            }
-        });
-        return;
-    }
-    if (wire_bf16) {
-        rpc_main_enqueue_counted(endpoint, get_stream(endpoint), 1, [endpoint, request, data, size]{
-            auto sock = get_socket(endpoint);
-            if (sock == nullptr) {
-                GGML_LOG_ERROR("[rpc get_tensor_async] lost connection to %s\n", endpoint.c_str());
-                return;
-            }
-            std::vector<uint8_t> wire(size / 2);
-            if (send_rpc_cmd(sock, RPC_CMD_GET_TENSOR_BF16, &request, sizeof(request),
-                             wire.data(), wire.size())) {
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) wire.data(),
-                                      (float *) data, size / sizeof(float));
-            }
-        });
-        return;
-    }
-    rpc_main_enqueue_counted(endpoint, get_stream(endpoint), 1, [endpoint, request, data, size]{
-        auto sock = get_socket(endpoint);
-        if (sock != nullptr) {
-            send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-        } else {
-            GGML_LOG_ERROR("[rpc get_tensor_async] lost connection to %s\n", endpoint.c_str());
-        }
-    });
-}
-
-static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
-    if (!rpc_async_enabled()) {
-        return false; // let the scheduler fall back to its synchronous copy
-    }
-    if (!ggml_backend_buffer_is_rpc(dst->buffer)) {
-        return false; // RPC -> non-RPC copies use the scheduler's synchronous fallback
-    }
-    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
-    const size_t size = ggml_nbytes(src);
-    const std::string dst_endpoint = dst_ctx->endpoint;
-
-    // [fork] direct remote->remote: hand the whole transfer to the producing
-    // node so the payload never crosses the client's NIC at all
-    if (rpc_peer_enabled() && ggml_backend_buffer_is_rpc(src->buffer)) {
-        ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
-        const std::string src_endpoint = src_ctx->endpoint;
-        rpc_ep_lanes * sep = src_endpoint == dst_endpoint ? nullptr : rpc_lanes_get_active(src_endpoint);
-        rpc_ep_lanes * dep = sep == nullptr ? nullptr : rpc_lanes_get_active(dst_endpoint);
-        if (dep != nullptr && rpc_peer_route_ready(src_endpoint, dst_endpoint, dep->session_id)) {
-            rpc_msg_push_tensor_req req = {};
-            // must be the address peer_open registered the link under, i.e. the
-            // mapped one -- it is the key into the producer's link table
-            const std::string & via = rpc_peer_addr(dst_endpoint);
-            memcpy(req.endpoint, via.c_str(), via.size());
-            req.src        = serialize_tensor(src);
-            req.dst        = serialize_tensor(dst);
-            req.src_offset = 0;
-            req.dst_offset = 0;
-            req.size       = size;
-            req.bf16       = (rpc_wire_bf16_ok(src, 0, size) && dst->type == GGML_TYPE_F32) ? 1 : 0;
-            // take the destination's SET slot: the peer's message applies in
-            // the same ordered position a client-side SET would have
-            {
-                std::lock_guard<std::mutex> l(dep->m);
-                req.wait_main = dep->main_enq;
-                req.wait_get  = dep->get_enq;
-                dep->set_enq++;
-            }
-            // ...and issue the read on the source's GET lane, after its compute
-            std::lock_guard<std::mutex> l(sep->m);
-            const uint64_t wait_main = sep->main_enq;
-            const uint64_t wait_set  = sep->set_enq;
-            sep->get_enq++;
-            socket_ptr lane = sep->get_sock;
-            sep->get_stream->enqueue([src_endpoint, dst_endpoint, lane, req, wait_main, wait_set]{
-                rpc_msg_push_tensor_rsp rsp = { 0 };
-                const bool ok = send_lane_cmd(lane, RPC_CMD_PUSH_TENSOR, wait_main, wait_set,
-                                              &req, sizeof(req))
-                             && recv_msg(lane, &rsp, sizeof(rsp));
-                if (!ok) {
-                    GGML_ABORT("[rpc peer] GET lane to %s lost during a push", src_endpoint.c_str());
-                }
-                if (!rsp.ok) {
-                    GGML_ABORT("[rpc peer] %s could not deliver a push to %s",
-                               src_endpoint.c_str(), dst_endpoint.c_str());
-                }
-            });
-            return true;
-        }
-    }
-
-    // bf16 wire: the boundary payload stays 2-byte end-to-end through the
-    // star hairpin (GET_BF16 from the source lands directly in the SET_BF16
-    // message) - both legs halve with no client-side conversion at all
-    const bool wire_bf16 = rpc_wire_bf16_ok(src, 0, size) && dst->type == GGML_TYPE_F32;
-    // snapshot the SET message header now; the payload is filled in by the tasks below
-    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(dst, nullptr, 0, size)
-                         : rpc_prepare_set_tensor(dst, nullptr, 0, size);
-    const enum rpc_cmd set_cmd = wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
-
-    // `prep` runs on the dst worker (lane or main stream) right before the SET
-    // is sent and must leave the payload filled in at msg + RPC_SET_TENSOR_HDR
-    std::function<void()> prep;
-
-    if (ggml_backend_buffer_is_rpc(src->buffer)) {
-        // RPC -> RPC (star topology): read on the source's GET lane (or its
-        // main stream when lanes are off - either way the fences/FIFO order the
-        // read after the source's compute), hand the payload to the dst worker
-        ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
-        const std::string src_endpoint = src_ctx->endpoint;
-        rpc_msg_get_tensor_req get_req;
-        get_req.tensor = serialize_tensor(src);
-        get_req.offset = 0;
-        get_req.size   = size;
-        auto gate = std::make_shared<rpc_gate>();
-        const size_t wire_size = wire_bf16 ? size / 2 : size;
-        rpc_ep_lanes * sep = rpc_lanes_get_active(src_endpoint);
-        if (sep != nullptr) {
-            std::lock_guard<std::mutex> l(sep->m);
-            const uint64_t wait_main = sep->main_enq;
-            const uint64_t wait_set  = sep->set_enq;
-            sep->get_enq++;
-            socket_ptr lane = sep->get_sock;
-            sep->get_stream->enqueue([src_endpoint, lane, get_req, msg, wire_size, gate, wire_bf16, wait_main, wait_set]{
-                const enum rpc_cmd get_cmd = wire_bf16 ? RPC_CMD_GET_TENSOR_BF16 : RPC_CMD_GET_TENSOR;
-                bool ok = send_lane_cmd(lane, get_cmd, wait_main, wait_set, &get_req, sizeof(get_req))
-                       && recv_msg(lane, msg->data() + RPC_SET_TENSOR_HDR, wire_size);
-                if (!ok) {
-                    GGML_ABORT("[rpc fdx] GET lane to %s lost", src_endpoint.c_str());
-                }
-                gate->set();
-            });
-        } else {
-            rpc_main_enqueue_counted(src_endpoint, get_stream(src_endpoint), 1,
-                                     [src_endpoint, get_req, msg, wire_size, gate, wire_bf16]{
-                auto sock = get_socket(src_endpoint);
-                if (sock != nullptr) {
-                    send_rpc_cmd(sock, wire_bf16 ? RPC_CMD_GET_TENSOR_BF16 : RPC_CMD_GET_TENSOR,
-                                 &get_req, sizeof(get_req), msg->data() + RPC_SET_TENSOR_HDR, wire_size);
-                } else {
-                    GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", src_endpoint.c_str());
-                }
-                gate->set();
-            });
-        }
-        prep = [gate]{ gate->wait(); };
-    } else if (wire_bf16) {
-        // host-visible source with bf16 wire: stage the f32 read separately,
-        // truncate to bf16 on the dst worker after the source compute is done
-        auto staging = std::make_shared<std::vector<uint8_t>>(size);
-        ggml_backend_tensor_get_async(backend_src, src, staging->data(), 0, size);
-        ggml_backend_event_t ev = rpc_src_event_record(backend_src);
-        prep = [msg, staging, size, ev, backend_src]() {
-            if (ev != nullptr) {
-                ggml_backend_event_synchronize(ev);
-                rpc_src_event_release(ev);
-            } else if (backend_src->iface.synchronize != nullptr) {
-                ggml_backend_synchronize(backend_src);
-            }
-            ggml_fp32_to_bf16_row((const float *) staging->data(),
-                                  (ggml_bf16_t *) (msg->data() + RPC_SET_TENSOR_HDR),
-                                  size / sizeof(float));
-        };
-    } else {
-        // host-visible source (CUDA/CPU): the payload must be read on the SOURCE
-        // backend's ordered timeline. Reading it later (from the dst stream's
-        // thread, gated only on a completion event) is racy whenever another
-        // graph is submitted to the source backend in the meantime: under
-        // pipelined prefill (n_copies > 1) the next ubatch's graph reuses the
-        // same compute-buffer address and overwrites the boundary tensor,
-        // tearing the copy mid-payload (measured: warm pipelined prefill
-        // nondeterminism with a CUDA first stage). Enqueue the D2H on the
-        // source stream NOW - submission order puts it before any later
-        // graph's kernels - then let the dst worker wait until the source has
-        // actually produced it before shipping.
-        ggml_backend_tensor_get_async(backend_src, src, msg->data() + RPC_SET_TENSOR_HDR, 0, size);
-        ggml_backend_event_t ev = rpc_src_event_record(backend_src);
-        prep = [ev, backend_src]() {
-            if (ev != nullptr) {
-                ggml_backend_event_synchronize(ev);
-                rpc_src_event_release(ev);
-            } else if (backend_src->iface.synchronize != nullptr) {
-                ggml_backend_synchronize(backend_src);
-            }
-        };
-    }
-
-    rpc_ep_lanes * dep = rpc_lanes_get_active(dst_endpoint);
-    if (dep != nullptr) {
-        std::lock_guard<std::mutex> l(dep->m);
-        const uint64_t wait_main = dep->main_enq;
-        const uint64_t wait_get  = dep->get_enq;
-        dep->set_enq++;
-        socket_ptr lane = dep->set_sock;
-        dep->set_stream->enqueue([dst_endpoint, lane, set_cmd, wait_main, wait_get, msg, prep = std::move(prep)]{
-            prep();
-            if (!send_lane_cmd(lane, set_cmd, wait_main, wait_get, msg->data(), msg->size())) {
-                GGML_ABORT("[rpc fdx] SET lane to %s lost", dst_endpoint.c_str());
-            }
-        });
-    } else {
-        rpc_main_enqueue_counted(dst_endpoint, get_stream(dst_endpoint), 1,
-                                 [dst_endpoint, set_cmd, msg, prep = std::move(prep)]{
-            prep();
-            auto sock = get_socket(dst_endpoint);
-            if (sock == nullptr) {
-                GGML_LOG_ERROR("[rpc cpy_tensor_async] lost connection to %s\n", dst_endpoint.c_str());
-                return;
-            }
-            send_rpc_cmd(sock, set_cmd, msg->data(), msg->size());
-        });
-    }
-    return true;
-}
-
-static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
-    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    rpc_event * ev = (rpc_event *)event->context;
-    uint64_t g = ev->record();
-    get_stream(rpc_ctx->endpoint)->enqueue([ev, g]{ ev->complete(g); });
-}
-
-static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
-    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    rpc_event * ev = (rpc_event *)event->context;
-    uint64_t target = ev->peek();
-    get_stream(rpc_ctx->endpoint)->enqueue([ev, target]{ ev->wait_for(target); });
-}
-
-static ggml_backend_i ggml_backend_rpc_interface = {
-    /* .get_name                = */ ggml_backend_rpc_name,
-    /* .free                    = */ ggml_backend_rpc_free,
-    /* .set_tensor_async        = */ ggml_backend_rpc_set_tensor_async,
-    /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
-    /* .set_tensor_2d_async     = */ NULL,
-    /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
-    /* .synchronize             = */ ggml_backend_rpc_synchronize,
-    /* .graph_plan_create       = */ NULL,
-    /* .graph_plan_free         = */ NULL,
-    /* .graph_plan_update       = */ NULL,
-    /* .graph_plan_compute      = */ NULL,
-    /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ ggml_backend_rpc_event_record,
-    /* .event_wait              = */ ggml_backend_rpc_event_wait,
-    /* .graph_optimize          = */ NULL,
-};
-
-ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    std::string buft_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
-    // NOTE: buffer types are allocated and never freed; this is by design
-    static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
-    auto it = buft_map.find(buft_name);
-    if (it != buft_map.end()) {
-        return it->second;
-    }
-    auto sock = get_socket(endpoint);
-    if (sock == nullptr) {
-        GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
-        return nullptr;
-    }
-    size_t alignment = get_alignment(endpoint, sock, device);
-    size_t max_size = get_max_size(endpoint, sock, device);
-    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
-        /* .endpoint  = */ endpoint,
-        /* .device    = */ device,
-        /* .name      = */ buft_name,
-        /* .alignment = */ alignment,
-        /* .max_size  = */ max_size
-    };
-    auto reg = ggml_backend_rpc_add_server(endpoint);
-    ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
-        /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(reg, device),
-        /* .context = */ buft_ctx
-    };
-    buft_map[buft_name] = buft;
-    return buft;
-}
-
-ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
-    std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
-    ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {
-        /* .endpoint       = */ endpoint,
-        /* .device         = */ device,
-        /* .name           = */ dev_name,
-    };
-    auto reg = ggml_backend_rpc_add_server(endpoint);
-    ggml_backend_t backend = new ggml_backend {
-        /* .guid    = */ ggml_backend_rpc_guid(),
-        /* .iface   = */ ggml_backend_rpc_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(reg, device),
-        /* .context = */ ctx
-    };
-    return backend;
-}
-
-bool ggml_backend_is_rpc(ggml_backend_t backend) {
-    return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
-}
-
-static void get_device_memory(
-        const std::string & endpoint, const std::shared_ptr<socket_t> & sock,
-        uint32_t device, size_t * free, size_t * total) {
-    rpc_msg_get_device_memory_req request;
-    request.device = device;
-    rpc_msg_get_device_memory_rsp response;
-    bool status = send_rpc_cmd_ordered(endpoint, sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
-    *free = response.free_mem;
-    *total = response.total_mem;
-}
-
-void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
-    auto sock = get_socket(endpoint);
-    if (sock == nullptr) {
-        *free = 0;
-        *total = 0;
-        return;
-    }
-    get_device_memory(endpoint, sock, device, free, total);
+    auto req = std::make_shared<rpc_msg_lane_fence_req>();
+    req->wait_set = ordinal;
+    req->wait_get = 0;
+    return disp->send(RPC_CMD_LANE_FENCE, req, sizeof(*req));
 }
 
 // ---------------------------------------------------------------------------
@@ -3460,11 +3098,11 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 // SESSION_DETACH asks the server to park its buffers and hands back a token,
 // and the reattach presents that token on a fresh connection.
 //
-// Everything torn down here is per-connection state: the command socket, the
-// async stream worker, the full-duplex lanes and their counters, the peer
-// route caches. What stays allocated on the far side is exactly the memory
-// that is expensive to rebuild - the KV cache, the compute buffers, and any
-// weights the caller chose not to unload first.
+// Everything torn down here is per-connection state: the sockets, the lane
+// counters, the peer route caches. The dispatchers themselves (and their
+// worker threads and ordinal counters) stay. What stays allocated on the far
+// side is exactly the memory that is expensive to rebuild - the KV cache, the
+// compute buffers, and any weights the caller chose not to unload first.
 //
 // Callers must quiesce first. Nothing here interrupts an in-flight graph; it
 // assumes there is none.
@@ -3475,47 +3113,27 @@ static std::unordered_map<std::string, uint64_t> g_resume_tokens;
 
 // close the transfer lanes and reset every counter that is scoped to a server
 // session, so a later reattach negotiates fresh lanes against the new session
-static void rpc_lanes_teardown(const std::string & endpoint) {
-    rpc_ep_lanes * ep = nullptr;
+static void rpc_lanes_teardown(const std::shared_ptr<rpc_dispatcher> & disp) {
+    rpc_lanes & ep = disp->lanes;
+    std::shared_ptr<rpc_dispatcher> set_lane, get_lane;
     {
-        std::lock_guard<std::mutex> l(g_lanes_m);
-        auto it = g_lanes.find(endpoint);
-        if (it == g_lanes.end()) {
-            return;
-        }
-        ep = it->second.get();
+        std::lock_guard<std::mutex> l(ep.m);
+        set_lane = ep.set_lane;
+        get_lane = ep.get_lane;
+        ep.main_enq = ep.set_enq = ep.get_enq = 0;
+        ep.fenced_set = ep.fenced_get = 0;
+        ep.session_id = 0;
+        ep.state = 0;   // untried: a reattach brings the lanes back up
     }
-    socket_ptr set_sock, get_sock;
-    rpc_stream * set_stream = nullptr;
-    rpc_stream * get_stream = nullptr;
-    {
-        std::lock_guard<std::mutex> l(ep->m);
-        set_sock.swap(ep->set_sock);
-        get_sock.swap(ep->get_sock);
-        set_stream = ep->set_stream;
-        get_stream = ep->get_stream;
-        // Fold the retiring GET stream's task count into the base, so read
-        // ordinals stay monotonic across the reattach. Everything it counted
-        // has completed: callers quiesce before a teardown.
-        if (get_stream != nullptr) {
-            ep->get_seq_base += get_stream->submitted_seq();
-        }
-        ep->set_stream = nullptr;
-        ep->get_stream = nullptr;
-        ep->main_enq = ep->set_enq = ep->get_enq = 0;
-        ep->fenced_set = ep->fenced_get = 0;
-        ep->barrier_set = ep->barrier_get = 0;
-        ep->session_id = 0;
-        ep->state = 0;   // untried: a reattach brings the lanes back up
+    // everything they counted has completed (callers quiesce before a
+    // teardown), so draining is a formality and the sockets can go
+    if (set_lane != nullptr) {
+        set_lane->drain();
+        set_lane->disconnect();
     }
-    // the workers own the sockets while they run, so stop them first
-    delete set_stream;
-    delete get_stream;
-    if (set_sock != nullptr) {
-        set_sock->shutdown_rw();
-    }
-    if (get_sock != nullptr) {
-        get_sock->shutdown_rw();
+    if (get_lane != nullptr) {
+        get_lane->drain();
+        get_lane->disconnect();
     }
 }
 
@@ -3535,31 +3153,6 @@ static void rpc_client_reset_peer_state() {
     st.lane_acked.clear();
 }
 
-static void rpc_drop_socket(const std::string & endpoint) {
-    // move the stream out under the lock and destroy it outside: the
-    // destructor joins the worker, and a worker task that reached for
-    // get_stream() would deadlock against a held g_streams_m
-    std::unique_ptr<rpc_stream> stream;
-    {
-        std::lock_guard<std::mutex> l(g_streams_m);
-        auto it = g_streams.find(endpoint);
-        if (it != g_streams.end()) {
-            stream = std::move(it->second);
-            g_streams.erase(it);
-        }
-    }
-    if (stream != nullptr) {
-        // same reason as the GET lane in rpc_lanes_teardown: the replacement
-        // stream counts from zero, so fold this one's total into the base
-        rpc_ep_lanes * ep = get_ep_lanes(endpoint);
-        std::lock_guard<std::mutex> el(ep->m);
-        ep->main_seq_base += stream->submitted_seq();
-    }
-    stream.reset();
-    std::lock_guard<std::mutex> l(g_sockets_m);
-    g_sockets.erase(endpoint);
-}
-
 // Park every connected endpoint's session and close the connections.
 // Returns the number of endpoints parked, or -1 if any of them refused.
 extern "C" {
@@ -3573,15 +3166,15 @@ GGML_BACKEND_API int ggml_backend_rpc_detach(void) {
     g_resume_tokens.clear();
     g_rpc_session_lost.store(false);
 
-    std::vector<std::pair<std::string, socket_ptr>> live;
+    std::vector<std::shared_ptr<rpc_dispatcher>> live;
     std::vector<std::string> missing;
     {
-        std::lock_guard<std::mutex> l(g_sockets_m);
-        for (auto & kv : g_sockets) {
-            live.emplace_back(kv.first, kv.second);
-        }
+        std::lock_guard<std::mutex> l(g_dispatchers_m);
         for (const auto & endpoint : g_endpoints_seen) {
-            if (g_sockets.find(endpoint) == g_sockets.end()) {
+            auto it = g_dispatchers.find(endpoint);
+            if (it != g_dispatchers.end() && it->second->connected()) {
+                live.push_back(it->second);
+            } else {
                 missing.push_back(endpoint);
             }
         }
@@ -3597,22 +3190,12 @@ GGML_BACKEND_API int ggml_backend_rpc_detach(void) {
         refused = 1;
     }
 
-    for (auto & item : live) {
-        const std::string & endpoint = item.first;
-        const socket_ptr  & sock     = item.second;
+    for (auto & disp : live) {
+        const std::string & endpoint = disp->endpoint;
+        disp->drain();
+        rpc_lanes_teardown(disp);
 
-        rpc_stream * st = nullptr;
-        {
-            std::lock_guard<std::mutex> l(g_streams_m);
-            auto it = g_streams.find(endpoint);
-            st = it == g_streams.end() ? nullptr : it->second.get();
-        }
-        if (st != nullptr) {
-            st->drain();
-        }
-        rpc_lanes_teardown(endpoint);
-
-        const int patch = (int) rpc_server_patch(endpoint);
+        const int patch = (int) disp->patch;
         if (patch < GGML_RPC_HIBERNATE_MIN_PATCH) {
             GGML_LOG_ERROR("[rpc hibernate] %s: server patch %d cannot park a session "
                            "(need %d) - its buffers will be lost\n",
@@ -3620,7 +3203,7 @@ GGML_BACKEND_API int ggml_backend_rpc_detach(void) {
             refused++;
         } else {
             rpc_msg_session_detach_rsp rsp = {};
-            if (!send_rpc_cmd(sock, RPC_CMD_SESSION_DETACH, nullptr, 0, &rsp, sizeof(rsp)) || rsp.token == 0) {
+            if (!disp->send(RPC_CMD_SESSION_DETACH, nullptr, 0, &rsp, sizeof(rsp)) || rsp.token == 0) {
                 GGML_LOG_ERROR("[rpc hibernate] %s: SESSION_DETACH failed\n", endpoint.c_str());
                 refused++;
             } else {
@@ -3632,7 +3215,7 @@ GGML_BACKEND_API int ggml_backend_rpc_detach(void) {
                               (unsigned long long) rsp.token);
             }
         }
-        rpc_drop_socket(endpoint);
+        disp->disconnect();
     }
 
     rpc_client_reset_peer_state();
@@ -3673,22 +3256,23 @@ GGML_BACKEND_API int ggml_backend_rpc_reattach(int timeout_ms) {
         std::vector<std::string> still;
         std::vector<std::string> done;
         for (const auto & endpoint : pending) {
-            auto sock = get_socket(endpoint);
-            if (sock == nullptr) {
+            auto disp = get_dispatcher(endpoint);
+            if (disp == nullptr) {
                 still.push_back(endpoint);
                 continue;
             }
-            rpc_msg_session_resume_req req = { g_resume_tokens.at(endpoint) };
+            auto req = std::make_shared<rpc_msg_session_resume_req>();
+            req->token = g_resume_tokens.at(endpoint);
             rpc_msg_session_resume_rsp rsp = {};
-            if (!send_rpc_cmd(sock, RPC_CMD_SESSION_RESUME, &req, sizeof(req), &rsp, sizeof(rsp))) {
-                rpc_drop_socket(endpoint);
+            if (!disp->send(RPC_CMD_SESSION_RESUME, req, sizeof(*req), &rsp, sizeof(rsp))) {
+                disp->disconnect();
                 still.push_back(endpoint);
                 continue;
             }
             if (!rsp.ok) {
                 GGML_LOG_ERROR("[rpc hibernate] %s: the parked session is gone, "
                                "its buffers cannot be recovered\n", endpoint.c_str());
-                rpc_drop_socket(endpoint);
+                disp->disconnect();
                 lost++;
                 continue;
             }
@@ -3703,9 +3287,8 @@ GGML_BACKEND_API int ggml_backend_rpc_reattach(int timeout_ms) {
             // command early and lands out of order. Nothing errors - the
             // model just computes on tensors that arrived too soon.
             {
-                rpc_ep_lanes * ep = get_ep_lanes(endpoint);
-                std::lock_guard<std::mutex> el(ep->m);
-                ep->main_enq++;
+                std::lock_guard<std::mutex> el(disp->lanes.m);
+                disp->lanes.main_enq++;
             }
             done.push_back(endpoint);
             resumed++;
@@ -3752,14 +3335,15 @@ GGML_BACKEND_API bool ggml_backend_rpc_session_lost(void) {
 // out_connected up to max entries and returns the total, so one probing call
 // is enough to size the caller's buffers.
 GGML_BACKEND_API int ggml_backend_rpc_endpoint_status(const char ** out_names, int * out_connected, int max) {
-    std::lock_guard<std::mutex> l(g_sockets_m);
+    std::lock_guard<std::mutex> l(g_dispatchers_m);
     const int total = (int) g_endpoints_seen.size();
     for (int i = 0; i < total && i < max; i++) {
         if (out_names != nullptr) {
             out_names[i] = g_endpoints_seen[i].c_str();
         }
         if (out_connected != nullptr) {
-            out_connected[i] = g_sockets.count(g_endpoints_seen[i]) > 0 ? 1 : 0;
+            auto it = g_dispatchers.find(g_endpoints_seen[i]);
+            out_connected[i] = (it != g_dispatchers.end() && it->second->connected()) ? 1 : 0;
         }
     }
     return total;
@@ -3769,8 +3353,8 @@ GGML_BACKEND_API int ggml_backend_rpc_endpoint_status(const char ** out_names, i
 
 // RPC server-side implementation
 
-// Evict least recently used cache entries until the directory fits within
-// limit bytes. Entry mtimes double as the LRU clock: get_cached_file bumps
+// [fork] Evict least recently used cache entries until the directory fits within
+// limit bytes. Entry mtimes double as the LRU clock: open_cached_file bumps
 // the mtime of every entry it serves.
 static void rpc_cache_enforce_limit(const char * cache_dir, size_t limit) {
     if (cache_dir == nullptr || limit == 0) {
@@ -3898,7 +3482,7 @@ static void rpc_peer_sender(rpc_peer_link * link, std::string endpoint) {
             std::lock_guard<std::mutex> l(link->m);
             sock = link->sock;
         }
-        if (sock == nullptr || !sock->send_data(msg.data(), msg.size())) {
+        if (sock == nullptr || !sock->send_data(msg.data(), msg.size()) || !sock->flush()) {
             GGML_LOG_ERROR("[rpc peer] lost the peer lane to %s mid-push\n", endpoint.c_str());
             std::lock_guard<std::mutex> l(link->q_m);
             link->failed = true;
@@ -3949,12 +3533,12 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
-    // allow_cache=false for lane traffic (activations): skips the pending
+    // [fork] allow_cache=false for lane traffic (activations): skips the pending
     // SET_TENSOR_HASH bookkeeping, which belongs to the main thread only
     bool set_tensor(const std::vector<uint8_t> & input, bool allow_cache = true);
-    // streaming form of set_tensor for the main command socket: the length
-    // prefix is already consumed, the body is still on the wire. Bounds host
-    // RAM to one chunk instead of the whole upload.
+    // [fork] streaming form of set_tensor for the main command socket: the
+    // length prefix is already consumed, the body is still on the wire. Bounds
+    // host RAM to one chunk instead of the whole upload.
     bool set_tensor_stream(socket_ptr sock, uint64_t msg_size, bool allow_cache = true);
     bool set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache = true);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
@@ -3983,11 +3567,12 @@ public:
     };
 
 private:
-    // Open a cache entry and report its size WITHOUT reading it. The payload is
-    // streamed into the tensor in chunks by set_tensor_hash; materialising a whole
-    // entry here is what used to drive a 16 GiB UMA board into its memory guard
-    // (llama.cpp hands the model over in ~1 GiB buffer chunks, so entries are that
-    // big). Returns false on a miss, leaving `ifs` unopened.
+    // [fork] Open a cache entry and report its size WITHOUT reading it. The
+    // payload is streamed into the tensor in chunks by set_tensor_hash;
+    // materialising a whole entry here is what used to drive a 16 GiB UMA board
+    // into its memory guard (llama.cpp hands the model over in ~1 GiB buffer
+    // chunks, so entries are that big). Returns false on a miss, leaving `ifs`
+    // unopened.
     bool open_cached_file(uint64_t hash, std::ifstream & ifs, size_t & size);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -3998,10 +3583,10 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
-    // staging for open_cached_file -> ggml_backend_tensor_set. Reused so a warm
-    // load does not churn a fresh chunk-sized allocation per tensor. Only the
-    // main command thread runs SET_TENSOR_HASH (lane traffic takes set_tensor
-    // with allow_cache=false), so this needs no locking.
+    // [fork] staging for open_cached_file -> ggml_backend_tensor_set. Reused so
+    // a warm load does not churn a fresh chunk-sized allocation per tensor.
+    // Only the main command thread runs SET_TENSOR_HASH (lane traffic takes
+    // set_tensor with allow_cache=false), so this needs no locking.
     std::vector<uint8_t> cache_read_buf;
     // staging for the streaming SET_TENSOR receive. Main command thread only,
     // same as cache_read_buf, so it needs no locking.
@@ -4351,7 +3936,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     if (result->buffer) {
-        // require that the tensor data does not go beyond the buffer end;
+        // [fork] require that the tensor data does not go beyond the buffer end;
         // reject the graph with an error instead of aborting so a bad client
         // cannot take the server down. zero-sized tensors are exempt: the meta
         // backend (split-mode tensor) emits zero-sized slice views whose data
@@ -4423,7 +4008,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input, bool allow_cache
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    // only cache uploads the client offered a hash for first (see cache_pending)
+    // [fork] only cache uploads the client offered a hash for first (see cache_pending)
     const bool cache_this = allow_cache && cache_pending
         && memcmp(&cache_pending_tensor, in_tensor, sizeof(rpc_tensor)) == 0
         && cache_pending_offset == offset;
@@ -4785,7 +4370,7 @@ bool rpc_server::set_tensor_stream(socket_ptr sock, uint64_t msg_size, bool allo
 
 bool rpc_server::set_tensor_bf16(const std::vector<uint8_t> & input, bool allow_cache) {
     // serialization format: | rpc_tensor | offset (8 bytes) | bf16 data (size/2 bytes) |
-    // expands to f32 at the buffer edge; never used for weight loads (async-only)
+    // expands to f32 at the buffer edge; never used for weight loads
     if (allow_cache) {
         cache_pending = false; // activations are never cache candidates
     }
@@ -5385,51 +4970,6 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     return result;
 }
 
-// [fork] GGML_RPC_GRAPH_OPS=1: one histogram per distinct (device, uid) graph.
-// tau on the SPD split is linear in node count, so the question "which ops make
-// up a stage graph, and how many are free views" is what picks the fusion
-// target. Fires once per shape, on the server, where the graph actually is.
-static void rpc_graph_ops_dump(uint32_t device, uint64_t uid, const ggml_cgraph * graph) {
-    static const bool enabled = [] {
-        const char * v = getenv("GGML_RPC_GRAPH_OPS");
-        return v && atoi(v) != 0;
-    }();
-    if (!enabled || graph == nullptr) {
-        return;
-    }
-    static std::mutex m;
-    static std::unordered_set<std::string> seen;
-    std::lock_guard<std::mutex> l(m);
-    if (!seen.insert(std::to_string(device) + ":" + std::to_string(uid)).second) {
-        return;
-    }
-    std::map<std::string, int> hist;
-    int n_view = 0;
-    for (int i = 0; i < graph->n_nodes; i++) {
-        const ggml_tensor * n = graph->nodes[i];
-        std::string name = ggml_op_name(n->op);
-        if (n->op == GGML_OP_UNARY) {
-            name += std::string("/") + ggml_unary_op_name(ggml_get_unary_op(n));
-        } else if (n->op == GGML_OP_GLU) {
-            name += std::string("/") + ggml_glu_op_name(ggml_get_glu_op(n));
-        }
-        hist[name]++;
-        // the set every backend treats as free: no dispatch, no device work
-        if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
-            n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE) {
-            n_view++;
-        }
-    }
-    std::vector<std::pair<std::string, int>> rows(hist.begin(), hist.end());
-    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
-    fprintf(stderr, "[rpc graph ops] dev=%u uid=%" PRIu64 " nodes=%d free_views=%d dispatched=%d\n",
-            device, uid, graph->n_nodes, n_view, graph->n_nodes - n_view);
-    for (const auto & r : rows) {
-        fprintf(stderr, "[rpc graph ops]   %-28s %5d\n", r.first.c_str(), r.second);
-    }
-    fflush(stderr);
-}
-
 // [fork] Batched trace output.
 //
 // The daemons run with stdout/stderr redirected straight to a log file on the
@@ -5582,7 +5122,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     const int64_t t_compute = graph_trace ? ggml_time_us() : 0;
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    rpc_graph_ops_dump(device, uid, graph);
     if (uid != 0) {
         sg.graph = graph;
         stored_graphs[device][uid] = std::move(sg);
@@ -5611,10 +5150,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     // [fork] This -- not graph_compute -- is the decode hot path: once a graph
-    // shape repeats, the client sends only a uid. It was the one command with no
-    // timing at all, which made every steady-state number an inference. Same
-    // GGML_RPC_GRAPH_TRACE gate; `compute` here is the device's honest cost for
-    // the stage, so client stage time minus this is the RPC overhead.
+    // shape repeats, the client sends only a uid. Same GGML_RPC_GRAPH_TRACE
+    // gate; `compute` here is the device's honest cost for the stage, so
+    // client stage time minus this is the RPC overhead.
     static const bool graph_trace = [] {
         const char * value = getenv("GGML_RPC_GRAPH_TRACE");
         return value && atoi(value) != 0;
@@ -5685,7 +5223,7 @@ rpc_server::~rpc_server() {
 }
 
 // ---------------------------------------------------------------------------
-// Full-duplex lane serving  [fork, pipeline-prefill Phase 2]
+// Full-duplex lane serving  [fork]
 //
 // A session is one main client connection plus up to two attached lane
 // connections. Execution order across the three connections is reconstructed
@@ -5720,7 +5258,7 @@ struct rpc_active_session {
     bool        closing = false;
     socket_ptr  set_sock, get_sock;
     std::thread set_reader_th, set_exec_th, get_th;
-    // [fork] peer lanes: other servers pushing activations straight to us.
+    // peer lanes: other servers pushing activations straight to us.
     // Each gets its own reader/applier thread (see rpc_lane_peer_serve).
     std::vector<socket_ptr>  peer_socks;
     std::vector<std::thread> peer_ths;
@@ -5869,7 +5407,7 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
         }
         // PUSH_TENSOR rides the GET lane because it is a local read like the
         // others -- the only difference is where the bytes go afterwards, so it
-        // wants exactly the same ordering against this node's compute [fork]
+        // wants exactly the same ordering against this node's compute
         const bool is_push = cmd == RPC_CMD_PUSH_TENSOR;
         if (cmd != RPC_CMD_GET_TENSOR && cmd != RPC_CMD_GET_TENSOR_BF16 && !is_push) {
             GGML_LOG_ERROR("[rpc fdx] unexpected command %d on GET lane\n", cmd);
@@ -5928,8 +5466,8 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
     s->fail();
 }
 
-// [fork] One thread per peer lane: read a SET message, wait for this node's
-// ordering counters, apply it, bump set_done.
+// One thread per peer lane: read a SET message, wait for this node's ordering
+// counters, apply it, bump set_done.
 //
 // Deliberately NOT sharing the client SET lane's queue and executor. A peer
 // message arrives decoupled from the client's stream order -- the producer
@@ -6068,10 +5606,11 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
 
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
     uint8_t cmd;
-    // the HELLO handshake was already completed by the connection dispatcher
-    // the first command decides the fate of a parked session: anything other
-    // than SESSION_RESUME means this client is not the one that parked it, and
-    // holding its buffers any longer would just deny this client the memory
+    // the HELLO handshake was already completed by the connection dispatcher.
+    // [fork] the first command decides the fate of a parked session: anything
+    // other than SESSION_RESUME means this client is not the one that parked
+    // it, and holding its buffers any longer would just deny this client the
+    // memory
     bool first_cmd = true;
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
@@ -6197,9 +5736,6 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 if (!server.free_buffer(request)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_BUFFER_CLEAR: {
@@ -6208,9 +5744,6 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                     return;
                 }
                 if (!server.buffer_clear(request)) {
-                    return;
-                }
-                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -6223,14 +5756,11 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 if (!server.memset_tensor(request)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                // streamed, not recv_msg'd: weight uploads are tensor-sized and
-                // must not be materialised in host RAM on a 16 GiB UMA board
+                // [fork] streamed, not recv_msg'd: weight uploads are tensor-sized
+                // and must not be materialised in host RAM on a 16 GiB UMA board
                 uint64_t msg_size;
                 if (!sock->recv_data(&msg_size, sizeof(msg_size))) {
                     return;
@@ -6284,9 +5814,6 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                     return;
                 }
                 if (!server.init_tensor(request)) {
-                    return;
-                }
-                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -6456,8 +5983,9 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 return;
             }
         }
-        // every processed main-lane command advances the ordering counter the
-        // lane fences wait on (the client mirrors this count at submission)
+        // [fork] every processed main-lane command advances the ordering
+        // counter the lane fences wait on (the client mirrors this count at
+        // submission)
         session.bump(session.main_done);
     }
 }
@@ -6559,10 +6087,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
-    // Connections are accepted and classified on a dedicated thread so that
-    // full-duplex lane connections can attach while the main thread is busy
-    // serving a session. Each fresh connection is classified on a short-lived
-    // thread of its own: a connected-but-silent peer must not stall accepts.
+    // [fork] Connections are accepted and classified on a dedicated thread so
+    // that full-duplex lane connections can attach while the main thread is
+    // busy serving a session. Each fresh connection is classified on a
+    // short-lived thread of its own: a connected-but-silent peer must not
+    // stall accepts.
     auto pending = std::make_shared<rpc_pending_conns>();
     std::thread acceptor([server_socket, pending]{
         for (;;) {
@@ -6668,6 +6197,7 @@ static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     return ctx->name.c_str();
 }
 
+// [fork] for the model loader's rpc-cache preflight
 static const char * ggml_backend_rpc_device_get_endpoint(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
     return ctx->endpoint.c_str();
@@ -6697,6 +6227,9 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->description = ggml_backend_rpc_device_get_description(dev);
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    // [fork] the scheduler only pipelines across backends that advertise async
+    // + events; in direct mode (GGML_RPC_ASYNC unset) every op is synchronous
+    // and the scheduler must know it
     props->caps = {
         /* .async                 = */ rpc_async_enabled(),
         /* .host_buffer           = */ false,
@@ -6704,27 +6237,6 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
         /* .events                = */ rpc_async_enabled(),
         /* .mmap_support          = */ true,
     };
-}
-
-// --- device-level event ops [fork, PipeDec Phase 1] ---
-
-static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
-    ggml_backend_event_t event = new ggml_backend_event();
-    event->device  = dev;
-    event->context = new rpc_event();
-    return event;
-}
-
-static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
-    delete (rpc_event *)event->context;
-    delete event;
-}
-
-static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
-    rpc_event * ev = (rpc_event *)event->context;
-    ev->wait_for(ev->peek());
 }
 
 static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
@@ -6757,6 +6269,30 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
     return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
+}
+
+static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    GGML_ASSERT(dispatcher != nullptr && "RPC endpoint unreachable");
+    return dispatcher->event_new(dev);
+}
+
+static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto dispatcher = find_dispatcher(ctx->endpoint);
+    if (dispatcher != nullptr) {
+        dispatcher->event_free(event);
+    }
+    delete event;
+}
+
+static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto dispatcher = find_dispatcher(ctx->endpoint);
+    if (dispatcher != nullptr) {
+        dispatcher->event_synchronize(event);
+    }
 }
 
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
@@ -6811,6 +6347,7 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+    // [fork] loader cache preflight + fleet hibernation
     if (std::strcmp(name, "ggml_backend_rpc_set_client_cache") == 0) {
         return (void *)ggml_backend_rpc_set_client_cache;
     }
@@ -6870,13 +6407,13 @@ ggml_backend_reg_t ggml_backend_rpc_reg(void) {
 }
 
 static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
-    auto sock = get_socket(endpoint);
-    if (sock == nullptr) {
+    auto dispatcher = get_dispatcher(endpoint);
+    if (dispatcher == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return 0;
     }
     rpc_msg_device_count_rsp response;
-    bool status = send_rpc_cmd_ordered(endpoint, sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
+    bool status = dispatcher->send(RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     return response.device_count;
 }
@@ -6911,6 +6448,8 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .name        = */    dev_name,
             /* .description = */    dev_desc,
             /* .known_graph_uids = */ {},
+            /* .quick_uids  = */    {},
+            /* .split_uids  = */    {},
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
