@@ -4667,6 +4667,10 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // [fork] eligibility as decided by the model-level gates above, kept so an
+                    // mtmd batch can opt back in below without bypassing any of them
+                    const bool ckpt_eligible = do_checkpoint;
+
                     bool has_mtmd = false;
 
                     // check if we should process the mtmd chunk
@@ -4811,7 +4815,9 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // [fork] ...or it consumed an mtmd chunk, which is never ordinary: see
+                        // the note on ckpt_mtmd below
+                        if (!is_user_start && !near_prompt_end && !has_mtmd) {
                             do_checkpoint = false;
                         }
                     }
@@ -4826,11 +4832,21 @@ private:
                         do_checkpoint = false;
                     }
 
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    // [fork] always checkpoint a batch that consumed an mtmd chunk. Upstream
+                    // skips it (d417bc43d) -- right when a replay is cheap, wrong when the
+                    // replay re-runs the vision encoder. mtmd keeps the bitmap, not the
+                    // embedding, so any reuse point landing before an image re-encodes it:
+                    // ~35 s per image with the mmproj on the CPU, paid again on every later
+                    // turn until the recovery point finally advances past it. The chunk's own
+                    // decode has already run by now, so the state here covers the image and
+                    // the recovery point lands immediately after it. Costs one extra state
+                    // snapshot per image, which is the trade we want.
+                    const bool ckpt_mtmd = has_mtmd && ckpt_eligible && (pos_min >= 0 || ckpt_defer);
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
+                    // ([fork] or unless an image just landed -- that one is always worth keeping)
+                    do_checkpoint = (do_checkpoint || ckpt_mtmd) && (
+                            ckpt_mtmd ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
