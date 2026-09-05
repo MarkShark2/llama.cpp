@@ -4841,7 +4841,7 @@ private:
                     // decode has already run by now, so the state here covers the image and
                     // the recovery point lands immediately after it. Costs one extra state
                     // snapshot per image, which is the trade we want.
-                    const bool ckpt_mtmd = has_mtmd && ckpt_eligible && (pos_min >= 0 || ckpt_defer);
+                    const bool ckpt_mtmd = has_mtmd && ckpt_eligible && pos_min >= 0;
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     // ([fork] or unless an image just landed -- that one is always worth keeping)
@@ -4854,7 +4854,17 @@ private:
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
-                    if (ckpt_defer) {
+                    if (ckpt_mtmd && do_checkpoint) {
+                        // [fork] snapshot the image right here rather than deferring. The
+                        // chunk's own decode has already run and this batch's text tokens have
+                        // not, so the recovery point lands immediately after the image. The
+                        // deferred path is no good for this: it only fires when the prompt
+                        // happens to complete in this same batch, and an image that sits a few
+                        // tokens from the end of the prompt would lose its checkpoint entirely
+                        // -- which is exactly the case that re-encodes on the next turn.
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        slot.ckpt_after_decode = false;
+                    } else if (ckpt_defer) {
                         // [fork] ... unless it is deferred, in which case the checkpoint *does*
                         // cover this batch and is taken in post_decode()
                         slot.ckpt_after_decode = do_checkpoint;
