@@ -1502,7 +1502,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                     SET_CAUSE(base_copy, "5.dvp");
                                 }
                                 int n_inputs = split->n_inputs++;
-                                GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                                if (n_inputs >= split->inputs_capacity) {
+                                    ggml_backend_sched_split_inputs_grow(split);
+                                }
                                 split->inputs[n_inputs] = base;
                             }
                             if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
