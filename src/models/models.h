@@ -1166,8 +1166,25 @@ struct llama_model_deepseek32 : public llama_model_base {
 // Reusable DeepSeek-V4-style MLA + hyper-connection graph bricks, shared between
 // llama_model_deepseek4::graph and any other model that reuses the same MTP/hyper-connection
 // design (e.g. the DFlash/DSpark drafter graph).
-struct llm_graph_context_dsv4_mla : public llm_graph_context {
-    llm_graph_context_dsv4_mla(const llm_graph_params & params) : llm_graph_context(params) {}
+// [fork] manifold-constrained hyper-connections (mHC) plus the DSV4 raw-attention
+// helper, shared by the deepseek4 trunk / MTP / SPD graphs and, through
+// llama_model_deepseek4::graph_base, by derived model graphs such as glm5-next.
+// Templated on the graph base so a model can stack the helpers on another
+// helper base (glm5-next needs the delta-net helpers for its KDA layers).
+template <typename Base = llm_graph_context>
+struct llm_graph_context_dsv4_mla_t : public Base {
+    llm_graph_context_dsv4_mla_t(const llm_graph_params & params) : Base(params) {}
+
+    // members of the dependent base used by the helpers
+    using Base::ctx0;
+    using Base::gf;
+    using Base::res;
+    using Base::hparams;
+    using Base::cparams;
+    using Base::n_embd;
+    using Base::norm_rms_eps;
+    using Base::cb;
+    using Base::build_attn_mha;
 
     // il >= 0 allows the fused DSV4 HC-pre kernel; pass -1 (the head collapse)
     // to force the primitive-op path
@@ -1185,6 +1202,9 @@ struct llm_graph_context_dsv4_mla : public llm_graph_context {
 
     mutable ggml_tensor * hc_stream_parent   = nullptr;
     mutable ggml_tensor * hc_stream_views[8] = {};
+
+    // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+    ggml_tensor * build_hc_mean(ggml_tensor * x) const;
 
     ggml_tensor * build_hc_sinkhorn(
             ggml_tensor * comb,
@@ -1222,6 +1242,8 @@ struct llm_graph_context_dsv4_mla : public llm_graph_context {
 
 };
 
+using llm_graph_context_dsv4_mla = llm_graph_context_dsv4_mla_t<llm_graph_context>;
+
 
 struct llama_model_dots3note : public llama_model_base {
     llama_model_dots3note(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -1256,10 +1278,14 @@ struct llama_model_deepseek4 : public llama_model_base {
     ggml_tensor * hc_head_base_out  = nullptr;
     ggml_tensor * hc_head_scale_out = nullptr;
 
+    // the mHC helper base, also stacked on other helper bases by derived model
+    // graphs (glm5-next uses graph_base<llm_build_delta_net_base>)
+    template <typename Base = llm_graph_context>
+    using graph_base = llm_graph_context_dsv4_mla_t<Base>;
+
     struct graph : public llm_graph_context_dsv4_mla {
         graph(const llm_graph_params & params) : llm_graph_context_dsv4_mla(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
-
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
@@ -2662,6 +2688,39 @@ struct llama_model_kimi_k3 : public llama_model_base {
 
         ggml_tensor * build_latent_moe(ggml_tensor * cur, const llama_layer & layer,
                                        int64_t n_embd_latent, int il);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_glm5_next : public llama_model_base {
+    llama_model_glm5_next(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // k-pool indexer inputs on top of the generic hybrid input
+    class llm_graph_input_kpool;
+
+    // mHC helpers from deepseek4, stacked on the delta net helpers
+    struct graph : public llama_model_deepseek4::graph_base<llm_build_delta_net_base> {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        const llama_model & model;
+
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+
+        ggml_tensor * build_kda_layer(ggml_tensor * cur, const llama_layer & layer,
+                                      llm_graph_input_rs * inp_rs,
+                                      int64_t d_conv, int64_t head_dim, int64_t n_head_kda,
+                                      int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
+
+        ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
+                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+
+        ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
+                                      const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
+                                      llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il);
+
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

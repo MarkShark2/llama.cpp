@@ -351,15 +351,15 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
-// mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
-static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_mean(ggml_tensor * x) const {
     const int64_t hc = x->ne[1];
 
-    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    ggml_tensor * acc = ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], 0);
     for (int64_t s = 1; s < hc; ++s) {
-        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
+        acc = ggml_add(ctx0, acc, ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
     }
-    return ggml_scale(ctx, acc, 1.0f/hc);
+    return ggml_scale(ctx0, acc, 1.0f/hc);
 }
 
 static ggml_tensor * dsv4_hc_affine(
@@ -372,7 +372,8 @@ static ggml_tensor * dsv4_hc_affine(
     return x;
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_hc_stream_view(ggml_tensor * parent, int64_t ih) const {
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_stream_view(ggml_tensor * parent, int64_t ih) const {
     const int64_t hc = hparams.dsv4_hc_mult;
     GGML_ASSERT(hc <= (int64_t) (sizeof(hc_stream_views)/sizeof(hc_stream_views[0])));
     GGML_ASSERT(ih >= 0 && ih < hc);
@@ -390,7 +391,8 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_stream_view(ggml_tensor * par
     return hc_stream_views[ih];
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_hc_weighted_sum(
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_weighted_sum(
         ggml_tensor * x,
         ggml_tensor * weights,
         int           il) const {
@@ -417,7 +419,8 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_weighted_sum(
     return result;
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_hc_sinkhorn(
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_sinkhorn(
         ggml_tensor * comb,
         int           il) const {
     GGML_UNUSED(il);
@@ -454,7 +457,8 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_sinkhorn(
     return comb;
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_hc_pre(
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_pre(
         ggml_tensor * x,
         ggml_tensor * hc_fn,
         ggml_tensor * hc_scale,
@@ -512,7 +516,8 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_pre(
     return result;
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_hc_post(
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_post(
         ggml_tensor * x,
         ggml_tensor * residual,
         ggml_tensor * post,
@@ -549,7 +554,8 @@ ggml_tensor * llm_graph_context_dsv4_mla::build_hc_post(
     return out;
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_hc_head(
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_hc_head(
         ggml_tensor * x,
         ggml_tensor * hc_fn,
         ggml_tensor * hc_scale,
@@ -985,7 +991,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     return out;
 }
 
-ggml_tensor * llm_graph_context_dsv4_mla::build_raw_attention(
+template <typename Base>
+ggml_tensor * llm_graph_context_dsv4_mla_t<Base>::build_raw_attention(
         llm_graph_input_dsv4_raw * inp_attn,
         ggml_tensor * q,
         ggml_tensor * kv,
@@ -1777,3 +1784,8 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
 }
+
+// instantiate the mHC helpers once for the deepseek4-family graphs (trunk, MTP,
+// SPD, DSpark) and once for glm5-next, which stacks them on the delta-net base
+template struct llm_graph_context_dsv4_mla_t<llm_graph_context>;
+template struct llm_graph_context_dsv4_mla_t<llm_build_delta_net_base>;
