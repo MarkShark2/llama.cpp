@@ -2491,7 +2491,7 @@ static bool pipedec_stage2_eligible(
 
     if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
          model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
-         model.arch != LLM_ARCH_GLM5NEXT && model.arch != LLM_ARCH_QWEN4EXP) ||
+         model.arch != LLM_ARCH_QWEN4EXP) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||
@@ -3630,7 +3630,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
-        model.arch == LLM_ARCH_GLM5NEXT ||
         // DSpark drafters may reuse the deepseek4-style MLA/MoE/HC graph
         (model.arch == LLM_ARCH_DFLASH &&
             (model.hparams.dsv4_hc_mult > 0 || model.hparams.dflash_dsv4_backbone)) ||
@@ -5303,7 +5302,7 @@ static bool pipedec_tree_batch_ok(
 
     if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
          model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
-         model.arch != LLM_ARCH_GLM5NEXT && model.arch != LLM_ARCH_QWEN4EXP) ||
+         model.arch != LLM_ARCH_QWEN4EXP) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
         cparams.embeddings ||

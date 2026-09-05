@@ -42,10 +42,7 @@ ggml_cgraph * clip_graph_glm4v::build() {
     cb(inp, "patch_bias", -1);
 
     // pos-conv norm
-    // GLM-OCR has none, and build_norm still normalizes on a null weight, so skip the call
-    if (model.norm_embd_w != nullptr) {
-        inp = build_norm(inp, model.norm_embd_w, model.norm_embd_b, norm_t, eps, -1);
-    }
+    inp = build_norm(inp, model.norm_embd_w, model.norm_embd_b, norm_t, eps, -1);
 
     ggml_tensor * learned_pos_embd = nullptr;
     // Note: GLM-OCR does not have learned position embeddings
