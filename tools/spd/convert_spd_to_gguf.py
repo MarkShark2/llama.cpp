@@ -84,7 +84,7 @@ def add_checkpoint_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tens
     )
 
 
-SUPPORTED_TARGET_ARCHS = ("qwen35", "gemma4", "deepseek4")
+SUPPORTED_TARGET_ARCHS = ("qwen35", "deepseek4")
 
 
 def spd_stage_layers(trunk_blocks: int, num_stages: int) -> list[int]:

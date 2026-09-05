@@ -65,7 +65,6 @@ struct llama_hparams {
     uint32_t n_embd;
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
-    uint32_t n_layer_nextn_per_head = 1; // nextn blocks consumed by one draft head (>1 = multi-block MTP step)
 
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.

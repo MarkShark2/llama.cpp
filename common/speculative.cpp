@@ -952,8 +952,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
-    int32_t         n_layer_tgt        = 0;       // extract id == n_layer_tgt -> "after the last layer"
-    bool            last_tap_nextn     = true;    // ...taken from the nextn tap rather than t_layer_inp[n_layer]
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1057,51 +1055,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        // turn on extraction of the target layers' input embeddings. an id equal
-        // to the target's layer count means "after the last layer", which the
-        // archs publish in one of two ways:
-        //  - deepseek4 captures it as t_layer_inp[n_layer], the mean over the
-        //    hyper-connection streams, exactly as the DSpark reference does
-        //    (h.mean(dim=2) after the layer loop, before the hc_head collapse);
-        //  - laguna has no such capture, so the closest equivalent is the
-        //    pre-final-norm hidden state on the unmasked nextn path.
-        // Picking the wrong one silently feeds the drafter a differently
-        // collapsed residual, so gate on the target arch rather than guessing.
-        n_layer_tgt = llama_model_n_layer(model_tgt);
+        // turn on extraction of the target layers' input embeddings
         {
-            char arch[64] = {};
-            if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) >= 0) {
-                last_tap_nextn = strcmp(arch, "deepseek4") != 0;
-            }
-        }
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            if (target_layer_ids[k] == n_layer_tgt) {
-                // keep the nextn tap on regardless: it is also what PipeDec
-                // stage 2 carries from the body lanes to the deferred head
-                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-                if (last_tap_nextn) {
-                    continue;
+            const int32_t n_layer_tgt = llama_model_n_layer(model_tgt);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                if (target_layer_ids[k] == n_layer_tgt) {
+                    // [fork, PipeDec] the "after the last layer" tap is also what stage 2
+                    // carries from the body lanes to the deferred head, so keep it on
+                    llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
                 }
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
             }
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
-
-        // generic DFlash drafts use non-causal block attention; Laguna drafters
-        // are trained with a causal noise block. DFlash2 is never "laguna", so
-        // it keeps upstream's non-causal default. Upstream reads the same
-        // decision from `dflash.attention.causal`; the Laguna GGUFs carry the
-        // fork's `dflash.decoder_arch` key instead, so honor either.
-        bool causal = causal_attn;
-        {
-            char buf[32] = {};
-            if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
-                causal = strcmp(buf, "laguna") == 0;
-            }
-        }
-        llama_set_causal_attn(ctx_dft, causal);
+        llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1196,9 +1165,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // injects them into the K/V cache at the target positions
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = (target_layer_ids[k] == n_layer_tgt && last_tap_nextn)
-                        ? llama_get_embeddings_nextn(ctx_tgt)
-                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1206,34 +1173,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                    }
-                }
-
-                // [fork] sanitize non-finite feature values before the fused encode.
-                // some backends stage f32 activations as f16 for the mat-mat kernels;
-                // Laguna's massive-activation rows (attention-sink tokens, |x| ~ 1e6 in
-                // the pre-final-norm residual) overflow f16 -> inf/nan, and one poisoned
-                // row would NaN the whole drafter KV cache. Upstream #27310 folded the
-                // encoder into the injection decode, so the scrub now runs in place on
-                // batch_inject.embd instead of the old features_buf.
-                {
-                    size_t       n_bad  = 0;
-                    float *      feat   = batch_inject.embd;
-                    const size_t n_feat = (size_t) n_chunk * n_embd_enc;
-                    for (size_t i = 0; i < n_feat; ++i) {
-                        float & v = feat[i];
-                        if (!std::isfinite(v)) {
-                            v = v != v ? 0.0f : (v > 0.0f ? 65504.0f : -65504.0f);
-                            n_bad++;
-                        }
-                    }
-                    if (n_bad > 0) {
-                        static bool warned = false;
-                        if (!warned) {
-                            LOG_WRN("%s: sanitized %zu non-finite target feature values (f16 overflow on massive activations); "
-                                    "draft quality may degrade slightly on affected rows\n", __func__, n_bad);
-                            warned = true;
-                        }
                     }
                 }
 
@@ -1477,9 +1416,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
-        // count invokable draft heads, not raw nextn blocks: a single draft step
-        // may span several nextn blocks (e.g. NemotronH Puzzle's [attention, moe])
-        n_mtp_layers = std::max(1, (int) llama_model_n_nextn_heads(llama_get_model(ctx_dft)));
+        n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         n_cap.assign(n_seq, 0);
 

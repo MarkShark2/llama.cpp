@@ -247,7 +247,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_GRANITE_SWITCH:
             return new llama_model_granite_switch(params);
         case LLM_ARCH_MINICPM:
-        case LLM_ARCH_MINICPM4:
             return new llama_model_minicpm(params);
         case LLM_ARCH_GRANITE_HYBRID:
             return new llama_model_granite_hybrid(params);
@@ -2143,7 +2142,6 @@ void llama_model::print_info() const {
         }
 
         if (arch == LLM_ARCH_MINICPM ||
-                arch == LLM_ARCH_MINICPM4 ||
                 arch == LLM_ARCH_GRANITE ||
                 arch == LLM_ARCH_GRANITE_MOE ||
                 arch == LLM_ARCH_GRANITE_HYBRID ||
@@ -2622,16 +2620,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
-                // Same reasoning for NEMOTRON_H_MOE (Puzzle): the MTP sub-blocks are
-                // non-recurrent (attention + moe, no mamba), so the MTP context must not
-                // carry the trunk's recurrent state - recurrent memory can't roll back
-                // (can_seq_rm() is false for it), which otherwise disables the draft
-                // rollback the speculative-decoding framework relies on.
-                const bool mtp_on_hybrid_nemotron_h =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) &&
-                    hparams.n_layer_nextn > 0;
-
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
@@ -2642,8 +2630,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
                             nullptr);
-                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen &&
-                           !mtp_on_hybrid_nemotron && !mtp_on_hybrid_nemotron_h) {
+                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -2770,13 +2757,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    }
-
-                    if (mtp_on_hybrid_nemotron_h) {
-                        // Only the attention sub-block (blk.n_layer) needs a KV slot; the
-                        // moe sub-block (blk.n_layer+1) never attends. More specific than
-                        // the mtp_on_hybrid_nemotron filter above, so it comes second.
-                        filter = [&](uint32_t il) { return il >= hparams.n_layer() && hparams.n_ff(il) == 0; };
                     }
 
                     if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
@@ -2981,10 +2961,6 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
-int32_t llama_model_n_nextn_heads(const llama_model * model) {
-    return model->hparams.n_layer_nextn / model->hparams.n_layer_nextn_per_head;
-}
-
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
@@ -3162,7 +3138,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_EXAONE4:
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_MINICPM3:
-        case LLM_ARCH_MINICPM4:
         case LLM_ARCH_BAILINGMOE2:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:

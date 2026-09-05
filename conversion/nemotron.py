@@ -201,7 +201,6 @@ class NemotronHModel(GraniteHybridModel):
     """Hybrid mamba2/attention model from NVIDIA"""
     model_arch = gguf.MODEL_ARCH.NEMOTRON_H
     is_moe: bool = False
-    _experts: list[dict[str, Tensor]] | None = None
     supports_mtp_export = True
     _experts: list[dict[str, Tensor]] | None = None
 
@@ -521,27 +520,27 @@ class NemotronHModel(GraniteHybridModel):
 @ModelBase.register("NemotronHPuzzleForCausalLM")
 @ModelBase.example("nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16")
 class NemotronHPuzzleModel(NemotronHModel):
-    """NVIDIA Puzzle: NemotronH with a per-block MoE config (block_configs) and an
-    MTP draft head (mtp.safetensors) appended as two extra blocks."""
+    """NVIDIA Puzzle: NemotronH with a per-block MoE config (block_configs).
+
+    The checkpoint also ships an MTP draft head (mtp.safetensors). It is skipped
+    here: there is no Puzzle MTP inference path in tree, and the head is laid out
+    by mtp_block_configs rather than the mtp.layers.* form NemotronHModel maps."""
 
     model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
     is_moe: bool = True
+    supports_mtp_export = False
 
     def __init__(self, dir_model: "Path", *args, **kwargs):
         hparams = dict(kwargs.pop("hparams", None) or ModelBase.load_hparams(dir_model, self.is_mistral_format))
 
         self.block_configs: list[dict] = hparams["block_configs"]
-        self.mtp_block_configs: list[dict] = hparams.get("mtp_block_configs", [])
         self.n_layer_trunk = len(self.block_configs)
 
-        # block_configs/mtp_block_configs carry the per-block MoE shape; the trunk's
-        # layers_block_type (already computed by the HF config wrapper) doesn't cover
-        # the MTP sub-layers, so build a combined length-90 pattern covering both.
-        hparams["num_hidden_layers"] = self.n_layer_trunk + len(self.mtp_block_configs)
-        hparams["layers_block_type"] = (
-            [bc["block_type"] for bc in self.block_configs]
-            + [bc["block_type"] for bc in self.mtp_block_configs]
-        )
+        # block_configs carries the per-block MoE shape, and is the authority on the
+        # block pattern too: the layers_block_type the HF config wrapper computes is
+        # not sized to it.
+        hparams["num_hidden_layers"] = self.n_layer_trunk
+        hparams["layers_block_type"] = [bc["block_type"] for bc in self.block_configs]
 
         self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
 
@@ -553,6 +552,11 @@ class NemotronHPuzzleModel(NemotronHModel):
         self.head_dim = self.find_hparam(["head_dim", "attention_head_dim"])
         self.d_inner = self.find_hparam(["num_heads"]) * self.d_model
 
+        # NemotronHModel.__init__ folds an MTP block into block_count when the
+        # config carries num_nextn_predict_layers; Puzzle's config does, but its
+        # head has a different layout and no inference path, so stay opted out.
+        self._mtp_bid = None
+
     def set_gguf_parameters(self):
         GraniteHybridModel.set_gguf_parameters(self)
 
@@ -562,9 +566,8 @@ class NemotronHPuzzleModel(NemotronHModel):
         self.gguf_writer.add_key_length(head_dim)
         self.gguf_writer.add_value_length(head_dim)
 
-        all_block_configs = self.block_configs + self.mtp_block_configs
-        ffn_lengths = [bc.get("moe_intermediate_size") or 0 for bc in all_block_configs]
-        experts_used = [bc.get("num_experts_per_tok") or 0 for bc in all_block_configs]
+        ffn_lengths = [bc.get("moe_intermediate_size") or 0 for bc in self.block_configs]
+        experts_used = [bc.get("num_experts_per_tok") or 0 for bc in self.block_configs]
 
         self.gguf_writer.add_feed_forward_length(ffn_lengths)
         self.gguf_writer.add_expert_feed_forward_length(ffn_lengths)
@@ -578,8 +581,6 @@ class NemotronHPuzzleModel(NemotronHModel):
         self.gguf_writer.add_expert_group_count(self.hparams["n_group"])
         self.gguf_writer.add_moe_latent_size(self.hparams["moe_latent_size"])
 
-        self.gguf_writer.add_nextn_predict_layers(len(self.mtp_block_configs))
-
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # The official BF16 checkpoint (NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16)
         # names the trunk "model.*" (model.layers.*, model.embeddings, model.norm_f)
@@ -591,28 +592,11 @@ class NemotronHPuzzleModel(NemotronHModel):
         if name.endswith("mixer.gate.e_score_correction_bias"):
             name = name[: -len("e_score_correction_bias")] + "e_score_correction.bias"
 
-        if name.startswith("mtp."):
-            assert bid is not None and bid in (0, 1), f"Unexpected MTP tensor: {name}"
-            mtp_bid = self.n_layer_trunk + bid
-
-            if name == "mtp.layers.0.eh_proj.weight":
-                yield self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, mtp_bid), data_torch
-                return
-            if name == "mtp.layers.0.enorm.weight":
-                yield self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_ENORM, mtp_bid), data_torch
-                return
-            if name == "mtp.layers.0.hnorm.weight":
-                yield self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_HNORM, mtp_bid), data_torch
-                return
-            if name == "mtp.layers.1.final_layernorm.weight":
-                yield self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, mtp_bid), data_torch
-                return
-
-            # Everything else (norm, mixer.*, experts.*) follows the exact same layout
-            # as a regular trunk block: rewrite onto a synthetic "backbone.layers.{mtp_bid}."
-            # name so it goes through the same handling (incl. expert stacking) as the trunk.
-            rewritten_name = name.replace(f"mtp.layers.{bid}.", f"backbone.layers.{mtp_bid}.", 1)
-            yield from super().modify_tensors(data_torch, rewritten_name, mtp_bid)
-            return
-
         yield from super().modify_tensors(data_torch, name, bid)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # Drop the MTP head unconditionally; see the class docstring.
+        if item[0].startswith("mtp."):
+            return None
+        return super().filter_tensors(item)

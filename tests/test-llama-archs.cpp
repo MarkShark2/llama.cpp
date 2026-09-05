@@ -11,9 +11,6 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
-// nextn/MTP accessors are still staging API
-#include "../src/llama-ext.h"
-
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -71,8 +68,6 @@ static void usage(char ** argv) {
     printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
 }
 
-// index_topk/index_kpool = 2 whole pools are selected per query row.
-
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
     std::mt19937 gen(seed);
     std::uniform_int_distribution<> dis(0, n_vocab - 1);
@@ -84,8 +79,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-// nextn appends one NextN/MTP block after the trunk, leaving the trunk itself unchanged
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool nextn = false) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -151,11 +145,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               nextn ? n_layer + 1 : n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
-    if (nextn) {
-        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
-    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -409,13 +400,10 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
-        bool load_mtp = false, uint32_t n_seq_max = 1, bool kv_unified = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
-    model_params.load_mtp = load_mtp;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -428,10 +416,6 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
-    ctx_params.cb_eval           = cb_eval;
-    ctx_params.cb_eval_user_data = cb_eval_user_data;
-    ctx_params.n_seq_max         = n_seq_max;
-    ctx_params.kv_unified        = kv_unified;
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -663,8 +647,6 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return 0;
 }
-
-//
 
 static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
     struct user_data_t {
@@ -899,9 +881,7 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }
-        int ret = 0;
-        ret |= test_backends(arch, seed, verbosity);
-        return ret;
+        return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

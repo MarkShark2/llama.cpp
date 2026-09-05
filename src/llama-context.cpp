@@ -2558,8 +2558,7 @@ static bool pipedec_stage2_eligible(
         }
     }
 
-    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
-         model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
+    if ((model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_DEEPSEEK4 &&
          model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_GLM5_NEXT) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||
@@ -5180,9 +5179,8 @@ llama_context * llama_init_from_model(
     if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
-        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_GEMMA4 &&
-        model->arch != LLM_ARCH_DEEPSEEK4) {
-        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5, Gemma 4 or DeepSeek-V4 model\n", __func__);
+        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 or DeepSeek-V4 model\n", __func__);
         return nullptr;
     }
 
@@ -5407,8 +5405,7 @@ static bool pipedec_tree_batch_ok(
         return false;
     }
 
-    if ((model.arch != LLM_ARCH_STEP35 && model.arch != LLM_ARCH_GEMMA4 &&
-         model.arch != LLM_ARCH_LAGUNA && model.arch != LLM_ARCH_DEEPSEEK4 &&
+    if ((model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_DEEPSEEK4 &&
          model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_GLM5_NEXT) ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         !cparams.causal_attn ||

@@ -1443,15 +1443,6 @@ struct llama_model_dflash : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // set when dflash.decoder_arch == "laguna": draft layers follow the Laguna
-    // decoder contract (softplus attn gate, per-aux feature norms, context K/V
-    // through input_layernorm, causal noise-block attention)
-    bool decoder_laguna = false;
-
-    // per-aux-feature RMSNorm weights stacked to [n_embd, n_aux], applied
-    // before concat + fc (Laguna drafters)
-    ggml_tensor * aux_norm = nullptr;
-
     template <bool is_enc>
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -1604,16 +1595,9 @@ struct llama_model_nemotron_h : public llama_model_base {
 
     struct graph : public llm_build_mamba_base {
         graph(const llama_model & model, const llm_graph_params & params);
-        // static so they can also be reused from graph_mtp (which does not derive from graph)
-        static ggml_tensor * build_ffn_layer(llm_graph_context & self, ggml_tensor * cur, const llama_model & model, int il);
-        static ggml_tensor * build_attention_layer(llm_graph_context & self, ggml_tensor * cur, llm_graph_input_attn_kv * inp_attn,
+        ggml_tensor * build_ffn_layer(ggml_tensor * cur, const llama_model & model, int il);
+        ggml_tensor * build_attention_layer(ggml_tensor * cur, llm_graph_input_attn_kv * inp_attn,
             const llama_model & model, int64_t n_embd_head, int il);
-    };
-
-    // LLM_GRAPH_TYPE_DECODER_MTP: Puzzle's MTP step is two appended blocks
-    // (blk.n_layer = attention, blk.n_layer+1 = moe) run serially as one step.
-    struct graph_mtp : public llm_graph_context {
-        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -1626,7 +1610,6 @@ struct llama_model_nemotron_h_moe : public llama_model_nemotron_h {
 
     using graph = llama_model_nemotron_h::graph;
 
-    // Puzzle's MoE variant overrides the MTP step (see nemotron-h-moe.cpp)
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
@@ -2016,10 +1999,6 @@ struct llama_model_laguna : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     };
 
-    struct graph_pipedec_head : public llm_graph_context {
-        graph_pipedec_head(const llama_model & model, const llm_graph_params & params);
-    };
-
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
@@ -2077,11 +2056,6 @@ struct llama_model_hy_v3 : public llama_model_base {
     llama_model_hy_v3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
-
-    // duplicate of output_norm placed with the last trunk layer, so the trunk's
-    // final norm (and the per-ubatch h_nextn extraction) stays on the last
-    // pipeline stage when the output head is pinned elsewhere via mtp_dev
-    ggml_tensor * output_norm_trunk = nullptr;
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -2798,10 +2772,6 @@ struct llama_model_step35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
-    };
-
-    struct graph_pipedec_head : public llm_graph_context {
-        graph_pipedec_head(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

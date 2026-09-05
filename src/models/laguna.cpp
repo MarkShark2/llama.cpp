@@ -148,9 +148,6 @@ void llama_model_laguna::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_laguna::build_arch_graph(const llm_graph_params & params) const {
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
-        return std::make_unique<graph_pipedec_head>(*this, params);
-    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -170,17 +167,11 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     const bool has_swa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
     llm_graph_input_attn_kv      * inp_attn_kv   = has_swa ? nullptr : build_attn_inp_kv();
     llm_graph_input_attn_kv_iswa * inp_attn_iswa = has_swa ? build_attn_inp_kv_iswa() : nullptr;
-    // PipeDec body lanes are single-token and keep every row (the deferred head
-    // consumes the raw h_nextn rows), so no out_ids gather is built for them.
-    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
-            ? nullptr : build_inp_out_ids();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
-        // residual-stream capture for speculative drafters (EAGLE3 / DFlash)
-        res->t_layer_inp[il] = inpL;
-
         const bool    is_swa_il   = hparams.is_swa(il);
         const int64_t n_head_il   = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
@@ -270,10 +261,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_o_proj", il);
         }
 
-        // When unmasked nextn extraction is on (DFlash needs the pre-norm
-        // hidden state for every token), defer the output-row gather to
-        // after the final-norm capture below (qwen35 pattern).
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -333,54 +321,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     cur = inpL;
-
-    // pre-final-norm residual stream: the DFlash drafter's last capture point
-    // ("input of layer n_layer" in the training convention)
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    // Stage 2 PipeDec queues token-sized trunk graphs across the layer devices.
-    // The body ends at the pre-final-norm hidden state (h_nextn); the rows (and
-    // any enabled per-layer DFlash feature taps) are copied out and fed to one
-    // batched graph_pipedec_head (output norm + lm_head) after the body
-    // pipeline drains.
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
-
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
-
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
-
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    cur = build_lora_mm(model.output, cur);
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
-}
-
-// Deferred output norm + LM head for a group of completed PipeDec body rows
-// (h_nextn is pre-norm for Laguna, so the head applies output_norm + lm_head,
-// like Step 3.5).
-llama_model_laguna::graph_pipedec_head::graph_pipedec_head(
-        const llama_model & model, const llm_graph_params & params)
-    : llm_graph_context(params) {
-    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->embd);
-    cb(inp->embd, "pipedec_h_input", -1);
-
-    ggml_tensor * cur = inp->embd;
-    res->add_input(std::move(inp));
-
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

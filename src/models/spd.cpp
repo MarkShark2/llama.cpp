@@ -54,8 +54,8 @@ private:
 
 void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    // qwen35-style sidecars carry rope sections (IMROPE); gemma4-style
-    // sidecars use standard NEOX rope and omit them
+    // qwen35-style sidecars carry rope sections (IMROPE); others use
+    // standard NEOX rope and omit them
     hparams.rope_sections.fill(0);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
     ml.get_key(LLM_KV_SPD_CHECKPOINT_VERSION, checkpoint_version);
