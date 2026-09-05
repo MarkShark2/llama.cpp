@@ -323,9 +323,9 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(llm_graph_context &
                     nullptr, // no gate
                     model.layers[il].ffn_down_exps,
                     model.layers[il].ffn_exp_probs_b,
-                    n_expert, (int64_t)hparams.n_expert_used(il),
-                    LLM_FFN_RELU_SQR, hparams.expert_weights_norm,
-                    hparams.expert_weights_scale,
+                    self.n_expert, (int64_t)self.hparams.n_expert_used(il),
+                    LLM_FFN_RELU_SQR, self.hparams.expert_weights_norm,
+                    self.hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
                     il,
                     router_logits, nullptr,

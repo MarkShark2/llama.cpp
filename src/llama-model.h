@@ -136,7 +136,6 @@ enum llm_type {
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
     LLM_TYPE_118B_A8B,  // Laguna-S-2
     LLM_TYPE_120B_A12B, // Nemotron 3 Super
-    LLM_TYPE_75B_A9B,   // Nemotron 3 Puzzle
     LLM_TYPE_122B_A10B, // Qwen3.5
     LLM_TYPE_124B_A5_1B, // Ling-3.0-flash
     LLM_TYPE_196B_A11B, // Step3.5-Flash
