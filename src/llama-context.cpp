@@ -5689,6 +5689,13 @@ int32_t llama_pipedec_tree_commit(llama_context * ctx, llama_seq_id seq_src, lla
     return ctx->pipedec_tree_commit(seq_src, seq_dst);
 }
 
+bool llama_memory_seq_trim(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0) {
+    if (!mem) {
+        return true;
+    }
+    return mem->seq_trim(seq_id, p0);
+}
+
 int32_t llama_pipedec_tree_n_lanes(void) {
     return (int32_t) llama_context::pipedec_tree_max_lanes();
 }

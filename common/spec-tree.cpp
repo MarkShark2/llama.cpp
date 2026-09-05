@@ -59,6 +59,7 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
     }
 
     lane_used.assign(this->params.lanes, false);
+    synced.assign(n_tree_seq, -1);
 
     h_out.resize((size_t) width * n_embd);
 
@@ -98,12 +99,44 @@ void common_spec_tree::free_node(int32_t id) {
     nodes[id].h_in.shrink_to_fit();
 }
 
+// a freed lane keeps the trunk cells it already shares (they stay valid for the
+// rest of this tree); only its own branch above the mark goes
 void common_spec_tree::free_seq(llama_seq_id seq) {
     if (seq < 0) {
         return;
     }
-    llama_memory_seq_rm(llama_get_memory(params.ctx_tgt), seq, -1, -1);
-    llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq, -1, -1);
+    const int32_t   i  = (int32_t) (seq - params.seq_base);
+    const llama_pos p0 = (i >= 0 && i < (int32_t) synced.size()) ? synced[i] + 1 : 0;
+    llama_memory_seq_trim(llama_get_memory(params.ctx_tgt), seq, p0);
+    llama_memory_seq_trim(llama_get_memory(params.ctx_dft), seq, p0);
+}
+
+void common_spec_tree::sync_seq(llama_seq_id parent_seq, llama_seq_id seq) {
+    const int32_t i = (int32_t) (seq - params.seq_base);
+    GGML_ASSERT(i >= 0 && i < (int32_t) synced.size());
+
+    // the parent's cells through root.pos - 1 are the trunk, shared by every
+    // seq in the tree; whatever this seq holds through its own mark is that
+    // same trunk, so only the span above the mark moves
+    const llama_pos p0 = synced[i] + 1;
+
+    llama_memory_seq_trim(llama_get_memory(params.ctx_tgt), seq, p0);
+    llama_memory_seq_trim(llama_get_memory(params.ctx_dft), seq, p0);
+    llama_memory_seq_cp(llama_get_memory(params.ctx_tgt), parent_seq, seq, p0, -1);
+    llama_memory_seq_cp(llama_get_memory(params.ctx_dft), parent_seq, seq, p0, -1);
+
+    synced[i] = std::max<llama_pos>(synced[i], nodes[root].pos - 1);
+}
+
+void common_spec_tree::clear_seqs(llama_seq_id keep) {
+    for (size_t i = 0; i < synced.size(); ++i) {
+        const llama_seq_id seq = params.seq_base + (llama_seq_id) i;
+        if (seq != keep && synced[i] >= 0) {
+            llama_memory_seq_rm(llama_get_memory(params.ctx_tgt), seq, -1, -1);
+            llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq, -1, -1);
+        }
+        synced[i] = -1;
+    }
 }
 
 // the bloodline dies: the node, its seq, its children, and any queued
@@ -142,6 +175,7 @@ bool common_spec_tree::begin(llama_token root_tok, llama_pos root_pos, llama_seq
     free_nodes.clear();
     hold_seqs.clear();
     std::fill(lane_used.begin(), lane_used.end(), false);
+    std::fill(synced.begin(), synced.end(), -1);
     ring_cursor = 0;
 
     const int32_t id = new_node();
@@ -359,13 +393,10 @@ int32_t common_spec_tree::submit_next() {
         n.row  = (int32_t) i;
 
         int64_t ta = ggml_time_us();
-        free_seq(n.seq);
+        sync_seq(n.parent_seq, n.seq);
         int64_t tb = ggml_time_us();
-        llama_memory_seq_cp(llama_get_memory(params.ctx_tgt), n.parent_seq, n.seq, -1, -1);
-        int64_t tc = ggml_time_us();
-        llama_memory_seq_cp(llama_get_memory(params.ctx_dft), n.parent_seq, n.seq, -1, -1);
-        int64_t td = ggml_time_us();
-        t_seq_rm += tb - ta; t_seq_tgt += tc - tb; t_seq_dft += td - tc;
+        t_seq_rm += tb - ta;
+        (void) t_seq_tgt; (void) t_seq_dft;
 
         common_batch_add(batch_tgt, n.tok, n.pos, { n.seq }, true);
     }
@@ -583,6 +614,10 @@ llama_seq_id common_spec_tree::finish(llama_pos * trunk_pos, const float ** trun
     root = -1;
     nodes.clear();
     free_nodes.clear();
+
+    // the next request rewrites the slot below the marks, so the trunk cells
+    // the lanes kept sharing go now; the caller empties the trunk seq itself
+    clear_seqs(trunk);
 
     if (trunk_pos) {
         *trunk_pos = tpos;

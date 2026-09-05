@@ -154,6 +154,15 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_trim(llama_seq_id seq_id, llama_pos p0) {
+    // the recurrent state goes whole: a ranged seq_rm there would attempt a
+    // per-token rollback, which is neither wanted nor guaranteed to succeed
+    if (!mem_recr->seq_rm(seq_id, -1, -1)) {
+        return false;
+    }
+    return mem_attn->seq_rm(seq_id, p0, -1);
+}
+
 void llama_memory_hybrid::set_static_cells(bool value) {
     mem_recr->set_static_cells(value);
 }

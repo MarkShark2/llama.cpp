@@ -128,6 +128,8 @@ private:
     int32_t new_node();
     void    free_node(int32_t id);
     void    free_seq(llama_seq_id seq);
+    void    sync_seq(llama_seq_id parent_seq, llama_seq_id seq); // give seq the parent's cells above its synced trunk
+    void    clear_seqs(llama_seq_id keep);                      // empty every tree seq but keep, forget the trunk marks
     void    kill(int32_t id);
     void    kill_subtree_except(int32_t parent, int32_t keep);
 
@@ -138,6 +140,13 @@ private:
 
     common_spec_tree_params params;
     common_spec_tree_stats  st;
+
+    // per tree seq (index seq - seq_base): the position through which the seq
+    // still holds the trunk's cells, -1 when it holds nothing. The trunk below
+    // the root never changes inside one tree, so a lane only ever needs the
+    // cells above this mark trimmed and re-copied: O(depth) per level instead
+    // of a walk over the whole context on every submit and kill.
+    std::vector<llama_pos> synced;
 
     int32_t n_embd = 0;
 

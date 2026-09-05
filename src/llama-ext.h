@@ -264,6 +264,8 @@ LLAMA_API int32_t       llama_pipedec_tree_close  (struct llama_context * ctx, i
 LLAMA_API void          llama_pipedec_tree_discard(struct llama_context * ctx, int32_t lane);
 LLAMA_API const float * llama_pipedec_tree_h      (struct llama_context * ctx, int32_t lane, int32_t row);
 LLAMA_API int32_t       llama_pipedec_tree_commit (struct llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst);
+// drop what seq_id holds from p0 on: attention cells by range, a recurrent state whole
+LLAMA_API bool          llama_memory_seq_trim(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0);
 LLAMA_API int32_t       llama_pipedec_tree_n_lanes(void);
 LLAMA_API int32_t       llama_pipedec_tree_n_rows_max(void);
 // close timing of the last llama_pipedec_tree_close: wait for the lane, head graph

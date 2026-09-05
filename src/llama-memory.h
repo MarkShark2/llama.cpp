@@ -131,6 +131,13 @@ struct llama_memory_i {
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+
+    // [fork, PipeDec tree] drop everything seq_id holds from p0 on. Attention
+    // cells go by range; a recurrent state cannot be cut, so it is dropped whole
+    // (the caller copies the parent's state back in right after). Unlike
+    // seq_rm(seq_id, p0, -1) this never tries a recurrent rollback, which can
+    // fail and leave the attention cells untouched.
+    virtual bool seq_trim(llama_seq_id seq_id, llama_pos p0) { return seq_rm(seq_id, p0, -1); }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
