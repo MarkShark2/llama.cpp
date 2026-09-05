@@ -1307,6 +1307,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            // a separate draft file is the MTP block itself
+            mparams_dft.load_mtp = true;
         }
         cparams_dft.n_rs_seq = 0;
 
@@ -1748,7 +1750,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = common_spec_has_mtp(params.speculative.types);
+    // [fork] with a separate draft file (--model-draft) the MTP block lives there, so the
+    // target must not materialize its own copy - glm5next ships blk.45 at Q8_0, 7.4 GiB
+    // that would otherwise land on --device-draft. The draft load re-enables the flag.
+    mparams.load_mtp                    = common_spec_has_mtp(params.speculative.types) &&
+                                          !params.speculative.has_dft();
 
     return mparams;
 }

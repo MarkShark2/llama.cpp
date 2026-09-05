@@ -185,6 +185,20 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     }
 }
 
+bool llama_memory_hybrid_idx::seq_trim(llama_seq_id seq_id, llama_pos p0) {
+    // [fork, PipeDec tree] the indexer cache mirrors the attention cache's slot layout,
+    // so a branch trim that leaves it untouched drifts the two apart
+    if (!llama_memory_hybrid::seq_trim(seq_id, p0)) {
+        return false;
+    }
+
+    if (mem_idx) {
+        mem_idx->seq_rm(seq_id, p0, -1);
+    }
+
+    return true;
+}
+
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
 

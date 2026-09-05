@@ -176,6 +176,13 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
         mtp_flags |= TENSOR_SKIP;
     }
 
+    // [fork] the draft head may also ship as its own GGUF (--model-draft + --device-draft):
+    // blk.<n_layer>.* plus token_embd / output / output_norm and none of the trunk, so it
+    // can be quantized apart from the trunk and pinned to the draft GPU. Both halves
+    // declare nextn in their metadata, so probe for the tensors as qwen4exp does.
+    const bool mtp_only    = (n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
@@ -184,55 +191,71 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
     }
     // note: no hc_head_*, the hyper-connection head is a plain mean
 
+    // [fork, PipeDec] when the output head is pinned to the draft GPU
+    // (--device-draft), the output norm and lm_head would follow it off the
+    // pipeline. A graph only pipelines if it ends on an RPC backend: a local
+    // tail makes every split-input copy fall back to synchronize + blocking
+    // copy, which drains the endpoint inside the submission of the current
+    // graph. Duplicate both onto the last transformer layer and use them in
+    // the trunk/body graphs (see graph) so the whole trunk stays on the
+    // pipeline, exactly as when there is no drafter at all. The deferred
+    // head graph keeps the originals on the draft GPU by design.
+    if (!mtp_only && params.mtp_dev != nullptr && n_layer > 0) {
+        output_norm_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        output_trunk      = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+    }
+
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
 
         const bool is_mtp  = i >= n_layer;
         const bool is_recr = !is_mtp && hparams.is_recr(i);
-        const int  flags   = is_mtp ? mtp_flags : 0;
+        const int  flags   = is_mtp ? mtp_flags : trunk_flags;
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
 
         // hyper-connections wrap the trunk blocks only, the MTP block uses plain residuals
         if (!is_mtp) {
-            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
-            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim},         0);
-            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3},                  0);
-            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim}, 0);
-            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim},         0);
-            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3},                  0);
+            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, trunk_flags);
+            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim},         trunk_flags);
+            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3},                  trunk_flags);
+            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim}, trunk_flags);
+            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim},         trunk_flags);
+            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3},                  trunk_flags);
         }
 
         if (is_recr) {
             // conv1d may be stored 4D [d_conv, 1, d_inner, 1] or 3D (quantization drops the trailing 1)
             auto conv = [&](llm_tensor tid) {
                 ggml_tensor * t = create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner, 1}, TENSOR_NOT_REQUIRED);
-                return t ? t : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, 0);
+                return t ? t : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, trunk_flags);
             };
             layer.ssm_q_conv = conv(LLM_TENSOR_SSM_CONV1D_Q);
             layer.ssm_k_conv = conv(LLM_TENSOR_SSM_CONV1D_K);
             layer.ssm_v_conv = conv(LLM_TENSOR_SSM_CONV1D_V);
 
-            create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, 0);
+            create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, trunk_flags);
 
-            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd,   head_dim},  0);
-            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner},   0);
-            layer.ssm_g_a  = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd,   head_dim},  0);
-            layer.ssm_g_b  = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner},   0);
-            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd,   n_head},    0);
+            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd,   head_dim},  trunk_flags);
+            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner},   trunk_flags);
+            layer.ssm_g_a  = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd,   head_dim},  trunk_flags);
+            layer.ssm_g_b  = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner},   trunk_flags);
+            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd,   n_head},    trunk_flags);
 
             // ssm_a holds -exp(A_log), folded at conversion time (kimi-linear/kimi-k3 convention)
-            layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {n_head}, 0);
+            layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {n_head}, trunk_flags);
 
             // some converters emit dt_bias under the default ".weight" suffix
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, TENSOR_NOT_REQUIRED);
             if (!layer.ssm_dt_b) {
-                layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "weight", i), {d_inner}, 0);
+                layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "weight", i), {d_inner}, trunk_flags);
             }
 
-            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, 0);
-            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, 0);
+            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, trunk_flags);
+            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, trunk_flags);
         } else {
             layer.wq_a           = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,       "weight", i), {n_embd, q_lora_rank}, flags);
             layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, flags);
@@ -292,6 +315,10 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_HEAD) {
+        return std::make_unique<graph_pipedec_head>(*this, params);
+    }
+
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
@@ -991,7 +1018,13 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     // the k-pool metadata is the same for every full layer, so build it once
     auto * inp_kpool = build_inp_kpool(inp_hyb);
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // The PipeDec body returns every unmasked hidden row directly and never
+    // gathers output rows. Do not register an unused out_ids input: unused
+    // graph inputs are intentionally not allocated, but set_inputs() would
+    // still attempt to populate one if it were registered here.
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+            ? nullptr
+            : build_inp_out_ids();
 
     // inputs_embeds.unsqueeze(2).expand(-1, -1, hc, -1)
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
@@ -1053,15 +1086,54 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur = glm5next_hc_mean(ctx0, inpL);
     cb(cur, "hc_head", -1);
 
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    const auto & model_glm = static_cast<const llama_model_glm5next &>(model);
+
+    cur = build_norm(cur, model_glm.output_norm_trunk ? model_glm.output_norm_trunk : model.output_norm,
+            nullptr, LLM_NORM_RMS, -1);
 
     // post-norm hidden state feeds the NextN/MTP draft head
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    // [fork, PipeDec] stage 2 queues token-sized trunk graphs across the layer
+    // devices. The body ends at the post-output-norm hidden state; those rows
+    // are copied out and fed to one batched graph_pipedec_head (lm_head only)
+    // after the body pipeline drains. Stopping here also keeps the body graph
+    // on the pipeline: the lm_head would otherwise drag the tail to the draft
+    // GPU and end the graph on a local backend.
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     if (inp_out_ids && narrow_late) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model_glm.output_trunk ? model_glm.output_trunk : model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// Deferred PipeDec verification head: the body lanes stop at the post-norm
+// hidden state, so all that is left here is the lm_head over the batched rows
+// gathered from every lane in the group. Runs on the draft GPU by design.
+llama_model_glm5next::graph_pipedec_head::graph_pipedec_head(
+        const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    cb(inp->embd, "pipedec_h_input", -1);
+
+    ggml_tensor * cur = inp->embd;
+    res->add_input(std::move(inp));
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

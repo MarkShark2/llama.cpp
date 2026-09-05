@@ -1387,6 +1387,12 @@ struct llama_model_glm5next : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // [fork, PipeDec] last-layer copies of the tail tensors, created only when
+    // the output head is pinned to the draft GPU (--device-draft), so the trunk
+    // and body graphs end on the pipeline instead of the local backend
+    ggml_tensor * output_norm_trunk = nullptr;
+    ggml_tensor * output_trunk      = nullptr;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
@@ -1431,6 +1437,12 @@ struct llama_model_glm5next : public llama_model_base {
     // no hyper-connections, so it runs on a plain attention cache holding only that block
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // deferred PipeDec verification head: lm_head over rows already normed by
+    // the body lanes; runs on the draft GPU where the head tensors live
+    struct graph_pipedec_head : public llm_graph_context {
+        graph_pipedec_head(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

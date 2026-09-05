@@ -2695,6 +2695,8 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // a separate draft file is the MTP block itself; the target skipped its copy
+        mparams.load_mtp = true;
     }
 
     // the draft context holds as many tokens per sequence as the target context
