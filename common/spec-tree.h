@@ -212,7 +212,9 @@ private:
     // where it disagrees with a level in flight, that suffix dies and the
     // fresh tokens take its place (the fresh block knows the root's true
     // taps, the stale token came from an older block's deeper position)
-    bool         chain_preempt = true;
+    //   0 off, 1 a block every step, 2 only the blocks the chain needs anyway
+    //   (started when the queue runs short, so they still run under the wait)
+    int32_t      chain_preempt = 2;
     std::thread  draft_thread;
     bool         draft_pending = false;
     int32_t      draft_rc  = 0;

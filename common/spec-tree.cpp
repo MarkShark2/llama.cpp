@@ -44,7 +44,7 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
             chain_take = std::max(0, atoi(s));
         }
         if (const char * s = getenv("GGML_PIPEDEC_CHAIN_PREEMPT")) {
-            chain_preempt = atoi(s) != 0;
+            chain_preempt = std::max(0, std::min(2, atoi(s)));
         }
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_tgt));
     } else {
@@ -249,7 +249,11 @@ bool common_spec_tree::begin(llama_token root_tok, llama_pos root_pos, llama_seq
 }
 
 void common_spec_tree::chain_draft_start() {
-    if (!chain_preempt || draft_pending || root < 0) {
+    if (chain_preempt == 0 || draft_pending || root < 0) {
+        return;
+    }
+    // opportunistic: only when the queue is about to run dry at this root
+    if (chain_preempt == 2 && (chain_toks.size() > 1 || chain_dry)) {
         return;
     }
     const node & R = nodes[root];
@@ -638,6 +642,8 @@ int32_t common_spec_tree::submit_next() {
             const int32_t id = chain_push(deepest, tok);
             pending = { id };
             pending_depth = nodes[id].level;
+            // the next block, under this level's submit and the close wait
+            chain_draft_start();
         } else {
             if (!expand()) {
                 return -1;
