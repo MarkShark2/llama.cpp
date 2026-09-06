@@ -2569,7 +2569,12 @@ static bool pipedec_stage2_eligible(
         has_samplers ||
         // qwen4exp deliberately carries its n_embd_out()-wide HC residual into
         // graph_pipedec_head; every older stage-2 head still requires flat rows.
-        (model.arch != LLM_ARCH_QWEN4EXP && model.hparams.n_embd != model.hparams.n_embd_out()) ||
+        // deepseek4's n_embd_out() is also hc_mult wide (the SPD boundary and
+        // the wide nextn tap), but its body collapses the streams before the
+        // handoff and its head takes flat rows - the row width is taken from
+        // the body result, not from n_embd_out() (pipedec_row_n_embd()).
+        (model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_DEEPSEEK4 &&
+         model.hparams.n_embd != model.hparams.n_embd_out()) ||
         // The qwen4exp recurrent snapshots are indexed from the known end of
         // one complete verification group; deferred groups do not know it yet.
         (model.arch == LLM_ARCH_QWEN4EXP && allow_single) ||
@@ -3114,7 +3119,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         pipedec_stage2 ? sched_pipedec_body[pipedec_lane][0].get() : sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd = hparams.n_embd_out();
+                // [fork, PipeDec] a body lane's row is as wide as the body left
+                // it: the collapsed n_embd on deepseek4, the full HC stack on
+                // qwen4exp. The group buffer is strided by that width.
+                if (pipedec_stage2) {
+                    GGML_ASSERT(t_h_nextn->ne[0] > 0 && (uint32_t) t_h_nextn->ne[0] <= hparams.n_embd_out());
+                    pipedec_row_width = (uint32_t) t_h_nextn->ne[0];
+                }
+                const uint32_t n_embd = pipedec_stage2 ? pipedec_row_n_embd() : hparams.n_embd_out();
 
                 // [fork, PipeDec] stage-2 rows land in the fixed group buffer: with a
                 // deferred group the GET may still be in flight when the NEXT decode's
@@ -3208,11 +3220,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         pipedec_group_tokens = 0;
 
         // make the group's hidden rows visible to llama_get_embeddings_nextn*
+        // (embd_nextn rows keep the n_embd_out() stride; a narrower body row
+        // is copied into the head of each slot)
         if (embd_nextn.data) {
             const uint32_t n_embd = hparams.n_embd_out();
+            const uint32_t n_row  = pipedec_row_n_embd();
             GGML_ASSERT((size_t) pipedec_total * n_embd <= embd_nextn.size);
-            PIPEDEC_STEP("group-close: memcpy nextn total=%u n_embd=%u\n", pipedec_total, n_embd);
-            std::memcpy(embd_nextn.data, pipedec_group_h.data(), (size_t) pipedec_total * n_embd * sizeof(float));
+            PIPEDEC_STEP("group-close: memcpy nextn total=%u n_embd=%u row=%u\n", pipedec_total, n_embd, n_row);
+            for (uint32_t r = 0; r < pipedec_total; ++r) {
+                std::memcpy(embd_nextn.data + (size_t) r * n_embd, pipedec_group_h.data() + (size_t) r * n_row,
+                        (size_t) n_row * sizeof(float));
+            }
         }
 
         // publish the group's per-layer DFlash feature taps to embd_layer_inp so
@@ -5451,7 +5469,11 @@ static bool pipedec_tree_batch_ok(
 }
 
 float * llama_context::pipedec_tree_row(int32_t lane, int32_t row) {
-    return pipedec_group_h.data() + ((size_t) lane * PIPEDEC_TREE_MAX_ROWS + row) * model.hparams.n_embd_out();
+    return pipedec_group_h.data() + ((size_t) lane * PIPEDEC_TREE_MAX_ROWS + row) * pipedec_row_n_embd();
+}
+
+uint32_t llama_context::pipedec_row_n_embd() const {
+    return pipedec_row_width > 0 ? pipedec_row_width : model.hparams.n_embd_out();
 }
 
 int32_t llama_context::pipedec_tree_enable(bool value) {
@@ -5558,7 +5580,9 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
         return -3;
     }
 
-    const uint32_t n_embd = model.hparams.n_embd_out();
+    GGML_ASSERT(t_h->ne[0] > 0 && (uint32_t) t_h->ne[0] <= model.hparams.n_embd_out());
+    pipedec_row_width = (uint32_t) t_h->ne[0];
+    const uint32_t n_embd = pipedec_row_n_embd();
     GGML_ASSERT(ggml_nelements(t_h) == (int64_t) n_tokens * n_embd);
 
     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_pipedec_body[lane][n_tokens - 1].get(), t_h);

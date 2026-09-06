@@ -224,6 +224,11 @@ struct llama_context {
     int32_t       pipedec_tree_commit (llama_seq_id seq_src, llama_seq_id seq_dst);
     // one LM-head graph over n_rows host rows; logits land in rows [0, n_rows)
     int32_t       pipedec_run_head    (const float * rows, uint32_t n_rows);
+    // width of one body-lane hidden row (stride of pipedec_group_h): what the
+    // body graph hands to the head - n_embd_out() unless a body result said
+    // otherwise (deepseek4 collapses its HC streams before the handoff)
+    uint32_t      pipedec_row_n_embd  () const;
+    uint32_t      pipedec_row_width = 0;
     static constexpr uint32_t pipedec_tree_max_lanes() { return PIPEDEC_STAGE2_MAX_LANES; }
     static constexpr uint32_t pipedec_tree_max_rows () { return PIPEDEC_TREE_MAX_ROWS; }
     int64_t pipedec_tree_wait_us() const { return pipedec_tree_t_wait_us; }
