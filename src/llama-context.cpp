@@ -5460,7 +5460,8 @@ static bool pipedec_tree_batch_ok(
         cparams.embeddings_nextn_masked ||
         cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
         has_samplers ||
-        (model.arch != LLM_ARCH_QWEN4EXP && model.hparams.n_embd != model.hparams.n_embd_out())) {
+        (model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_DEEPSEEK4 &&
+         model.hparams.n_embd != model.hparams.n_embd_out())) {
         LLAMA_LOG_ERROR("%s: context is not stage-2 eligible\n", __func__);
         return false;
     }
