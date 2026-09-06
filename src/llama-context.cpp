@@ -2661,7 +2661,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // n_embd_inp_ctx, not n_embd: an SPD stage is fed the previous stage's raw
     // residual, which on DeepSeek-V4 is hc_mult streams wide. n_embd stays as
     // the model's own width for the embeddings output below.
-    if (!balloc->init(batch_inp, vocab, memory.get(), cparams.n_embd_inp_ctx, n_seq_max, output_all)) {
+    //
+    // A DFlash/DSpark draft is the one context whose embd batches are wider
+    // than its own n_embd_inp(): the fused encoder injection carries
+    // target_layer_ids x n_embd_tgt features per row (upstream's dflash_embd
+    // rule). Striding those at n_embd_inp_ctx copies the first
+    // n_tokens*n_embd/n_embd_enc rows correctly and reads the rest past the
+    // end of batch.embd -- on DSV4 + DSpark that is rows 18..54 of a 55-token
+    // prompt, and the garbage features came back out of the drafter as NaN
+    // logits, an argmax of -1, and an out-of-bounds get_rows on the Markov
+    // table.
+    const bool    dflash_embd  = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
+    const int64_t n_embd_batch = dflash_embd ? (int64_t) hparams.n_embd_inp_enc() : (int64_t) cparams.n_embd_inp_ctx;
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd_batch, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
