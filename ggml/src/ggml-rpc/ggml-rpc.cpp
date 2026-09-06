@@ -741,6 +741,9 @@ private:
     void exec(rpc_msg & msg);
     // enqueue (async mode) or execute inline (direct mode); returns the message
     rpc_msg_ptr submit(rpc_msg_ptr msg);
+    // [fork] submit a message that puts exactly one command on the main
+    // connection, counted for the lane fences (see enqueue_counted)
+    void submit_counted(rpc_msg_ptr msg);
     void ensure_worker();
 
     rpc_msg_queue    queue;
@@ -821,6 +824,62 @@ rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
     return msg;
 }
 
+// [fork] Every command that goes out on the main connection - the plain
+// send()s of the buffer interface (weight uploads, allocs, synchronous reads,
+// memsets, session commands) just as much as the graph submits and async
+// tensor ops that go through enqueue_counted - advances the server's
+// main-lane ordering counter (rpc_serve_client bumps main_done after each
+// one). The lane fences are built on the client's mirror of that count, so
+// a command that reaches the wire uncounted leaves the mirror behind the
+// server for the rest of the connection: every later SET/GET lane target
+// names a position the server has already passed, and full-duplex traffic
+// is released early - inputs land on a board while the previous graph is
+// still reading them, boundary reads return the previous ubatch. Nothing
+// errors; the model computes garbage. (This was the async regression of the
+// dispatcher port: the pre-port send_rpc_cmd_ordered counted everything.)
+void rpc_dispatcher::submit_counted(rpc_msg_ptr msg) {
+    if (!rpc_async_enabled()) {
+        // direct mode never brings the lanes up, and there is no queue to
+        // order against: nothing to count, and enqueue_counted's lock would
+        // otherwise be held across an inline socket round trip
+        submit(msg);
+        return;
+    }
+    rpc_lanes & ep = lanes;
+    std::lock_guard<std::mutex> l(ep.m);
+    const bool fence = ep.state == 1 && (ep.set_enq != ep.fenced_set || ep.get_enq != ep.fenced_get);
+    if (!fence) {
+        ep.main_enq += 1;
+        submit(msg);
+        return;
+    }
+    // lane traffic advanced since the last fence: this command has to order
+    // itself behind it, exactly like enqueue_counted does for a task
+    rpc_msg_lane_fence_req freq = { ep.set_enq, ep.get_enq };
+    ep.fenced_set = ep.set_enq;
+    ep.fenced_get = ep.get_enq;
+    ep.main_enq += 2;
+    const enum rpc_cmd          cmd         = msg->cmd;
+    std::shared_ptr<const void> input       = msg->input;
+    const size_t                input_size  = msg->input_size;
+    void *                      output      = msg->output;
+    const size_t                output_size = msg->output_size;
+    msg->task = [freq, cmd, input, input_size, output, output_size](const socket_ptr & s) {
+        if (s == nullptr) {
+            GGML_LOG_ERROR("[rpc] not connected; command %d dropped\n", (int) cmd);
+            return false;
+        }
+        if (!send_rpc_cmd(s, RPC_CMD_LANE_FENCE, &freq, sizeof(freq))) {
+            return false;
+        }
+        if (output != nullptr) {
+            return send_rpc_cmd(s, cmd, input.get(), input_size, output, output_size);
+        }
+        return send_rpc_cmd(s, cmd, input.get(), input_size);
+    };
+    submit(msg);
+}
+
 bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
@@ -829,7 +888,7 @@ bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->output = nullptr;
     msg->output_size = 0;
     auto future = msg->completion.get_future();
-    submit(msg);
+    submit_counted(msg);
     future.wait();
     return msg->ok;
 }
@@ -841,7 +900,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
-    submit(msg);
+    submit_counted(msg);
 }
 
 bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
@@ -852,7 +911,7 @@ bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->output = output;
     msg->output_size = output_size;
     auto future = msg->completion.get_future();
-    submit(msg);
+    submit_counted(msg);
     future.wait();
     return msg->ok;
 }
@@ -864,7 +923,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
-    submit(msg);
+    submit_counted(msg);
 }
 
 void rpc_dispatcher::task(task_fn fn) {
@@ -1025,6 +1084,13 @@ bool rpc_dispatcher::start() {
         std::lock_guard<std::mutex> l(sock_m);
         sock  = s;
         patch = server_patch;
+    }
+    {
+        // the server's main-lane ordering counter is per connection and
+        // starts at zero after HELLO; the client's mirror restarts with it
+        // (a reattach counts its SESSION_RESUME like any other command)
+        std::lock_guard<std::mutex> l(lanes.m);
+        lanes.main_enq = 0;
     }
     if (rpc_async_enabled()) {
         ensure_worker();
@@ -3278,18 +3344,10 @@ GGML_BACKEND_API int ggml_backend_rpc_reattach(int timeout_ms) {
             }
             GGML_LOG_INFO("[rpc hibernate] %s: resumed %llu buffers\n",
                           endpoint.c_str(), (unsigned long long) rsp.n_buffers);
-            // SESSION_RESUME is a main-connection command, and the server
-            // bumps its ordering counter for every one of those. The client's
-            // mirror (main_enq, zeroed by rpc_lanes_teardown) therefore has to
-            // count it too. Miss it and the server's count stays one ahead
-            // forever: every later lane fence names a target it has already
-            // passed, so full-duplex SET/GET traffic is released one main
-            // command early and lands out of order. Nothing errors - the
-            // model just computes on tensors that arrived too soon.
-            {
-                std::lock_guard<std::mutex> el(disp->lanes.m);
-                disp->lanes.main_enq++;
-            }
+            // SESSION_RESUME is a main-connection command like any other:
+            // send() counted it against the mirror that start() zeroed for
+            // this fresh connection, matching the server's per-connection
+            // counter (see submit_counted)
             done.push_back(endpoint);
             resumed++;
         }
