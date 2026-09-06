@@ -216,12 +216,16 @@ struct llama_context {
     uint32_t pipedec_group_n() const { return pipedec_group_tokens; }
 
     // [fork, PipeDec tree] see llama-ext.h
-    int32_t       pipedec_tree_enable (bool value);
+    int32_t       pipedec_tree_enable (bool value, bool chain);
     int32_t       pipedec_tree_submit (const llama_batch & batch, int32_t lane);
     int32_t       pipedec_tree_close  (int32_t lane, int32_t row);
     void          pipedec_tree_discard(int32_t lane);
     const float * pipedec_tree_h      (int32_t lane, int32_t row);
     int32_t       pipedec_tree_commit (llama_seq_id seq_src, llama_seq_id seq_dst);
+    // chain mode: a closed (or drained) single-row level's layer-input tap
+    const float * pipedec_tree_layer_inp(int32_t lane, uint32_t il);
+    // drain every lane, in flight or dead
+    void          pipedec_tree_retire ();
     // one LM-head graph over n_rows host rows; logits land in rows [0, n_rows)
     int32_t       pipedec_run_head    (const float * rows, uint32_t n_rows);
     // width of one body-lane hidden row (stride of pipedec_group_h): what the
@@ -333,7 +337,9 @@ private:
     // [fork, PipeDec] stage-2 variant: async-GET each enabled layer-input row of a
     // single-token body lane into the stable per-group buffers (published to
     // embd_layer_inp at group close, mirroring pipedec_group_h -> embd_nextn).
-    void extract_layer_inputs_pipedec(const llm_graph_result * res, ggml_backend_sched_t lane_sched, uint32_t lane);
+    // read_backends, when given, collects the backend of every GET issued
+    void extract_layer_inputs_pipedec(const llm_graph_result * res, ggml_backend_sched_t lane_sched, uint32_t lane,
+            std::vector<ggml_backend_t> * read_backends = nullptr);
 
     //
     // graph
@@ -474,12 +480,15 @@ private:
     // busy = its body graph or row GETs may still run. Rows stay readable after
     // close until the lane is reused.
     bool     pipedec_tree_enabled = false;
+    // chain mode: single-row levels in the slot's own seq (a block drafter's
+    // tree: no prefix sharing, the level's layer-input taps are read too)
+    bool     pipedec_tree_chain   = false;
     std::array<uint32_t, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_rows{};
     std::array<bool,     PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_busy{};
-    // the row GET's read fence: waiting on it proves this lane's graph retired
-    // on the last stage without draining the other lanes' queued work
-    std::array<ggml_backend_t, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_backend{};
-    std::array<uint64_t,       PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_fence{};
+    // the row GETs' read fences, one per backend read: waiting on them proves
+    // this lane's graph retired on those stages without draining the other
+    // lanes' queued work
+    std::array<std::vector<std::pair<ggml_backend_t, uint64_t>>, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_reads{};
     void pipedec_tree_lane_wait(int32_t lane);
     // set by close(): the logits came from the head, which already waited on
     // its device, so synchronize() (llama_get_logits_ith calls it) must not

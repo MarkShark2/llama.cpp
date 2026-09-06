@@ -186,6 +186,14 @@ struct common_speculative_impl {
     // [fork, PipeDec tree] draft-mtp carry-over hidden row (see speculative.h)
     virtual const float * mtp_pending_h(llama_seq_id /*seq_id*/) const { return nullptr; }
     virtual void mtp_set_pending_h(llama_seq_id /*seq_id*/, const float * /*h*/) {}
+
+    // [fork, PipeDec tree] block-drafter interface (see speculative.h)
+    virtual common_spec_tree_kind tree_kind() const { return COMMON_SPEC_TREE_NONE; }
+    virtual int32_t tree_block_draft(llama_seq_id /*seq*/, llama_token /*tok*/, llama_pos /*pos*/, int32_t /*n_cand*/,
+            std::vector<std::vector<common_spec_tree_cand>> & /*out*/) { return -1; }
+    virtual int32_t tree_feat_layers(const int32_t ** ids) const { *ids = nullptr; return 0; }
+    virtual int32_t tree_feat_width() const { return 0; }
+    virtual bool    tree_inject(llama_seq_id /*seq*/, int32_t /*n_rows*/, const llama_pos * /*pos*/, const float * /*feats*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -953,11 +961,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // [fork, PipeDec tree] block drafting for the prediction tree: the tree's
+    // depth is its own (n_max is not clamped to the block), tree seqs sample on
+    // this dedicated CPU sampler
+    const bool         tree_mode;
+    common_sampler_ptr tree_smpl;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+        , tree_mode(params.tree_enabled())
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1012,13 +1027,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
         const int32_t n_draft_max = is_dspark && sample_from_anchor ? block_size : block_size - 1;
-        if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
+        if (tree_mode) {
+            // the tree's n_max is its depth (levels in flight); every block the
+            // tree asks for is n_draft_max levels deep and chains further blocks
+            // from the drafter's own noise cells
+            LOG_INF("%s: PipeDec tree: %d levels per block, tree depth %d\n", __func__, n_draft_max, this->params.n_max);
+        } else if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
             LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained block size %d -- clamping to %d\n",
                     __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
             this->params.n_max = std::min(this->params.n_max, n_draft_max);
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+
+        if (tree_mode) {
+            common_params_sampling sparams;
+            sparams.no_perf  = true;
+            sparams.top_k    = std::max(16, this->params.n_max);
+            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            tree_smpl.reset(common_sampler_init(model_dft, sparams));
+        }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
@@ -1390,6 +1418,106 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
     }
+
+    // [fork, PipeDec tree] block drafting. The tree owns the seqs; the block is
+    // the same noise decode draft() runs, anchored at the node's token.
+    common_spec_tree_kind tree_kind() const override {
+        return tree_mode && !is_dflash2 ? COMMON_SPEC_TREE_BLOCK : COMMON_SPEC_TREE_NONE;
+    }
+
+    int32_t tree_block_draft(llama_seq_id seq_id, llama_token tok, llama_pos pos, int32_t n_cand,
+            std::vector<std::vector<common_spec_tree_cand>> & out) override {
+        auto * ctx_dft = params.ctx_dft;
+        out.clear();
+        if (!tree_smpl) {
+            return -1;
+        }
+
+        // the previous block on this seq (or on the seq it was cloned from) left
+        // its noise cells from pos on; the decoder is non-causal inside the block
+        // and would attend both
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos, -1);
+
+        const int32_t n_draft         = is_dspark && sample_from_anchor ? block_size : block_size - 1;
+        const int32_t n_block_tokens  = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+        common_batch_clear(batch);
+        for (int32_t i = 0; i < n_block_tokens; ++i) {
+            common_batch_add(batch, i == 0 ? tok : mask_token_id, pos + i, { seq_id }, true);
+        }
+
+        const int ret = llama_decode(ctx_dft, batch);
+        if (ret != 0) {
+            LOG_ERR("%s: llama_decode returned %d (seq=%d pos=%d)\n", __func__, ret, (int) seq_id, (int) pos);
+            return -1;
+        }
+
+        const int32_t i_draft_beg = is_dspark && sample_from_anchor ? 0 : 1;
+        for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+            common_sampler_reset(tree_smpl.get());
+            common_sampler_sample(tree_smpl.get(), ctx_dft, i, true);
+            const auto * cur_p = common_sampler_get_candidates(tree_smpl.get(), true);
+
+            std::vector<common_spec_tree_cand> cands;
+            for (int k = 0; k < (int) cur_p->size && k < n_cand; ++k) {
+                if (cur_p->data[k].p <= 0.0f) {
+                    break;
+                }
+                cands.push_back({ cur_p->data[k].id, cur_p->data[k].p });
+            }
+            if (cands.empty()) {
+                break;
+            }
+            out.push_back(std::move(cands));
+        }
+        return (int32_t) out.size();
+    }
+
+    int32_t tree_feat_layers(const int32_t ** ids) const override {
+        *ids = target_layer_ids;
+        return (int32_t) target_layer_ids_n;
+    }
+
+    int32_t tree_feat_width() const override {
+        return n_embd_enc;
+    }
+
+    bool tree_inject(llama_seq_id seq_id, int32_t n_rows, const llama_pos * pos, const float * feats) override {
+        auto * ctx_dft = params.ctx_dft;
+        if (n_rows <= 0) {
+            return true;
+        }
+        // drop the noise cells the last block left from the first injected
+        // position on: the decoder is non-causal, so anything above these rows
+        // would be attended, and nothing above them is an injected state (the
+        // tree injects in position order). The next block re-draws the noise.
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos[0], -1);
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+            batch_inject.n_tokens = n_chunk;
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                std::memcpy(batch_inject.embd + (size_t) i * n_embd_enc,
+                        feats + (size_t) (offset + i) * n_embd_enc, (size_t) n_embd_enc * sizeof(float));
+                const llama_pos p = pos[offset + i];
+                batch_inject.pos[i] = p;
+                if (is_mrope) {
+                    batch_inject.pos[1 * n_chunk + i] = p;
+                    batch_inject.pos[2 * n_chunk + i] = p;
+                    batch_inject.pos[3 * n_chunk + i] = 0;
+                }
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i]    = false;
+            }
+            const int32_t rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (seq=%d n_rows=%d)\n", __func__, rc, (int) seq_id, n_rows);
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -1536,6 +1664,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return nullptr;
         }
         return &probe_topk[seq_id][step];
+    }
+
+    common_spec_tree_kind tree_kind() const override {
+        return COMMON_SPEC_TREE_MTP_ROW;
     }
 
     const float * mtp_pending_h(llama_seq_id seq_id) const override {
@@ -3146,6 +3278,48 @@ void common_speculative_mtp_set_pending_h(common_speculative * spec, llama_seq_i
             impl->mtp_set_pending_h(seq_id, h);
         }
     }
+}
+
+// [fork, PipeDec tree] the first implementation that can feed the tree
+static common_speculative_impl * common_speculative_tree_impl(common_speculative * spec) {
+    for (auto & impl : spec->impls) {
+        if (impl->tree_kind() != COMMON_SPEC_TREE_NONE) {
+            return impl.get();
+        }
+    }
+    return nullptr;
+}
+
+common_spec_tree_kind common_speculative_tree_kind(common_speculative * spec) {
+    auto * impl = spec ? common_speculative_tree_impl(spec) : nullptr;
+    return impl ? impl->tree_kind() : COMMON_SPEC_TREE_NONE;
+}
+
+int32_t common_speculative_tree_block_draft(
+        common_speculative * spec, llama_seq_id seq, llama_token tok, llama_pos pos, int32_t n_cand,
+        std::vector<std::vector<common_spec_tree_cand>> & out) {
+    auto * impl = common_speculative_tree_impl(spec);
+    return impl ? impl->tree_block_draft(seq, tok, pos, n_cand, out) : -1;
+}
+
+int32_t common_speculative_tree_feat_layers(common_speculative * spec, const int32_t ** ids) {
+    auto * impl = common_speculative_tree_impl(spec);
+    if (!impl) {
+        *ids = nullptr;
+        return 0;
+    }
+    return impl->tree_feat_layers(ids);
+}
+
+int32_t common_speculative_tree_feat_width(common_speculative * spec) {
+    auto * impl = common_speculative_tree_impl(spec);
+    return impl ? impl->tree_feat_width() : 0;
+}
+
+bool common_speculative_tree_inject(
+        common_speculative * spec, llama_seq_id seq, int32_t n_rows, const llama_pos * pos, const float * feats) {
+    auto * impl = common_speculative_tree_impl(spec);
+    return impl ? impl->tree_inject(seq, n_rows, pos, feats) : false;
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

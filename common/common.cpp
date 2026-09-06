@@ -1795,7 +1795,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     // [fork, PipeDec tree] branches share their prefix cells by seq_cp, which
     // is metadata only on a unified cache and a full copy per stream otherwise
-    if (params.speculative.tree_enabled()) {
+    if (params.speculative.tree_enabled() && !params.speculative.tree_chain()) {
         cparams.kv_unified = true;
     }
 

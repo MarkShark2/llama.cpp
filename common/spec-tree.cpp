@@ -25,8 +25,29 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
         this->params.branch = this->params.width;
     }
 
-    n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_dft));
-    GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(params.ctx_tgt)));
+    chain = params.spec != nullptr && common_speculative_tree_kind(params.spec) == COMMON_SPEC_TREE_BLOCK;
+    if (chain) {
+        GGML_ASSERT(this->params.width == 1 && "chain mode is width 1");
+        this->params.branch = 1;
+
+        const int32_t * ids = nullptr;
+        const int32_t n_ids = common_speculative_tree_feat_layers(params.spec, &ids);
+        GGML_ASSERT(n_ids > 0 && ids != nullptr);
+        feat_layers.assign(ids, ids + n_ids);
+        n_feat     = common_speculative_tree_feat_width(params.spec);
+        n_embd_tgt = n_feat / n_ids;
+        GGML_ASSERT(n_feat > 0 && n_embd_tgt * n_ids == n_feat);
+        GGML_ASSERT(n_embd_tgt == llama_model_n_embd(llama_get_model(params.ctx_tgt)));
+        feat_buf.assign((size_t) n_feat, 0.0f);
+
+        if (const char * s = getenv("GGML_PIPEDEC_CHAIN_TAKE")) {
+            chain_take = std::max(0, atoi(s));
+        }
+        n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_tgt));
+    } else {
+        n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_dft));
+        GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(params.ctx_tgt)));
+    }
 
     const int32_t width = this->params.width;
 
@@ -45,7 +66,8 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
     }
 
     // backend top-k on the draft device for every tree seq, CPU fallback otherwise
-    const int32_t n_tree_seq = this->params.lanes * width;
+    // (chain mode owns no seqs: the drafter samples on its own)
+    const int32_t n_tree_seq = chain ? 0 : this->params.lanes * width;
     backend_chains.assign(n_tree_seq, nullptr);
     for (int32_t i = 0; i < n_tree_seq; ++i) {
         const llama_seq_id seq = this->params.seq_base + i;
@@ -63,9 +85,14 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
 
     h_out.resize((size_t) width * n_embd);
 
-    LOG_INF("%s: PipeDec tree: depth=%d width=%d branch=%d lanes=%d seq_base=%d p_min=%.2f backend_topk=%s\n",
-            __func__, this->params.depth, width, this->params.branch, this->params.lanes,
-            (int) this->params.seq_base, this->params.p_min, backend_chains[0] ? "yes" : "no");
+    if (chain) {
+        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d taps=%d x %d\n",
+                __func__, this->params.depth, this->params.lanes, chain_take, (int) feat_layers.size(), n_embd_tgt);
+    } else {
+        LOG_INF("%s: PipeDec tree: depth=%d width=%d branch=%d lanes=%d seq_base=%d p_min=%.2f backend_topk=%s\n",
+                __func__, this->params.depth, width, this->params.branch, this->params.lanes,
+                (int) this->params.seq_base, this->params.p_min, backend_chains[0] ? "yes" : "no");
+    }
 }
 
 common_spec_tree::~common_spec_tree() {
@@ -102,8 +129,8 @@ void common_spec_tree::free_node(int32_t id) {
 // a freed lane keeps the trunk cells it already shares (they stay valid for the
 // rest of this tree); only its own branch above the mark goes
 void common_spec_tree::free_seq(llama_seq_id seq) {
-    if (seq < 0) {
-        return;
+    if (seq < 0 || chain) {
+        return; // chain mode: the seq is the slot's, a miss drops its suffix in advance()
     }
     const int32_t   i  = (int32_t) (seq - params.seq_base);
     const llama_pos p0 = (i >= 0 && i < (int32_t) synced.size()) ? synced[i] + 1 : 0;
@@ -112,6 +139,9 @@ void common_spec_tree::free_seq(llama_seq_id seq) {
 }
 
 void common_spec_tree::sync_seq(llama_seq_id parent_seq, llama_seq_id seq) {
+    if (chain) {
+        return;
+    }
     const int32_t i = (int32_t) (seq - params.seq_base);
     GGML_ASSERT(i >= 0 && i < (int32_t) synced.size());
 
@@ -129,6 +159,9 @@ void common_spec_tree::sync_seq(llama_seq_id parent_seq, llama_seq_id seq) {
 }
 
 void common_spec_tree::clear_seqs(llama_seq_id keep) {
+    if (chain) {
+        return;
+    }
     for (size_t i = 0; i < synced.size(); ++i) {
         const llama_seq_id seq = params.seq_base + (llama_seq_id) i;
         if (seq != keep && synced[i] >= 0) {
@@ -186,13 +219,134 @@ bool common_spec_tree::begin(llama_token root_tok, llama_pos root_pos, llama_seq
     n.level      = 0;
     n.parent_seq = parent_seq;
     n.logp       = 0.0f;
-    n.h_in.assign(h_in, h_in + n_embd);
+    if (chain) {
+        // the drafter's cache holds the injected taps through the root's
+        // predecessor (process() on the batch that produced the root)
+        n.seq      = parent_seq;
+        chain_seq  = parent_seq;
+        feat_pos   = root_pos - 1;
+        deepest    = id;
+        chain_dry  = false;
+        chain_toks.clear();
+    } else {
+        n.h_in.assign(h_in, h_in + n_embd);
+    }
 
     root = id;
     pending = { id };
     pending_depth = 0;
 
     TREE_TRC("begin root tok=%d pos=%d parent_seq=%d\n", (int) root_tok, (int) root_pos, (int) parent_seq);
+    return true;
+}
+
+int32_t common_spec_tree::chain_node_at(llama_pos pos) const {
+    int32_t id = root;
+    while (id >= 0) {
+        const auto & n = nodes[id];
+        if (n.pos == pos) {
+            return id;
+        }
+        id = n.children.empty() ? -1 : n.children[0];
+    }
+    return -1;
+}
+
+int32_t common_spec_tree::chain_push(int32_t parent, llama_token tok) {
+    const llama_pos pos   = nodes[parent].pos + 1;
+    const int32_t   level = nodes[parent].level + 1;
+
+    const int32_t id = new_node();
+    auto & c = nodes[id];
+    c.tok        = tok;
+    c.pos        = pos;
+    c.parent     = parent;
+    c.level      = level;
+    c.parent_seq = chain_seq;
+    c.seq        = chain_seq;
+    c.logp       = 0.0f;
+
+    nodes[parent].children.push_back(id);
+    return id;
+}
+
+// the closed level's target taps become the drafter's context for that position
+bool common_spec_tree::chain_inject(int32_t id) {
+    const auto & n = nodes[id];
+    if (n.lane < 0) {
+        return false;
+    }
+    if (n.pos != feat_pos + 1) {
+        LOG_ERR("%s: taps out of order (pos %d, injected through %d)\n", __func__, (int) n.pos, (int) feat_pos);
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+    for (size_t k = 0; k < feat_layers.size(); ++k) {
+        const float * tap = llama_pipedec_tree_layer_inp(params.ctx_tgt, n.lane, (uint32_t) feat_layers[k]);
+        if (!tap) {
+            LOG_ERR("%s: no layer-input tap %d on lane %d\n", __func__, feat_layers[k], n.lane);
+            return false;
+        }
+        std::memcpy(feat_buf.data() + k * (size_t) n_embd_tgt, tap, (size_t) n_embd_tgt * sizeof(float));
+    }
+    const llama_pos pos = n.pos;
+    if (!common_speculative_tree_inject(params.spec, chain_seq, 1, &pos, feat_buf.data())) {
+        return false;
+    }
+    feat_pos = pos;
+    st.t_inject_us += ggml_time_us() - t0;
+    return true;
+}
+
+// one block anchored at the root (the drafter holds the taps through root.pos-1):
+// positions already in flight are compared, the rest extend the chain
+bool common_spec_tree::chain_expand() {
+    const node & R = nodes[root];
+    if (feat_pos != R.pos - 1) {
+        LOG_ERR("%s: drafter context ends at %d, root at %d\n", __func__, (int) feat_pos, (int) R.pos);
+        return false;
+    }
+
+    const int64_t t0 = ggml_time_us();
+
+    std::vector<std::vector<common_spec_tree_cand>> out;
+    const int32_t n_levels = common_speculative_tree_block_draft(params.spec, chain_seq, R.tok, R.pos, 1, out);
+    if (n_levels < 0) {
+        return false;
+    }
+    st.n_blocks += 1;
+
+    const llama_pos pos_deepest = nodes[deepest].pos;
+    int32_t n_new = 0;
+    for (int32_t j = 0; j < n_levels; ++j) {
+        if (out[j].empty()) {
+            break;
+        }
+        const llama_pos   p   = R.pos + 1 + j;
+        const llama_token tok = out[j][0].tok;
+        if (p <= pos_deepest) {
+            const int32_t id = chain_node_at(p);
+            if (id >= 0 && nodes[id].tok == tok) {
+                st.n_agree += 1;
+            } else {
+                st.n_disagree += 1;
+            }
+            continue;
+        }
+        if (chain_take > 0 && n_new >= chain_take) {
+            break;
+        }
+        chain_toks.push_back(tok);
+        n_new++;
+    }
+    st.n_block_new += n_new;
+    st.t_draft_us  += ggml_time_us() - t0;
+
+    // nothing past the deepest level: the block cannot reach further until the
+    // root moves, so stop asking until the next advance
+    chain_dry = n_new == 0;
+
+    TREE_TRC("block root=%d pos=%d levels=%d new=%d deepest=%d\n", (int) R.tok, (int) R.pos, n_levels, n_new, (int) pos_deepest);
     return true;
 }
 
@@ -215,6 +369,9 @@ bool common_spec_tree::can_submit() const {
     }
     if (!pending.empty()) {
         return true;
+    }
+    if (chain) {
+        return !chain_toks.empty() || !chain_dry;
     }
     if (levels.empty()) {
         return false;
@@ -365,12 +522,31 @@ int32_t common_spec_tree::submit_next() {
     }
 
     if (pending.empty()) {
-        if (!expand()) {
-            return -1;
-        }
-        select();
-        if (pending.empty()) {
-            return 0;
+        if (chain) {
+            if (chain_toks.empty()) {
+                if (chain_dry) {
+                    return 0;
+                }
+                if (!chain_expand()) {
+                    return -1;
+                }
+                if (chain_toks.empty()) {
+                    return 0;
+                }
+            }
+            const llama_token tok = chain_toks.front();
+            chain_toks.pop_front();
+            const int32_t id = chain_push(deepest, tok);
+            pending = { id };
+            pending_depth = nodes[id].level;
+        } else {
+            if (!expand()) {
+                return -1;
+            }
+            select();
+            if (pending.empty()) {
+                return 0;
+            }
         }
     }
 
@@ -388,7 +564,7 @@ int32_t common_spec_tree::submit_next() {
     int64_t t_seq_rm = 0, t_seq_tgt = 0, t_seq_dft = 0;
     for (size_t i = 0; i < pending.size(); ++i) {
         auto & n = nodes[pending[i]];
-        n.seq  = params.seq_base + lane * params.width + (llama_seq_id) i;
+        n.seq  = chain ? chain_seq : params.seq_base + lane * params.width + (llama_seq_id) i;
         n.lane = lane;
         n.row  = (int32_t) i;
 
@@ -419,6 +595,9 @@ int32_t common_spec_tree::submit_next() {
     levels.push_back({ lane, pending_depth, pending });
     lane_used[lane] = true;
     ring_cursor = (lane + 1) % params.lanes;
+    if (chain) {
+        deepest = pending[0];
+    }
 
     st.n_levels += 1;
     st.n_rows   += (int64_t) pending.size();
@@ -490,6 +669,65 @@ common_spec_tree_advance common_spec_tree::advance(llama_token x) {
         }
     }
     st.n_children += res.n_children;
+
+    if (chain) {
+        // the root is verified: its taps are the drafter's context from now on
+        if (!chain_inject(root)) {
+            LOG_ERR("%s: tap injection failed at pos %d\n", __func__, (int) R.pos);
+        }
+        chain_dry = false;
+
+        if (hit >= 0) {
+            res.hit = true;
+            st.n_hits += 1;
+            nodes[hit].parent = -1;
+            R.children.clear();
+            free_node(root);
+            root = hit;
+            TREE_TRC("hit x=%d inflight=%d chain=%zu\n", (int) x, n_inflight(), chain_toks.size());
+        } else {
+            // miss: the suffix in flight dies in the queue and in the cache
+            st.n_restarts += 1;
+            const llama_pos pos = R.pos + 1;
+
+            for (const auto & l : levels) {
+                llama_pipedec_tree_discard(params.ctx_tgt, l.lane);
+                lane_used[l.lane] = false;
+            }
+            levels.clear();
+            auto children = R.children;
+            for (int32_t c : children) {
+                kill(c);
+            }
+            GGML_ASSERT(pending.empty());
+            chain_toks.clear();
+            free_node(root);
+
+            // the dead levels' cells: the host bookkeeping goes now, the lanes
+            // still queued write before the restart's lane (daemon FIFO)
+            if (!llama_memory_seq_rm(llama_get_memory(params.ctx_tgt), chain_seq, pos, -1)) {
+                LOG_ERR("%s: could not drop the dead suffix from %d (rollback deeper than n_rs_seq?)\n", __func__, (int) pos);
+            }
+
+            const int32_t id = new_node();
+            node & X = nodes[id];
+            X.tok        = x;
+            X.pos        = pos;
+            X.parent     = -1;
+            X.level      = 0;
+            X.parent_seq = chain_seq;
+            X.seq        = chain_seq;
+            X.logp       = 0.0f;
+
+            root = id;
+            deepest = id;
+            pending = { id };
+            pending_depth = 0;
+
+            TREE_TRC("miss x=%d restart pos=%d\n", (int) x, (int) pos);
+        }
+        return res;
+    }
 
     // the target's true hidden row at the root (the lane is drained: close ran)
     const float * h_true = llama_pipedec_tree_h(params.ctx_tgt, lv.lane, R.row);
@@ -577,6 +815,50 @@ llama_seq_id common_spec_tree::finish(llama_pos * trunk_pos, const float ** trun
 
     llama_seq_id trunk;
     llama_pos    tpos;
+    if (chain) {
+        // the committed state ends at the root if its level ran, at its
+        // predecessor otherwise; the root's taps go into the drafter so the
+        // next request's injection starts where the cache ends
+        if (R.lane >= 0) {
+            (void) llama_pipedec_tree_h(params.ctx_tgt, R.lane, R.row); // wait for the level
+            if (!chain_inject(root)) {
+                LOG_WRN("%s: root taps not injected at pos %d\n", __func__, (int) R.pos);
+            }
+            tpos = R.pos;
+        } else {
+            tpos = R.pos - 1;
+        }
+        trunk = chain_seq;
+
+        for (const auto & l : levels) {
+            llama_pipedec_tree_discard(params.ctx_tgt, l.lane);
+            lane_used[l.lane] = false;
+        }
+        levels.clear();
+        llama_pipedec_tree_retire(params.ctx_tgt);
+
+        // whatever ran past the root is gone from the cache
+        if (!llama_memory_seq_rm(llama_get_memory(params.ctx_tgt), chain_seq, tpos + 1, -1)) {
+            LOG_ERR("%s: could not drop the suffix past %d\n", __func__, (int) tpos);
+        }
+
+        pending.clear();
+        chain_toks.clear();
+        root = -1;
+        deepest = -1;
+        nodes.clear();
+        free_nodes.clear();
+        hold_seqs.clear();
+
+        if (trunk_pos) {
+            *trunk_pos = tpos;
+        }
+        if (trunk_h) {
+            *trunk_h = nullptr;
+        }
+        TREE_TRC("finish (chain) trunk_pos=%d feat_pos=%d\n", (int) tpos, (int) feat_pos);
+        return trunk;
+    }
     if (R.lane >= 0) {
         // the committed state ends at the root; read its row before the lanes go
         const float * h = llama_pipedec_tree_h(params.ctx_tgt, R.lane, R.row);
@@ -640,5 +922,14 @@ std::string common_spec_tree::summary() const {
             (double) st.n_children / steps, (long long) st.n_restarts, (long long) st.n_levels, (long long) st.n_rows,
             st.t_draft_us / 1000.0 / steps, st.t_submit_us / 1000.0 / steps,
             st.t_wait_us / 1000.0 / steps, st.t_head_us / 1000.0 / steps);
-    return buf;
+    std::string s = buf;
+    if (chain) {
+        const double blocks = st.n_blocks > 0 ? (double) st.n_blocks : 1.0;
+        snprintf(buf, sizeof(buf),
+                " | chain: blocks=%lld new/block=%.2f agree=%lld disagree=%lld inject %.2f ms/step",
+                (long long) st.n_blocks, (double) st.n_block_new / blocks,
+                (long long) st.n_agree, (long long) st.n_disagree, st.t_inject_us / 1000.0 / steps);
+        s += buf;
+    }
+    return s;
 }

@@ -15,10 +15,20 @@
 // children are drafted from (the target's true row at a restart, the head's own
 // output row further down), and a level is expanded in one batched draft
 // decode over the frontier.
+//
+// Chain mode (a block drafter such as draft-dspark, `spec` set): width 1, and
+// every level lives in the slot's own seq, so the cache needs neither unified
+// mode nor per-node seqs. The drafter's one noise-block forward, anchored at
+// the root, yields the candidates of the next block_size positions; the tokens
+// past the deepest level in flight extend the chain. When the root closes its
+// layer-input taps are injected into the drafter's cache (its context for the
+// next block), a hit advances the root, a miss drops the suffix from the cache
+// (a bounded partial rollback, n_rs_seq >= depth) and restarts from x.
 
 #include "llama.h"
 #include "common.h"
 #include "sampling.h"
+#include "speculative.h"
 
 #include <cstdint>
 #include <deque>
@@ -27,7 +37,10 @@
 
 struct common_spec_tree_params {
     llama_context * ctx_tgt = nullptr;
-    llama_context * ctx_dft = nullptr; // draft-mtp context
+    llama_context * ctx_dft = nullptr; // draft-mtp context, or the block drafter's
+
+    // chain mode: the speculative context whose block drafter feeds the tree
+    common_speculative * spec = nullptr;
 
     int32_t depth  = 2;  // levels in flight, i.e. how far the tree runs ahead of the root
     int32_t width  = 4;  // max nodes per level
@@ -51,6 +64,13 @@ struct common_spec_tree_stats {
     int64_t t_submit_us = 0;
     int64_t t_wait_us   = 0;
     int64_t t_head_us   = 0;
+
+    // chain mode
+    int64_t n_blocks    = 0; // block drafts
+    int64_t n_block_new = 0; // chain tokens taken from them
+    int64_t n_agree     = 0; // block positions that matched a level already in flight
+    int64_t n_disagree  = 0;
+    int64_t t_inject_us = 0;
 };
 
 struct common_spec_tree_advance {
@@ -136,6 +156,12 @@ private:
     bool    expand();  // batched draft decode over the frontier's unexpanded live nodes
     void    select();  // fill pending from the frontier's unused candidates
 
+    // chain mode
+    bool    chain_expand();          // one block from the root, extend the chain past the deepest level
+    bool    chain_inject(int32_t id); // a closed level's taps into the drafter's cache
+    int32_t chain_push(int32_t parent, llama_token tok); // node for the next chain token
+    int32_t chain_node_at(llama_pos pos) const;          // lineage node at pos, -1 if none
+
     int32_t alloc_lane() const;
 
     common_spec_tree_params params;
@@ -163,6 +189,19 @@ private:
 
     std::vector<bool> lane_used;
     int32_t ring_cursor = 0;
+
+    // chain mode
+    bool         chain      = false;
+    llama_seq_id chain_seq  = -1; // the slot's seq: every node lives here
+    llama_pos    feat_pos   = -1; // the drafter's cache holds injected target taps through here
+    int32_t      deepest    = -1; // last node of the lineage (root when nothing is past it)
+    int32_t      chain_take = 0;  // chain tokens taken per block (0 = all past the deepest level)
+    bool         chain_dry  = false; // the last block added nothing: wait for the root to move
+    std::deque<llama_token>  chain_toks; // drafted past the deepest level, not yet submitted
+    std::vector<int32_t>     feat_layers;
+    int32_t                  n_feat     = 0; // one feature row
+    int32_t                  n_embd_tgt = 0; // one tap
+    std::vector<float>       feat_buf;
 
     // draft side
     llama_batch batch_dft;

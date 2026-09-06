@@ -107,6 +107,41 @@ const std::vector<llama_token> * common_speculative_dbg_topk(common_speculative 
 const float * common_speculative_mtp_pending_h    (common_speculative * spec, llama_seq_id seq_id);
 void          common_speculative_mtp_set_pending_h(common_speculative * spec, llama_seq_id seq_id, const float * h);
 
+// [fork, PipeDec tree] how the loaded drafter feeds the prediction tree:
+//   MTP_ROW - draft-mtp: one head step per level, chained on the head's own hidden row
+//   BLOCK   - draft-dflash / draft-dspark: one noise-block forward yields the candidates
+//             of block_size consecutive levels (valid along the in-graph argmax chain);
+//             committed tokens are handed back as target-layer features for KV injection
+enum common_spec_tree_kind {
+    COMMON_SPEC_TREE_NONE = 0,
+    COMMON_SPEC_TREE_MTP_ROW,
+    COMMON_SPEC_TREE_BLOCK,
+};
+
+struct common_spec_tree_cand {
+    llama_token tok;
+    float       p;
+};
+
+common_spec_tree_kind common_speculative_tree_kind(common_speculative * spec);
+
+// block drafters: run the noise block on `seq` anchored at (tok, pos), after dropping
+// whatever `seq` held from pos on. out[j] = top candidates for position pos + 1 + j.
+// Returns the number of levels drafted, < 0 on error.
+int32_t common_speculative_tree_block_draft(
+        common_speculative * spec, llama_seq_id seq, llama_token tok, llama_pos pos, int32_t n_cand,
+        std::vector<std::vector<common_spec_tree_cand>> & out);
+
+// block drafters: the target layers whose input features the drafter injects, in the
+// order the feature row is laid out (n_layers x n_embd_tgt floats per row)
+int32_t common_speculative_tree_feat_layers(common_speculative * spec, const int32_t ** ids);
+int32_t common_speculative_tree_feat_width (common_speculative * spec);
+
+// block drafters: inject n_rows committed positions into `seq` from their target
+// features (rows of tree_feat_width floats), replacing the noise cells there
+bool    common_speculative_tree_inject(
+        common_speculative * spec, llama_seq_id seq, int32_t n_rows, const llama_pos * pos, const float * feats);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

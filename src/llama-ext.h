@@ -262,7 +262,14 @@ LLAMA_API uint32_t llama_pipedec_group_n(struct llama_context * ctx);
 // state (KV cells and recurrent cells) into another seq after every lane is
 // drained. enable switches the recurrent cache to static cells and sizes the
 // row buffers; n_lanes/n_rows_max report the limits.
-LLAMA_API int32_t       llama_pipedec_tree_enable (struct llama_context * ctx, bool value);
+// chain: single-row levels in the slot's own seq (a block drafter's tree) - no
+// prefix sharing, so neither a unified cache nor n_rs_seq == 0 is needed; a
+// dead suffix is a bounded partial rollback instead. Each level's enabled
+// layer-input taps are read along with its hidden row (layer_inp), and retire
+// drains every lane before the seq is rewritten.
+LLAMA_API int32_t       llama_pipedec_tree_enable (struct llama_context * ctx, bool value, bool chain);
+LLAMA_API const float * llama_pipedec_tree_layer_inp(struct llama_context * ctx, int32_t lane, uint32_t il);
+LLAMA_API void          llama_pipedec_tree_retire (struct llama_context * ctx);
 LLAMA_API int32_t       llama_pipedec_tree_submit (struct llama_context * ctx, const struct llama_batch * batch, int32_t lane);
 LLAMA_API int32_t       llama_pipedec_tree_close  (struct llama_context * ctx, int32_t lane, int32_t row);
 LLAMA_API void          llama_pipedec_tree_discard(struct llama_context * ctx, int32_t lane);

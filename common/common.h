@@ -194,6 +194,13 @@ inline bool common_spec_has_mtp(const std::vector<common_speculative_type> & typ
     return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
 }
 
+// [fork, PipeDec tree] block drafters (one noise-block forward per draft): the
+// tree runs them in chain mode - a single seq, a bounded rollback per miss
+inline bool common_spec_has_block(const std::vector<common_speculative_type> & types) {
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end() ||
+           std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+}
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -418,16 +425,23 @@ struct common_params_speculative {
         return tree_width > 0;
     }
 
+    // the tree over a block drafter runs in chain mode: one seq, no prefix
+    // sharing, a dead suffix is a bounded partial rollback
+    bool tree_chain() const {
+        return tree_enabled() && !common_spec_has_mtp(types) && common_spec_has_block(types);
+    }
+
     // seq ids the tree needs on top of the slots: one per node in flight
     uint32_t tree_n_seq() const {
-        return tree_enabled() ? (uint32_t) tree_lanes * (uint32_t) std::min(tree_width, 8) : 0u;
+        return tree_enabled() && !tree_chain() ? (uint32_t) tree_lanes * (uint32_t) std::min(tree_width, 8) : 0u;
     }
 
     uint32_t need_n_rs_seq() const {
-        // the tree never rolls a seq back: every node owns its seq and a dead
-        // branch is simply dropped, so no snapshot planes are needed
+        // the MTP tree never rolls a seq back: every node owns its seq and a
+        // dead branch is simply dropped, so no snapshot planes are needed. The
+        // chain tree drops up to depth (= draft.n_max) levels per miss.
         if (tree_enabled()) {
-            return 0u;
+            return tree_chain() ? (uint32_t) draft.n_max : 0u;
         }
 
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {

@@ -3669,7 +3669,8 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_back
     }
 }
 
-void llama_context::extract_layer_inputs_pipedec(const llm_graph_result * res, ggml_backend_sched_t lane_sched, uint32_t lane) {
+void llama_context::extract_layer_inputs_pipedec(const llm_graph_result * res, ggml_backend_sched_t lane_sched, uint32_t lane,
+        std::vector<ggml_backend_t> * read_backends) {
     if (pipedec_group_layer_inp.size() < cparams.embeddings_layer_inp.size()) {
         pipedec_group_layer_inp.resize(cparams.embeddings_layer_inp.size());
     }
@@ -3693,6 +3694,9 @@ void llama_context::extract_layer_inputs_pipedec(const llm_graph_result * res, g
         GGML_ASSERT(backend != nullptr);
         PIPEDEC_STEP("  extract il=%u tap='%s' backend=%s nbytes=%zu\n", il, t->name, ggml_backend_name(backend), nbytes);
         ggml_backend_tensor_get_async(backend, t, buf.data() + (size_t) lane * n_embd, 0, nbytes);
+        if (read_backends && std::find(read_backends->begin(), read_backends->end(), backend) == read_backends->end()) {
+            read_backends->push_back(backend);
+        }
     }
 }
 
@@ -5489,30 +5493,42 @@ uint32_t llama_context::pipedec_row_n_embd() const {
     return pipedec_row_width > 0 ? pipedec_row_width : model.hparams.n_embd_out();
 }
 
-int32_t llama_context::pipedec_tree_enable(bool value) {
+int32_t llama_context::pipedec_tree_enable(bool value, bool chain) {
     if (value) {
         if (!memory) {
             LLAMA_LOG_ERROR("%s: context has no memory\n", __func__);
             return -1;
         }
-        if (cparams.n_rs_seq != 0) {
-            LLAMA_LOG_ERROR("%s: tree mode needs n_rs_seq == 0 (got %u)\n", __func__, cparams.n_rs_seq);
-            return -1;
+        if (chain) {
+            // every level lives in the slot's seq; a dead suffix is a partial
+            // rollback, which a state-carrying cache bounds by n_rs_seq (the
+            // caller checks it against the depth in flight)
+            if (cparams.n_seq_max != 1) {
+                LLAMA_LOG_ERROR("%s: chain mode needs n_seq_max == 1 (got %u)\n", __func__, cparams.n_seq_max);
+                return -1;
+            }
+        } else {
+            if (cparams.n_rs_seq != 0) {
+                LLAMA_LOG_ERROR("%s: tree mode needs n_rs_seq == 0 (got %u)\n", __func__, cparams.n_rs_seq);
+                return -1;
+            }
+            if (!cparams.kv_unified) {
+                LLAMA_LOG_ERROR("%s: tree mode needs a unified KV cache\n", __func__);
+                return -1;
+            }
+            memory->set_static_cells(true);
         }
-        if (!cparams.kv_unified) {
-            LLAMA_LOG_ERROR("%s: tree mode needs a unified KV cache\n", __func__);
-            return -1;
-        }
-        memory->set_static_cells(true);
         pipedec_group_h.assign((size_t) PIPEDEC_STAGE2_MAX_LANES * PIPEDEC_TREE_MAX_ROWS * model.hparams.n_embd_out(), 0.0f);
         pipedec_tree_lane_rows.fill(0);
         pipedec_tree_lane_busy.fill(false);
-        LLAMA_LOG_INFO("%s: PipeDec tree lanes enabled: %u lanes x %u rows, static recurrent cells\n",
-                __func__, PIPEDEC_STAGE2_MAX_LANES, PIPEDEC_TREE_MAX_ROWS);
-    } else if (memory) {
+        LLAMA_LOG_INFO("%s: PipeDec tree lanes enabled: %u lanes x %u rows, %s\n",
+                __func__, PIPEDEC_STAGE2_MAX_LANES, PIPEDEC_TREE_MAX_ROWS,
+                chain ? "chain mode (single seq, layer taps read per level)" : "static recurrent cells");
+    } else if (memory && !pipedec_tree_chain) {
         memory->set_static_cells(false);
     }
     pipedec_tree_enabled = value;
+    pipedec_tree_chain   = value && chain;
     return 0;
 }
 
@@ -5603,12 +5619,22 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
 
     ggml_backend_tensor_get_async(backend_h, t_h, pipedec_tree_row(lane, 0), 0, (size_t) n_tokens * n_embd * sizeof(float));
 
-    // snapshot the read fence right after the GET: the daemon FIFO orders the
+    // chain mode: the level's layer-input taps ride along (a block drafter
+    // injects them once the level is verified)
+    std::vector<ggml_backend_t> read_backends = { backend_h };
+    if (pipedec_tree_chain && n_tokens == 1) {
+        extract_layer_inputs_pipedec(res, sched_pipedec_body[lane][0].get(), (uint32_t) lane, &read_backends);
+    }
+
+    // snapshot the read fences right after the GETs: the daemon FIFO orders a
     // read after the graph that produced the rows, so a completed read is the
-    // lane's completion - endpoint-global synchronize would also drain every
-    // other level in flight and serialize the pipeline
-    pipedec_tree_lane_backend[lane] = backend_h;
-    pipedec_tree_lane_fence[lane]   = ggml_backend_is_rpc(backend_h) ? ggml_backend_rpc_read_ordinal(backend_h) : 0;
+    // lane's completion on that stage - endpoint-global synchronize would also
+    // drain every other level in flight and serialize the pipeline
+    auto & reads = pipedec_tree_lane_reads[lane];
+    reads.clear();
+    for (ggml_backend_t b : read_backends) {
+        reads.emplace_back(b, ggml_backend_is_rpc(b) ? ggml_backend_rpc_read_ordinal(b) : 0);
+    }
 
     pipedec_tree_lane_rows[lane] = n_tokens;
     pipedec_tree_lane_busy[lane] = true;
@@ -5701,19 +5727,43 @@ int32_t llama_context::pipedec_run_head(const float * rows, uint32_t n_rows) {
 }
 
 void llama_context::pipedec_tree_lane_wait(int32_t lane) {
-    ggml_backend_t b = pipedec_tree_lane_backend[lane];
-    if (b == nullptr) {
-        return; // nothing of this lane is in flight
-    }
-    if (ggml_backend_is_rpc(b)) {
-        if (pipedec_tree_lane_fence[lane] != 0) {
-            ggml_backend_rpc_read_wait(b, pipedec_tree_lane_fence[lane]);
+    auto & reads = pipedec_tree_lane_reads[lane];
+    for (const auto & [b, fence] : reads) {
+        if (ggml_backend_is_rpc(b)) {
+            if (fence != 0) {
+                ggml_backend_rpc_read_wait(b, fence);
+            }
+        } else {
+            ggml_backend_synchronize(b);
         }
-    } else {
-        ggml_backend_synchronize(b);
     }
-    pipedec_tree_lane_backend[lane] = nullptr;
-    pipedec_tree_lane_fence[lane]   = 0;
+    reads.clear();
+}
+
+const float * llama_context::pipedec_tree_layer_inp(int32_t lane, uint32_t il) {
+    if (lane < 0 || lane >= (int32_t) PIPEDEC_STAGE2_MAX_LANES || pipedec_tree_lane_rows[lane] != 1) {
+        return nullptr;
+    }
+    if (il >= pipedec_group_layer_inp.size() || pipedec_group_layer_inp[il].empty()) {
+        return nullptr;
+    }
+    if (pipedec_tree_lane_busy[lane]) {
+        pipedec_tree_lane_wait(lane);
+        pipedec_tree_lane_busy[lane] = false;
+    }
+    return pipedec_group_layer_inp[il].data() + (size_t) lane * model.hparams.n_embd;
+}
+
+void llama_context::pipedec_tree_retire() {
+    for (uint32_t lane = 0; lane < PIPEDEC_STAGE2_MAX_LANES; ++lane) {
+        for (auto & lane_sched : sched_pipedec_body[lane]) {
+            if (lane_sched) {
+                ggml_backend_sched_synchronize(lane_sched.get());
+            }
+        }
+        pipedec_tree_lane_reads[lane].clear();
+        pipedec_tree_lane_busy[lane] = false;
+    }
 }
 
 int32_t llama_context::pipedec_tree_close(int32_t lane, int32_t row) {
@@ -5827,8 +5877,16 @@ int32_t llama_context::pipedec_tree_commit(llama_seq_id seq_src, llama_seq_id se
     return ret;
 }
 
-int32_t llama_pipedec_tree_enable(llama_context * ctx, bool value) {
-    return ctx->pipedec_tree_enable(value);
+int32_t llama_pipedec_tree_enable(llama_context * ctx, bool value, bool chain) {
+    return ctx->pipedec_tree_enable(value, chain);
+}
+
+const float * llama_pipedec_tree_layer_inp(llama_context * ctx, int32_t lane, uint32_t il) {
+    return ctx->pipedec_tree_layer_inp(lane, il);
+}
+
+void llama_pipedec_tree_retire(llama_context * ctx) {
+    ctx->pipedec_tree_retire();
 }
 
 int32_t llama_pipedec_tree_submit(llama_context * ctx, const llama_batch * batch, int32_t lane) {

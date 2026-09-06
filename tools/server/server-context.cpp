@@ -1716,14 +1716,17 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
-        // [fork, PipeDec tree] the prediction tree needs the draft-mtp head,
-        // a single slot, and the lane pipeline (checked inside enable)
+        // [fork, PipeDec tree] the prediction tree needs a drafter that can feed
+        // it (the draft-mtp head, or a block drafter in chain mode), a single
+        // slot, and the lane pipeline (checked inside enable)
         if (params_base.speculative.tree_enabled()) {
             const auto & sp = params_base.speculative;
-            if (!spec || !ctx_dft || !common_spec_has_mtp(sp.types)) {
-                SRV_ERR("%s", "--spec-tree-width needs --spec-type draft-mtp with a draft head\n");
+            const auto kind = common_speculative_tree_kind(spec.get());
+            if (!spec || !ctx_dft || kind == COMMON_SPEC_TREE_NONE) {
+                SRV_ERR("%s", "--spec-tree-width needs --spec-type draft-mtp, draft-dflash or draft-dspark with a draft model\n");
                 return false;
             }
+            const bool chain = kind == COMMON_SPEC_TREE_BLOCK;
             if (params_base.n_parallel != 1) {
                 SRV_ERR("PipeDec tree requires exactly one server slot (--parallel 1), got %d\n", params_base.n_parallel);
                 return false;
@@ -1733,7 +1736,19 @@ private:
                 SRV_ERR("--spec-tree-lanes (%d) must be at least --spec-draft-n-max + 2 (%d)\n", sp.tree_lanes, depth + 2);
                 return false;
             }
-            if (llama_pipedec_tree_enable(ctx_tgt, true) != 0) {
+            if (chain) {
+                if (sp.tree_width != 1 || sp.tree_branch > 1) {
+                    SRV_ERR("%s", "a block drafter runs the PipeDec tree in chain mode: --spec-tree-width 1 and --spec-tree-branch 1\n");
+                    return false;
+                }
+                // a miss drops up to depth levels from the slot's seq
+                if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) < (uint32_t) depth) {
+                    SRV_ERR("PipeDec chain: the target cache rolls back at most %u tokens, the depth is %d\n",
+                            llama_n_rs_seq(ctx_tgt), depth);
+                    return false;
+                }
+            }
+            if (llama_pipedec_tree_enable(ctx_tgt, true, chain) != 0) {
                 SRV_ERR("%s", "failed to enable PipeDec tree lanes on the target context\n");
                 return false;
             }
@@ -1741,6 +1756,7 @@ private:
             common_spec_tree_params tp;
             tp.ctx_tgt  = ctx_tgt;
             tp.ctx_dft  = ctx_dft;
+            tp.spec     = chain ? spec.get() : nullptr;
             tp.depth    = depth;
             tp.width    = sp.tree_width;
             tp.branch   = sp.tree_branch;
@@ -1748,7 +1764,8 @@ private:
             tp.seq_base = params_base.n_parallel;
             tp.p_min    = sp.draft.p_min;
             spec_tree = std::make_unique<common_spec_tree>(tp);
-            SRV_INF("PipeDec tree enabled: depth=%d width=%d branch=%d lanes=%d\n", tp.depth, tp.width, tp.branch, tp.lanes);
+            SRV_INF("PipeDec tree enabled: depth=%d width=%d branch=%d lanes=%d%s\n", tp.depth, tp.width, tp.branch, tp.lanes,
+                    chain ? " (chain mode)" : "");
         }
 
         if (spec) {
@@ -5299,8 +5316,10 @@ private:
             return;
         }
 
+        // chain mode drafts from the drafter's own cache; the MTP tree needs
+        // the target's hidden row to draft the root's children from
         const float * h = common_speculative_mtp_pending_h(spec.get(), slot.id);
-        if (h == nullptr) {
+        if (h == nullptr && common_speculative_tree_kind(spec.get()) != COMMON_SPEC_TREE_BLOCK) {
             SLT_WRN(slot, "%s", "no draft-mtp hidden row - the tree stays off for this task\n");
             return;
         }
