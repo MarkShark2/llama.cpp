@@ -2920,7 +2920,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // [fork] a decode-group ubatch (one token per sequence) rides its own
         // persistent lane; anything else takes the shared scheduler
         int32_t decode_lane = decode_lanes_ok &&
-                ubatch.n_seq_tokens == 1 && ubatch.n_tokens == ubatch.n_seqs &&
+                ubatch.n_seq_tokens == 1 && ubatch.n_tokens == ubatch.n_seqs_unq &&
                 (int32_t) decode_lane_next < llama_decode_lanes_max()
                 ? (int32_t) decode_lane_next++ : -1;
 

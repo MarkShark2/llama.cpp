@@ -613,8 +613,15 @@ private:
         // land just under n_ubatch and masquerade as token generation (the
         // old `n_tokens < n_ubatch` test serialized concurrent prefill at
         // one full pipeline walk per ubatch once plan bucketing made the
-        // shapes stable enough to actually reuse)
-        return ubatch.n_seq_tokens == 1;
+        // shapes stable enough to actually reuse).
+        //
+        // n_seq_tokens alone is not the test: split_simple (the single-stream
+        // path, so every one-slot DSV4 config) labels a 256-token prompt chunk
+        // as n_seqs = n_tokens with one token each, exactly like a decode
+        // batch. Measured 2026-09-06 on the 10-stage DSV4 fabric: 36 t/s
+        // prefill, one full pipeline drain per ubatch. One token per *unique*
+        // sequence is what token generation actually looks like.
+        return ubatch.n_seq_tokens == 1 && ubatch.n_tokens == ubatch.n_seqs_unq;
     }
 
     // perf
