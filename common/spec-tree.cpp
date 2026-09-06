@@ -44,7 +44,7 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
             chain_take = std::max(0, atoi(s));
         }
         if (const char * s = getenv("GGML_PIPEDEC_CHAIN_PREEMPT")) {
-            chain_preempt = std::max(0, std::min(2, atoi(s)));
+            chain_preempt = atoi(s) != 0 ? 1 : 0;
         }
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_tgt));
     } else {
@@ -249,11 +249,11 @@ bool common_spec_tree::begin(llama_token root_tok, llama_pos root_pos, llama_seq
 }
 
 void common_spec_tree::chain_draft_start() {
-    if (chain_preempt == 0 || draft_pending || root < 0) {
+    if (draft_pending || root < 0) {
         return;
     }
-    // opportunistic: only when the queue is about to run dry at this root
-    if (chain_preempt == 2 && (chain_toks.size() > 1 || chain_dry)) {
+    // only when the queue is about to run dry (preempting: every step)
+    if (!chain_preempt && (chain_toks.size() > 1 || chain_dry)) {
         return;
     }
     const node & R = nodes[root];
@@ -265,11 +265,14 @@ void common_spec_tree::chain_draft_start() {
     const llama_token tok = R.tok;
     const llama_pos   pos = R.pos;
     draft_pos     = pos;
+    draft_epoch   = chain_epoch;
     draft_pending = true;
+    draft_done.store(false);
     draft_thread  = std::thread([this, tok, pos]() {
         const int64_t t0 = ggml_time_us();
         draft_rc = common_speculative_tree_block_draft(params.spec, chain_seq, tok, pos, 1, draft_out);
         draft_us = ggml_time_us() - t0;
+        draft_done.store(true);
     });
 }
 
@@ -375,24 +378,32 @@ void common_spec_tree::chain_preempt_at(int32_t id) {
 // one block anchored at the root (the drafter holds the taps through root.pos-1):
 // the worker's if one is pending, drafted here otherwise
 bool common_spec_tree::chain_expand() {
+    bool have = false;
     if (chain_draft_join()) {
         if (draft_rc < 0) {
             return false;
         }
-        if (draft_pos != nodes[root].pos) {
-            LOG_WRN("%s: block anchored at %d, root at %d - dropped\n", __func__, (int) draft_pos, (int) nodes[root].pos);
+        // a block from before a restart describes a dead lineage; preempting
+        // also wants the current root's own block
+        have = draft_epoch == chain_epoch && (!chain_preempt || draft_pos == nodes[root].pos);
+        if (!have) {
+            st.n_stale += 1;
             draft_out.clear();
+        }
+    }
+    if (!have) {
+        const node & R = nodes[root];
+        if (chain_dry) {
             return true;
         }
-    } else {
-        const node & R = nodes[root];
         if (feat_pos != R.pos - 1) {
             LOG_ERR("%s: drafter context ends at %d, root at %d\n", __func__, (int) feat_pos, (int) R.pos);
             return false;
         }
         const int64_t t0 = ggml_time_us();
-        draft_pos = R.pos;
-        draft_rc  = common_speculative_tree_block_draft(params.spec, chain_seq, R.tok, R.pos, 1, draft_out);
+        draft_pos   = R.pos;
+        draft_epoch = chain_epoch;
+        draft_rc    = common_speculative_tree_block_draft(params.spec, chain_seq, R.tok, R.pos, 1, draft_out);
         st.t_draft_us += ggml_time_us() - t0;
         if (draft_rc < 0) {
             return false;
@@ -407,6 +418,7 @@ bool common_spec_tree::chain_expand() {
 bool common_spec_tree::chain_apply() {
     const node & R = nodes[root];
     const int32_t n_levels = (int32_t) draft_out.size();
+    const llama_pos anchor = draft_pos; // the root when the block was drafted; at or below R.pos
 
     // a fresh block supersedes whatever an older one left queued
     if (chain_preempt) {
@@ -420,8 +432,11 @@ bool common_spec_tree::chain_apply() {
         if (draft_out[j].empty()) {
             break;
         }
-        const llama_pos   p   = R.pos + 1 + j;
+        const llama_pos   p   = anchor + 1 + j;
         const llama_token tok = draft_out[j][0].tok;
+        if (p <= R.pos) {
+            continue; // verified since
+        }
         if (p <= pos_deepest) {
             const int32_t id = chain_node_at(p);
             if (id >= 0 && nodes[id].tok == tok) {
@@ -445,11 +460,13 @@ bool common_spec_tree::chain_apply() {
     st.n_block_new += n_new;
     draft_out.clear();
 
-    // nothing past the deepest level: the block cannot reach further until the
-    // root moves, so stop asking until the next advance
-    chain_dry = n_new == 0;
+    // nothing past the deepest level from the current root: the block cannot
+    // reach further until the root moves, so stop asking until the next advance
+    if (anchor == R.pos) {
+        chain_dry = n_new == 0;
+    }
 
-    TREE_TRC("block root=%d pos=%d levels=%d new=%d deepest=%d\n", (int) R.tok, (int) R.pos, n_levels, n_new, (int) pos_deepest);
+    TREE_TRC("block anchor=%d root=%d levels=%d new=%d deepest=%d\n", (int) anchor, (int) R.pos, n_levels, n_new, (int) pos_deepest);
     return true;
 }
 
@@ -753,7 +770,7 @@ int32_t common_spec_tree::close_oldest() {
 
     // chain mode: the block drafted under that wait goes in before the root
     // is sampled, so a level it disagrees with is replaced now
-    if (chain && draft_pending) {
+    if (chain && draft_pending && draft_done.load()) {
         if (!chain_expand()) {
             return -1;
         }
@@ -830,6 +847,7 @@ common_spec_tree_advance common_spec_tree::advance(llama_token x) {
             }
             GGML_ASSERT(pending.empty());
             chain_toks.clear();
+            chain_epoch += 1;
             free_node(root);
 
             // the dead levels' cells: the host bookkeeping goes now, the lanes
@@ -1062,11 +1080,11 @@ std::string common_spec_tree::summary() const {
     if (chain) {
         const double blocks = st.n_blocks > 0 ? (double) st.n_blocks : 1.0;
         snprintf(buf, sizeof(buf),
-                " | chain: blocks=%lld new/block=%.2f agree=%lld disagree=%lld preempt=%lld (%lld levels) soft_hits=%lld"
+                " | chain: blocks=%lld new/block=%.2f agree=%lld disagree=%lld preempt=%lld (%lld levels) soft_hits=%lld stale=%lld"
                 " | per step ms: inject %.2f draft_bg %.2f join %.2f",
                 (long long) st.n_blocks, (double) st.n_block_new / blocks,
                 (long long) st.n_agree, (long long) st.n_disagree, (long long) st.n_preempt, (long long) st.n_preempt_levels,
-                (long long) st.n_soft_hits,
+                (long long) st.n_soft_hits, (long long) st.n_stale,
                 st.t_inject_us / 1000.0 / steps, st.t_draft_bg_us / 1000.0 / steps, st.t_draft_join_us / 1000.0 / steps);
         s += buf;
     }

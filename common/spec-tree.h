@@ -30,6 +30,7 @@
 #include "sampling.h"
 #include "speculative.h"
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -74,6 +75,7 @@ struct common_spec_tree_stats {
     int64_t n_preempt   = 0; // suffixes in flight replaced by a fresh block's tokens
     int64_t n_preempt_levels = 0;
     int64_t n_soft_hits = 0; // x matched the fresh block's first token before its level was submitted
+    int64_t n_stale     = 0; // background blocks dropped: a restart happened while they ran
     int64_t t_inject_us = 0;
     int64_t t_draft_bg_us   = 0; // block drafts on the worker thread (off the step)
     int64_t t_draft_join_us = 0; // what the step still waited for them
@@ -207,20 +209,25 @@ private:
     int32_t      deepest    = -1; // last node of the lineage (root when nothing is past it)
     int32_t      chain_take = 0;  // chain tokens taken per block (0 = all past the deepest level)
     bool         chain_dry  = false; // the last block added nothing: wait for the root to move
-    // preempt: a block every step, drafted on a worker thread while the step
-    // submits and waits on the fabric, folded in before the root is sampled;
-    // where it disagrees with a level in flight, that suffix dies and the
-    // fresh tokens take its place (the fresh block knows the root's true
-    // taps, the stale token came from an older block's deeper position)
-    //   0 off, 1 a block every step, 2 only the blocks the chain needs anyway
-    //   (started when the queue runs short, so they still run under the wait)
-    int32_t      chain_preempt = 2;
-    std::thread  draft_thread;
-    bool         draft_pending = false;
-    int32_t      draft_rc  = 0;
-    int64_t      draft_us  = 0;
-    llama_pos    draft_pos = -1; // the root the block was anchored at
+    // blocks draft on a worker thread: started when the queue is down to one
+    // token (right after that token's level goes out, so the block runs under
+    // the close wait), joined when the queue is empty or, at close, once it
+    // has finished. A block anchored at an older root still extends the
+    // chain; one drafted before a restart is stale and dropped.
+    std::thread        draft_thread;
+    bool               draft_pending = false;
+    std::atomic<bool>  draft_done{false};
+    int32_t            draft_rc    = 0;
+    int64_t            draft_us    = 0;
+    llama_pos          draft_pos   = -1; // the root the block was anchored at
+    int64_t            draft_epoch = 0;
+    int64_t            chain_epoch = 0;  // bumped by a restart
     std::vector<std::vector<common_spec_tree_cand>> draft_out;
+    // preempt (GGML_PIPEDEC_CHAIN_PREEMPT=1): a block every step; where it
+    // disagrees with a level in flight, that suffix dies and the fresh tokens
+    // take its place. Measured a loss on DSV4/DSpark (the resubmitted level
+    // waits the whole pipeline again, like a miss would), off by default.
+    int32_t      chain_preempt = 0;
     std::deque<llama_token>  chain_toks; // drafted past the deepest level, not yet submitted
     std::vector<int32_t>     feat_layers;
     int32_t                  n_feat     = 0; // one feature row
