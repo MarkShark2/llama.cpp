@@ -258,12 +258,18 @@ private:
     // take its place. Measured a loss on DSV4/DSpark (the resubmitted level
     // waits the whole pipeline again, like a miss would), off by default.
     int32_t      chain_preempt = 0;
-    // prefix (GGML_PIPEDEC_CHAIN_PREFIX=1, default): a block every step, the
+    // prefix (GGML_PIPEDEC_CHAIN_PREFIX=1): a block every step, the
     // levels in flight past the root ride in it as real tokens ahead of the
     // masks, so the new chain tokens come out of the block's first mask
     // positions instead of its tail; the queued tokens are replaced by every
-    // fresh block, the levels in flight never are
-    int32_t      chain_prefix = 1;
+    // fresh block, the levels in flight never are. Measured no gain on
+    // DSV4/DSpark: its acceptance is ~60% per token in every slot.
+    int32_t      chain_prefix = 0;
+    // async (GGML_PIPEDEC_CHAIN_ASYNC=1): queue the next block as soon as the
+    // queue is down to one token, so it runs under the close wait. Measured
+    // within noise of drafting when the queue is empty (the restart's block
+    // is the one that matters and nothing hides it), off by default.
+    int32_t      chain_async  = 0;
     std::deque<llama_token>  chain_toks; // drafted past the deepest level, not yet submitted
     std::vector<int32_t>     feat_layers;
     int32_t                  n_feat     = 0; // one feature row

@@ -49,6 +49,9 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
         if (const char * s = getenv("GGML_PIPEDEC_CHAIN_PREFIX")) {
             chain_prefix = atoi(s) != 0 ? 1 : 0;
         }
+        if (const char * s = getenv("GGML_PIPEDEC_CHAIN_ASYNC")) {
+            chain_async = atoi(s) != 0 ? 1 : 0;
+        }
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_tgt));
     } else {
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_dft));
@@ -93,9 +96,9 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
 
     if (chain) {
         worker = std::thread([this]() { chain_worker_loop(); });
-        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d preempt=%d prefix=%d taps=%d x %d\n",
+        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d preempt=%d prefix=%d async=%d taps=%d x %d\n",
                 __func__, this->params.depth, this->params.lanes, chain_take, (int) chain_preempt, (int) chain_prefix,
-                (int) feat_layers.size(), n_embd_tgt);
+                (int) chain_async, (int) feat_layers.size(), n_embd_tgt);
     } else {
         LOG_INF("%s: PipeDec tree: depth=%d width=%d branch=%d lanes=%d seq_base=%d p_min=%.2f backend_topk=%s\n",
                 __func__, this->params.depth, width, this->params.branch, this->params.lanes,
@@ -334,9 +337,10 @@ void common_spec_tree::chain_draft_start() {
     if (root < 0) {
         return;
     }
-    // prefix and preempt modes: a block every step; otherwise one block at a
-    // time, and only when the queue is about to run dry
-    if (!chain_prefix && !chain_preempt && (draft_pending() || chain_toks.size() > 1 || chain_dry)) {
+    // prefix and preempt modes: a block every step; async: one block at a
+    // time, and only when the queue is about to run dry; otherwise the block
+    // is drafted when the queue is empty (chain_expand)
+    if (!chain_prefix && !chain_preempt && (!chain_async || draft_pending() || chain_toks.size() > 1 || chain_dry)) {
         return;
     }
     if (chain_dry && !chain_prefix) {
