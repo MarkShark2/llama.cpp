@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct common_spec_tree_params {
@@ -72,7 +73,10 @@ struct common_spec_tree_stats {
     int64_t n_disagree  = 0;
     int64_t n_preempt   = 0; // suffixes in flight replaced by a fresh block's tokens
     int64_t n_preempt_levels = 0;
+    int64_t n_soft_hits = 0; // x matched the fresh block's first token before its level was submitted
     int64_t t_inject_us = 0;
+    int64_t t_draft_bg_us   = 0; // block drafts on the worker thread (off the step)
+    int64_t t_draft_join_us = 0; // what the step still waited for them
 };
 
 struct common_spec_tree_advance {
@@ -159,7 +163,10 @@ private:
     void    select();  // fill pending from the frontier's unused candidates
 
     // chain mode
-    bool    chain_expand();          // one block from the root, extend the chain past the deepest level
+    bool    chain_expand();          // one block from the root (joined or drafted now), folded into the chain
+    bool    chain_apply();           // fold draft_out into the chain: compare, preempt, extend
+    void    chain_draft_start();     // preempting: draft the root's block on the worker thread
+    bool    chain_draft_join();      // wait for it; false when none was pending
     void    chain_preempt_at(int32_t id); // kill the lineage from node id on, queued and in flight
     bool    chain_inject(int32_t id); // a closed level's taps into the drafter's cache
     int32_t chain_push(int32_t parent, llama_token tok); // node for the next chain token
@@ -200,12 +207,18 @@ private:
     int32_t      deepest    = -1; // last node of the lineage (root when nothing is past it)
     int32_t      chain_take = 0;  // chain tokens taken per block (0 = all past the deepest level)
     bool         chain_dry  = false; // the last block added nothing: wait for the root to move
-    // preempt: a block every step; where it disagrees with a level in flight,
-    // that suffix dies and the fresh tokens take its place (the fresh block
-    // knows the root's true taps, the stale token came from an older block's
-    // deeper position)
+    // preempt: a block every step, drafted on a worker thread while the step
+    // submits and waits on the fabric, folded in before the root is sampled;
+    // where it disagrees with a level in flight, that suffix dies and the
+    // fresh tokens take its place (the fresh block knows the root's true
+    // taps, the stale token came from an older block's deeper position)
     bool         chain_preempt = true;
-    bool         chain_fresh   = false; // the root moved: draft before the next submit
+    std::thread  draft_thread;
+    bool         draft_pending = false;
+    int32_t      draft_rc  = 0;
+    int64_t      draft_us  = 0;
+    llama_pos    draft_pos = -1; // the root the block was anchored at
+    std::vector<std::vector<common_spec_tree_cand>> draft_out;
     std::deque<llama_token>  chain_toks; // drafted past the deepest level, not yet submitted
     std::vector<int32_t>     feat_layers;
     int32_t                  n_feat     = 0; // one feature row
