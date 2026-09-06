@@ -410,6 +410,12 @@ static void test_expressions(testing & t) {
         "True"
     );
 
+    test_template(t, "dotted integer member is computed access",
+        "{{ a.0 }}{{ a.1.name }}{{ s.0 }}{{ s.0.x is defined }}",
+        {{"a", json::array({"first", json{{"name", "Bob"}}})}, {"s", "str"}},
+        "firstBobsFalse"
+    );
+
     test_template(t, "array access",
         "{{ items[1] }}",
         {{"items", json::array({"a", "b", "c"})}},

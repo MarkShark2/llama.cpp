@@ -504,6 +504,10 @@ private:
             if (computed) {
                 prop = parse_member_expression_arguments();
                 expect(token::close_square_bracket, "Expected ]");
+            } else if (is(token::numeric_literal)) {
+                // jinja2 parses obj.0 as obj[0]
+                computed = true;
+                prop = parse_primary_expression();
             } else {
                 prop = parse_primary_expression();
             }
