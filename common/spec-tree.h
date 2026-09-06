@@ -222,7 +222,9 @@ private:
         llama_pos          pos;
         llama_token        tok;
         int64_t            epoch;
-        std::vector<float> feats;
+        int64_t            id;      // BLOCK: superseded by any later block
+        std::vector<float> feats;   // INJECT
+        std::vector<llama_token> prefix; // BLOCK: the lineage in flight past the anchor
     };
     std::thread             worker;
     std::mutex              worker_m;
@@ -236,9 +238,11 @@ private:
     void chain_worker_flush();           // wait until every queued job ran
     bool chain_draft_done();             // the queued block has its result
 
-    // the block job's result (worker_m)
+    // the block job's result (worker_m): the latest queued block's, older
+    // ones are superseded (a queued one is dropped, a running one ignored)
     bool      draft_pending = false; // a block is queued or running
-    bool      draft_ready   = false;
+    int64_t   draft_id_latest = 0;
+    int64_t   draft_id_done   = 0;
     int32_t   draft_rc    = 0;
     int64_t   draft_us    = 0;
     llama_pos draft_pos   = -1; // the root the block was anchored at
@@ -250,6 +254,12 @@ private:
     // take its place. Measured a loss on DSV4/DSpark (the resubmitted level
     // waits the whole pipeline again, like a miss would), off by default.
     int32_t      chain_preempt = 0;
+    // prefix (GGML_PIPEDEC_CHAIN_PREFIX=1, default): a block every step, the
+    // levels in flight past the root ride in it as real tokens ahead of the
+    // masks, so the new chain tokens come out of the block's first mask
+    // positions instead of its tail; the queued tokens are replaced by every
+    // fresh block, the levels in flight never are
+    int32_t      chain_prefix = 1;
     std::deque<llama_token>  chain_toks; // drafted past the deepest level, not yet submitted
     std::vector<int32_t>     feat_layers;
     int32_t                  n_feat     = 0; // one feature row

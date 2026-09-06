@@ -126,10 +126,15 @@ struct common_spec_tree_cand {
 common_spec_tree_kind common_speculative_tree_kind(common_speculative * spec);
 
 // block drafters: run the noise block on `seq` anchored at (tok, pos), after dropping
-// whatever `seq` held from pos on. out[j] = top candidates for position pos + 1 + j.
-// Returns the number of levels drafted, < 0 on error.
+// whatever `seq` held from pos on. The n_prefix tokens already drafted for
+// pos + 1 .. pos + n_prefix ride in the block as real tokens ahead of the
+// masks, so the masks predict from the deepest of them (the drafter has never
+// seen the target's state for them, only their embeddings). out[j] = top
+// candidates for position pos + 1 + j. Returns the number of levels drafted,
+// < 0 on error.
 int32_t common_speculative_tree_block_draft(
-        common_speculative * spec, llama_seq_id seq, llama_token tok, llama_pos pos, int32_t n_cand,
+        common_speculative * spec, llama_seq_id seq, llama_token tok, llama_pos pos,
+        const llama_token * prefix, int32_t n_prefix, int32_t n_cand,
         std::vector<std::vector<common_spec_tree_cand>> & out);
 
 // block drafters: the target layers whose input features the drafter injects, in the

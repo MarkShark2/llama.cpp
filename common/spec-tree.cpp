@@ -46,6 +46,9 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
         if (const char * s = getenv("GGML_PIPEDEC_CHAIN_PREEMPT")) {
             chain_preempt = atoi(s) != 0 ? 1 : 0;
         }
+        if (const char * s = getenv("GGML_PIPEDEC_CHAIN_PREFIX")) {
+            chain_prefix = atoi(s) != 0 ? 1 : 0;
+        }
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_tgt));
     } else {
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_dft));
@@ -90,8 +93,9 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
 
     if (chain) {
         worker = std::thread([this]() { chain_worker_loop(); });
-        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d preempt=%d taps=%d x %d\n",
-                __func__, this->params.depth, this->params.lanes, chain_take, (int) chain_preempt, (int) feat_layers.size(), n_embd_tgt);
+        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d preempt=%d prefix=%d taps=%d x %d\n",
+                __func__, this->params.depth, this->params.lanes, chain_take, (int) chain_preempt, (int) chain_prefix,
+                (int) feat_layers.size(), n_embd_tgt);
     } else {
         LOG_INF("%s: PipeDec tree: depth=%d width=%d branch=%d lanes=%d seq_base=%d p_min=%.2f backend_topk=%s\n",
                 __func__, this->params.depth, width, this->params.branch, this->params.lanes,
@@ -281,7 +285,8 @@ void common_spec_tree::chain_worker_loop() {
         } else {
             std::vector<std::vector<common_spec_tree_cand>> out;
             const int64_t t0 = ggml_time_us();
-            const int32_t rc = common_speculative_tree_block_draft(params.spec, chain_seq, job.tok, job.pos, 1, out);
+            const int32_t rc = common_speculative_tree_block_draft(params.spec, chain_seq, job.tok, job.pos,
+                    job.prefix.data(), (int32_t) job.prefix.size(), 1, out);
             const int64_t us = ggml_time_us() - t0;
             std::lock_guard<std::mutex> lk(worker_m);
             draft_rc    = rc;
@@ -289,7 +294,7 @@ void common_spec_tree::chain_worker_loop() {
             draft_pos   = job.pos;
             draft_epoch = job.epoch;
             draft_out   = std::move(out);
-            draft_ready = true;
+            draft_id_done = job.id;
         }
 
         {
@@ -303,6 +308,13 @@ void common_spec_tree::chain_worker_loop() {
 void common_spec_tree::chain_enqueue(chain_job job) {
     {
         std::lock_guard<std::mutex> lk(worker_m);
+        if (job.kind == chain_job::BLOCK) {
+            // a block not yet started is superseded by this one
+            for (auto it = jobs.begin(); it != jobs.end();) {
+                it = it->kind == chain_job::BLOCK ? jobs.erase(it) : it + 1;
+            }
+            job.id = ++draft_id_latest;
+        }
         jobs.push_back(std::move(job));
     }
     worker_cv.notify_one();
@@ -315,15 +327,19 @@ void common_spec_tree::chain_worker_flush() {
 
 bool common_spec_tree::chain_draft_done() {
     std::lock_guard<std::mutex> lk(worker_m);
-    return draft_ready;
+    return draft_id_done == draft_id_latest;
 }
 
 void common_spec_tree::chain_draft_start() {
-    if (draft_pending || root < 0) {
+    if (root < 0) {
         return;
     }
-    // only when the queue is about to run dry (preempting: every step)
-    if (!chain_preempt && (chain_toks.size() > 1 || chain_dry)) {
+    // prefix and preempt modes: a block every step; otherwise one block at a
+    // time, and only when the queue is about to run dry
+    if (!chain_prefix && !chain_preempt && (draft_pending || chain_toks.size() > 1 || chain_dry)) {
+        return;
+    }
+    if (chain_dry && !chain_prefix) {
         return;
     }
     const node & R = nodes[root];
@@ -332,12 +348,16 @@ void common_spec_tree::chain_draft_start() {
         return;
     }
 
-    draft_pending = true;
-    {
-        std::lock_guard<std::mutex> lk(worker_m);
-        draft_ready = false;
+    chain_job job = { chain_job::BLOCK, R.pos, R.tok, chain_epoch, 0, {}, {} };
+    if (chain_prefix) {
+        // the lineage in flight past the root, root's child first
+        for (int32_t id = R.children.empty() ? -1 : R.children[0]; id >= 0;
+             id = nodes[id].children.empty() ? -1 : nodes[id].children[0]) {
+            job.prefix.push_back(nodes[id].tok);
+        }
     }
-    chain_enqueue({ chain_job::BLOCK, R.pos, R.tok, chain_epoch, {} });
+    draft_pending = true;
+    chain_enqueue(std::move(job));
 }
 
 bool common_spec_tree::chain_draft_join() {
@@ -347,7 +367,7 @@ bool common_spec_tree::chain_draft_join() {
     const int64_t t0 = ggml_time_us();
     {
         std::unique_lock<std::mutex> lk(worker_m);
-        worker_done.wait(lk, [&] { return draft_ready; });
+        worker_done.wait(lk, [&] { return draft_id_done == draft_id_latest; });
     }
     draft_pending = false;
     st.t_draft_join_us += ggml_time_us() - t0;
@@ -468,12 +488,15 @@ bool common_spec_tree::chain_expand() {
         }
         // the root's block now, through the worker (it owns the drafter)
         const int64_t t0 = ggml_time_us();
-        draft_pending = true;
-        {
-            std::lock_guard<std::mutex> lk(worker_m);
-            draft_ready = false;
+        chain_job job = { chain_job::BLOCK, R.pos, R.tok, chain_epoch, 0, {}, {} };
+        if (chain_prefix) {
+            for (int32_t id = R.children.empty() ? -1 : R.children[0]; id >= 0;
+                 id = nodes[id].children.empty() ? -1 : nodes[id].children[0]) {
+                job.prefix.push_back(nodes[id].tok);
+            }
         }
-        chain_enqueue({ chain_job::BLOCK, R.pos, R.tok, chain_epoch, {} });
+        draft_pending = true;
+        chain_enqueue(std::move(job));
         chain_draft_join();
         st.t_draft_us += ggml_time_us() - t0;
         if (draft_rc < 0) {
@@ -492,7 +515,7 @@ bool common_spec_tree::chain_apply() {
     const llama_pos anchor = draft_pos; // the root when the block was drafted; at or below R.pos
 
     // a fresh block supersedes whatever an older one left queued
-    if (chain_preempt) {
+    if (chain_preempt || chain_prefix) {
         chain_toks.clear();
     }
 
@@ -533,7 +556,7 @@ bool common_spec_tree::chain_apply() {
 
     // nothing past the deepest level from the current root: the block cannot
     // reach further until the root moves, so stop asking until the next advance
-    if (anchor == R.pos) {
+    if (anchor == R.pos && !chain_prefix) {
         chain_dry = n_new == 0;
     }
 
@@ -731,7 +754,9 @@ int32_t common_spec_tree::submit_next() {
             pending = { id };
             pending_depth = nodes[id].level;
             // the next block, under this level's submit and the close wait
-            chain_draft_start();
+            if (!chain_prefix) {
+                chain_draft_start();
+            }
         } else {
             if (!expand()) {
                 return -1;

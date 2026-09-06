@@ -189,7 +189,8 @@ struct common_speculative_impl {
 
     // [fork, PipeDec tree] block-drafter interface (see speculative.h)
     virtual common_spec_tree_kind tree_kind() const { return COMMON_SPEC_TREE_NONE; }
-    virtual int32_t tree_block_draft(llama_seq_id /*seq*/, llama_token /*tok*/, llama_pos /*pos*/, int32_t /*n_cand*/,
+    virtual int32_t tree_block_draft(llama_seq_id /*seq*/, llama_token /*tok*/, llama_pos /*pos*/,
+            const llama_token * /*prefix*/, int32_t /*n_prefix*/, int32_t /*n_cand*/,
             std::vector<std::vector<common_spec_tree_cand>> & /*out*/) { return -1; }
     virtual int32_t tree_feat_layers(const int32_t ** ids) const { *ids = nullptr; return 0; }
     virtual int32_t tree_feat_width() const { return 0; }
@@ -1425,7 +1426,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return tree_mode && !is_dflash2 ? COMMON_SPEC_TREE_BLOCK : COMMON_SPEC_TREE_NONE;
     }
 
-    int32_t tree_block_draft(llama_seq_id seq_id, llama_token tok, llama_pos pos, int32_t n_cand,
+    int32_t tree_block_draft(llama_seq_id seq_id, llama_token tok, llama_pos pos,
+            const llama_token * prefix, int32_t n_prefix, int32_t n_cand,
             std::vector<std::vector<common_spec_tree_cand>> & out) override {
         auto * ctx_dft = params.ctx_dft;
         out.clear();
@@ -1440,9 +1442,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_draft         = is_dspark && sample_from_anchor ? block_size : block_size - 1;
         const int32_t n_block_tokens  = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+        // the prefix takes the block's first mask slots; at least one mask stays
+        n_prefix = std::max(0, std::min(n_prefix, n_block_tokens - 2));
         common_batch_clear(batch);
         for (int32_t i = 0; i < n_block_tokens; ++i) {
-            common_batch_add(batch, i == 0 ? tok : mask_token_id, pos + i, { seq_id }, true);
+            const llama_token t = i == 0 ? tok : (i <= n_prefix ? prefix[i - 1] : mask_token_id);
+            common_batch_add(batch, t, pos + i, { seq_id }, true);
         }
 
         const int ret = llama_decode(ctx_dft, batch);
@@ -3296,10 +3301,11 @@ common_spec_tree_kind common_speculative_tree_kind(common_speculative * spec) {
 }
 
 int32_t common_speculative_tree_block_draft(
-        common_speculative * spec, llama_seq_id seq, llama_token tok, llama_pos pos, int32_t n_cand,
+        common_speculative * spec, llama_seq_id seq, llama_token tok, llama_pos pos,
+        const llama_token * prefix, int32_t n_prefix, int32_t n_cand,
         std::vector<std::vector<common_spec_tree_cand>> & out) {
     auto * impl = common_speculative_tree_impl(spec);
-    return impl ? impl->tree_block_draft(seq, tok, pos, n_cand, out) : -1;
+    return impl ? impl->tree_block_draft(seq, tok, pos, prefix, n_prefix, n_cand, out) : -1;
 }
 
 int32_t common_speculative_tree_feat_layers(common_speculative * spec, const int32_t ** ids) {
