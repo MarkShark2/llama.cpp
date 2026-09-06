@@ -43,6 +43,9 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
         if (const char * s = getenv("GGML_PIPEDEC_CHAIN_TAKE")) {
             chain_take = std::max(0, atoi(s));
         }
+        if (const char * s = getenv("GGML_PIPEDEC_CHAIN_PREEMPT")) {
+            chain_preempt = atoi(s) != 0;
+        }
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_tgt));
     } else {
         n_embd = llama_model_n_embd_out(llama_get_model(params.ctx_dft));
@@ -86,8 +89,8 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
     h_out.resize((size_t) width * n_embd);
 
     if (chain) {
-        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d taps=%d x %d\n",
-                __func__, this->params.depth, this->params.lanes, chain_take, (int) feat_layers.size(), n_embd_tgt);
+        LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d preempt=%d taps=%d x %d\n",
+                __func__, this->params.depth, this->params.lanes, chain_take, (int) chain_preempt, (int) feat_layers.size(), n_embd_tgt);
     } else {
         LOG_INF("%s: PipeDec tree: depth=%d width=%d branch=%d lanes=%d seq_base=%d p_min=%.2f backend_topk=%s\n",
                 __func__, this->params.depth, width, this->params.branch, this->params.lanes,
@@ -227,6 +230,7 @@ bool common_spec_tree::begin(llama_token root_tok, llama_pos root_pos, llama_seq
         feat_pos   = root_pos - 1;
         deepest    = id;
         chain_dry  = false;
+        chain_fresh = false;
         chain_toks.clear();
     } else {
         n.h_in.assign(h_in, h_in + n_embd);
@@ -298,8 +302,38 @@ bool common_spec_tree::chain_inject(int32_t id) {
     return true;
 }
 
+// the lineage from node id on dies: its levels leave the ring (their lanes
+// retire on their own), its cells leave the cache (the lanes still queued
+// write before any replacement's lane, daemon FIFO), its parent is the
+// deepest node again
+void common_spec_tree::chain_preempt_at(int32_t id) {
+    const llama_pos p      = nodes[id].pos;
+    const int32_t   parent = nodes[id].parent;
+    GGML_ASSERT(parent >= 0 && id != root);
+
+    int32_t n_levels = 0;
+    while (!levels.empty() && nodes[levels.back().nodes[0]].pos >= p) {
+        llama_pipedec_tree_discard(params.ctx_tgt, levels.back().lane);
+        lane_used[levels.back().lane] = false;
+        levels.pop_back();
+        n_levels++;
+    }
+    kill(id);
+    nodes[parent].children.clear();
+    deepest = parent;
+
+    if (!llama_memory_seq_rm(llama_get_memory(params.ctx_tgt), chain_seq, p, -1)) {
+        LOG_ERR("%s: could not drop the preempted suffix from %d\n", __func__, (int) p);
+    }
+
+    st.n_preempt        += 1;
+    st.n_preempt_levels += n_levels;
+    TREE_TRC("preempt pos=%d levels=%d inflight=%d\n", (int) p, n_levels, n_inflight());
+}
+
 // one block anchored at the root (the drafter holds the taps through root.pos-1):
-// positions already in flight are compared, the rest extend the chain
+// positions already in flight are compared (and, preempting, replaced from the
+// first disagreement on), the rest extend the chain
 bool common_spec_tree::chain_expand() {
     const node & R = nodes[root];
     if (feat_pos != R.pos - 1) {
@@ -316,7 +350,13 @@ bool common_spec_tree::chain_expand() {
     }
     st.n_blocks += 1;
 
-    const llama_pos pos_deepest = nodes[deepest].pos;
+    // a fresh block supersedes whatever an older one left queued
+    if (chain_preempt) {
+        chain_toks.clear();
+    }
+
+    const llama_pos pos_deepest_0 = nodes[deepest].pos;
+    llama_pos pos_deepest = pos_deepest_0;
     int32_t n_new = 0;
     for (int32_t j = 0; j < n_levels; ++j) {
         if (out[j].empty()) {
@@ -328,12 +368,17 @@ bool common_spec_tree::chain_expand() {
             const int32_t id = chain_node_at(p);
             if (id >= 0 && nodes[id].tok == tok) {
                 st.n_agree += 1;
-            } else {
-                st.n_disagree += 1;
+                continue;
             }
-            continue;
+            st.n_disagree += 1;
+            if (!chain_preempt || id < 0) {
+                continue;
+            }
+            chain_preempt_at(id);
+            pos_deepest = p - 1;
         }
-        if (chain_take > 0 && n_new >= chain_take) {
+        // the take cap applies past what was in flight; a replaced suffix is refilled whole
+        if (chain_take > 0 && p > pos_deepest_0 && n_new >= chain_take) {
             break;
         }
         chain_toks.push_back(tok);
@@ -344,7 +389,8 @@ bool common_spec_tree::chain_expand() {
 
     // nothing past the deepest level: the block cannot reach further until the
     // root moves, so stop asking until the next advance
-    chain_dry = n_new == 0;
+    chain_dry   = n_new == 0;
+    chain_fresh = false;
 
     TREE_TRC("block root=%d pos=%d levels=%d new=%d deepest=%d\n", (int) R.tok, (int) R.pos, n_levels, n_new, (int) pos_deepest);
     return true;
@@ -523,8 +569,8 @@ int32_t common_spec_tree::submit_next() {
 
     if (pending.empty()) {
         if (chain) {
-            if (chain_toks.empty()) {
-                if (chain_dry) {
+            if (chain_toks.empty() || (chain_preempt && chain_fresh)) {
+                if (chain_dry && !chain_fresh) {
                     return 0;
                 }
                 if (!chain_expand()) {
@@ -675,7 +721,8 @@ common_spec_tree_advance common_spec_tree::advance(llama_token x) {
         if (!chain_inject(root)) {
             LOG_ERR("%s: tap injection failed at pos %d\n", __func__, (int) R.pos);
         }
-        chain_dry = false;
+        chain_dry   = false;
+        chain_fresh = true;
 
         if (hit >= 0) {
             res.hit = true;
@@ -926,9 +973,10 @@ std::string common_spec_tree::summary() const {
     if (chain) {
         const double blocks = st.n_blocks > 0 ? (double) st.n_blocks : 1.0;
         snprintf(buf, sizeof(buf),
-                " | chain: blocks=%lld new/block=%.2f agree=%lld disagree=%lld inject %.2f ms/step",
+                " | chain: blocks=%lld new/block=%.2f agree=%lld disagree=%lld preempt=%lld (%lld levels) inject %.2f ms/step",
                 (long long) st.n_blocks, (double) st.n_block_new / blocks,
-                (long long) st.n_agree, (long long) st.n_disagree, st.t_inject_us / 1000.0 / steps);
+                (long long) st.n_agree, (long long) st.n_disagree, (long long) st.n_preempt, (long long) st.n_preempt_levels,
+                st.t_inject_us / 1000.0 / steps);
         s += buf;
     }
     return s;

@@ -70,6 +70,8 @@ struct common_spec_tree_stats {
     int64_t n_block_new = 0; // chain tokens taken from them
     int64_t n_agree     = 0; // block positions that matched a level already in flight
     int64_t n_disagree  = 0;
+    int64_t n_preempt   = 0; // suffixes in flight replaced by a fresh block's tokens
+    int64_t n_preempt_levels = 0;
     int64_t t_inject_us = 0;
 };
 
@@ -158,6 +160,7 @@ private:
 
     // chain mode
     bool    chain_expand();          // one block from the root, extend the chain past the deepest level
+    void    chain_preempt_at(int32_t id); // kill the lineage from node id on, queued and in flight
     bool    chain_inject(int32_t id); // a closed level's taps into the drafter's cache
     int32_t chain_push(int32_t parent, llama_token tok); // node for the next chain token
     int32_t chain_node_at(llama_pos pos) const;          // lineage node at pos, -1 if none
@@ -197,6 +200,12 @@ private:
     int32_t      deepest    = -1; // last node of the lineage (root when nothing is past it)
     int32_t      chain_take = 0;  // chain tokens taken per block (0 = all past the deepest level)
     bool         chain_dry  = false; // the last block added nothing: wait for the root to move
+    // preempt: a block every step; where it disagrees with a level in flight,
+    // that suffix dies and the fresh tokens take its place (the fresh block
+    // knows the root's true taps, the stale token came from an older block's
+    // deeper position)
+    bool         chain_preempt = true;
+    bool         chain_fresh   = false; // the root moved: draft before the next submit
     std::deque<llama_token>  chain_toks; // drafted past the deepest level, not yet submitted
     std::vector<int32_t>     feat_layers;
     int32_t                  n_feat     = 0; // one feature row
