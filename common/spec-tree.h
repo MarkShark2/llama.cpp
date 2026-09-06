@@ -30,9 +30,10 @@
 #include "sampling.h"
 #include "speculative.h"
 
-#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -167,7 +168,7 @@ private:
     // chain mode
     bool    chain_expand();          // one block from the root (joined or drafted now), folded into the chain
     bool    chain_apply();           // fold draft_out into the chain: compare, preempt, extend
-    void    chain_draft_start();     // preempting: draft the root's block on the worker thread
+    void    chain_draft_start();     // queue the root's block on the worker
     bool    chain_draft_join();      // wait for it; false when none was pending
     void    chain_preempt_at(int32_t id); // kill the lineage from node id on, queued and in flight
     bool    chain_inject(int32_t id); // a closed level's taps into the drafter's cache
@@ -209,19 +210,40 @@ private:
     int32_t      deepest    = -1; // last node of the lineage (root when nothing is past it)
     int32_t      chain_take = 0;  // chain tokens taken per block (0 = all past the deepest level)
     bool         chain_dry  = false; // the last block added nothing: wait for the root to move
-    // blocks draft on a worker thread: started when the queue is down to one
-    // token (right after that token's level goes out, so the block runs under
-    // the close wait), joined when the queue is empty or, at close, once it
-    // has finished. A block anchored at an older root still extends the
-    // chain; one drafted before a restart is stale and dropped.
-    std::thread        draft_thread;
-    bool               draft_pending = false;
-    std::atomic<bool>  draft_done{false};
-    int32_t            draft_rc    = 0;
-    int64_t            draft_us    = 0;
-    llama_pos          draft_pos   = -1; // the root the block was anchored at
-    int64_t            draft_epoch = 0;
-    int64_t            chain_epoch = 0;  // bumped by a restart
+    // the drafter's context has one owner: a worker thread running the tap
+    // injections and the block drafts in the order they were queued. A block
+    // is queued when the chain queue is down to one token (right after that
+    // token's level goes out, so it runs under the close wait) and folded in
+    // when the queue is empty or, at close, once it has finished. A block
+    // anchored at an older root still extends the chain; one drafted before
+    // a restart is stale and dropped.
+    struct chain_job {
+        enum kind_t { INJECT, BLOCK } kind;
+        llama_pos          pos;
+        llama_token        tok;
+        int64_t            epoch;
+        std::vector<float> feats;
+    };
+    std::thread             worker;
+    std::mutex              worker_m;
+    std::condition_variable worker_cv;   // main -> worker: a job was queued, or stop
+    std::condition_variable worker_done; // worker -> main: a job finished
+    std::deque<chain_job>   jobs;
+    bool                    worker_stop = false;
+    bool                    worker_busy = false;
+    void chain_worker_loop();
+    void chain_enqueue(chain_job job);
+    void chain_worker_flush();           // wait until every queued job ran
+    bool chain_draft_done();             // the queued block has its result
+
+    // the block job's result (worker_m)
+    bool      draft_pending = false; // a block is queued or running
+    bool      draft_ready   = false;
+    int32_t   draft_rc    = 0;
+    int64_t   draft_us    = 0;
+    llama_pos draft_pos   = -1; // the root the block was anchored at
+    int64_t   draft_epoch = 0;
+    int64_t   chain_epoch = 0;  // bumped by a restart
     std::vector<std::vector<common_spec_tree_cand>> draft_out;
     // preempt (GGML_PIPEDEC_CHAIN_PREEMPT=1): a block every step; where it
     // disagrees with a level in flight, that suffix dies and the fresh tokens

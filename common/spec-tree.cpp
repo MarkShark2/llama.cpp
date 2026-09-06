@@ -89,6 +89,7 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
     h_out.resize((size_t) width * n_embd);
 
     if (chain) {
+        worker = std::thread([this]() { chain_worker_loop(); });
         LOG_INF("%s: PipeDec tree (chain mode): depth=%d lanes=%d take=%d preempt=%d taps=%d x %d\n",
                 __func__, this->params.depth, this->params.lanes, chain_take, (int) chain_preempt, (int) feat_layers.size(), n_embd_tgt);
     } else {
@@ -99,7 +100,14 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
 }
 
 common_spec_tree::~common_spec_tree() {
-    chain_draft_join();
+    if (worker.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(worker_m);
+            worker_stop = true;
+        }
+        worker_cv.notify_one();
+        worker.join();
+    }
     for (size_t i = 0; i < backend_chains.size(); ++i) {
         if (backend_chains[i]) {
             llama_set_sampler(params.ctx_dft, params.seq_base + (llama_seq_id) i, nullptr);
@@ -248,6 +256,68 @@ bool common_spec_tree::begin(llama_token root_tok, llama_pos root_pos, llama_seq
     return true;
 }
 
+void common_spec_tree::chain_worker_loop() {
+    for (;;) {
+        chain_job job;
+        {
+            std::unique_lock<std::mutex> lk(worker_m);
+            worker_cv.wait(lk, [&] { return worker_stop || !jobs.empty(); });
+            if (jobs.empty()) {
+                break; // stop, nothing left
+            }
+            job = std::move(jobs.front());
+            jobs.pop_front();
+            worker_busy = true;
+        }
+
+        if (job.kind == chain_job::INJECT) {
+            const int64_t t0 = ggml_time_us();
+            if (!common_speculative_tree_inject(params.spec, chain_seq, 1, &job.pos, job.feats.data())) {
+                LOG_ERR("%s: tap injection failed at pos %d\n", __func__, (int) job.pos);
+            }
+            const int64_t us = ggml_time_us() - t0;
+            std::lock_guard<std::mutex> lk(worker_m);
+            st.t_inject_us += us;
+        } else {
+            std::vector<std::vector<common_spec_tree_cand>> out;
+            const int64_t t0 = ggml_time_us();
+            const int32_t rc = common_speculative_tree_block_draft(params.spec, chain_seq, job.tok, job.pos, 1, out);
+            const int64_t us = ggml_time_us() - t0;
+            std::lock_guard<std::mutex> lk(worker_m);
+            draft_rc    = rc;
+            draft_us    = us;
+            draft_pos   = job.pos;
+            draft_epoch = job.epoch;
+            draft_out   = std::move(out);
+            draft_ready = true;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(worker_m);
+            worker_busy = false;
+        }
+        worker_done.notify_all();
+    }
+}
+
+void common_spec_tree::chain_enqueue(chain_job job) {
+    {
+        std::lock_guard<std::mutex> lk(worker_m);
+        jobs.push_back(std::move(job));
+    }
+    worker_cv.notify_one();
+}
+
+void common_spec_tree::chain_worker_flush() {
+    std::unique_lock<std::mutex> lk(worker_m);
+    worker_done.wait(lk, [&] { return jobs.empty() && !worker_busy; });
+}
+
+bool common_spec_tree::chain_draft_done() {
+    std::lock_guard<std::mutex> lk(worker_m);
+    return draft_ready;
+}
+
 void common_spec_tree::chain_draft_start() {
     if (draft_pending || root < 0) {
         return;
@@ -262,18 +332,12 @@ void common_spec_tree::chain_draft_start() {
         return;
     }
 
-    const llama_token tok = R.tok;
-    const llama_pos   pos = R.pos;
-    draft_pos     = pos;
-    draft_epoch   = chain_epoch;
     draft_pending = true;
-    draft_done.store(false);
-    draft_thread  = std::thread([this, tok, pos]() {
-        const int64_t t0 = ggml_time_us();
-        draft_rc = common_speculative_tree_block_draft(params.spec, chain_seq, tok, pos, 1, draft_out);
-        draft_us = ggml_time_us() - t0;
-        draft_done.store(true);
-    });
+    {
+        std::lock_guard<std::mutex> lk(worker_m);
+        draft_ready = false;
+    }
+    chain_enqueue({ chain_job::BLOCK, R.pos, R.tok, chain_epoch, {} });
 }
 
 bool common_spec_tree::chain_draft_join() {
@@ -281,7 +345,10 @@ bool common_spec_tree::chain_draft_join() {
         return false;
     }
     const int64_t t0 = ggml_time_us();
-    draft_thread.join();
+    {
+        std::unique_lock<std::mutex> lk(worker_m);
+        worker_done.wait(lk, [&] { return draft_ready; });
+    }
     draft_pending = false;
     st.t_draft_join_us += ggml_time_us() - t0;
     st.t_draft_bg_us   += draft_us;
@@ -328,21 +395,20 @@ bool common_spec_tree::chain_inject(int32_t id) {
         LOG_ERR("%s: taps out of order (pos %d, injected through %d)\n", __func__, (int) n.pos, (int) feat_pos);
         return false;
     }
-    const int64_t t0 = ggml_time_us();
+    // the taps are copied off the lane now (it may be reused before the worker
+    // gets to them); the injection itself runs on the worker, in order
+    chain_job job = { chain_job::INJECT, n.pos, 0, chain_epoch, {} };
+    job.feats.resize((size_t) n_feat);
     for (size_t k = 0; k < feat_layers.size(); ++k) {
         const float * tap = llama_pipedec_tree_layer_inp(params.ctx_tgt, n.lane, (uint32_t) feat_layers[k]);
         if (!tap) {
             LOG_ERR("%s: no layer-input tap %d on lane %d\n", __func__, feat_layers[k], n.lane);
             return false;
         }
-        std::memcpy(feat_buf.data() + k * (size_t) n_embd_tgt, tap, (size_t) n_embd_tgt * sizeof(float));
+        std::memcpy(job.feats.data() + k * (size_t) n_embd_tgt, tap, (size_t) n_embd_tgt * sizeof(float));
     }
-    const llama_pos pos = n.pos;
-    if (!common_speculative_tree_inject(params.spec, chain_seq, 1, &pos, feat_buf.data())) {
-        return false;
-    }
-    feat_pos = pos;
-    st.t_inject_us += ggml_time_us() - t0;
+    feat_pos = n.pos;
+    chain_enqueue(std::move(job));
     return true;
 }
 
@@ -400,10 +466,15 @@ bool common_spec_tree::chain_expand() {
             LOG_ERR("%s: drafter context ends at %d, root at %d\n", __func__, (int) feat_pos, (int) R.pos);
             return false;
         }
+        // the root's block now, through the worker (it owns the drafter)
         const int64_t t0 = ggml_time_us();
-        draft_pos   = R.pos;
-        draft_epoch = chain_epoch;
-        draft_rc    = common_speculative_tree_block_draft(params.spec, chain_seq, R.tok, R.pos, 1, draft_out);
+        draft_pending = true;
+        {
+            std::lock_guard<std::mutex> lk(worker_m);
+            draft_ready = false;
+        }
+        chain_enqueue({ chain_job::BLOCK, R.pos, R.tok, chain_epoch, {} });
+        chain_draft_join();
         st.t_draft_us += ggml_time_us() - t0;
         if (draft_rc < 0) {
             return false;
@@ -770,7 +841,7 @@ int32_t common_spec_tree::close_oldest() {
 
     // chain mode: the block drafted under that wait goes in before the root
     // is sampled, so a level it disagrees with is replaced now
-    if (chain && draft_pending && draft_done.load()) {
+    if (chain && draft_pending && chain_draft_done()) {
         if (!chain_expand()) {
             return -1;
         }
@@ -966,10 +1037,6 @@ llama_seq_id common_spec_tree::finish(llama_pos * trunk_pos, const float ** trun
     llama_seq_id trunk;
     llama_pos    tpos;
     if (chain) {
-        // a block still drafting owns the drafter's cache until it returns
-        chain_draft_join();
-        draft_out.clear();
-
         // the committed state ends at the root if its level ran, at its
         // predecessor otherwise; the root's taps go into the drafter so the
         // next request's injection starts where the cache ends
@@ -983,6 +1050,11 @@ llama_seq_id common_spec_tree::finish(llama_pos * trunk_pos, const float ** trun
             tpos = R.pos - 1;
         }
         trunk = chain_seq;
+
+        // the drafter's cache is the caller's again once every queued job ran
+        chain_worker_flush();
+        draft_pending = false;
+        draft_out.clear();
 
         for (const auto & l : levels) {
             llama_pipedec_tree_discard(params.ctx_tgt, l.lane);
