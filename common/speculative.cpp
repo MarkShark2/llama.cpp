@@ -1169,6 +1169,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
+                    // [fork] LLAMA_SPEC_DEBUG: audit the target features before they
+                    // reach the drafter - a row that never landed (async readback
+                    // still in flight, a split that wrote fewer rows than the batch)
+                    // shows up here as non-finite or absurd values, long before the
+                    // NaN it becomes inside the draft graph
+                    static const bool audit = getenv("LLAMA_SPEC_DEBUG") != nullptr;
+                    if (audit) {
+                        const llama_seq_id * meta_seq = nullptr;
+                        const llama_pos    * meta_pos = nullptr;
+                        const int32_t n_meta = llama_get_embeddings_layer_inp_rows(ctx_tgt, &meta_seq, &meta_pos);
+                        int32_t n_bad = 0, first_bad = -1;
+                        double  first_bad_max = 0.0, first_good_max = 0.0;
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            const float * row = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            double mx = 0.0;
+                            bool finite = true;
+                            for (int32_t j = 0; j < n_embd_tgt; ++j) {
+                                const float v = row[j];
+                                if (!std::isfinite(v)) { finite = false; break; }
+                                mx = std::max(mx, (double) std::fabs(v));
+                            }
+                            const bool bad = !finite || mx > 1.0e6;
+                            if (bad) {
+                                if (first_bad < 0) { first_bad = i; first_bad_max = finite ? mx : -1.0; }
+                                n_bad++;
+                            } else if (i == 0) {
+                                first_good_max = mx;
+                            }
+                        }
+                        LOG_INF("%s: audit layer %d rows [%d,%d) of batch %d: meta_rows=%d (pos %d..%d) bad=%d first_bad=%d (max %g) row0 max %g\n",
+                                __func__, target_layer_ids[k], offset, offset + n_chunk, n_tokens, n_meta,
+                                n_meta > 0 ? (int) meta_pos[0] : -1, n_meta > 0 ? (int) meta_pos[n_meta - 1] : -1,
+                                n_bad, first_bad, first_bad_max, first_good_max);
+                    }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
