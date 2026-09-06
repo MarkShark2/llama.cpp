@@ -2148,6 +2148,11 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
         const llama_ubatch & ubatch, llama_memory_context_i * mctx,
         uint32_t lane, uint32_t total, ggml_status & ret) {
     PIPEDEC_STEP("body lane=%u enter\n", lane);
+    // [fork] GGML_PIPEDEC_LANE_TRACE=1 prints the per-lane submission budget for
+    // classic stage-2 lanes too (the tree trace only covers tree lanes)
+    static const bool tree_trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
+    static const bool lane_trace = getenv("GGML_PIPEDEC_LANE_TRACE") != nullptr && atoi(getenv("GGML_PIPEDEC_LANE_TRACE")) != 0;
+    const int64_t t_a0 = ggml_time_us();
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2164,7 +2169,6 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     auto & lane_sched = sched_pipedec_body[lane][shape];
     auto & lane_res   = gf_res_pipedec_body[lane][shape];
 
-    static const bool tree_trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
     const int64_t t_b0 = ggml_time_us();
     int64_t t_build = 0, t_alloc = 0;
     bool reused = false;
@@ -2238,10 +2242,12 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
         return nullptr;
     }
     PIPEDEC_STEP("body lane=%u submitted status=%d\n", lane, (int) ret);
-    if (tree_trace && pipedec_tree_enabled) {
+    if ((tree_trace && pipedec_tree_enabled) || lane_trace) {
         const int64_t t_b5 = ggml_time_us();
-        fprintf(stderr, "[tree] body lane=%u rows=%u reused=%d build=%.2f alloc=%.2f inputs=%.2f compute=%.2f ms\n",
-                lane, ubatch.n_tokens, (int) reused, t_build/1000.0, t_alloc/1000.0, (t_b4 - t_b3)/1000.0, (t_b5 - t_b4)/1000.0);
+        fprintf(stderr, "[%s] body lane=%u rows=%u apply=%.2f reused=%d build=%.2f alloc=%.2f inputs=%.2f compute=%.2f ms\n",
+                pipedec_tree_enabled ? "tree" : "lane",
+                lane, ubatch.n_tokens, (t_b0 - t_a0)/1000.0, (int) reused, t_build/1000.0, t_alloc/1000.0,
+                (t_b4 - t_b3)/1000.0, (t_b5 - t_b4)/1000.0);
     }
 
     return res;
@@ -2796,12 +2802,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    static const bool lane_trace = getenv("GGML_PIPEDEC_LANE_TRACE") != nullptr && atoi(getenv("GGML_PIPEDEC_LANE_TRACE")) != 0;
+    const int64_t t_init0 = (lane_trace && pipedec_stage2) ? ggml_time_us() : 0;
+
     while (true) {
         mctx = pipedec_stage2
                 ? memory->init_batch_token_lanes(*balloc, 1, output_all)
                 : memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
             return -2;
+        }
+        if (lane_trace && pipedec_stage2) {
+            fprintf(stderr, "[lane] init_batch n_tokens=%u status=%d %.2f ms\n",
+                    n_tokens_all, (int) mctx->get_status(), (ggml_time_us() - t_init0)/1000.0);
         }
 
         switch (mctx->get_status()) {
