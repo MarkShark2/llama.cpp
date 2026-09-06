@@ -327,7 +327,7 @@ void common_spec_tree::chain_worker_flush() {
 
 bool common_spec_tree::chain_draft_done() {
     std::lock_guard<std::mutex> lk(worker_m);
-    return draft_id_done == draft_id_latest;
+    return draft_id_done > draft_id_applied;
 }
 
 void common_spec_tree::chain_draft_start() {
@@ -336,7 +336,7 @@ void common_spec_tree::chain_draft_start() {
     }
     // prefix and preempt modes: a block every step; otherwise one block at a
     // time, and only when the queue is about to run dry
-    if (!chain_prefix && !chain_preempt && (draft_pending || chain_toks.size() > 1 || chain_dry)) {
+    if (!chain_prefix && !chain_preempt && (draft_pending() || chain_toks.size() > 1 || chain_dry)) {
         return;
     }
     if (chain_dry && !chain_prefix) {
@@ -356,20 +356,20 @@ void common_spec_tree::chain_draft_start() {
             job.prefix.push_back(nodes[id].tok);
         }
     }
-    draft_pending = true;
     chain_enqueue(std::move(job));
 }
 
+// wait for a result newer than the last one folded in
 bool common_spec_tree::chain_draft_join() {
-    if (!draft_pending) {
+    if (!draft_pending()) {
         return false;
     }
     const int64_t t0 = ggml_time_us();
     {
         std::unique_lock<std::mutex> lk(worker_m);
-        worker_done.wait(lk, [&] { return draft_id_done == draft_id_latest; });
+        worker_done.wait(lk, [&] { return draft_id_done > draft_id_applied; });
+        draft_id_applied = draft_id_done;
     }
-    draft_pending = false;
     st.t_draft_join_us += ggml_time_us() - t0;
     st.t_draft_bg_us   += draft_us;
     return true;
@@ -495,7 +495,6 @@ bool common_spec_tree::chain_expand() {
                 job.prefix.push_back(nodes[id].tok);
             }
         }
-        draft_pending = true;
         chain_enqueue(std::move(job));
         chain_draft_join();
         st.t_draft_us += ggml_time_us() - t0;
@@ -738,7 +737,7 @@ int32_t common_spec_tree::submit_next() {
     if (pending.empty()) {
         if (chain) {
             if (chain_toks.empty()) {
-                if (chain_dry && !draft_pending) {
+                if (chain_dry && !draft_pending()) {
                     return 0;
                 }
                 if (!chain_expand()) {
@@ -866,7 +865,7 @@ int32_t common_spec_tree::close_oldest() {
 
     // chain mode: the block drafted under that wait goes in before the root
     // is sampled, so a level it disagrees with is replaced now
-    if (chain && draft_pending && chain_draft_done()) {
+    if (chain && chain_draft_done()) {
         if (!chain_expand()) {
             return -1;
         }
@@ -1078,8 +1077,11 @@ llama_seq_id common_spec_tree::finish(llama_pos * trunk_pos, const float ** trun
 
         // the drafter's cache is the caller's again once every queued job ran
         chain_worker_flush();
-        draft_pending = false;
-        draft_out.clear();
+        {
+            std::lock_guard<std::mutex> lk(worker_m);
+            draft_id_applied = draft_id_latest;
+            draft_out.clear();
+        }
 
         for (const auto & l : levels) {
             llama_pipedec_tree_discard(params.ctx_tgt, l.lane);

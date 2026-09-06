@@ -238,11 +238,15 @@ private:
     void chain_worker_flush();           // wait until every queued job ran
     bool chain_draft_done();             // the queued block has its result
 
-    // the block job's result (worker_m): the latest queued block's, older
-    // ones are superseded (a queued one is dropped, a running one ignored)
-    bool      draft_pending = false; // a block is queued or running
-    int64_t   draft_id_latest = 0;
-    int64_t   draft_id_done   = 0;
+    // the block job's result (worker_m): the newest the worker finished. A
+    // block not yet started is dropped when a newer one is queued; a finished
+    // one is folded in whether or not a newer one is already running (its
+    // extension past the deepest level is still valid), so the chain never
+    // waits for the worker unless the queue is empty.
+    int64_t   draft_id_latest  = 0; // queued
+    int64_t   draft_id_done    = 0; // finished (result in draft_out)
+    int64_t   draft_id_applied = 0; // folded in
+    bool      draft_pending() const { return draft_id_latest > draft_id_applied; }
     int32_t   draft_rc    = 0;
     int64_t   draft_us    = 0;
     llama_pos draft_pos   = -1; // the root the block was anchored at
