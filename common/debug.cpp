@@ -181,6 +181,37 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
     }
 
+    // [fork] LLAMA_SPEC_DEBUG_SRCS=1: also dump the matched node's f32 sources,
+    // with a per-row audit (rows holding non-finite or absurd values) - the
+    // sources are what the node actually read, leaf inputs included, which the
+    // node-only walk never shows
+    static const bool dump_srcs = getenv("LLAMA_SPEC_DEBUG_SRCS") != nullptr && atoi(getenv("LLAMA_SPEC_DEBUG_SRCS")) != 0;
+    if (dump_srcs && matches_filter) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const struct ggml_tensor * s = t->src[i];
+            if (!s || s->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const size_t n_bytes = ggml_nbytes(s);
+            std::vector<uint8_t> buf(n_bytes);
+            ggml_backend_tensor_get(s, buf.data(), 0, n_bytes);
+            int64_t n_bad = 0, first_bad = -1;
+            const int64_t n_rows = s->ne[1] * s->ne[2] * s->ne[3];
+            for (int64_t r = 0; r < n_rows; ++r) {
+                const float * row = (const float *) (buf.data() + r * s->nb[1]);
+                bool bad = false;
+                for (int64_t c = 0; c < s->ne[0]; ++c) {
+                    if (!std::isfinite(row[c]) || std::fabs(row[c]) > 1.0e6f) { bad = true; break; }
+                }
+                if (bad) { n_bad++; if (first_bad < 0) first_bad = r; }
+            }
+            LOG("%s:   src%d %s{%s} buffer=%s rows=%lld bad_rows=%lld first_bad=%lld\n", __func__, i, s->name,
+                common_ggml_ne_string(s).c_str(), s->buffer ? ggml_backend_buffer_name(s->buffer) : "none",
+                (long long) n_rows, (long long) n_bad, (long long) first_bad);
+            common_debug_print_tensor(buf.data(), s->type, s->ne, s->nb, 3, false);
+        }
+    }
+
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
