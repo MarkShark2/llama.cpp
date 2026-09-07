@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <typeinfo>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -1446,7 +1447,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
+            // [fork] INFO under the opt-in: the reason a lane rebuilds has to
+            // reach a served config's log, and DEBUG lines never do
+            LLAMA_LOG_INFO("%s: cannot reuse graph due to incompatible graph parameters (gtype=%d n_tokens=%u n_seqs=%u lane=%d)\n",
+                    __func__, (int) params.gtype, params.ubatch.n_tokens, params.ubatch.n_seqs, params.pipedec_lane);
         }
 
         return false;
@@ -1461,8 +1465,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
 
-        if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+        if (debug > 1 && !cur) {
+            LLAMA_LOG_INFO("%s: input %s blocks reuse (gtype=%d n_tokens=%u lane=%d)\n",
+                    __func__, typeid(*input).name(), (int) params.gtype, params.ubatch.n_tokens, params.pipedec_lane);
         }
 
         res = res && cur;
