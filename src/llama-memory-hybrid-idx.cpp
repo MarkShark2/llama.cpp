@@ -684,8 +684,15 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 namespace {
 
 // The last padded pool is always unused.
-uint32_t kpool_pad(uint32_t n_pool) {
-    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+//
+// [fork] The pools are a ratio-kpool cache of the indexer keys, so their count
+// follows LLAMA_KV_BUCKET the way the DSV4 compressed caches do. Padded to 64
+// alone it stepped every 256 prompt tokens, and every step was a new graph
+// shape past the reserved one: a galloc re-plan and a full fabric drain
+// (2.7 s) after every fourth 64-token ubatch on the nine-board GLM-5.3 split.
+uint32_t kpool_pad(uint32_t n_pool, uint32_t kpool, uint32_t kv_size) {
+    const uint32_t n_max = kv_size/std::max(1u, kpool) + 1;
+    return llama_kv_bucket_pad(n_pool + 1, std::max(n_max, 64u), 64u, kpool);
 }
 
 }
@@ -994,7 +1001,7 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    return kpool_pad(kpool_cur().n_pool_real, mem->get_kpool(), mem->get_mem_idx()->get_size());
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -1031,7 +1038,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
     const uint32_t n_new    = st.n_new;
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real, kpool, mem->get_mem_idx()->get_size()));
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
