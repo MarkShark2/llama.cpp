@@ -703,7 +703,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx())) {
     if (kpool_track()) {
-        kpool_st = std::make_unique<kpool_state>(kpool_build_layout());
+        kpool_st = std::make_unique<kpool_state>(kpool_build_layout(nullptr));
         i_kpool  = 0;
     }
 }
@@ -797,7 +797,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 // k-pool DSA indexer (glm5-next)
 
 // Layout only, used by the full cache context so get_n_kpool() works during graph reserve.
-llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kpool_build_layout() const {
+//
+// [fork] The layout is per ubatch: only the sequences in it get pools. A
+// prediction tree keeps a dozen seqs alive that are whole-prefix copies of
+// the slot's, and laying every one of them out scored their pools over and
+// over on each level and reshaped the pool tensors on every level, so no
+// lane graph was ever reused. A token only ever sees its own sequence's
+// pools (the mask is per seq), so absent seqs are dead weight. Reservation
+// passes no ubatch and keeps the full scan.
+llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kpool_build_layout(const llama_ubatch * ubatch) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
     const uint32_t kpool = mem->get_kpool();
@@ -808,14 +816,45 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     const auto * kv = mem->get_mem_idx();
     const uint32_t n_stream_kv = kv->get_n_stream();
 
+    std::vector<uint8_t> in_ub;
+    if (ubatch != nullptr) {
+        in_ub.assign(LLAMA_MAX_SEQ, 0);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            for (int32_t k = 0; k < ubatch->n_seq_id[i]; ++k) {
+                in_ub[ubatch->seq_id[i][k]] = 1;
+            }
+        }
+    }
+    auto wanted = [&](llama_seq_id s) { return in_ub.empty() || in_ub[s] != 0; };
+
     if (n_stream_kv == 1) {
         const auto & cells = kv->get_cells(0);
 
         // Scan only active sequences
         std::vector<llama_seq_id> active;
         for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            if (cells.seq_pos_min(s) >= 0) {
+            if (cells.seq_pos_min(s) >= 0 && wanted(s)) {
                 active.push_back(s);
+            }
+        }
+
+        // [fork] Pools are grouped relative to each sequence's first position,
+        // so a pooled key cached in a cell that several sequences share is
+        // right for all of them as long as their groupings coincide, which
+        // they do when every live sequence starts at the same position (the
+        // tree's seqs, copies of the slot's). Shared cells used to disable the
+        // cache outright, re-pooling everything on every level.
+        llama_pos pos_min_all = -1;
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const llama_pos p = cells.seq_pos_min(s);
+            if (p < 0) {
+                continue;
+            }
+            if (pos_min_all < 0) {
+                pos_min_all = p;
+            } else if (p != pos_min_all) {
+                st.cache_safe = false;
+                break;
             }
         }
 
@@ -824,22 +863,17 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
                 continue;
             }
             const llama_pos p = cells.pos_get(i);
-            uint32_t n_seq_cell = 0;
             for (const llama_seq_id s : active) {
                 if (cells.seq_has(i, s)) {
                     st.seqs[s].cells.emplace_back(p, i);
-                    ++n_seq_cell;
                 }
-            }
-            if (n_seq_cell > 1) {
-                st.cache_safe = false;
             }
         }
     } else {
         // When kv is non unified, one stream per sequence, so streams never share cells. Cell indices stay stream-local.
         for (llama_seq_id s = 0; s < (llama_seq_id) n_stream_kv; ++s) {
             const auto & cells = kv->get_cells(s);
-            if (cells.seq_pos_min(s) < 0) {
+            if (cells.seq_pos_min(s) < 0 || !wanted(s)) {
                 continue;
             }
             auto & sq = st.seqs[s];
@@ -904,7 +938,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 // Orphaned pooled slots are never cleared, a slot is only ever read through pool_cells, which is derived from the current grouping every ubatch.
 llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kpool_build_state(
         const llama_ubatch & ubatch) const {
-    kpool_state st = kpool_build_layout();
+    kpool_state st = kpool_build_layout(&ubatch);
 
     const uint32_t kpool = mem->get_kpool();
 
@@ -1001,17 +1035,18 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
-    GGML_ASSERT((n_new == 0) == (new_pool_idxs == nullptr));
-    GGML_ASSERT(st.cache_safe || new_pool_rep == nullptr);
-    GGML_ASSERT(!st.cache_safe || (n_new == 0) == (new_pool_rep == nullptr));
-
-    if (n_new > 0) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
-        GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new);
-        if (new_pool_rep != nullptr) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_rep->buffer));
-            GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_new);
-        }
+    // [fork] the new-pool tensors are sized to the padded pool count, not to
+    // the pools this ubatch completes (0 or 1 in decode, everything after a
+    // seq edit): a shape that tracked n_new rebuilt the lane graph on every
+    // tree level. Rows past n_new duplicate a real pool, so the graph rewrites
+    // a pooled key with its own value.
+    GGML_ASSERT(new_pool_idxs != nullptr && ggml_backend_buffer_is_host(new_pool_idxs->buffer));
+    GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_pool);
+    GGML_ASSERT(n_new <= n_pool);
+    GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
+    if (new_pool_rep != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_rep->buffer));
+        GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_pool);
     }
 
     const uint32_t kv_size = mem->get_mem_idx()->get_size();
@@ -1063,8 +1098,12 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     int32_t * pcell = (int32_t *) pool_cells->data;
     int32_t * pidx  = (int32_t *) pool_idxs->data;
-    int32_t * nidx  = n_new > 0 ? (int32_t *) new_pool_idxs->data : nullptr;
+    int32_t * nidx  = (int32_t *) new_pool_idxs->data;
     int64_t * nrep  = new_pool_rep != nullptr ? (int64_t *) new_pool_rep->data : nullptr;
+
+    // the last real pool laid out, the template for the padded new-pool rows
+    const kpool_state::seq * last_sq = nullptr;
+    uint32_t last_j = 0;
 
     uint32_t i_new = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -1099,9 +1138,29 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
 
             pool_end.push_back(sq.cells[j + kpool - 1].first);
+            last_sq = &sq;
+            last_j  = j;
         }
     }
     GGML_ASSERT(i_new == n_new);
+
+    // [fork] pad the new-pool rows: a copy of a pool that exists, whose pooled
+    // key is then recomputed from the same members and written back to the
+    // same rep row. With no complete pool yet the members and the rep are the
+    // ubatch's first cell, which cannot be a rep until its pool completes and
+    // is rewritten.
+    for (uint32_t ip = n_new; ip < n_pool; ++ip) {
+        for (uint32_t k = 0; k < kpool; ++k) {
+            nidx[(size_t) ip*kpool + k] = last_sq != nullptr
+                ? (int32_t) gcell(*last_sq, last_sq->cells[last_j + k].second)
+                : (int32_t) dummy_cell;
+        }
+        if (nrep != nullptr) {
+            nrep[ip] = last_sq != nullptr
+                ? gcell(*last_sq, last_sq->cells[last_j + kpool - 1].second)
+                : dummy_cell;
+        }
+    }
 
     const uint32_t n_pool_real = (uint32_t) pool_end.size();
     for (uint32_t ip = n_pool_real; ip < n_pool; ++ip) {

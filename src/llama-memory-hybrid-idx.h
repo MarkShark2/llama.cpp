@@ -202,7 +202,8 @@ private:
 
     // K-pool layouts
     struct kpool_state;
-    kpool_state kpool_build_layout() const;
+    // ubatch == nullptr lays out every live sequence (graph reservation)
+    kpool_state kpool_build_layout(const llama_ubatch * ubatch) const;
     kpool_state kpool_build_state(const llama_ubatch & ubatch) const;
     const kpool_state & kpool_cur() const;
 
