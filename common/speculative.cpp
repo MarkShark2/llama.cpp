@@ -2838,6 +2838,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+
+    // [fork] the draft context catches up on every prompt batch in its own
+    // ubatches; a wider one runs the MTP block far fewer times per prompt
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+        result.n_batch  = std::max(result.n_batch, result.n_ubatch);
+    }
     // [fork, PipeDec tree] the draft context also carries one seq per tree node
     // and its output buffers are sized by n_seq_max
     result.n_outputs_max = params.n_parallel + (int32_t) params.speculative.tree_n_seq();
