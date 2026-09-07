@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
 
+#include <cstdlib>
+
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
 
@@ -100,11 +102,25 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     // layer and use them in the trunk/body graphs so the whole trunk stays on the
     // pipeline, exactly as when there is no drafter at all. The deferred head graph
     // keeps the originals on the draft GPU by design.
+    //
+    // Only the norm has to stay: it runs on every row of every ubatch to feed
+    // h_nextn to the drafter. The logits matmul runs on n_outputs rows, which
+    // is zero for every prompt ubatch but the last and zero in the body lanes
+    // (the head on the draft GPU takes the logits), and the copy of an empty
+    // input is skipped, so the trunk pipelines just the same with the matmul
+    // on the original. LLAMA_TRUNK_OUTPUT_LOCAL=1 drops the 496 MiB duplicate
+    // from the last board, which on the nine-board split is the one hordd's
+    // guard kills first.
     if (!mtp_only && params.mtp_dev != nullptr && n_layer > 0) {
         output_norm_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},
                 TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
-        output_trunk      = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
-                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        const char * e = getenv("LLAMA_TRUNK_OUTPUT_LOCAL");
+        if (e && atoi(e) != 0) {
+            LLAMA_LOG_INFO("%s: trunk logits on the draft GPU, no output duplicate on the last layer (LLAMA_TRUNK_OUTPUT_LOCAL)\n", __func__);
+        } else {
+            output_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab},
+                    TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
+        }
     }
 
     for (int i = 0; i < n_layer_all; ++i) {
