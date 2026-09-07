@@ -1887,6 +1887,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [fork] one synchronize for the whole batch. The _ith accessor drains
+        // every scheduler of the target per call (main, PipeDec lanes, head),
+        // and a prompt batch reads thousands of rows: on the nine-board split
+        // that was 45 s per 8192-token batch once the tree lanes existed. The
+        // rows are dense by batch index, as the shifted copy above already
+        // assumes.
+        const float * h_all = llama_get_embeddings_nextn(ctx_tgt);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1896,10 +1904,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            std::memcpy(verify_h[seq_id].data(), h_all + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes * n_rows);
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
