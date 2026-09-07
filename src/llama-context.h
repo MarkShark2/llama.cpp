@@ -535,6 +535,7 @@ private:
     // galloc_restore_worstcase(). Tracks the scheduler's re-plan epoch so a
     // shrunk reserve can be restored before it costs another fabric drain.
     int      galloc_epoch_seen     = 0;
+    bool     galloc_restore_failed = false;
 
     bool     mem_reserve_valid     = false;
     uint32_t mem_reserve_n_tokens  = 0;

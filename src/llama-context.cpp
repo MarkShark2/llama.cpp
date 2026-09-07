@@ -1036,7 +1036,17 @@ void llama_context::galloc_restore_worstcase() {
         const char * e = getenv("LLAMA_GALLOC_PRIMARY_RESERVE");
         return e && atoi(e) != 0;
     }();
-    if (!enabled || !memory) {
+    if (!enabled || !memory || galloc_restore_failed) {
+        return;
+    }
+
+    // The restore buys back a fabric drain. A context on one device has
+    // none: its re-plan is a local malloc, and the draft context of a
+    // speculative pair re-plans on every tree step anyway (the router
+    // matmul flips between CPU and the GPU as the shapes alternate), so
+    // restoring it there is a worst-case reserve per step - 15 ms of
+    // failed cudaMalloc per step once the drafter's GPU is full.
+    if (model.n_devices() <= 1) {
         return;
     }
 
@@ -1057,8 +1067,12 @@ void llama_context::galloc_restore_worstcase() {
 
     const int64_t t0 = ggml_time_us();
     if (!graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get())) {
-        // the narrow plan still works, it just keeps costing drains
-        LLAMA_LOG_WARN("%s: failed to restore the worst-case reserve\n", __func__);
+        // the narrow plan still works, it just keeps costing drains. Memory
+        // that was not there for this reserve will not be there for the
+        // next one, and every retry is a failed backend alloc per re-plan,
+        // so give up for the life of the context and say so once.
+        galloc_restore_failed = true;
+        LLAMA_LOG_WARN("%s: failed to restore the worst-case reserve, not retrying for this context\n", __func__);
         return;
     }
     // graph_reserve() re-plans galloc itself, so resync rather than
