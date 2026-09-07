@@ -3151,8 +3151,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // it: the collapsed n_embd on deepseek4, the full HC stack on
                 // qwen4exp. The group buffer is strided by that width.
                 if (pipedec_stage2) {
-                    GGML_ASSERT(t_h_nextn->ne[0] > 0 && (uint32_t) t_h_nextn->ne[0] <= hparams.n_embd_out());
-                    pipedec_row_width = (uint32_t) t_h_nextn->ne[0];
+                    // element count over rows, not ne[0]: qwen4exp exports [n_embd, hc, rows]
+                    GGML_ASSERT(ggml_nelements(t_h_nextn) % n_rows == 0);
+                    const int64_t row_width = ggml_nelements(t_h_nextn) / n_rows;
+                    GGML_ASSERT(row_width > 0 && (uint32_t) row_width <= hparams.n_embd_out());
+                    pipedec_row_width = (uint32_t) row_width;
                 }
                 const uint32_t n_embd = pipedec_stage2 ? pipedec_row_n_embd() : hparams.n_embd_out();
 
@@ -5634,10 +5637,14 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
         return -3;
     }
 
-    GGML_ASSERT(t_h->ne[0] > 0 && (uint32_t) t_h->ne[0] <= model.hparams.n_embd_out());
-    pipedec_row_width = (uint32_t) t_h->ne[0];
+    // the row width is whatever the body left per token: ne[0] on a flat
+    // [width, rows] export (deepseek4), ne[0]*ne[1] on qwen4exp's
+    // [n_embd, hc, rows] residual - so divide the element count by the rows
+    GGML_ASSERT(ggml_nelements(t_h) % n_tokens == 0);
+    const int64_t row_width = ggml_nelements(t_h) / n_tokens;
+    GGML_ASSERT(row_width > 0 && (uint32_t) row_width <= model.hparams.n_embd_out());
+    pipedec_row_width = (uint32_t) row_width;
     const uint32_t n_embd = pipedec_row_n_embd();
-    GGML_ASSERT(ggml_nelements(t_h) == (int64_t) n_tokens * n_embd);
 
     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_pipedec_body[lane][n_tokens - 1].get(), t_h);
     GGML_ASSERT(backend_h != nullptr);
