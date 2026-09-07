@@ -1,9 +1,6 @@
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
 
-#include <algorithm>
-#include <cstdlib>
-
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
 
@@ -103,25 +100,11 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     // layer and use them in the trunk/body graphs so the whole trunk stays on the
     // pipeline, exactly as when there is no drafter at all. The deferred head graph
     // keeps the originals on the draft GPU by design.
-    //
-    // Any pipeline stage will do for the duplicates, not only the last: the hop
-    // from the last layer to them is an RPC-to-RPC peer push of n_tokens rows,
-    // which stays asynchronous. LLAMA_TRUNK_TAIL_LAYER picks the layer whose
-    // device carries them. On the nine-board split the last board held five
-    // layers plus this 496 MiB copy and was the one hordd's guard killed at
-    // 15k tokens, 400 MiB short of its siblings, while the four-layer boards
-    // had 2-3 GiB spare.
     if (!mtp_only && params.mtp_dev != nullptr && n_layer > 0) {
-        const int il_last = (int) n_layer - 1;
-        int il_tail = il_last;
-        if (const char * e = getenv("LLAMA_TRUNK_TAIL_LAYER")) {
-            il_tail = std::max(0, std::min(il_last, atoi(e)));
-            LLAMA_LOG_INFO("%s: trunk tail duplicates placed with layer %d (LLAMA_TRUNK_TAIL_LAYER)\n", __func__, il_tail);
-        }
         output_norm_trunk = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},
-                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, il_tail);
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
         output_trunk      = create_tensor_on_layer(ml, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
-                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, il_tail);
+                TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED, n_layer - 1);
     }
 
     for (int i = 0; i < n_layer_all; ++i) {
