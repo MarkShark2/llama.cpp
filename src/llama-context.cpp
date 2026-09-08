@@ -22,6 +22,28 @@
 #include <stdexcept>
 #include <string>
 
+// [fork] LLAMA_GRAPH_NODES_DUMP=<dir>: write the node list of the first few
+// built graphs (reserve and live) so two shapes can be diffed by name
+static void llama_graph_nodes_dump(ggml_cgraph * gf, const char * tag, uint32_t n_tokens, uint32_t n_outputs) {
+    static const char * dir = getenv("LLAMA_GRAPH_NODES_DUMP");
+    static int idx = 0;
+    if (dir == nullptr || gf == nullptr || idx >= 12) {
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/gnodes_%02d_%s_t%u_o%u.txt", dir, idx++, tag, n_tokens, n_outputs);
+    FILE * f = fopen(path, "w");
+    if (f == nullptr) {
+        return;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        fprintf(f, "%5d %-16s %-48s [%lld,%lld,%lld,%lld]\n", i, ggml_op_name(t->op), t->name,
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+    }
+    fclose(f);
+}
+
 // [fork, PipeDec] fork-internal ggml export, kept out of ggml-backend.h so the
 // public header (a dependency of every CUDA object) stays untouched.
 extern "C" void ggml_backend_sched_set_stable_host_inputs(ggml_backend_sched_t sched, bool stable);
@@ -2006,6 +2028,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf = model.build_graph(gparams);
 
+        llama_graph_nodes_dump(gf, "live", ubatch.n_tokens, n_outputs);
+
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
@@ -3974,6 +3998,8 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    llama_graph_nodes_dump(gf, "reserve", n_tokens, n_outputs);
 
     this->n_outputs = save_n_outputs;
 

@@ -1583,9 +1583,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::thread catchup;
     bool        catchup_ok = true;
 
+    // LLAMA_SPEC_TRACE=1: per prompt batch, how long the caller waited on the
+    // worker, how long the worker ran, and how long the target sync took
+    int64_t catchup_t0    = 0;
+    int64_t catchup_t1    = 0;
+    int32_t catchup_n_tok = 0;
+
+    static bool trace_enabled() {
+        static const bool enabled = [] {
+            const char * e = getenv("LLAMA_SPEC_TRACE");
+            return e && atoi(e) != 0;
+        }();
+        return enabled;
+    }
+
     bool catchup_join() {
         if (catchup.joinable()) {
+            const int64_t tj0 = ggml_time_us();
             catchup.join();
+            if (trace_enabled()) {
+                const int64_t tj1 = ggml_time_us();
+                fprintf(stderr, "[spec] catch-up %d tok: worker %.0f ms, caller waited %.0f ms\n",
+                        catchup_n_tok, (catchup_t1 - catchup_t0) / 1000.0, (tj1 - tj0) / 1000.0);
+            }
         }
         return catchup_ok;
     }
@@ -1991,7 +2011,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // rows are dense by batch index, as the shifted copy above already
         // assumes. This tail runs before the catch-up so pending_h is the
         // last row of this batch by the time the next one arrives.
+        const int64_t ts0 = ggml_time_us();
         const float * h_all = llama_get_embeddings_nextn(ctx_tgt);
+        if (trace_enabled()) {
+            fprintf(stderr, "[spec] prompt batch %d tok: target sync %.0f ms\n", n_tokens, (ggml_time_us() - ts0) / 1000.0);
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
@@ -2013,8 +2037,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // submit the next prompt batch to the target while the draft device
         // runs this one. The next entry into the drafter joins it.
         if (!is_mem_shared && !embd_in) {
-            catchup_ok = true;
-            catchup    = std::thread([this]() { catchup_ok = catchup_decode(); });
+            catchup_ok    = true;
+            catchup_n_tok = n_tokens;
+            catchup       = std::thread([this]() {
+                catchup_t0 = ggml_time_us();
+                catchup_ok = catchup_decode();
+                catchup_t1 = ggml_time_us();
+            });
         }
 
         return true;
