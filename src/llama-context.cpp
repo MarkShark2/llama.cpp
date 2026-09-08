@@ -347,6 +347,18 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // [fork] LLAMA_UBATCH_NONCAUSAL=N: a non-causal batch (an mtmd image span,
+    // whose tokens attend to each other) cannot be cut into ubatches, so it
+    // decodes as one ubatch of its own size. Prefill keeps n_ubatch; this only
+    // raises the ceiling such a batch may reach and sizes the SWA caches for it.
+    cparams.n_ubatch_nc = cparams.n_ubatch;
+    if (const char * e = getenv("LLAMA_UBATCH_NONCAUSAL")) {
+        const int v = atoi(e);
+        if (v > 0) {
+            cparams.n_ubatch_nc = std::max(cparams.n_ubatch, std::min(cparams.n_batch, (uint32_t) v));
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -413,6 +425,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
+    if (cparams.n_ubatch_nc != cparams.n_ubatch) {
+        LLAMA_LOG_INFO("%s: n_ubatch_nc           = %u\n",   __func__, cparams.n_ubatch_nc);
+    }
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -770,7 +785,8 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    // graph meta only: a non-causal ubatch may be n_ubatch_nc wide
+    const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch_nc));
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -2767,7 +2783,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
-    GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+    // [fork] a non-causal batch attends within itself, so it is one ubatch of
+    // its own size, bounded by the ceiling the caches were sized for
+    if (!cparams.causal_attn && n_tokens_all > cparams.n_ubatch_nc) {
+        LLAMA_LOG_ERROR("%s: non-causal batch of %u tokens exceeds the non-causal ubatch ceiling %u (n_ubatch = %u, raise LLAMA_UBATCH_NONCAUSAL)\n",
+                __func__, n_tokens_all, cparams.n_ubatch_nc, cparams.n_ubatch);
+        return -1;
+    }
+    const uint32_t n_ubatch_split = cparams.causal_attn ? cparams.n_ubatch : std::max(cparams.n_ubatch, n_tokens_all);
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
@@ -2823,7 +2846,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     while (true) {
         mctx = pipedec_stage2
                 ? memory->init_batch_token_lanes(*balloc, 1, output_all)
-                : memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+                : memory->init_batch(*balloc, n_ubatch_split, output_all);
         if (!mctx) {
             return -2;
         }

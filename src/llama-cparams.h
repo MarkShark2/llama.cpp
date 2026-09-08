@@ -12,6 +12,7 @@ struct llama_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_ubatch_nc;     // [fork] ceiling for a non-causal batch (an mtmd image span) decoded as one ubatch; >= n_ubatch, sizes the SWA caches and graph meta
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
