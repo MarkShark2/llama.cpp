@@ -36,6 +36,7 @@ struct llama_ubatch {
     uint32_t n_seqs;       // sequence sets in the ubatch
     uint32_t n_seqs_unq;   // unique sequence ids in the ubatch
     uint32_t n_pos;        // number of position inputs for each token/embedding
+    uint32_t n_embd;       // [fork] floats per embd row, the width the allocator strided batch.embd at
 
     // seq_id_unq: unique sequence ids in the ubatch
     // seq_idx:    indices of the unique sequence ids in the ubatch in [0, n_seqs_unq)

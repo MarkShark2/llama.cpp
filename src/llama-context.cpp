@@ -2712,7 +2712,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // prompt, and the garbage features came back out of the drafter as NaN
     // logits, an argmax of -1, and an out-of-bounds get_rows on the Markov
     // table.
-    const int64_t n_embd_batch = dflash_embd ? n_embd : (int64_t) cparams.n_embd_inp_ctx;
+    //
+    // A token-less MTP batch is a vision chunk from the drafter's prompt hook:
+    // each row is the token embedding followed by the target's hidden row,
+    // which llm_graph_input_embd_h splits back apart, so it is strided at the
+    // summed width.
+    const bool    mtp_pair     = mtp_embd && batch_inp.token == nullptr;
+    const int64_t n_embd_batch = dflash_embd ? n_embd
+                               : mtp_pair    ? (int64_t) hparams.n_embd_inp() + (int64_t) cparams.n_embd_inp_ctx
+                               :               (int64_t) cparams.n_embd_inp_ctx;
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd_batch, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;

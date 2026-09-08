@@ -1530,6 +1530,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     llama_batch batch;
 
+    // [fork] rows of a vision chunk, [embed(x_i) | h_{i-1}], allocated on the first one
+    llama_batch batch_pair = {};
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1710,6 +1713,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             free(batch.token);
             batch.token = nullptr;
         }
+        if (batch_pair.embd != nullptr) {
+            llama_batch_free(batch_pair);
+        }
         llama_batch_free(batch);
     }
 
@@ -1788,15 +1794,102 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // [fork] The catch-up decode for a vision chunk. The hook sees the rows the
+    // target decoded in place of token ids (the projector's output, at the
+    // input width), and the target's h_nextn rows for the batch are dense by
+    // batch index, so the drafter is fed each image position the way it is
+    // fed a text one: embed(x_i) beside h_{i-1}, the previous row's hidden
+    // state, pending_h for the first. The pair goes in one row of a batch at
+    // the summed width, which llm_graph_input_embd_h splits back apart, in
+    // slices of the draft ubatch.
+    bool process_embd(const llama_batch & batch_in) {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const int32_t n_embd_tok = llama_model_n_embd_inp(llama_get_model(ctx_dft));
+        if (n_embd_tok != llama_model_n_embd_inp(llama_get_model(ctx_tgt))) {
+            SPC_ERR("vision rows are %d wide, the drafter embeds %d wide\n",
+                    llama_model_n_embd_inp(llama_get_model(ctx_tgt)), n_embd_tok);
+            return false;
+        }
+
+        const int32_t n_embd_pair = n_embd_tok + n_embd;
+        const int32_t n_ub        = (int32_t) llama_n_ubatch(ctx_dft);
+
+        if (batch_pair.embd == nullptr) {
+            batch_pair = llama_batch_init(n_ub, n_embd_pair, 1);
+        }
+
+        const float * h_all   = llama_get_embeddings_nextn(ctx_tgt);
+        auto        * mem_dft = llama_get_memory(ctx_dft);
+
+        bool ok = true;
+        for (int head = 0; head < n_mtp_layers && ok; ++head) {
+            if (chain_heads) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                    }
+                }
+                llama_set_nextn_layer_offset(ctx_dft, head);
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && ok; ++seq_id) {
+                const int32_t beg = i_batch_beg[seq_id];
+                const int32_t end = i_batch_end[seq_id];
+                if (beg < 0) {
+                    continue;
+                }
+
+                for (int32_t off = beg; off <= end && ok; off += n_ub) {
+                    const int32_t n_chunk = std::min(n_ub, end - off + 1);
+
+                    batch_pair.n_tokens = n_chunk;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t k      = off + i;
+                        float       * row    = batch_pair.embd + (size_t) i * n_embd_pair;
+                        const float * h_prev = k == beg ? pending_h[seq_id].data() : h_all + (size_t) (k - 1) * n_embd;
+
+                        std::memcpy(row,              batch_in.embd + (size_t) k * n_embd_tok, (size_t) n_embd_tok * sizeof(float));
+                        std::memcpy(row + n_embd_tok, h_prev,                                  (size_t) n_embd     * sizeof(float));
+
+                        batch_pair.pos[i]       = batch_in.pos[k];
+                        batch_pair.n_seq_id[i]  = 1;
+                        batch_pair.seq_id[i][0] = seq_id;
+                        batch_pair.logits[i]    = false;
+                    }
+
+                    const int32_t rc = llama_decode(ctx_dft, batch_pair);
+                    if (rc != 0) {
+                        SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d on a vision chunk (pos=%d, n_rows=%d)\n",
+                                head, (int) rc, (int) batch_in.pos[off], (int) n_chunk);
+                        ok = false;
+                    }
+                }
+            }
+        }
+
+        if (chain_heads) {
+            llama_set_nextn_layer_offset(ctx_dft, 0);
+        }
+
+        return ok;
+    }
+
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        // [fork] A vision chunk reaches the hook as an embedding batch: the
+        // target decoded the projector's rows in place of token ids. Skipping
+        // it left a hole in the draft cache at the image's positions, and the
+        // next text batch failed the position check (Y = X + 1). A batch with
+        // both token and embd is the drafter's own, never a prompt.
+        if (batch_in.token != nullptr && batch_in.embd != nullptr) {
             return true;
         }
+        const bool embd_in = batch_in.token == nullptr;
 
         const int32_t n_tokens = batch_in.n_tokens;
 
@@ -1825,7 +1918,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && embd_in) {
+            if (!process_embd(batch_in)) {
+                return false;
+            }
+        }
+        if (!is_mem_shared && !embd_in) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {

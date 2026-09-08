@@ -108,8 +108,27 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
-        // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
+
+        // [fork] A vision chunk on an MTP draft context: the row is the token
+        // embedding followed by the target's hidden row (process_embd in
+        // common/speculative.cpp), strided at the summed width by decode().
+        const int64_t n_embd_tok = embd->ne[0];
+        const int64_t n_embd_h   = h->ne[0];
+        if (ubatch->n_embd == (uint32_t) (n_embd_tok + n_embd_h)) {
+            std::vector<float> tok((size_t) n_tokens*n_embd_tok);
+            std::vector<float> hid((size_t) n_tokens*n_embd_h);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const float * row = ubatch->embd + i*(n_embd_tok + n_embd_h);
+                std::memcpy(tok.data() + i*n_embd_tok, row,              n_embd_tok*sizeof(float));
+                std::memcpy(hid.data() + i*n_embd_h,   row + n_embd_tok, n_embd_h  *sizeof(float));
+            }
+            ggml_backend_tensor_set(embd, tok.data(), 0, tok.size()*ggml_element_size(embd));
+            ggml_backend_tensor_set(h,    hid.data(), 0, hid.size()*ggml_element_size(h));
+            return;
+        }
+
+        // note: mtmd embedding input goes through here
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
