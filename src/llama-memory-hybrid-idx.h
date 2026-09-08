@@ -102,10 +102,13 @@ public:
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
-    // The pooled keys persist in the idx cache across batches.
-    // Sequence edits shift the pool grid and stale the cached values.
-    bool mem_idx_is_stale() const { return mem_idx_stale; }
-    void mem_idx_stale_clear   ()       { mem_idx_stale = false; }
+    // [fork] The pooled keys persist in the idx cache across batches. Per idx
+    // cell, the kpool stream-local member cells of the pool whose pooled key
+    // it holds (UINT32_MAX: none), so only a pool whose members changed is
+    // re-pooled: a tail trim or a whole-prefix seq_cp invalidates nothing,
+    // where a global stale flag re-pooled every pool in the context on the
+    // next ubatch, in every tree lane graph, on every level.
+    std::vector<uint32_t> & get_kpool_members() { return kpool_members; }
 
     void set_mtp_dsa_index_share(bool enabled);
     bool get_mtp_dsa_index_share() const { return mtp_dsa_index_share; }
@@ -123,7 +126,7 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
-    bool mem_idx_stale = false;
+    std::vector<uint32_t> kpool_members;
 
     bool mtp_dsa_index_share = false;
     std::vector<int32_t> mtp_dsa_selection;
@@ -215,7 +218,4 @@ private:
 
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
-
-    // Clear a pending full re-pool only after the first ubatch succeeds
-    bool mem_idx_stale_batch = false;
 };

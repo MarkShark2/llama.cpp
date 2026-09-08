@@ -292,6 +292,13 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
 }
 
 
+// [fork] rows of the new-pool tensors: a fixed count for the pools one ubatch
+// can complete or touch, the whole pool count when a regroup re-pools more
+static uint32_t kpool_n_new_pad(uint32_t n_new, bool cache_safe, uint32_t n_pool, uint32_t n_ubatch, uint32_t kpool) {
+    const uint32_t base = std::min<uint32_t>(n_pool, GGML_PAD(n_ubatch/std::max(1u, kpool) + 2, 64));
+    return (cache_safe && n_new <= base) ? base : n_pool;
+}
+
 // K-pool indexer inputs
 class llama_model_glm5_next::llm_graph_input_kpool : public llm_graph_input_i {
 public:
@@ -322,8 +329,10 @@ public:
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
-        // The new-pool tensors follow n_pool (checked above), not the exact count
         res &= cache_safe        == mctx->get_kpool_cache_safe();
+        // The new-pool shape is fixed unless a regroup widens it.
+        res &= new_pool_idxs->ne[1] == (int64_t) kpool_n_new_pad(mctx->get_n_kpool_new(), mctx->get_kpool_cache_safe(),
+                                                                 mctx->get_n_kpool(), params.cparams.n_ubatch, kpool);
         const bool share = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mctx->get_mtp_dsa_index_share();
         const size_t saved = mctx->get_mtp_dsa_selection_size();
         const bool reuse = share && saved == (size_t) n_sel*params.ubatch.n_tokens;
@@ -410,17 +419,17 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         }
     }
 
-    // [fork] the new-pool tensors are sized to the padded pool count so their
-    // shape is stable across the ubatches of a decode (the exact count is 0
-    // or 1 per token and every pool after a seq edit, which rebuilt the
-    // PipeDec lane graph on every tree level); the padding rows duplicate a
-    // real pool, see set_input_kpool
-    inp->n_new = n_pool;
+    // [fork] the new-pool tensors take a fixed shape that covers what one
+    // ubatch can complete or touch, so a lane graph keeps one shape across
+    // tree levels without carrying (and re-pooling) every pool in the context
+    // on every level; a regroup that re-pools more falls back to the wide
+    // shape once. The padding rows duplicate a real pool, see set_input_kpool.
+    inp->n_new = kpool_n_new_pad(mctx_hyb->get_n_kpool_new(), cache_safe, n_pool, cparams.n_ubatch, kpool);
     inp->cache_safe = cache_safe;
-    inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
+    inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
     if (cache_safe) {
-        inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_pool);
+        inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
         ggml_set_input(inp->new_pool_rep);
     }
 
