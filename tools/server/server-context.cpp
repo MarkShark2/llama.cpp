@@ -348,10 +348,18 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // [fork] the drafter may still be catching up on ctx_dft from the last
+    // prompt batch; nothing below touches that context before this
+    void spec_sync() const {
+        common_speculative_sync(spec);
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
+
+        spec_sync();
 
         const size_t cur_size_tgt = io_tgt->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = io_dft->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -404,6 +412,8 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        spec_sync();
+
         bool res = prompt_cache.load(prompt, tokens, *io_tgt, *io_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -415,6 +425,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        spec_sync();
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
@@ -887,6 +898,7 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
+        spec_sync();
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
@@ -1080,6 +1092,7 @@ private:
     }
 
     common_state_seq_io & state_io_dft() {
+        common_speculative_sync(spec.get());
         return io_ctx_dft;
     }
 
@@ -2270,6 +2283,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // [fork] the previous task may have left the drafter catching up on
+        // its last prompt batch; the slot's cache is trimmed below
+        slot.spec_sync();
+
         if (spd_mode) {
             auto & sampling = task.params.sampling;
 
@@ -5346,6 +5363,7 @@ private:
         const llama_seq_id trunk = spec_tree->finish(&trunk_pos, &trunk_h);
 
         if (trunk >= 0 && trunk != slot.id) {
+            slot.spec_sync();
             if (llama_pipedec_tree_commit(ctx_tgt, trunk, slot.id) != 0) {
                 SLT_ERR(slot, "%s", "failed to commit the tree trunk into the slot seq\n");
             }

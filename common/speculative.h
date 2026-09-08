@@ -97,6 +97,10 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// [fork] wait for any draft work the last process() left running on the draft
+// context; call before touching that context (its memory or state) directly
+void common_speculative_sync(common_speculative * spec);
+
 // [fork, PipeDec probe] top candidates (best first) the draft sampler saw at draft
 // step `step` of the most recent draft for this seq; nullptr if unavailable
 const std::vector<llama_token> * common_speculative_dbg_topk(common_speculative * spec, llama_seq_id seq_id, int step);

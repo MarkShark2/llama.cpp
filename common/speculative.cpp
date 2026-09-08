@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <thread>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -174,6 +175,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // [fork] wait for draft work left running by process()
+    virtual void sync() {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1570,6 +1574,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<std::vector<llama_token>>> probe_topk;
 
     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
+
+    // [fork] The prompt catch-up decode of a text batch runs on this thread,
+    // so the target's next batch is submitted while the draft device works
+    // through the last one: the hook owns everything the decode reads (batch,
+    // i_batch_beg) and touches only ctx_dft, and every other entry of the
+    // drafter joins it first. A failure is reported by the next process().
+    std::thread catchup;
+    bool        catchup_ok = true;
+
+    bool catchup_join() {
+        if (catchup.joinable()) {
+            catchup.join();
+        }
+        return catchup_ok;
+    }
+
+    void sync() override {
+        catchup_join();
+    }
+
     bool dsa_index_share = false;
     size_t dsa_sel_width = 0;
     std::vector<std::vector<int32_t>> dsa_sel;
@@ -1693,6 +1717,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        catchup_join();
+
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1781,6 +1807,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (N <= 0) {
             return;
         }
+
+        catchup_join();
 
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
@@ -1877,6 +1905,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        if (!catchup_join()) {
+            return false;
+        }
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1911,7 +1942,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
 
         reset_dsa_index_share();
 
@@ -1952,37 +1982,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
-
-            auto * mem_dft = llama_get_memory(ctx_dft);
-
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
-                    }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
-                }
-
-                const int32_t rc = llama_decode(ctx_dft, batch);
-                if (rc != 0) {
-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
-                    ok = false;
-                    break;
-                }
-            }
-
-            if (chain_heads) {
-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
-            }
-            if (!ok) {
-                return false;
-            }
         }
 
         // [fork] one synchronize for the whole batch. The _ith accessor drains
@@ -1990,7 +1989,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // and a prompt batch reads thousands of rows: on the nine-board split
         // that was 45 s per 8192-token batch once the tree lanes existed. The
         // rows are dense by batch index, as the shifted copy above already
-        // assumes.
+        // assumes. This tail runs before the catch-up so pending_h is the
+        // last row of this batch by the time the next one arrives.
         const float * h_all = llama_get_embeddings_nextn(ctx_tgt);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2008,11 +2008,64 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        // [fork] The catch-up decode itself goes to the worker: the target's
+        // rows are already copied into the owned batch, so the caller can
+        // submit the next prompt batch to the target while the draft device
+        // runs this one. The next entry into the drafter joins it.
+        if (!is_mem_shared && !embd_in) {
+            catchup_ok = true;
+            catchup    = std::thread([this]() { catchup_ok = catchup_decode(); });
+        }
+
         return true;
+    }
+
+    // [fork] the heads loop of the prompt catch-up, on the worker thread
+    bool catchup_decode() {
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        bool ok = true;
+        for (int head = 0; head < n_mtp_layers; ++head) {
+            if (chain_heads) {
+                // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    llama_memory_seq_rm(mem_dft, seq_id, batch.pos[i_batch_beg[seq_id]], -1);
+                }
+                llama_set_nextn_layer_offset(ctx_dft, head);
+            }
+
+            const int32_t rc = llama_decode(ctx_dft, batch);
+            if (rc != 0) {
+                SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                        head, (int) rc, (int) batch.pos[0]);
+                ok = false;
+                break;
+            }
+        }
+
+        if (chain_heads) {
+            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+        return ok;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        if (!catchup_join()) {
+            SPC_ERR("%s", "prompt catch-up decode failed, drafting nothing\n");
+            for (auto & dp : dparams) {
+                if (dp.drafting && dp.result != nullptr) {
+                    dp.result->clear();
+                }
+                dp.drafting = false;
+            }
+            return;
+        }
 
         reset_dsa_index_share();
 
@@ -3256,6 +3309,16 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+void common_speculative_sync(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->sync();
+    }
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
