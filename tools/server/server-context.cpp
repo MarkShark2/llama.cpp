@@ -3510,14 +3510,13 @@ private:
                                     }
                                 }
                             }
-                            SLT_INF(*slot, "restored %zu context checkpoints from beside the slot file\n", slot->prompt.checkpoints.size());
-                        }
-                        {
-                            auto & ckpt = slot->prompt.checkpoints.emplace_back();
-                            ckpt.update_pos(slot->prompt.tokens.size(), 0, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id));
-                            ckpt.update_tgt(state_io_tgt(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            ckpt.update_dft(state_io_dft(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            common_speculative_get_state(spec.get(), slot->id, ckpt.data_spec);
+                            for (const auto & c : slot->prompt.checkpoints) {
+                                SLT_INF(*slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                        c.pos_min, c.pos_max, c.n_tokens, (float) c.size() / 1024 / 1024);
+                            }
+                            if (slot->prompt.checkpoints.empty()) {
+                                SLT_WRN(*slot, "%s", "no context checkpoints beside the slot file - a hybrid memory re-processes this prompt unless a request extends it\n");
+                            }
                         }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
@@ -4677,12 +4676,7 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            // [fork] <= rather than <: the deferred end-of-prompt snapshot of a
-                                            // recurrent/hybrid memory has pos_min == its last position, which is
-                                            // exactly pos_min_thold when the same prompt comes back. It is used
-                                            // the way a pos_min == 0 checkpoint is (the last token is re-decoded
-                                            // onto it) instead of re-processing the whole prompt.
-                                            return cur.pos_min <= pos_min_thold || cur.pos_min == 0;
+                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
 
