@@ -64,6 +64,7 @@ struct common_spec_tree_stats {
     int64_t n_restarts  = 0;
 
     int64_t t_draft_us  = 0;
+    int64_t t_draft_dec_us = 0; // the draft decode alone (the rest of t_draft is sampling and the row copies)
     int64_t t_submit_us = 0;
     int64_t t_wait_us   = 0;
     int64_t t_head_us   = 0;

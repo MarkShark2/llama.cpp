@@ -75,11 +75,20 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
     }
 
     // backend top-k on the draft device for every tree seq, CPU fallback otherwise
-    // (chain mode owns no seqs: the drafter samples on its own)
+    // (chain mode owns no seqs: the drafter samples on its own).
+    // GGML_PIPEDEC_TREE_CPU_TOPK=1 samples every row on the CPU instead: a
+    // backend sampler is keyed by seq and a level rides a different lane seq
+    // each time, so with backend sampling the draft graph is rebuilt on every
+    // level, without it the graph is reused.
+    const bool cpu_topk = getenv("GGML_PIPEDEC_TREE_CPU_TOPK") && atoi(getenv("GGML_PIPEDEC_TREE_CPU_TOPK")) != 0;
     const int32_t n_tree_seq = chain ? 0 : this->params.lanes * width;
     backend_chains.assign(n_tree_seq, nullptr);
     for (int32_t i = 0; i < n_tree_seq; ++i) {
         const llama_seq_id seq = this->params.seq_base + i;
+        if (cpu_topk) {
+            llama_set_sampler(params.ctx_dft, seq, nullptr); // the drafter's own chain for this seq goes too
+            continue;
+        }
         llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
         llama_sampler_chain_add(chain, llama_sampler_init_top_k(std::max(16, this->params.branch)));
         if (!llama_set_sampler(params.ctx_dft, seq, chain)) {
@@ -643,6 +652,7 @@ bool common_spec_tree::expand() {
         LOG_ERR("%s: draft decode failed rc=%d (rows=%zu pos=%d)\n", __func__, rc, rows.size(), (int) nodes[rows[0]].pos);
         return false;
     }
+    st.t_draft_dec_us += ggml_time_us() - t0;
 
     for (size_t i = 0; i < rows.size(); ++i) {
         auto & n = nodes[rows[i]];
@@ -1174,10 +1184,10 @@ std::string common_spec_tree::summary() const {
     char buf[512];
     snprintf(buf, sizeof(buf),
             "tree: steps=%lld hits=%lld (%.1f%%) children/step=%.2f restarts=%lld levels=%lld rows=%lld | "
-            "per step ms: draft %.2f submit %.2f wait %.2f head %.2f",
+            "per step ms: draft %.2f (decode %.2f) submit %.2f wait %.2f head %.2f",
             (long long) st.n_steps, (long long) st.n_hits, 100.0 * st.n_hits / steps,
             (double) st.n_children / steps, (long long) st.n_restarts, (long long) st.n_levels, (long long) st.n_rows,
-            st.t_draft_us / 1000.0 / steps, st.t_submit_us / 1000.0 / steps,
+            st.t_draft_us / 1000.0 / steps, st.t_draft_dec_us / 1000.0 / steps, st.t_submit_us / 1000.0 / steps,
             st.t_wait_us / 1000.0 / steps, st.t_head_us / 1000.0 / steps);
     std::string s = buf;
     if (chain) {
