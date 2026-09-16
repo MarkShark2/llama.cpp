@@ -3,6 +3,14 @@
 
 #include <cstdlib>
 
+// [fork] declared in ggml.c (no public-header change): attaches a gathered
+// top-k KV segment to a flash_attn_ext node (src[5]=kc, src[6]=idx, src[7]=nvis)
+extern "C" void ggml_flash_attn_ext_set_sparse(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kc,
+        struct ggml_tensor * idx,
+        struct ggml_tensor * nvis);
+
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
 
@@ -699,7 +707,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
 ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
-        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il) {
+        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, bool sparse, int il) {
 
     const auto * mctx_lid = mctx_hyb->get_idx();
 
@@ -781,6 +789,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     cb(pooled, "indexer_pool_k", il);
 
     ggml_tensor * sel_idx = inp_kpool->reuse_sel;
+    ggml_tensor * sel_fa  = nullptr; // [fork] sel_idx with the invisible pools removed, for the sparse FA path
     if (sel_idx == nullptr) {
         ggml_tensor * weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
         weights = ggml_scale(ctx0, weights, 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)));
@@ -821,9 +830,28 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                 ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens));  // [kpool, n_top_pool*n_tokens]
         sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*n_top_pool, n_tokens);
 
+        if (sparse) {
+            // [fork] the sparse FA path has no scatter mask to fold causal
+            // visibility into: a token that sees fewer than n_top_pool pools
+            // still gets n_top_pool from top_k, the surplus carrying a -inf
+            // score. Their cells go to -1, which the kernel skips.
+            ggml_tensor * vis = ggml_get_rows(ctx0,
+                    ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k);  // [1, n_top_pool, n_tokens]
+            vis = ggml_clamp(ctx0, ggml_scale_bias(ctx0, vis, 1.0f, 1e30f), 0.0f, 1.0f);
+            vis = ggml_reshape_2d(ctx0, vis, 1, n_top_pool*n_tokens);
+
+            ggml_tensor * cells = ggml_scale_bias(ctx0, ggml_cast(ctx0, sel_idx, GGML_TYPE_F32), 1.0f, 1.0f);
+            cells = ggml_mul(ctx0, ggml_reshape_2d(ctx0, cells, kpool, n_top_pool*n_tokens), vis);
+            cells = ggml_scale_bias(ctx0, cells, 1.0f, -1.0f);
+            sel_fa = ggml_cast(ctx0, ggml_reshape_2d(ctx0, cells, kpool*n_top_pool, n_tokens), GGML_TYPE_I32);
+        }
+
         if (hparams.indexer_kpool_select_tail) {
             // Append the incomplete tail with n_kv for missing cells.
             sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
+            if (sel_fa != nullptr) {
+                sel_fa = ggml_concat(ctx0, sel_fa, inp_kpool->tail_idxs, 0);
+            }
         }
     } else {
         cb(sel_idx, "indexer_sel_reuse", il);
@@ -840,6 +868,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         GGML_ASSERT(inp_kpool->gather_mask->ne[0] == n_sel && inp_kpool->gather_mask->ne[3] == n_tokens);
         cb(sel_idx, "indexer_sel_idx", il);
         return sel_idx;
+    }
+
+    if (sparse) {
+        GGML_ASSERT(sel_fa != nullptr);
+        cb(sel_fa, "indexer_sel_fa", il);
+        return sel_fa;
     }
 
     // Tie scatter storage lifetime to this layer's selected indices.
@@ -901,9 +935,15 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
+    // [fork] prompt shapes (no gather) attend with the DSA sparse FA kernel
+    // over the selected cells alone instead of dense FA over the whole
+    // bucketed context with a scatter mask. The latent cache must be f16.
+    const bool sparse = !inp_kpool->gather && inp_kpool->reuse_sel == nullptr && cparams.flash_attn &&
+                        mctx_mla->get_k_storage(il)->type == GGML_TYPE_F16 && inp_kpool->n_kv > inp_kpool->n_sel;
+
     ggml_tensor * sel = nullptr;
     if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
-        sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, il);
+        sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, sparse, il);
         *prev_sel = sel;
     } else {
         GGML_ASSERT(*prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");
@@ -945,6 +985,46 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
         out = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));     // [n_embd_head_v, n_head, 1, n_tokens]
         out = ggml_reshape_2d(ctx0, out, kqv->ne[0]*n_head, n_tokens);
+    } else if (sparse) {
+        // Sparse FA: every row comes through the index list, the dense segment
+        // is one masked-out row because the kernels want one. The causal mask
+        // stays a graph leaf so set_input has its buffer, but nothing reads it.
+        ggml_build_forward_expand(gf, kq_mask);
+
+        ggml_tensor * sel_idx = sel; // I32 [n_sel, n_tokens], -1 or n_kv for the cells to skip
+        const int64_t n_sel = sel_idx->ne[0];
+
+        ggml_tensor * kv = mctx_mla->get_k(ctx0, il); // F16 [kv_lora_rank, 1, n_kv, ns], the ubatch's streams
+        GGML_ASSERT(kv->ne[0] == kv_lora_rank && kv->ne[1] == 1 && "GLM5-Next MLA cache holds a single latent head");
+        const int64_t n_kv = kv->ne[2];
+        const int64_t ns   = kv->ne[3];
+        const int64_t T    = n_tokens/ns;
+
+        ggml_tensor * kc = ggml_permute(ctx0, kv, 0, 2, 1, 3); // [kv_lora_rank, n_kv, 1, ns]
+        ggml_tensor * kd = ggml_view_4d(ctx0, kv, kv_lora_rank, 1, 1, ns, kv->nb[2], kv->nb[2], kv->nb[3], 0);
+
+        // the constants derive from sel_idx so they land on its backend
+        ggml_tensor * seed = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
+        ggml_tensor * md = ggml_fill(ctx0, ggml_cast(ctx0, seed, GGML_TYPE_F16), -INFINITY);
+        md = ggml_repeat_4d(ctx0, md, 1, T, 1, ns);
+        ggml_tensor * nv = ggml_repeat_4d(ctx0, ggml_fill(ctx0, seed, (float) n_kv), T, 1, 1, ns);
+        nv = ggml_cast(ctx0, nv, GGML_TYPE_I32);
+
+        ggml_tensor * qf = ggml_view_4d(ctx0, q_absorbed, kv_lora_rank, n_head, T, ns,
+                q_absorbed->nb[1], q_absorbed->nb[2], q_absorbed->nb[3]/ns, 0);
+        qf = ggml_permute(ctx0, qf, 0, 2, 1, 3); // [kv_lora_rank, T, n_head, ns]
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx0, qf, kd, kd, md, kq_scale, 0.0f, 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il});
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_sparse(fa, kc, ggml_reshape_4d(ctx0, sel_idx, n_sel, T, 1, ns), nv);
+        cb(fa, "kqv_sparse", il);
+
+        // [kv_lora_rank, n_head, T, ns] -> wv_b applied the way build_attn_mha applies v_mla
+        out = ggml_permute(ctx0, fa, 0, 2, 1, 3);
+        out = ggml_mul_mat(ctx0, layer.wv_b, out);
+        out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));
+        out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
     } else {
         // The scatter selection already includes the causal mask.
         ggml_tensor * mask = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);

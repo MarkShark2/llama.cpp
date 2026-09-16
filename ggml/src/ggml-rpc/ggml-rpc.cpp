@@ -12,6 +12,7 @@
 #include <queue>
 #include <condition_variable>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -131,6 +132,10 @@ enum rpc_cmd {
     // which is the one thing a hibernation cycle must not have to rebuild.
     RPC_CMD_SESSION_DETACH,
     RPC_CMD_SESSION_RESUME,
+    // SET lane payload dedupe (GGML_RPC_SET_DEDUPE=1, the default): a SET whose
+    // payload the server stashed recently is sent as header + hash only, see
+    // rpc_dedupe_lru.
+    RPC_CMD_SET_TENSOR_DEDUPE,
     RPC_CMD_COUNT,
 };
 
@@ -144,6 +149,8 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 #define GGML_RPC_IMAT_MIN_PATCH 3
 // ...and detach/resume of a parked session (fleet hibernation)
 #define GGML_RPC_HIBERNATE_MIN_PATCH 4
+// ...and SET lane payload dedupe
+#define GGML_RPC_DEDUPE_MIN_PATCH 5
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -644,10 +651,89 @@ private:
 // LANE_ATTACHed connection; the counters live on the endpoint's main
 // dispatcher because that is the one the fences are sent on.
 // ---------------------------------------------------------------------------
+// [fork] SET lane payload dedupe. The PipeDec tree re-sends the same DSA pool
+// tables to every board on every tree level (~4.5 MB of the 5 MB a level
+// uploads at 100k context on GLM), and they only change when a pool completes.
+// The client hashes each SET lane payload in the size window and keeps an LRU
+// of recent hashes; the server keeps the same LRU with the bytes. A hit sends
+// header + hash and the server copies from its stash. Both sides apply the
+// same policy to the same in-order command stream, so nothing is negotiated:
+// the client's set is always a subset of the server's (a lane reattach resets
+// only the client, which makes the server's set the larger one).
+struct rpc_dedupe_lru {
+    struct entry {
+        uint64_t hash;
+        size_t   size;
+        std::vector<uint8_t> data; // server side only
+    };
+    size_t max_entries = 64;
+    size_t max_bytes   = 64ull << 20;
+    size_t bytes       = 0;
+    std::list<entry> order; // most recent at the back
+    std::unordered_map<uint64_t, std::list<entry>::iterator> map;
+
+    // a hit moves the entry to most recent
+    const entry * find(uint64_t hash) {
+        auto it = map.find(hash);
+        if (it == map.end()) {
+            return nullptr;
+        }
+        order.splice(order.end(), order, it->second);
+        return &*it->second;
+    }
+
+    void insert(uint64_t hash, size_t size, std::vector<uint8_t> data) {
+        order.push_back({hash, size, std::move(data)});
+        map[hash] = std::prev(order.end());
+        bytes += size;
+        while (order.size() > max_entries || bytes > max_bytes) {
+            bytes -= order.front().size;
+            map.erase(order.front().hash);
+            order.pop_front();
+        }
+    }
+};
+
+static bool rpc_dedupe_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_RPC_SET_DEDUPE");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+// payload size window: below it the header costs more than the bytes it
+// saves, above it a stash entry would crowd out the tables this is for
+static const size_t RPC_DEDUPE_MIN_BYTES = 32u << 10;
+static const size_t RPC_DEDUPE_MAX_BYTES = 4u << 20;
+
+static uint64_t rpc_dedupe_hash(const uint8_t * data, size_t size) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t) size;
+    size_t i = 0;
+    for (; i + 8 <= size; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, sizeof(w));
+        h ^= w;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+    }
+    for (; i < size; ++i) {
+        h ^= data[i];
+        h *= 0x100000001b3ULL;
+    }
+    h ^= h >> 29;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 32;
+    return h;
+}
+
 struct rpc_lanes {
     std::mutex m;
     // client-side wire-command counts per lane since HELLO, in submission order
     uint64_t main_enq = 0, set_enq = 0, get_enq = 0;
+    // [fork] mirror of the server's SET lane dedupe stash, fresh on every attach;
+    // touched only by the SET lane thread
+    std::shared_ptr<rpc_dedupe_lru> dedupe;
     // lane counts covered by the most recent LANE_FENCE enqueued on the main lane
     uint64_t fenced_set = 0, fenced_get = 0;
     int      state = 0;   // 0 = untried, 1 = active, -1 = unavailable
@@ -1359,6 +1445,7 @@ static rpc_lanes * rpc_lanes_get_active(const std::shared_ptr<rpc_dispatcher> & 
         }
         ep.set_lane->adopt(set_sock);
         ep.get_lane->adopt(get_sock);
+        ep.dedupe = std::make_shared<rpc_dedupe_lru>();
         ep.state = 1;
     }
     GGML_LOG_INFO("[rpc fdx] %s: transfer lanes active (session %" PRIu64 ")\n", endpoint.c_str(), info.session_id);
@@ -2380,6 +2467,36 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor(
     return msg;
 }
 
+// serialized SET_TENSOR_DEDUPE wire message:
+// | rpc_tensor | offset (8) | hash (8) | size (8) | hit (1) | payload (size, only on a miss) |
+// hash and hit are filled in on the SET lane thread, where the stash order is the wire order
+static const size_t RPC_SET_TENSOR_DEDUPE_HDR = RPC_SET_TENSOR_HDR + 2*sizeof(uint64_t) + 1;
+
+static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_dedupe(
+        const ggml_tensor * tensor, const void * data, uint64_t offset, size_t size) {
+    rpc_tensor rt = serialize_tensor(tensor);
+    const uint64_t size64 = size;
+    auto msg = std::make_shared<std::vector<uint8_t>>(RPC_SET_TENSOR_DEDUPE_HDR + size);
+    memcpy(msg->data(), &rt, sizeof(rt));
+    memcpy(msg->data() + sizeof(rt), &offset, sizeof(offset));
+    memcpy(msg->data() + RPC_SET_TENSOR_HDR + sizeof(uint64_t), &size64, sizeof(size64));
+    memcpy(msg->data() + RPC_SET_TENSOR_DEDUPE_HDR, data, size);
+    return msg;
+}
+
+// hashes the payload against the mirror and returns how many bytes to send
+static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, std::vector<uint8_t> & msg) {
+    const size_t   size = msg.size() - RPC_SET_TENSOR_DEDUPE_HDR;
+    const uint64_t hash = rpc_dedupe_hash(msg.data() + RPC_SET_TENSOR_DEDUPE_HDR, size);
+    memcpy(msg.data() + RPC_SET_TENSOR_HDR, &hash, sizeof(hash));
+    const bool hit = lru.find(hash) != nullptr;
+    if (!hit) {
+        lru.insert(hash, size, {});
+    }
+    msg[RPC_SET_TENSOR_DEDUPE_HDR - 1] = hit ? 1 : 0;
+    return hit ? RPC_SET_TENSOR_DEDUPE_HDR : msg.size();
+}
+
 static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
         const ggml_tensor * tensor, const void * data, uint64_t offset, size_t size) {
     rpc_tensor rt = serialize_tensor(tensor);
@@ -2450,19 +2567,24 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
     // snapshot the full wire message now: the caller may reuse `data` (and the graph
     // may rewrite `tensor`) once we return
-    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
-    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(tensor, data, offset, size)
-                         : rpc_prepare_set_tensor(tensor, data, offset, size);
-    const enum rpc_cmd cmd = wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : RPC_CMD_SET_TENSOR;
     rpc_lanes * ep = rpc_lanes_get_active(disp);
+    const bool wire_bf16 = rpc_wire_bf16_ok(tensor, offset, size);
+    const bool dedupe    = !wire_bf16 && ep != nullptr && rpc_dedupe_enabled() && disp->patch >= GGML_RPC_DEDUPE_MIN_PATCH
+                        && size >= RPC_DEDUPE_MIN_BYTES && size <= RPC_DEDUPE_MAX_BYTES;
+    auto msg = wire_bf16 ? rpc_prepare_set_tensor_bf16(tensor, data, offset, size)
+             : dedupe    ? rpc_prepare_set_tensor_dedupe(tensor, data, offset, size)
+                         : rpc_prepare_set_tensor(tensor, data, offset, size);
+    const enum rpc_cmd cmd = wire_bf16 ? RPC_CMD_SET_TENSOR_BF16 : dedupe ? RPC_CMD_SET_TENSOR_DEDUPE : RPC_CMD_SET_TENSOR;
     if (ep != nullptr) {
         std::lock_guard<std::mutex> l(ep->m);
         const uint64_t wait_main = ep->main_enq;
         const uint64_t wait_get  = ep->get_enq;
         ep->set_enq++;
         const std::string endpoint = disp->endpoint;
-        ep->set_lane->task([endpoint, cmd, wait_main, wait_get, msg](const socket_ptr & lane) {
-            if (!send_lane_cmd(lane, cmd, wait_main, wait_get, msg->data(), msg->size())) {
+        std::shared_ptr<rpc_dedupe_lru> lru = dedupe ? ep->dedupe : nullptr;
+        ep->set_lane->task([endpoint, cmd, wait_main, wait_get, msg, lru](const socket_ptr & lane) {
+            const size_t n = lru ? rpc_dedupe_finish(*lru, *msg) : msg->size();
+            if (!send_lane_cmd(lane, cmd, wait_main, wait_get, msg->data(), n)) {
                 GGML_ABORT("[rpc fdx] SET lane to %s lost", endpoint.c_str());
             }
             return true;
@@ -3594,6 +3716,8 @@ public:
     // [fork] allow_cache=false for lane traffic (activations): skips the pending
     // SET_TENSOR_HASH bookkeeping, which belongs to the main thread only
     bool set_tensor(const std::vector<uint8_t> & input, bool allow_cache = true);
+    // [fork] SET lane dedupe: applies a payload, or on a hit the stashed copy
+    bool set_tensor_dedupe(const std::vector<uint8_t> & input);
     // [fork] streaming form of set_tensor for the main command socket: the
     // length prefix is already consumed, the body is still on the wire. Bounds
     // host RAM to one chunk instead of the whole upload.
@@ -3666,6 +3790,12 @@ private:
     // lifecycle commands. The cache_* fields stay main-thread-only.
     std::mutex buffers_mtx;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    // [fork] SET lane dedupe stash, in wire order (see rpc_dedupe_lru)
+    std::mutex     dedupe_mtx;
+    rpc_dedupe_lru dedupe;
+    size_t         dedupe_hits = 0, dedupe_hit_bytes = 0, dedupe_misses = 0;
+
+    bool set_tensor_raw(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size);
     // [fork, PipeDec] deserialized graphs kept per backend, keyed by the
     // client's graph uid. The client mirrors this set with a bounded LRU and
     // evicts explicitly via GRAPH_FORGET, so lookups on RECOMPUTE never miss.
@@ -4038,33 +4168,6 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input, bool allow_cache
     memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
     const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
 
-    struct ggml_init_params params {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context_ptr ctx_ptr { ggml_init(params) };
-    GGML_ASSERT(ctx_ptr != nullptr);
-    ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
-    if (tensor == nullptr || tensor->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
-        return false;
-    }
-    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
-
-    // sanitize tensor->data
-    {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
-            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
-            return false;
-        }
-    }
-
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
     // [fork] only cache uploads the client offered a hash for first (see cache_pending)
     const bool cache_this = allow_cache && cache_pending
@@ -4086,8 +4189,74 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input, bool allow_cache
             GGML_LOG_ERROR("[%s] failed to write cache entry '%s'\n", __func__, cache_file.string().c_str());
         }
     }
+    return set_tensor_raw(*in_tensor, offset, data, size);
+}
+
+bool rpc_server::set_tensor_raw(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
+
+    // sanitize tensor->data
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (in_tensor.data + offset < p0 || in_tensor.data + offset >= p1 || size > (p1 - in_tensor.data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor.data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
+}
+
+bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input) {
+    // | rpc_tensor | offset (8) | hash (8) | size (8) | hit (1) | payload (size, only on a miss) |
+    const size_t hdr = sizeof(rpc_tensor) + 3*sizeof(uint64_t) + 1;
+    if (input.size() < hdr) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    uint64_t offset, hash, size;
+    memcpy(&offset, input.data() + sizeof(rpc_tensor),                      sizeof(offset));
+    memcpy(&hash,   input.data() + sizeof(rpc_tensor) +   sizeof(uint64_t), sizeof(hash));
+    memcpy(&size,   input.data() + sizeof(rpc_tensor) + 2*sizeof(uint64_t), sizeof(size));
+    const bool hit = input[hdr - 1] != 0;
+
+    std::lock_guard<std::mutex> l(dedupe_mtx);
+    const void * data = nullptr;
+    if (hit) {
+        const rpc_dedupe_lru::entry * e = dedupe.find(hash);
+        if (e == nullptr || e->size != size) {
+            GGML_LOG_ERROR("[rpc dedupe] hit on hash %016" PRIx64 " (%" PRIu64 " bytes) not in the stash - client mirror out of step\n", hash, size);
+            return false;
+        }
+        data = e->data.data();
+        dedupe_hits++;
+        dedupe_hit_bytes += size;
+    } else {
+        if (input.size() != hdr + size) {
+            return false;
+        }
+        data = input.data() + hdr;
+        dedupe.insert(hash, size, std::vector<uint8_t>(input.begin() + hdr, input.end()));
+        dedupe_misses++;
+    }
+    return set_tensor_raw(*in_tensor, offset, data, size);
 }
 
 bool rpc_server::open_cached_file(uint64_t hash, std::ifstream & ifs, size_t & size) {
@@ -5275,6 +5444,10 @@ rpc_server::~rpc_server() {
                 cache_hits, cache_hit_bytes / double(1024ull * 1024ull * 1024ull),
                 cache_misses, cache_upload_bytes / double(1024ull * 1024ull * 1024ull));
     }
+    if (dedupe_hits > 0 || dedupe_misses > 0) {
+        GGML_LOG_INFO("[rpc dedupe] hits=%zu (%.2f GiB skipped), misses=%zu\n",
+                dedupe_hits, dedupe_hit_bytes / double(1024ull * 1024ull * 1024ull), dedupe_misses);
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -5378,7 +5551,7 @@ static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
-        if (cmd != RPC_CMD_SET_TENSOR && cmd != RPC_CMD_SET_TENSOR_BF16) {
+        if (cmd != RPC_CMD_SET_TENSOR && cmd != RPC_CMD_SET_TENSOR_BF16 && (is_peer || cmd != RPC_CMD_SET_TENSOR_DEDUPE)) {
             GGML_LOG_ERROR("[rpc fdx] unexpected command %d on %s lane\n", cmd, is_peer ? "peer" : "SET");
             break;
         }
@@ -5444,9 +5617,9 @@ static void rpc_lane_set_exec(rpc_active_session * s) {
         if (!s->wait_counts(m.wait_main, 0, m.wait_get)) {
             return;
         }
-        const bool ok = m.cmd == RPC_CMD_SET_TENSOR
-            ? s->server->set_tensor(m.payload, /*allow_cache =*/ false)
-            : s->server->set_tensor_bf16(m.payload, /*allow_cache =*/ false);
+        const bool ok = m.cmd == RPC_CMD_SET_TENSOR        ? s->server->set_tensor(m.payload, /*allow_cache =*/ false)
+                      : m.cmd == RPC_CMD_SET_TENSOR_DEDUPE ? s->server->set_tensor_dedupe(m.payload)
+                                                           : s->server->set_tensor_bf16(m.payload, /*allow_cache =*/ false);
         if (!ok) {
             GGML_LOG_ERROR("[rpc fdx] SET lane apply failed\n");
             s->fail();

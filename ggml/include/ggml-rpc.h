@@ -23,7 +23,7 @@ extern "C" {
 // GRAPH_RECOMPUTE carry a graph uid for the multi-slot server graph cache at
 // every patch level, so this client does not interoperate with a stock
 // rpc-server; the fleet's daemons are deployed together with it.
-#define RPC_PROTO_PATCH_VERSION    4
+#define RPC_PROTO_PATCH_VERSION    5
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

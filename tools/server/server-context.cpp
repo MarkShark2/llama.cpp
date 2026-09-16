@@ -3370,6 +3370,20 @@ private:
                         break;
                     }
 
+                    // [fork] the drafter's cache and its pending hidden row travel
+                    // with the slot, so a restore needs no catch-up decode and
+                    // SLOT_RESTORE can synthesize the end-of-prompt checkpoint a
+                    // hybrid memory needs before it reuses a cached prompt
+                    if (ctx_dft != nullptr) {
+                        const size_t n_dft = state_io_dft().save_file(filepath + ".dft", slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        const float * h = spec ? common_speculative_mtp_pending_h(spec.get(), slot->id) : nullptr;
+                        if (n_dft != 0 && h != nullptr) {
+                            std::ofstream ofs(filepath + ".mtp", std::ios::binary);
+                            ofs.write((const char *) h, (size_t) llama_model_n_embd(model_tgt) * sizeof(float));
+                        }
+                        SLT_INF(*slot, "saved draft state beside the slot file: %zu bytes, pending row: %d\n", n_dft, (int) (h != nullptr));
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3429,6 +3443,30 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // [fork] the drafter's state saved beside the file, then the
+                        // checkpoint prefill would have left at the end of the prompt:
+                        // a hybrid memory reuses a cached prompt only through one, so
+                        // without it the next request re-processes all of it
+                        if (ctx_dft != nullptr) {
+                            const size_t n_dft = state_io_dft().load_file(filepath + ".dft", slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            std::vector<float> h((size_t) llama_model_n_embd(model_tgt));
+                            std::ifstream ifs(filepath + ".mtp", std::ios::binary);
+                            const bool has_h = ifs && ifs.read((char *) h.data(), h.size() * sizeof(float));
+                            if (has_h && spec) {
+                                common_speculative_mtp_set_pending_h(spec.get(), slot->id, h.data());
+                            }
+                            if (n_dft == 0 || !has_h) {
+                                SLT_WRN(*slot, "no draft state beside the slot file (dft = %zu bytes, pending row = %d) - drafts degrade until the next prompt\n", n_dft, (int) has_h);
+                            }
+                        }
+                        {
+                            auto & ckpt = slot->prompt.checkpoints.emplace_back();
+                            ckpt.update_pos(slot->prompt.tokens.size(), 0, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id));
+                            ckpt.update_tgt(state_io_tgt(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.update_dft(state_io_dft(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            common_speculative_get_state(spec.get(), slot->id, ckpt.data_spec);
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
