@@ -319,6 +319,14 @@ public:
         if (reuse_sel != nullptr) {
             mctx->set_input_mtp_dsa_selection(reuse_sel, gather_mask, gather, ubatch);
         }
+        if (fa_mask != nullptr) {
+            // [fork] the gather-path sparse FA: one masked-out dense row and
+            // every cell of the storage visible to the index list
+            std::vector<ggml_fp16_t> m(ggml_nelements(fa_mask), ggml_fp32_to_fp16(-INFINITY));
+            ggml_backend_tensor_set(fa_mask, m.data(), 0, ggml_nbytes(fa_mask));
+            std::vector<int32_t> v(ggml_nelements(fa_nvis), (int32_t) fa_n_kc);
+            ggml_backend_tensor_set(fa_nvis, v.data(), 0, ggml_nbytes(fa_nvis));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -359,6 +367,9 @@ public:
     ggml_tensor * reuse_sel     = nullptr; // I32     [n_sel, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
+    ggml_tensor * fa_mask       = nullptr; // F16     [1, n_tokens]    -inf, the sparse FA's dense row (gather + FA)
+    ggml_tensor * fa_nvis       = nullptr; // I32     [n_tokens]       n_kc, every storage cell is addressable (gather + FA)
+    uint32_t fa_n_kc = 0;
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
@@ -958,8 +969,57 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_build_forward_expand(gf, kv_cmpr);
     ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
+    // [fork] decode shapes (gather) attend with the same sparse FA kernel
+    // straight out of the cache storage: one node per layer instead of a
+    // get_rows, two f32 mat-vec batches and a softmax. LLAMA_GLM_GATHER_FA=0
+    // restores the gathered mat-vecs.
+    static const bool gather_fa_env = [] {
+        const char * e = getenv("LLAMA_GLM_GATHER_FA");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool gather_fa = inp_kpool->gather && gather_fa_env && cparams.flash_attn &&
+                           mctx_mla->get_k_storage(il)->type == GGML_TYPE_F16;
+
     ggml_tensor * out = nullptr;
-    if (inp_kpool->gather) {
+    if (gather_fa) {
+        ggml_build_forward_expand(gf, kq_mask);
+
+        ggml_tensor * sel_idx = sel; // I32 [n_sel, n_tokens], global cell indices into the storage
+        const int64_t n_sel = sel_idx->ne[0];
+
+        ggml_tensor * k = mctx_mla->get_k_storage(il); // F16 [kv_lora_rank, kv_size, n_stream]
+        GGML_ASSERT(k->ne[0] == kv_lora_rank && k->nb[2] == k->nb[1]*k->ne[1] && "GLM5-Next MLA cache holds a single latent head");
+        const int64_t n_kc = k->ne[1]*k->ne[2];
+
+        if (inp_kpool->fa_mask == nullptr) {
+            inp_kpool->fa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, 1, n_tokens);
+            inp_kpool->fa_nvis = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            inp_kpool->fa_n_kc = (uint32_t) n_kc;
+            ggml_set_input(inp_kpool->fa_mask);
+            ggml_set_input(inp_kpool->fa_nvis);
+        }
+        GGML_ASSERT(inp_kpool->fa_n_kc == (uint32_t) n_kc);
+
+        // the gather mask (0 / -inf per slot) folds into the index list: a masked slot becomes -1, which the kernel skips
+        ggml_tensor * idx = ggml_add(ctx0, ggml_cast(ctx0, sel_idx, GGML_TYPE_F32),
+                                     ggml_reshape_2d(ctx0, inp_kpool->gather_mask, n_sel, n_tokens));
+        idx = ggml_cast(ctx0, ggml_clamp(ctx0, idx, -1.0f, (float) n_kc), GGML_TYPE_I32);
+
+        ggml_tensor * kc = ggml_view_4d(ctx0, k, kv_lora_rank, n_kc, 1, 1, k->nb[1], k->nb[1]*n_kc, k->nb[1]*n_kc, 0);
+        ggml_tensor * kd = ggml_view_4d(ctx0, k, kv_lora_rank, 1, 1, 1, k->nb[1], k->nb[1], k->nb[1], 0);
+        ggml_tensor * qf = ggml_permute(ctx0, q_absorbed, 0, 2, 1, 3); // [kv_lora_rank, n_tokens, n_head, 1]
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx0, qf, kd, kd, inp_kpool->fa_mask, kq_scale, 0.0f, 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il});
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_sparse(fa, kc, ggml_reshape_4d(ctx0, idx, n_sel, n_tokens, 1, 1), inp_kpool->fa_nvis);
+        cb(fa, "kqv_sparse_gathered", il);
+
+        out = ggml_permute(ctx0, fa, 0, 2, 1, 3);
+        out = ggml_mul_mat(ctx0, layer.wv_b, out);
+        out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));
+        out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+    } else if (inp_kpool->gather) {
         // Attend over gathered latents with the token dimension in ne[3].
 
         ggml_build_forward_expand(gf, kq_mask);
