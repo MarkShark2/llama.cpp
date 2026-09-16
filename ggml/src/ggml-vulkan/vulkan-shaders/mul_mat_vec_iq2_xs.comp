@@ -44,7 +44,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
                 const vec4 grid0 = grid0_vals[l];
                 const vec4 grid1 = grid1_vals[l];
                 // Precompute indices
-                const uint b_idx = (j * p.batch_stride_b + b_offset + y_idx) / 4 + 2 * l;
+                const uint b_idx = (b_off[j] + y_idx) / 4 + 2 * l;
                 const vec4 b0 = vec4(data_b_v4[b_idx + 0]);
                 const vec4 b4 = vec4(data_b_v4[b_idx + 1]);
                 sum +=
@@ -95,11 +95,11 @@ void main() {
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
+        MMV_COMPUTE(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
             return;
         }
-        compute_outputs(first_row, p.stride_d - first_row);
+        MMV_COMPUTE(first_row, p.stride_d - first_row);
     }
 }

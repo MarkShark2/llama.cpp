@@ -763,6 +763,13 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        // [fork] rows grouped by expert, for MUL_MAT_ID with a few rows per expert
+        if (tname != "f32" && tname != "f16" && tname != "bf16" && tname != "mxfp4" && tname != "nvfp4") {
+            string_to_spv("mul_mat_vec_idg_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_GROUPED", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_idg_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_GROUPED", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_idg_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_GROUPED", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {
@@ -1293,6 +1300,14 @@ void write_output_files() {
         if (basename(input_filepath) == "mul_mat_vec.comp") {
             src << "const void * arr_dmmv_id_"   << tname << "_" << btype << "_f32_data[3] = {mul_mat_vec_id_" << tname << "_" << btype << "_f32_data, mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_data, mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_no_shmem_data};\n";
             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
+        }
+        if (btype == "f32" && tname != "f32" && tname != "f16" && tname != "bf16" && tname != "mxfp4" && tname != "nvfp4") {
+            hdr << "extern const void * arr_dmmv_idg_"   << tname << "_f32_f32_data[3];\n";
+            hdr << "extern const uint64_t arr_dmmv_idg_" << tname << "_f32_f32_len[3];\n";
+            if (basename(input_filepath) == "mul_mat_vec.comp") {
+                src << "const void * arr_dmmv_idg_"   << tname << "_f32_f32_data[3] = {mul_mat_vec_idg_" << tname << "_f32_f32_data, mul_mat_vec_idg_" << tname << "_f32_f32_subgroup_data, mul_mat_vec_idg_" << tname << "_f32_f32_subgroup_no_shmem_data};\n";
+                src << "const uint64_t arr_dmmv_idg_" << tname << "_f32_f32_len[3] =  {mul_mat_vec_idg_" << tname << "_f32_f32_len,  mul_mat_vec_idg_" << tname << "_f32_f32_subgroup_len, mul_mat_vec_idg_"  << tname << "_f32_f32_subgroup_no_shmem_len};\n";
+            }
         }
     }
     }

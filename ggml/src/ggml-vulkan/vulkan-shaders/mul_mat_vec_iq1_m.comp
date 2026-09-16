@@ -44,7 +44,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
         // Loop over columns of the output
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             // Compute base index for matrix B
-            const uint base_b_idx = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+            const uint base_b_idx = (b_off[j] + y_idx) / 4;
             vec4 b_vals[8];
 
             // Load 8 vec4 values from matrix B
@@ -122,11 +122,11 @@ void main() {
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
+        MMV_COMPUTE(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
             return;
         }
-        compute_outputs(first_row, p.stride_d - first_row);
+        MMV_COMPUTE(first_row, p.stride_d - first_row);
     }
 }

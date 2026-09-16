@@ -23,21 +23,21 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, 
     OOB_w = lastiter && (iybs + iqs + y_offset*3 >= p.ncols);
 
     if (!OOB_w) {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*3]));
+        return vec4(FLOAT_TYPE(data_b[b_off[j] + iybs + iqs]),
+                 FLOAT_TYPE(data_b[b_off[j] + iybs + iqs + y_offset]),
+                 FLOAT_TYPE(data_b[b_off[j] + iybs + iqs + y_offset*2]),
+                 FLOAT_TYPE(data_b[b_off[j] + iybs + iqs + y_offset*3]));
     } else if (!OOB_z) {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2]),
+        return vec4(FLOAT_TYPE(data_b[b_off[j] + iybs + iqs]),
+                 FLOAT_TYPE(data_b[b_off[j] + iybs + iqs + y_offset]),
+                 FLOAT_TYPE(data_b[b_off[j] + iybs + iqs + y_offset*2]),
                  0);
     } else if (!OOB_y) {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
+        return vec4(FLOAT_TYPE(data_b[b_off[j] + iybs + iqs]),
+                 FLOAT_TYPE(data_b[b_off[j] + iybs + iqs + y_offset]),
                  0, 0);
     } else {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
+        return vec4(FLOAT_TYPE(data_b[b_off[j] + iybs + iqs]),
                  0, 0, 0);
     }
 }
@@ -53,13 +53,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #if QUANT_R == 2
         // Note that we end up fetching bogus elements here, but its fine as they'll be
         // within an accessible block.
-        const vec4 bv02 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-        const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
+        const vec4 bv02 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
+        const vec4 bv13 = vec4(data_b_v4[(b_off[j] + iybs + iqs + y_offset) / 4]);
         const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
         const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
 #else
-        const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-        const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
+        const vec4 bv0 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
+        const vec4 bv1 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4 + 1]);
 #endif
 #else
         bool OOB_y;
@@ -122,7 +122,7 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
         const uint iqs = 0; // quant index
         const uint iybs = col; // y block start index
 
-        const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
+        const vec4 b = data_b_v4[(b_off[j] + iybs + iqs) / 4];
 
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -254,11 +254,11 @@ void main() {
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
+        MMV_COMPUTE(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
             return;
         }
-        compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
+        MMV_COMPUTE(first_row, min(NUM_ROWS, p.stride_d - first_row));
     }
 }
