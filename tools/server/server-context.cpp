@@ -3383,6 +3383,33 @@ private:
                         }
                         SLT_INF(*slot, "saved draft state beside the slot file: %zu bytes, pending row: %d\n", n_dft, (int) (h != nullptr));
                     }
+                    // ...and the in-RAM context checkpoints, so a slot saved after a
+                    // generation still restores to the end of its prompt
+                    {
+                        std::ofstream ofs(filepath + ".ckpt", std::ios::binary);
+                        uint32_t n = 0;
+                        for (const auto & c : slot->prompt.checkpoints) {
+                            n += c.file_tgt == nullptr && c.file_dft == nullptr;
+                        }
+                        ofs.write((const char *) &n, sizeof(n));
+                        auto put = [&](const std::vector<uint8_t> & v) {
+                            const uint64_t sz = v.size();
+                            ofs.write((const char *) &sz, sizeof(sz));
+                            ofs.write((const char *) v.data(), v.size());
+                        };
+                        for (const auto & c : slot->prompt.checkpoints) {
+                            if (c.file_tgt != nullptr || c.file_dft != nullptr) {
+                                continue;
+                            }
+                            ofs.write((const char *) &c.n_tokens, sizeof(c.n_tokens));
+                            ofs.write((const char *) &c.pos_min,  sizeof(c.pos_min));
+                            ofs.write((const char *) &c.pos_max,  sizeof(c.pos_max));
+                            put(c.data_tgt);
+                            put(c.data_dft);
+                            put(c.data_spec);
+                        }
+                        SLT_INF(*slot, "saved %u context checkpoints beside the slot file\n", n);
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -3459,6 +3486,31 @@ private:
                             if (n_dft == 0 || !has_h) {
                                 SLT_WRN(*slot, "no draft state beside the slot file (dft = %zu bytes, pending row = %d) - drafts degrade until the next prompt\n", n_dft, (int) has_h);
                             }
+                        }
+                        {
+                            std::ifstream ifs(filepath + ".ckpt", std::ios::binary);
+                            uint32_t n = 0;
+                            auto get = [&](std::vector<uint8_t> & v) {
+                                uint64_t sz = 0;
+                                ifs.read((char *) &sz, sizeof(sz));
+                                v.resize(sz);
+                                ifs.read((char *) v.data(), sz);
+                            };
+                            if (ifs && ifs.read((char *) &n, sizeof(n))) {
+                                for (uint32_t i = 0; i < n && ifs; ++i) {
+                                    common_prompt_checkpoint c;
+                                    ifs.read((char *) &c.n_tokens, sizeof(c.n_tokens));
+                                    ifs.read((char *) &c.pos_min,  sizeof(c.pos_min));
+                                    ifs.read((char *) &c.pos_max,  sizeof(c.pos_max));
+                                    get(c.data_tgt);
+                                    get(c.data_dft);
+                                    get(c.data_spec);
+                                    if (ifs) {
+                                        slot->prompt.checkpoints.push_back(std::move(c));
+                                    }
+                                }
+                            }
+                            SLT_INF(*slot, "restored %zu context checkpoints from beside the slot file\n", slot->prompt.checkpoints.size());
                         }
                         {
                             auto & ckpt = slot->prompt.checkpoints.emplace_back();
@@ -4625,7 +4677,12 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            // [fork] <= rather than <: the deferred end-of-prompt snapshot of a
+                                            // recurrent/hybrid memory has pos_min == its last position, which is
+                                            // exactly pos_min_thold when the same prompt comes back. It is used
+                                            // the way a pos_min == 0 checkpoint is (the last token is re-decoded
+                                            // onto it) instead of re-processing the whole prompt.
+                                            return cur.pos_min <= pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
 
