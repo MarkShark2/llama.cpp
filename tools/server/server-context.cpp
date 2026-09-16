@@ -3371,9 +3371,7 @@ private:
                     }
 
                     // [fork] the drafter's cache and its pending hidden row travel
-                    // with the slot, so a restore needs no catch-up decode and
-                    // SLOT_RESTORE can synthesize the end-of-prompt checkpoint a
-                    // hybrid memory needs before it reuses a cached prompt
+                    // with the slot, so a restore needs no catch-up decode
                     if (ctx_dft != nullptr) {
                         const size_t n_dft = state_io_dft().save_file(filepath + ".dft", slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
                         const float * h = spec ? common_speculative_mtp_pending_h(spec.get(), slot->id) : nullptr;
@@ -3471,10 +3469,10 @@ private:
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
 
-                        // [fork] the drafter's state saved beside the file, then the
-                        // checkpoint prefill would have left at the end of the prompt:
-                        // a hybrid memory reuses a cached prompt only through one, so
-                        // without it the next request re-processes all of it
+                        // [fork] the drafter's state and the context checkpoints saved
+                        // beside the file: a hybrid memory reuses a cached prompt only
+                        // through a checkpoint (its state cannot be rewound), so without
+                        // them the next request re-processes all of it
                         if (ctx_dft != nullptr) {
                             const size_t n_dft = state_io_dft().load_file(filepath + ".dft", slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
                             std::vector<float> h((size_t) llama_model_n_embd(model_tgt));
