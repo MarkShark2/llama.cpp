@@ -859,6 +859,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_sel = sel_idx->ne[0];
 
     if (inp_kpool->mtp_share && il >= (int) hparams.n_layer() && inp_kpool->reuse_sel == nullptr) {
+        if (sparse) {
+            // the sparse path reads sel_fa; the record still needs sel_idx in the graph
+            ggml_build_forward_expand(gf, sel_idx);
+        }
         res->t_mtp_dsa_sel  = sel_idx;
         res->t_mtp_dsa_mask = inp_kpool->gather_mask;
     }
