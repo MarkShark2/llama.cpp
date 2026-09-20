@@ -1039,6 +1039,20 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         return true;
     }
 
+    // [fork] the leafs are placed from leaf_allocs, which the node/src walk below
+    // never looks at: a leaf that grew while every checked tensor still fits is
+    // written past the end of its buffer
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &galloc->leaf_allocs[i].leaf)) {
+            if (ggml_gallocr_realloc_trace()) {
+                fprintf(stderr, "[galloc] realloc: leaf %s needs %zu, fits %zu\n",
+                        leaf->name, ggml_nbytes(leaf), galloc->leaf_allocs[i].leaf.size_max);
+            }
+            return true;
+        }
+    }
+
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
