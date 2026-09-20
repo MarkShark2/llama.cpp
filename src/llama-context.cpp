@@ -1448,14 +1448,32 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+void llama_context::nextn_reorder() {
+    if (embd_nextn_order.empty() || embd_nextn.data == nullptr) {
+        return;
+    }
+
+    const size_t n_embd = model.hparams.n_embd_out();
+    const size_t n_rows = embd_nextn_order.size();
+    GGML_ASSERT(n_rows * n_embd <= embd_nextn.size);
+
+    std::vector<float> tmp(embd_nextn.data, embd_nextn.data + n_rows * n_embd);
+    for (size_t r = 0; r < n_rows; ++r) {
+        std::memcpy(embd_nextn.data + (size_t) embd_nextn_order[r] * n_embd, tmp.data() + r * n_embd, n_embd * sizeof(float));
+    }
+    embd_nextn_order.clear();
+}
+
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
+    nextn_reorder();
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
+    nextn_reorder();
 
     try {
         if (embd_nextn.data == nullptr) {
@@ -3370,6 +3388,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // [fork] unmasked nextn rows were read out in ubatch order. The drafter
+    // takes them by batch index, and an equal split of several sequences
+    // interleaves them, so remember the order for the first reader.
+    embd_nextn_order.clear();
+    if (!pipedec_stage2 && embd_nextn.data && !cparams.embeddings_nextn_masked) {
+        const auto & tok_ids = balloc->get_tok_ids();
+        bool in_order = tok_ids.size() == n_tokens_all;
+        for (size_t r = 0; in_order && r < tok_ids.size(); ++r) {
+            in_order = tok_ids[r] == (int32_t) r;
+        }
+        if (!in_order && tok_ids.size() == n_tokens_all) {
+            embd_nextn_order = tok_ids;
+        }
+    }
 
     if (pipedec_stage2 && pipedec_defer_this) {
         // deferred group member: lanes and hidden-row GETs are in flight; the

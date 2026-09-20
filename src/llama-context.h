@@ -95,6 +95,12 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // [fork] unmasked nextn rows arrive in ubatch order; with several sequences
+    // in a batch that spans ubatches that is not batch order. Row r belongs to
+    // batch token embd_nextn_order[r]; empty when the two orders agree.
+    void nextn_reorder();
+    std::vector<int32_t> embd_nextn_order;
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     // [fork, SPD collect] row metadata of embd_layer_inp for the last decode
