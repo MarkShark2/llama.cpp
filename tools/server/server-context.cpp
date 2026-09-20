@@ -295,6 +295,11 @@ struct server_slot {
     // [fork, PipeDec tree] generation runs on the prediction tree; the classic
     // per-iteration decode path stays off this slot until the tree is finished
     bool tree_active = false;
+
+    // [fork, PipeDec streams] this slot's verification run is in flight on its
+    // own lanes; release() must not leave it there
+    bool stream_inflight = false;
+    std::function<void(server_slot &)> callback_on_stream_abort;
     std::function<void(server_slot &)> callback_on_tree_finish;
 
     // `spec_draft` currently holds tokens the target already accepted, kept only to be re-evaluated
@@ -709,6 +714,10 @@ struct server_slot {
         // [fork, PipeDec tree] fold the tree's trunk back into this slot's seq
         if (tree_active && callback_on_tree_finish) {
             callback_on_tree_finish(*this);
+        }
+
+        if (stream_inflight && callback_on_stream_abort) {
+            callback_on_stream_abort(*this);
         }
 
         // [fork, PipeDec] never leave a deferred verify group in flight
@@ -1857,6 +1866,10 @@ private:
 
             slot.callback_on_tree_finish = [this](server_slot & s) {
                 tree_finish(s);
+            };
+
+            slot.callback_on_stream_abort = [this](server_slot & s) {
+                stream_abort(s);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -3986,6 +3999,10 @@ private:
             return;
         }
 
+        if (stream_step()) {
+            return;
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -4062,7 +4079,7 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            if (slot.state == SLOT_STATE_GENERATING && !slot.stream_inflight && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -4142,7 +4159,7 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING) {
+            if (slot.state != SLOT_STATE_GENERATING || slot.stream_inflight) {
                 return;
             }
 
@@ -5636,6 +5653,233 @@ private:
         return false;
     }
 
+    //
+    // [fork, PipeDec streams] speculative slots out of phase
+    //
+    // The classic round drafts for every slot, verifies them in one decode and
+    // accepts, so the fabric is empty while the host works and the host idle
+    // while the fabric works. With GGML_PIPEDEC_STREAMS=1 each generating slot
+    // is its own stream: its [sampled + drafts] run is queued on its own lanes
+    // and the round returns; the oldest stream in flight is then closed,
+    // accepted and sent. pre_decode() and post_decode() do the work, limited to
+    // the slots with nothing in flight and to the slot just closed.
+    //
+
+    struct stream_run {
+        std::vector<llama_token> token;
+        std::vector<llama_pos>   pos;
+        std::vector<int32_t>     n_seq_id;
+        std::vector<llama_seq_id *> seq_id;
+        std::vector<int8_t>      logits;
+    };
+
+    std::vector<stream_run> stream_runs;
+    std::deque<int32_t>     stream_order; // slot ids, oldest submission first
+    bool                    stream_broken = false;
+
+    bool stream_available() const {
+        static const bool enabled = [] {
+            auto on = [](const char * name) {
+                const char * e = std::getenv(name);
+                return e && atoi(e) != 0;
+            };
+            return on("GGML_PIPEDEC") && on("GGML_PIPEDEC_STAGE2") && on("GGML_PIPEDEC_STREAMS");
+        }();
+        return enabled && !stream_broken && spec && !spec_tree && !spd_mode &&
+                params_base.n_parallel > 1 && params_base.n_parallel <= llama_pipedec_stream_n() &&
+                ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    }
+
+    // plain speculative generation: no probs, embeddings, lora or replay
+    static bool stream_slot_ok(const server_slot & slot) {
+        return slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.need_embd() &&
+                slot.task->params.sampling.n_probs == 0 && slot.lora.empty() && slot.inp_embd.empty() &&
+                !slot.spec_is_replay && !slot.spd_seq;
+    }
+
+    void stream_abort(server_slot & slot) {
+        llama_pipedec_stream_wait(ctx_tgt, slot.id);
+        slot.stream_inflight = false;
+        stream_order.erase(std::remove(stream_order.begin(), stream_order.end(), slot.id), stream_order.end());
+
+        // the run was never verified: neither the tokens nor the cache are worth keeping
+        slot.i_batch = -1;
+        slot.spec_i_batch.clear();
+        slot.spec_draft.clear();
+        slot.prompt_clear();
+    }
+
+    void stream_fail(const std::string & what) {
+        SRV_ERR("%s - PipeDec streams are off for this run\n", what.c_str());
+        stream_broken = true;
+        abort_all_slots(what);
+    }
+
+    // queue the runs pre_decode() just built, one stream per slot
+    bool stream_submit() {
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_GENERATING || slot.stream_inflight) {
+                continue;
+            }
+            const int32_t off = slot.spec_i_batch.empty() ? slot.i_batch : slot.spec_i_batch.front();
+            const int32_t n   = slot.spec_i_batch.empty() ? 1 : (int32_t) slot.spec_i_batch.size();
+            if (off < 0) {
+                continue; // not in this round's batch
+            }
+
+            llama_batch view = batch.get_view(off, n);
+
+            auto & run = stream_runs[slot.id];
+            run.token.assign(view.token, view.token + n);
+            run.pos.assign(view.pos, view.pos + n);
+            run.n_seq_id.assign(n, 1);
+            run.seq_id.assign(n, &slot.id);
+            run.logits.assign(n, 1);
+
+            int ret;
+            {
+                scoped_timer timer(t_spec_submt, n_spec_submt);
+                ret = llama_pipedec_stream_submit(ctx_tgt, &view, slot.id);
+            }
+            if (ret != 0) {
+                // the slot's token list already holds the run
+                slot.i_batch = -1;
+                slot.spec_i_batch.clear();
+                slot.spec_draft.clear();
+                slot.prompt_clear();
+                stream_fail("stream submit failed, ret = " + std::to_string(ret));
+                return false;
+            }
+
+            // the close leaves this run's rows at [0, n)
+            if (slot.i_batch >= 0) {
+                slot.i_batch -= off;
+            }
+            for (auto & i : slot.spec_i_batch) {
+                i -= off;
+            }
+
+            slot.stream_inflight = true;
+            stream_order.push_back(slot.id);
+        }
+        return true;
+    }
+
+    // wait for the slot's run, then catch the drafter up, accept and send
+    bool stream_close(server_slot & slot) {
+        int ret;
+        {
+            scoped_timer timer(t_spec_verif, n_spec_verif);
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_pipedec_stream_close(ctx_tgt, slot.id);
+            });
+        }
+        slot.stream_inflight = false;
+        if (ret != 0) {
+            slot.i_batch = -1;
+            slot.spec_i_batch.clear();
+            slot.spec_draft.clear();
+            slot.prompt_clear();
+            stream_fail("stream close failed, ret = " + std::to_string(ret));
+            return false;
+        }
+        metrics.n_decode++;
+
+        auto & run = stream_runs[slot.id];
+        llama_batch run_batch = {
+            (int32_t) run.token.size(), run.token.data(), nullptr, run.pos.data(),
+            run.n_seq_id.data(), run.seq_id.data(), run.logits.data(),
+        };
+
+        try {
+            {
+                scoped_timer timer(t_spec_procs, n_spec_procs);
+                bool ok = true;
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), run_batch);
+                });
+                if (!ok) {
+                    throw std::runtime_error("failed to process speculative batch");
+                }
+            }
+            scoped_timer t(t_post_decode, n_post_decode);
+            post_decode(run_batch.n_tokens, 0, run_batch);
+        } catch (const std::exception & e) {
+            stream_fail("stream accept failed: " + std::string(e.what()));
+            return false;
+        }
+        return true;
+    }
+
+    // settle every stream before the classic round touches the context
+    void stream_flush() {
+        while (!stream_order.empty()) {
+            const int32_t id = stream_order.front();
+            stream_order.pop_front();
+            server_slot * slot = get_slot_by_id(id);
+            if (slot == nullptr || !slot->stream_inflight || !stream_close(*slot)) {
+                break;
+            }
+        }
+    }
+
+    bool stream_step() {
+        if (!stream_available()) {
+            return false;
+        }
+        if (stream_runs.size() != slots.size()) {
+            stream_runs.resize(slots.size());
+        }
+
+        // prompt work and anything but plain speculative generation belong to
+        // the classic round, which needs the context settled
+        int32_t n_ok = 0;
+        bool    all  = true;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (stream_slot_ok(slot)) {
+                n_ok++;
+            } else {
+                all = false;
+            }
+        }
+        if (!all || n_ok < 2) {
+            stream_flush();
+            return false;
+        }
+
+        bool ready = false;
+        for (auto & slot : slots) {
+            ready |= slot.state == SLOT_STATE_GENERATING && !slot.stream_inflight;
+        }
+        if (ready) {
+            try {
+                scoped_timer t(t_pre_decode, n_pre_decode);
+                pre_decode();
+                batch.render();
+            } catch (const std::exception & e) {
+                stream_fail("pre_decode() failed: " + std::string(e.what()));
+                return true;
+            }
+            if (!stream_submit()) {
+                return true;
+            }
+        }
+
+        if (!stream_order.empty()) {
+            const int32_t id = stream_order.front();
+            stream_order.pop_front();
+            server_slot * slot = get_slot_by_id(id);
+            if (slot != nullptr && slot->stream_inflight) {
+                stream_close(*slot);
+            }
+        }
+        return true;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -5831,7 +6075,7 @@ private:
         iterate(slots, [&](server_slot & slot) {
             // [fork, PipeDec] deferred verify: spec_i_batch holds group row
             // indices, not batch indices - the group spans this whole batch
-            if (slot.spec_deferred) {
+            if (slot.spec_deferred || slot.stream_inflight) {
                 return;
             }
             for (auto & i : slot.spec_i_batch) {
@@ -5878,7 +6122,7 @@ private:
                 }
             }
 
-            if (!is_inside_view(slot.i_batch)) {
+            if (!is_inside_view(slot.i_batch) || slot.stream_inflight) {
                 // the required token not in this sub-batch, skip
                 return;
             }
@@ -5969,7 +6213,7 @@ private:
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
-                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+                    slot.spec_draft.empty() || slot.spec_i_batch.empty() || slot.stream_inflight) {
                 return;
             }
 

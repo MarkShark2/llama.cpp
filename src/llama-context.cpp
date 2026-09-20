@@ -6099,6 +6099,194 @@ int32_t llama_context::pipedec_tree_commit(llama_seq_id seq_src, llama_seq_id se
     return ret;
 }
 
+//
+// [fork, PipeDec streams] one server slot's verification run as its own group
+//
+// Classic stage 2 closes every slot's lanes in one decode, so the fabric sits
+// empty while the host drafts and accepts. A stream is one sequence's
+// [sampled + drafts] run on its own lanes and its own read fences: submit
+// returns once the lanes are queued, close waits for this stream only. The
+// server keeps several in flight and works on one while the others traverse.
+//
+
+int32_t llama_context::pipedec_stream_submit(const llama_batch & batch_inp, int32_t stream) {
+    if (pipedec_tree_enabled || stream < 0 || stream >= (int32_t) PIPEDEC_STREAMS_MAX) {
+        return -1;
+    }
+    if (pipedec_stream_rows[stream] != 0) {
+        LLAMA_LOG_ERROR("%s: stream %d is still in flight\n", __func__, stream);
+        return -1;
+    }
+
+    const uint32_t n_tokens     = batch_inp.n_tokens;
+    const bool     has_samplers = !sampling.samplers.empty();
+    if (!pipedec_stage2_eligible(model, cparams, batch_inp, n_tokens, n_tokens, has_samplers, true, PIPEDEC_STREAM_LANES)) {
+        return -1;
+    }
+    for (bool enabled : cparams.embeddings_layer_inp) {
+        if (enabled) {
+            return -1;
+        }
+    }
+
+    pipedec_tree_logits_fresh = false;
+    pipedec_stage2_drained    = false;
+
+    if (!balloc->init(batch_inp, model.vocab, memory.get(), cparams.n_embd_inp_ctx, n_seq_max(), false)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -1;
+    }
+
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens;
+
+    memory_update(false);
+
+    auto mctx = memory->init_batch_token_lanes(*balloc, 1, false);
+    if (!mctx) {
+        return -2;
+    }
+    if (mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_WARN("%s: failed to find a memory slot for %u tokens (status %d)\n",
+                __func__, n_tokens, (int) mctx->get_status());
+        return 1;
+    }
+
+    if (pipedec_stream_h.empty()) {
+        pipedec_stream_h.resize((size_t) PIPEDEC_STAGE2_MAX_LANES * model.hparams.n_embd_out());
+    }
+
+    auto & reads = pipedec_stream_reads[stream];
+    reads.clear();
+
+    uint32_t i = 0;
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+        GGML_ASSERT(ubatch.n_tokens == 1 && i < n_tokens);
+
+        n_outputs = 1;
+
+        // the lane is the token's distance from the end of the run, which is
+        // also its rollback plane: a lane's graph then repeats step after
+        // step whatever the draft length
+        const uint32_t rollback = n_tokens - i - 1;
+        const uint32_t lane     = (uint32_t) stream * PIPEDEC_STREAM_LANES + rollback;
+
+        ggml_status status = GGML_STATUS_FAILED;
+        const auto * res = process_ubatch_pipedec_body(ubatch, mctx.get(), lane, 0, rollback + 1, status);
+        auto * t_h = res ? res->get_h_nextn() : nullptr;
+        if (!t_h) {
+            pipedec_stream_wait(stream);
+            memory->seq_rm(batch_inp.seq_id[0][0], batch_inp.pos[0], -1);
+            return status == GGML_STATUS_ABORTED ? 2 : -3;
+        }
+
+        GGML_ASSERT(ggml_nelements(t_h) > 0 && (uint32_t) ggml_nelements(t_h) <= model.hparams.n_embd_out());
+        pipedec_row_width = (uint32_t) ggml_nelements(t_h);
+        const uint32_t n_embd = pipedec_row_n_embd();
+
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_pipedec_body[lane][0].get(), t_h);
+        GGML_ASSERT(backend_h != nullptr);
+        ggml_backend_tensor_get_async(backend_h, t_h, pipedec_stream_h.data() + (size_t) lane * n_embd, 0, (size_t) n_embd * sizeof(float));
+
+        // a read fence per row: an endpoint-global synchronize would drain
+        // every other stream in flight
+        reads.emplace_back(backend_h, ggml_backend_is_rpc(backend_h) ? ggml_backend_rpc_read_ordinal(backend_h) : 0);
+
+        ++i;
+    } while (mctx->next());
+
+    GGML_ASSERT(i == n_tokens);
+    pipedec_stream_rows[stream] = n_tokens;
+
+    return 0;
+}
+
+void llama_context::pipedec_stream_wait(int32_t stream) {
+    if (stream < 0 || stream >= (int32_t) PIPEDEC_STREAMS_MAX) {
+        return;
+    }
+    for (const auto & [b, fence] : pipedec_stream_reads[stream]) {
+        if (ggml_backend_is_rpc(b)) {
+            if (fence != 0) {
+                ggml_backend_rpc_read_wait(b, fence);
+            }
+        } else {
+            ggml_backend_synchronize(b);
+        }
+    }
+    pipedec_stream_reads[stream].clear();
+    pipedec_stream_rows[stream] = 0;
+}
+
+int32_t llama_context::pipedec_stream_close(int32_t stream) {
+    if (stream < 0 || stream >= (int32_t) PIPEDEC_STREAMS_MAX || pipedec_stream_rows[stream] == 0) {
+        return -1;
+    }
+
+    const uint32_t n_rows = pipedec_stream_rows[stream];
+
+    pipedec_stream_wait(stream);
+
+    if (output_reserve(n_rows) < n_rows) {
+        LLAMA_LOG_ERROR("%s: could not reserve %u output rows\n", __func__, n_rows);
+        return -2;
+    }
+
+    // lanes hold the rows by distance from the end; the head and the drafter
+    // take them in token order
+    const uint32_t n_row  = pipedec_row_n_embd();
+    const uint32_t n_embd = model.hparams.n_embd_out();
+    pipedec_stream_head_in.resize((size_t) n_rows * n_row);
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        const uint32_t lane = (uint32_t) stream * PIPEDEC_STREAM_LANES + (n_rows - i - 1);
+        std::memcpy(pipedec_stream_head_in.data() + (size_t) i * n_row, pipedec_stream_h.data() + (size_t) lane * n_row,
+                (size_t) n_row * sizeof(float));
+    }
+
+    embd_nextn_order.clear();
+    if (embd_nextn.data) {
+        GGML_ASSERT((size_t) n_rows * n_embd <= embd_nextn.size);
+        for (uint32_t i = 0; i < n_rows; ++i) {
+            std::memcpy(embd_nextn.data + (size_t) i * n_embd, pipedec_stream_head_in.data() + (size_t) i * n_row,
+                    (size_t) n_row * sizeof(float));
+        }
+    }
+
+    const int32_t ret = pipedec_run_head(pipedec_stream_head_in.data(), n_rows);
+    if (ret != 0) {
+        return ret;
+    }
+
+    n_outputs = n_rows;
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        output_ids[i] = i;
+    }
+    output_swaps.clear();
+    pipedec_tree_logits_fresh = true;
+
+    return 0;
+}
+
+int32_t llama_pipedec_stream_submit(llama_context * ctx, const llama_batch * batch, int32_t stream) {
+    return ctx->pipedec_stream_submit(*batch, stream);
+}
+
+int32_t llama_pipedec_stream_close(llama_context * ctx, int32_t stream) {
+    return ctx->pipedec_stream_close(stream);
+}
+
+void llama_pipedec_stream_wait(llama_context * ctx, int32_t stream) {
+    ctx->pipedec_stream_wait(stream);
+}
+
+int32_t llama_pipedec_stream_n(void) {
+    return (int32_t) llama_context::pipedec_streams_max();
+}
+
 int32_t llama_pipedec_tree_enable(llama_context * ctx, bool value, bool chain) {
     return ctx->pipedec_tree_enable(value, chain);
 }

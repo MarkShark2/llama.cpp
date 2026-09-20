@@ -275,6 +275,16 @@ LLAMA_API int32_t       llama_pipedec_tree_close  (struct llama_context * ctx, i
 LLAMA_API void          llama_pipedec_tree_discard(struct llama_context * ctx, int32_t lane);
 LLAMA_API const float * llama_pipedec_tree_h      (struct llama_context * ctx, int32_t lane, int32_t row);
 LLAMA_API int32_t       llama_pipedec_tree_commit (struct llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst);
+// [fork, PipeDec streams] classic stage 2 for several server slots out of
+// phase: submit queues one sequence's [sampled + drafts] run (up to 8 tokens,
+// consecutive positions, all outputs) on the stream's own lanes and returns;
+// close waits for that stream only, runs the LM head and leaves logits and
+// nextn rows indexed by batch position, as a decode of that batch would. wait
+// drops a stream unread. Other streams stay in flight across all three.
+LLAMA_API int32_t       llama_pipedec_stream_submit(struct llama_context * ctx, const struct llama_batch * batch, int32_t stream);
+LLAMA_API int32_t       llama_pipedec_stream_close (struct llama_context * ctx, int32_t stream);
+LLAMA_API void          llama_pipedec_stream_wait  (struct llama_context * ctx, int32_t stream);
+LLAMA_API int32_t       llama_pipedec_stream_n     (void);
 // drop what seq_id holds from p0 on: attention cells by range, a recurrent state whole
 LLAMA_API bool          llama_memory_seq_trim(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0);
 LLAMA_API int32_t       llama_pipedec_tree_n_lanes(void);

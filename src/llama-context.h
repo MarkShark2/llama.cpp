@@ -236,6 +236,12 @@ struct llama_context {
     const float * pipedec_tree_layer_inp(int32_t lane, uint32_t il);
     // drain every lane, in flight or dead
     void          pipedec_tree_retire ();
+    // [fork, PipeDec streams] one sequence's [sampled + drafts] run on its own
+    // lanes: submit queues them and returns, close waits for this stream only
+    // and runs the head, wait drops a stream without reading it
+    int32_t       pipedec_stream_submit(const llama_batch & batch_inp, int32_t stream);
+    int32_t       pipedec_stream_close (int32_t stream);
+    void          pipedec_stream_wait  (int32_t stream);
     // one LM-head graph over n_rows host rows; logits land in rows [0, n_rows)
     int32_t       pipedec_run_head    (const float * rows, uint32_t n_rows);
     // width of one body-lane hidden row (stride of pipedec_group_h): what the
@@ -244,6 +250,7 @@ struct llama_context {
     uint32_t      pipedec_row_n_embd  () const;
     uint32_t      pipedec_row_width = 0;
     static constexpr uint32_t pipedec_tree_max_lanes() { return PIPEDEC_STAGE2_MAX_LANES; }
+    static constexpr uint32_t pipedec_streams_max  () { return PIPEDEC_STREAMS_MAX; }
     static constexpr uint32_t pipedec_tree_max_rows () { return PIPEDEC_TREE_MAX_ROWS; }
     int64_t pipedec_tree_wait_us() const { return pipedec_tree_t_wait_us; }
     int64_t pipedec_tree_head_us() const { return pipedec_tree_t_head_us; }
@@ -482,6 +489,8 @@ private:
     // own lanes, so this bounds n_parallel x (1 + n_draft_max)
     static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 32;
     static constexpr uint32_t PIPEDEC_TREE_MAX_ROWS    = 8;
+    static constexpr uint32_t PIPEDEC_STREAM_LANES     = 8;
+    static constexpr uint32_t PIPEDEC_STREAMS_MAX      = PIPEDEC_STAGE2_MAX_LANES / PIPEDEC_STREAM_LANES;
     // [fork] one scheduler per (lane, level rows). A graph is reused only for
     // its own ubatch shape, and a tree lane alternates 1-row restart levels
     // with width-row levels: one scheduler per lane rebuilt and reallocated
@@ -503,6 +512,12 @@ private:
     // lanes' queued work
     std::array<std::vector<std::pair<ggml_backend_t, uint64_t>>, PIPEDEC_STAGE2_MAX_LANES> pipedec_tree_lane_reads{};
     void pipedec_tree_lane_wait(int32_t lane);
+
+    // [fork, PipeDec streams] lanes [s*8, s*8 + 8) belong to stream s
+    std::array<uint32_t, PIPEDEC_STREAMS_MAX> pipedec_stream_rows{};
+    std::array<std::vector<std::pair<ggml_backend_t, uint64_t>>, PIPEDEC_STREAMS_MAX> pipedec_stream_reads{};
+    std::vector<float> pipedec_stream_h;
+    std::vector<float> pipedec_stream_head_in;
     // set by close(): the logits came from the head, which already waited on
     // its device, so synchronize() (llama_get_logits_ith calls it) must not
     // drain the fabric behind the levels still in flight
