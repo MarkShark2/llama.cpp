@@ -111,7 +111,15 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch_impl(
                 // instead write one current state plus their one lane-indexed
                 // snapshot, so forcing the tail together would defeat the split.
                 const uint32_t n_keep_tail = token_lanes ? 0 : (n_rs_seq > 0 ? n_rs_seq + 1 : 0);
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_keep_tail);
+
+                // A one-token lane split is one batch token per ubatch in batch
+                // order, whatever the sequence: split_equal(1) would pair one
+                // token from each sequence into a single ubatch (its seq-set
+                // scan stops one past n_ubatch), which is exactly not a lane.
+                // A tree level of several rows keeps the equal split.
+                ubatch = token_lanes && n_ubatch == 1
+                        ? balloc.split_seq(1)
+                        : balloc.split_equal(n_ubatch, !unified, n_keep_tail);
             }
 
             if (ubatch.n_tokens == 0) {

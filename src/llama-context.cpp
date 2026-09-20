@@ -2237,7 +2237,7 @@ static bool pipedec_step_trace() {
 
 llm_graph_result * llama_context::process_ubatch_pipedec_body(
         const llama_ubatch & ubatch, llama_memory_context_i * mctx,
-        uint32_t lane, uint32_t total, ggml_status & ret) {
+        uint32_t lane, uint32_t plane_lane, uint32_t plane_total, ggml_status & ret) {
     PIPEDEC_STEP("body lane=%u enter\n", lane);
     // [fork] GGML_PIPEDEC_LANE_TRACE=1 prints the per-lane submission budget for
     // classic stage-2 lanes too (the tree trace only covers tree lanes)
@@ -2280,7 +2280,7 @@ llm_graph_result * llama_context::process_ubatch_pipedec_body(
     auto * gf  = res->get_gf();
     const auto gparams = graph_params(
             res, ubatch, mctx, LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY,
-            lane_sched.get(), lane, total);
+            lane_sched.get(), plane_lane, plane_total);
 
     if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
         n_reused++;
@@ -2640,18 +2640,19 @@ static bool pipedec_stage2_eligible(
         uint32_t              n_tokens,
         uint32_t              n_outputs,
         bool                  has_samplers,
-        bool                  allow_single) {
+        bool                  allow_single,
+        uint32_t              max_lanes) {
     const char * pipedec = getenv("GGML_PIPEDEC");
     const char * stage2  = getenv("GGML_PIPEDEC_STAGE2");
     if (!pipedec || atoi(pipedec) == 0 || !stage2 || atoi(stage2) == 0) {
         return false;
     }
 
-    uint32_t max_tokens = 8;
+    uint32_t max_tokens = max_lanes;
     if (const char * value = getenv("GGML_PIPEDEC_STAGE2_MAX_TOKENS")) {
         const int parsed = atoi(value);
         if (parsed > 0) {
-            max_tokens = std::min<uint32_t>((uint32_t) parsed, 8);
+            max_tokens = std::min<uint32_t>((uint32_t) parsed, max_lanes);
         }
     }
 
@@ -2686,13 +2687,30 @@ static bool pipedec_stage2_eligible(
     // the stage-2 path itself: each body lane async-GETs its rows into the
     // per-group buffers, published to embd_layer_inp at group close.
 
-    const llama_seq_id seq_id = batch.seq_id[0][0];
-    const llama_pos    pos_0  = batch.pos[0];
+    // One verification group per sequence: each slot's [sampled + drafts] run
+    // is contiguous with consecutive positions, and no sequence appears twice.
+    // Several sequences in one batch ride the same lane ring (one token per
+    // lane, batch order); a deferred group is always a single sequence.
+    uint32_t n_seqs = 0;
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        if (batch.logits[i] == 0 || batch.n_seq_id[i] != 1 ||
-            batch.seq_id[i][0] != seq_id || batch.pos[i] != pos_0 + (llama_pos) i) {
+        if (batch.logits[i] == 0 || batch.n_seq_id[i] != 1) {
             return false;
         }
+        if (i == 0 || batch.seq_id[i][0] != batch.seq_id[i - 1][0]) {
+            for (uint32_t j = 0; j < i; ++j) {
+                if (batch.seq_id[j][0] == batch.seq_id[i][0]) {
+                    return false;
+                }
+            }
+            n_seqs++;
+            continue;
+        }
+        if (batch.pos[i] != batch.pos[i - 1] + 1) {
+            return false;
+        }
+    }
+    if (n_seqs > 1 && allow_single) {
+        return false;
     }
 
     return true;
@@ -2797,7 +2815,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const bool pipedec_stage2 = pipedec_stage2_eligible(
             model, cparams, balloc->get_batch(), n_tokens_all, n_outputs_all, has_samplers,
-            pipedec_defer_this || pipedec_group_tokens > 0);
+            pipedec_defer_this || pipedec_group_tokens > 0, PIPEDEC_STAGE2_MAX_LANES);
+
+    // [fork, PipeDec] per batch token: its index and its sequence's token count
+    // within the verification group. A single-sequence batch (or a deferred
+    // group) keeps the global lane index; with several slots in the batch the
+    // recurrent rollback plane a lane writes is relative to its own slot's run.
+    std::vector<uint32_t> pipedec_seq_lane;
+    std::vector<uint32_t> pipedec_seq_total;
+    if (pipedec_stage2) {
+        const auto & batch = balloc->get_batch();
+        pipedec_seq_lane.resize(n_tokens_all);
+        pipedec_seq_total.resize(n_tokens_all);
+        uint32_t run_beg = 0;
+        for (uint32_t i = 0; i <= n_tokens_all; ++i) {
+            if (i == n_tokens_all || (i > 0 && batch.seq_id[i][0] != batch.seq_id[run_beg][0])) {
+                for (uint32_t j = run_beg; j < i; ++j) {
+                    pipedec_seq_lane[j]  = j - run_beg;
+                    pipedec_seq_total[j] = i - run_beg;
+                }
+                run_beg = i;
+            }
+        }
+    }
 
     if (pipedec_defer_this && !pipedec_stage2) {
         LLAMA_LOG_ERROR("%s: deferred decode requested but the batch is not stage-2 eligible\n", __func__);
@@ -3049,9 +3089,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             fflush(stderr);
         }
 
+        // a deferred group spans decode calls, so its planes stay on the global
+        // lane index; otherwise the token's own sequence run is the group
+        const bool     pipedec_per_seq     = pipedec_stage2 && pipedec_group_tokens == 0 && !pipedec_defer_this;
+        const uint32_t pipedec_plane_lane  = pipedec_per_seq ? pipedec_seq_lane [n_tokens_prev] : pipedec_lane;
+        const uint32_t pipedec_plane_total = pipedec_per_seq ? pipedec_seq_total[n_tokens_prev] : pipedec_total_planned;
+        if (pipedec_per_seq) {
+            GGML_ASSERT(ubatch.n_tokens == 1 && ubatch.seq_id[0][0] == balloc->get_batch().seq_id[n_tokens_prev][0]);
+        }
+
         const auto * res = pipedec_stage2
                 ? process_ubatch_pipedec_body(
-                        ubatch, mctx.get(), pipedec_lane, pipedec_total_planned, status)
+                        ubatch, mctx.get(), pipedec_lane, pipedec_plane_lane, pipedec_plane_total, status)
                 : decode_lane >= 0
                 ? process_ubatch_decode_lane(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), (uint32_t) decode_lane, status)
                 : process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -5716,7 +5765,7 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     n_outputs = n_tokens;
 
     ggml_status status;
-    const auto * res = process_ubatch_pipedec_body(ubatch, mctx.get(), (uint32_t) lane, 0, status);
+    const auto * res = process_ubatch_pipedec_body(ubatch, mctx.get(), (uint32_t) lane, 0, 0, status);
     if (!res) {
         for (uint32_t i = 0; i < n_tokens; ++i) {
             memory->seq_rm(batch_inp.seq_id[i][0], batch_inp.pos[i], -1);

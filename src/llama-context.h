@@ -184,11 +184,15 @@ struct llama_context {
     // Stage 2 body submission uses one token-sized scheduler lane per in-flight
     // speculative token. This keeps every lane's graph and activations stable
     // without multiplying the much larger prompt/prefill graph buffers.
+    // lane picks the scheduler; plane_lane / plane_total are the token's index
+    // and count within its own sequence's verification group (the recurrent
+    // rollback plane it writes), 0 / 0 for a tree level.
     llm_graph_result * process_ubatch_pipedec_body(
                 const llama_ubatch & ubatch,
             llama_memory_context_i * mctx,
                            uint32_t   lane,
-                           uint32_t   total,
+                           uint32_t   plane_lane,
+                           uint32_t   plane_total,
                        ggml_status & ret);
 
     // [fork] decode lane pool (LLAMA_DECODE_LANES): one persistent scheduler +
@@ -468,7 +472,9 @@ private:
 
     ggml_backend_sched_ptr sched;
 
-    static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 16;
+    // classic stage 2 runs every slot's verification group of one batch on its
+    // own lanes, so this bounds n_parallel x (1 + n_draft_max)
+    static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 32;
     static constexpr uint32_t PIPEDEC_TREE_MAX_ROWS    = 8;
     // [fork] one scheduler per (lane, level rows). A graph is reused only for
     // its own ubatch shape, and a tree lane alternates 1-row restart levels

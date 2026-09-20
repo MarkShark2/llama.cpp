@@ -260,7 +260,8 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
-                                 int64_t mem_size, int64_t n_rs_seq) {
+                                 int64_t mem_size, int64_t n_rs_seq,
+                                 uint32_t pipedec_lane, uint32_t pipedec_total) {
     const int64_t d_inner         = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t n_embd_r_total  = 3 * conv_state_size;
@@ -276,10 +277,8 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
 
     // Snapshot plane s holds the conv window s tokens back.
     const int64_t n_planes = n_rs_seq + 1;
-    for (int64_t t = 1; t <= n_planes; ++t) {
-        const int64_t s_idx  = std::max<int64_t>(0, n_seq_tokens - n_planes + t);
-        const int64_t s_slot = n_planes - t;
 
+    auto write_plane = [&](int64_t s_idx, int64_t s_slot) {
         ggml_tensor * conv_window = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
 
@@ -289,6 +288,28 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
             ((s_slot * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all));
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_window, conv_update));
+    };
+
+    if (pipedec_total > 0) {
+        // [fork, PipeDec] a token lane: the post-token window goes to plane 0 so
+        // the next lane chains from it, and once more to the plane that is this
+        // token's distance from the end of its verification group (same rule
+        // as the GDN state in delta-net-base.cpp and the qwen4exp conv)
+        GGML_ASSERT(n_seq_tokens == 1);
+        GGML_ASSERT(pipedec_lane < pipedec_total);
+        GGML_ASSERT((int64_t) pipedec_total <= n_planes);
+
+        const int64_t rollback = (int64_t) pipedec_total - pipedec_lane - 1;
+        write_plane(1, 0);
+        if (rollback > 0) {
+            write_plane(1, rollback);
+        }
+    } else {
+        for (int64_t t = 1; t <= n_planes; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, n_seq_tokens - n_planes + t);
+            const int64_t s_slot = n_planes - t;
+            write_plane(s_idx, s_slot);
+        }
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
@@ -649,9 +670,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq);
+    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total);
+    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total);
+    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
