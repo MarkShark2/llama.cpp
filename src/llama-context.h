@@ -507,6 +507,9 @@ private:
     // its device, so synchronize() (llama_get_logits_ith calls it) must not
     // drain the fabric behind the levels still in flight
     bool     pipedec_tree_logits_fresh = false;
+    // [fork] a classic stage-2 close drained every lane and the head itself, so
+    // until the next submission there is nothing left for synchronize() to wait on
+    bool     pipedec_stage2_drained    = false;
     int64_t  pipedec_tree_t_wait_us = 0;
     int64_t  pipedec_tree_t_head_us = 0;
     ggml_backend_sched_ptr sched_pipedec_copy; // recurrent state copy at commit

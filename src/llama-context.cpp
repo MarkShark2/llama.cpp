@@ -974,20 +974,26 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
-    for (auto & lane_scheds : sched_pipedec_body) {
-        for (auto & lane_sched : lane_scheds) {
+    // [fork, PipeDec] a classic stage-2 close leaves nothing in flight. The
+    // server reads the group's logits one row at a time, and each of those
+    // reads lands here: walking every lane scheduler over every RPC endpoint
+    // was ~30 ms per row on 13 boards, 150 ms per slot per step.
+    if (!pipedec_stage2_drained) {
+        ggml_backend_sched_synchronize(sched.get());
+        for (auto & lane_scheds : sched_pipedec_body) {
+            for (auto & lane_sched : lane_scheds) {
+                if (lane_sched) {
+                    ggml_backend_sched_synchronize(lane_sched.get());
+                }
+            }
+        }
+        if (sched_pipedec_head) {
+            ggml_backend_sched_synchronize(sched_pipedec_head.get());
+        }
+        for (auto & lane_sched : sched_decode_lane) {
             if (lane_sched) {
                 ggml_backend_sched_synchronize(lane_sched.get());
             }
-        }
-    }
-    if (sched_pipedec_head) {
-        ggml_backend_sched_synchronize(sched_pipedec_head.get());
-    }
-    for (auto & lane_sched : sched_decode_lane) {
-        if (lane_sched) {
-            ggml_backend_sched_synchronize(lane_sched.get());
         }
     }
 
@@ -2736,6 +2742,7 @@ static bool pipedec_stage2_eligible(
 
 int llama_context::decode(const llama_batch & batch_inp) {
     pipedec_tree_logits_fresh = false;
+    pipedec_stage2_drained    = false;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -3580,6 +3587,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             output_ids[i] = i;
         }
 
+        // every lane and the head were synchronized above, on their own schedulers
+        pipedec_stage2_drained = true;
+
         return 0;
     }
 
@@ -4171,6 +4181,9 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    // anything submitted on the main scheduler is in flight again
+    pipedec_stage2_drained = false;
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -5758,6 +5771,7 @@ int32_t llama_context::pipedec_tree_submit(const llama_batch & batch_inp, int32_
     const uint32_t n_tokens = batch_inp.n_tokens;
 
     pipedec_tree_logits_fresh = false;
+    pipedec_stage2_drained    = false;
 
     // a discarded level may still run here; its graph inputs are rewritten below
     pipedec_tree_lane_wait(lane);
