@@ -6,6 +6,7 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-context.h"
 #include "llama-io.h"
 #include "llama-model.h"
 
@@ -112,14 +113,24 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch_impl(
                 // snapshot, so forcing the tail together would defeat the split.
                 const uint32_t n_keep_tail = token_lanes ? 0 : (n_rs_seq > 0 ? n_rs_seq + 1 : 0);
 
-                // A one-token lane split is one batch token per ubatch in batch
-                // order, whatever the sequence: split_equal(1) would pair one
-                // token from each sequence into a single ubatch (its seq-set
-                // scan stops one past n_ubatch), which is exactly not a lane.
+                // A classic lane holds one token of every sequence at the same
+                // distance from the end of its run, so all its rows write the
+                // same rollback plane. Lanes are in flight together, so a
+                // sequence's cell must not move between them.
                 // A tree level of several rows keeps the equal split.
-                ubatch = token_lanes && n_ubatch == 1
-                        ? balloc.split_seq(1)
-                        : balloc.split_equal(n_ubatch, !unified, n_keep_tail);
+                if (token_lanes && n_ubatch == 1) {
+                    const auto & cells = get_mem_recr()->cells;
+                    std::vector<int32_t> seq_cell(cells.size(), -1);
+                    for (size_t s = 0; s < cells.size(); ++s) {
+                        const int32_t tail = cells[s].tail;
+                        if (tail >= 0 && cells[tail].seq_id.size() == 1) {
+                            seq_cell[s] = tail;
+                        }
+                    }
+                    ubatch = balloc.split_lane_tail(seq_cell, llama_context::pipedec_tree_max_rows());
+                } else {
+                    ubatch = balloc.split_equal(n_ubatch, !unified, n_keep_tail);
+                }
             }
 
             if (ubatch.n_tokens == 0) {
