@@ -1597,6 +1597,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return enabled;
     }
 
+    // LLAMA_SPEC_TRACE=2: per seq, the checksum of every hidden row the drafter
+    // takes from the target and the tokens it drafts from them
+    static bool trace_rows() {
+        static const bool enabled = [] {
+            const char * e = getenv("LLAMA_SPEC_TRACE");
+            return e && atoi(e) >= 2;
+        }();
+        return enabled;
+    }
+
+    double row_sum(const float * row) const {
+        double s = 0.0;
+        for (int32_t j = 0; j < n_embd; ++j) {
+            s += row[j];
+        }
+        return s;
+    }
+
     bool catchup_join() {
         if (catchup.joinable()) {
             const int64_t tj0 = ggml_time_us();
@@ -2030,6 +2048,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            if (trace_rows() && batch_in.token != nullptr) {
+                fprintf(stderr, "[spec] rows seq %d pos %d n %d:", (int) seq_id, (int) batch_in.pos[i_batch_beg[seq_id]], (int) n_rows);
+                for (int32_t r = 0; r < n_rows && r < 8; ++r) {
+                    fprintf(stderr, " %d=%.4f", (int) batch_in.token[i_batch_beg[seq_id] + r], row_sum(verify_h[seq_id].data() + (size_t) r * n_embd));
+                }
+                fprintf(stderr, "
+");
+            }
         }
 
         // [fork] The catch-up decode itself goes to the worker: the target's
@@ -2278,6 +2305,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+            }
+
+            if (trace_rows()) {
+                fprintf(stderr, "[spec] draft seq %d n_past %d last %d h %.4f ->", (int) seq_id, (int) dp.n_past, (int) dp.id_last, row_sum(pending_h[seq_id].data()));
+                for (const llama_token t : *dp.result) {
+                    fprintf(stderr, " %d", (int) t);
+                }
+                fprintf(stderr, "
+");
             }
         }
     }
