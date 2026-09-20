@@ -2613,6 +2613,17 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
     GGML_ASSERT(tensor->data == NULL);
     GGML_ASSERT(tensor->view_src == NULL);
     GGML_ASSERT(addr >= ggml_backend_buffer_get_base(buffer));
+    // [fork] name the tensor: the bare assert says nothing about which graph outgrew its plan
+    if (!ggml_backend_buffer_is_meta(buffer) &&
+        (char *) addr + ggml_backend_buffer_get_alloc_size(buffer, tensor) >
+        (char *) ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer)) {
+        GGML_LOG_ERROR("%s: tensor '%s' (%s, ne = [%lld, %lld, %lld, %lld]) needs %zu bytes at offset %zu of %s buffer of %zu bytes\n",
+                __func__, tensor->name, ggml_op_desc(tensor),
+                (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                ggml_backend_buffer_get_alloc_size(buffer, tensor),
+                (size_t) ((char *) addr - (char *) ggml_backend_buffer_get_base(buffer)),
+                ggml_backend_buffer_name(buffer), ggml_backend_buffer_get_size(buffer));
+    }
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer) ||
         (char *) addr + ggml_backend_buffer_get_alloc_size(buffer, tensor) <=
         (char *) ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer));
