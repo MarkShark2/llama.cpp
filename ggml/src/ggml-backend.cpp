@@ -1837,7 +1837,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // reserve instead of letting the plan ratchet down.
         sched->galloc_reserve_epoch++;
         const int64_t tr0 = ggml_time_us();
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            // [fork] a failed reserve leaves the new plan over the old buffers, and
+            // the alloc below then asserts on the first tensor past the end of one.
+            // Drop the plan so the next graph reserves from scratch, and fail this one.
+            GGML_LOG_ERROR("%s: failed to reserve the compute buffers (n_nodes = %d)\n", __func__, sched->graph.n_nodes);
+            ggml_gallocr_free(sched->galloc);
+            sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+            return false;
+        }
         const int64_t tr1 = ggml_time_us();
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
