@@ -4373,16 +4373,38 @@ private:
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len, const std::vector<ggml_backend_t> * backends = nullptr) : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_read_host() {
         // flush the reads
         static const bool trace = getenv("LLAMA_STATE_IO_TRACE") != nullptr;
         const int64_t t0 = ggml_time_us();
+        // [fork] a blocking write is one board at a time. The RPC async write
+        // snapshots its payload and later work on that endpoint orders itself
+        // behind it, so queue the boards' writes and let them land together.
+        // LLAMA_STATE_SET_ASYNC=0 restores the blocking writes.
+        static const bool async = [] {
+            const char * e = getenv("LLAMA_STATE_SET_ASYNC");
+            return e == nullptr || atoi(e) != 0;
+        }();
         size_t n_bytes_set = 0;
         for (const auto & rinfo : rinfos) {
             n_bytes_set += rinfo.size;
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            ggml_backend_t backend = nullptr;
+            if (async && backends != nullptr && rinfo.tensor->buffer != nullptr) {
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+                for (ggml_backend_t b : *backends) {
+                    if (ggml_backend_is_rpc(b) && ggml_backend_get_default_buffer_type(b) == buft) {
+                        backend = b;
+                        break;
+                    }
+                }
+            }
+            if (backend != nullptr) {
+                ggml_backend_tensor_set_async(backend, rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            } else {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
         }
         if (trace && !rinfos.empty()) {
             fprintf(stderr, "[state io] set: %zu writes, %.2f MiB, %.1f ms\n",
@@ -4429,6 +4451,8 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+    const std::vector<ggml_backend_t> * backends;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -4866,7 +4890,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(src, size, &backend_ptrs);
     }
 
     try {
