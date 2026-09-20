@@ -468,9 +468,15 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     inp->cache_safe = cache_safe;
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
+    // [fork] same as gather_mask: set_input_kpool always fills these. A drafter
+    // that reuses the target's selection while the cache is not pool-safe (live
+    // sequences starting at different positions, e.g. a restored slot beside
+    // running ones) reads neither, and an input outside the graph has no buffer.
+    ggml_build_forward_expand(gf, inp->new_pool_idxs);
     if (cache_safe) {
         inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
         ggml_set_input(inp->new_pool_rep);
+        ggml_build_forward_expand(gf, inp->new_pool_rep);
     }
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
