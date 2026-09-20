@@ -2063,8 +2063,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // submit the next prompt batch to the target while the draft device
         // runs this one. The next entry into the drafter joins it.
         if (!is_mem_shared && !embd_in) {
+            // A verification batch (every token an output) is followed at once
+            // by the server trimming the rejected suffix off this context, so
+            // there is nothing to overlap and the worker would race that
+            // seq_rm: it left stale draft positions behind with one slot and
+            // tripped the k-pool layout assert with four. Only a prompt batch
+            // goes to the worker.
+            bool verify = batch_in.logits != nullptr;
+            for (int k = 0; verify && k < n_tokens; ++k) {
+                verify = batch_in.logits[k] != 0;
+            }
+
             catchup_ok    = true;
             catchup_n_tok = n_tokens;
+            if (verify) {
+                catchup_t0 = ggml_time_us();
+                catchup_ok = catchup_decode();
+                catchup_t1 = ggml_time_us();
+                return catchup_ok;
+            }
             catchup       = std::thread([this]() {
                 catchup_t0 = ggml_time_us();
                 catchup_ok = catchup_decode();
@@ -2317,6 +2334,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        // the server edits this context's sequences right after accepting; a
+        // slot verified in the same batch as another slot's prompt still has
+        // the catch-up on the worker
+        catchup_join();
+
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
