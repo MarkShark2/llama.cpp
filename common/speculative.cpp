@@ -2054,8 +2054,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (int32_t r = 0; r < n_rows && r < 8; ++r) {
                     fprintf(stderr, " %d=%.4f", (int) batch_in.token[i_batch_beg[seq_id] + r], row_sum(verify_h[seq_id].data() + (size_t) r * n_embd));
                 }
-                fprintf(stderr, "
-");
+                fprintf(stderr, "\n");
             }
         }
 
@@ -2312,8 +2311,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (const llama_token t : *dp.result) {
                     fprintf(stderr, " %d", (int) t);
                 }
-                fprintf(stderr, "
-");
+                fprintf(stderr, "\n");
             }
         }
     }
