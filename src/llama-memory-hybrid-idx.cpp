@@ -716,6 +716,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         new llama_kv_cache_context(mem->get_mem_idx())) {
     if (kpool_track()) {
         kpool_st = std::make_unique<kpool_state>(kpool_build_layout(nullptr));
+        // Reserve pool inputs for the full cache, including before any cells are occupied.
+        kpool_st->n_pool_real = mem->get_mem_idx()->get_size()/mem->get_kpool();
         i_kpool  = 0;
     }
 }
@@ -1300,5 +1302,4 @@ void llama_memory_hybrid_idx_context::set_input_mtp_dsa_selection(
     ggml_backend_tensor_set(sel, mapped.data(), 0, mapped.size()*sizeof(mapped[0]));
     ggml_backend_tensor_set(mask, valid.data(), 0, valid.size()*sizeof(valid[0]));
 }
-
 

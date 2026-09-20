@@ -15,6 +15,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -26,12 +27,24 @@
 // built graphs (reserve and live) so two shapes can be diffed by name
 static void llama_graph_nodes_dump(ggml_cgraph * gf, const char * tag, uint32_t n_tokens, uint32_t n_outputs) {
     static const char * dir = getenv("LLAMA_GRAPH_NODES_DUMP");
-    static int idx = 0;
-    if (dir == nullptr || gf == nullptr || idx >= 12) {
+    static std::atomic<int> idx_reserve{0};
+    static std::atomic<int> idx_live{0};
+    if (dir == nullptr || gf == nullptr) {
+        return;
+    }
+    // reserves rotate through three slots (the last ones matter), live graphs
+    // keep the first eight
+    const bool reserve = strcmp(tag, "reserve") == 0;
+    if (!reserve && idx_live.load(std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    const int idx = reserve ? (idx_reserve.fetch_add(1, std::memory_order_relaxed) % 3)
+                            : idx_live.fetch_add(1, std::memory_order_relaxed);
+    if (!reserve && idx >= 8) {
         return;
     }
     char path[1024];
-    snprintf(path, sizeof(path), "%s/gnodes_%02d_%s_t%u_o%u.txt", dir, idx++, tag, n_tokens, n_outputs);
+    snprintf(path, sizeof(path), "%s/gnodes_%s_%02d_t%u_o%u_n%d.txt", dir, tag, idx, n_tokens, n_outputs, ggml_graph_n_nodes(gf));
     FILE * f = fopen(path, "w");
     if (f == nullptr) {
         return;
@@ -831,6 +844,7 @@ void llama_context::sched_reserve() {
     sched_decode_lane.clear();
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    glm_prefill_epoch = -1;
 
     // [fork] a brand-new scheduler holds none of the allocation the worst-case
     // reserve produced, so memory_update() must do a real one next time
@@ -1993,6 +2007,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return e ? atoi(e) : 0;
     }();
     const int64_t pu_t0 = pu_trace ? ggml_time_us() : 0;
+
+    static const bool glm_prefill_reserve = [] {
+        const char * e = getenv("LLAMA_GLM_PREFILL_RESERVE");
+        return !e || atoi(e) != 0;
+    }();
+    if (glm_prefill_reserve && model.arch == LLM_ARCH_GLM5_NEXT &&
+            gtype == LLM_GRAPH_TYPE_DEFAULT && cparams.pipeline_parallel &&
+            ubatch.token && !ubatch.embd && ubatch.n_tokens > 16 &&
+            ubatch.n_tokens <= cparams.n_ubatch && ubatch.n_seqs_unq == 1 &&
+            glm_prefill_epoch != ggml_backend_sched_galloc_reserve_epoch(sched.get())) {
+        // Small prompt prefixes and decode change the plan. Restore the single-sequence
+        // prompt shape once, then keep its full-cache allocation across KV buckets.
+        const auto full = memory->init_full();
+        if (!full || !graph_reserve(std::max(cparams.n_ubatch, ubatch.n_tokens), 1,
+                std::max(1u, n_outputs), full.get())) {
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+        glm_prefill_epoch = ggml_backend_sched_galloc_reserve_epoch(sched.get());
+        if (pu_trace) {
+            fprintf(stderr, "[glm-prefill] restored full-cache prompt plan in %.1f ms\n", (ggml_time_us() - pu_t0)/1000.0);
+        }
+    }
 
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
