@@ -116,13 +116,6 @@ public:
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 
-    // [fork, PipeDec] token lanes for several sequences: one token from every
-    // sequence that has the most tokens left, so each ubatch sits at one
-    // distance from the end of its sequences' runs. seq_cell[seq_id] is the
-    // recurrent cell of the sequence (-1 = none); a ubatch only takes
-    // sequences on consecutive cells, in cell order, so no cell is moved.
-    llama_ubatch split_lane_tail(const std::vector<int32_t> & seq_cell, uint32_t n_rows_max);
-
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);

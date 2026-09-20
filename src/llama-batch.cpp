@@ -734,56 +734,6 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     return ubatch_add(idxs, 1, true);
 }
 
-llama_ubatch llama_batch_allocr::split_lane_tail(const std::vector<int32_t> & seq_cell, uint32_t n_rows_max) {
-    // per sequence: the first unused token and the number of unused tokens
-    struct seq_left { llama_seq_id id; int32_t cell; int32_t first; uint32_t n; };
-    std::vector<seq_left> left;
-
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        if (used[i]) {
-            continue;
-        }
-        const llama_seq_id id = batch.seq_id[i][0];
-        auto it = std::find_if(left.begin(), left.end(), [&](const seq_left & s) { return s.id == id; });
-        if (it == left.end()) {
-            const int32_t cell = (size_t) id < seq_cell.size() ? seq_cell[id] : -1;
-            left.push_back({ id, cell, i, 1 });
-        } else {
-            it->n++;
-        }
-    }
-
-    if (left.empty()) {
-        return {};
-    }
-
-    uint32_t n_max = 0;
-    for (const auto & s : left) {
-        n_max = std::max(n_max, s.n);
-    }
-
-    std::vector<seq_left> level;
-    for (const auto & s : left) {
-        if (s.n == n_max) {
-            level.push_back(s);
-        }
-    }
-    std::sort(level.begin(), level.end(), [](const seq_left & a, const seq_left & b) { return a.cell < b.cell; });
-
-    std::vector<int32_t> idxs;
-    for (size_t s = 0; s < level.size() && idxs.size() < n_rows_max; ++s) {
-        if (s > 0 && (level[s - 1].cell < 0 || level[s].cell != level[s - 1].cell + 1)) {
-            break;
-        }
-        idxs.push_back(level[s].first);
-
-        used[level[s].first] = true;
-        ++n_used;
-    }
-
-    return ubatch_add(idxs, idxs.size(), true);
-}
-
 void llama_batch_allocr::clear() {
     n_outputs = 0;
 

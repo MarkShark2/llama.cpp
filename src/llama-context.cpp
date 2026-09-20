@@ -3044,15 +3044,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     const bool    pipedec_trace   = pipedec_stage2 && getenv("GGML_PIPEDEC_TRACE") && atoi(getenv("GGML_PIPEDEC_TRACE")) != 0;
-
-    // [fork, PipeDec] lane ring of a several-slot verification batch
-    std::vector<bool>                 pipedec_ring_used;
-    uint32_t                          pipedec_ring_size  = 0;
-    uint32_t                          pipedec_ring_extra = 0;
-    std::vector<ggml_backend_sched_t> pipedec_scheds_used;
-    for (uint32_t total : pipedec_seq_total) {
-        pipedec_ring_size = std::max(pipedec_ring_size, total);
-    }
     const int64_t pipedec_body_t0 = pipedec_stage2 ? ggml_time_us() : 0;
 
     // [fork] decode lane pool eligibility. Lanes carry the plain logits path
@@ -3095,40 +3086,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        // first group row of this ubatch; a lane of a deferred group is one row
-        const uint32_t pipedec_row = pipedec_group_tokens + n_tokens_prev;
-
-        // a deferred group spans decode calls, so its planes stay on the global
-        // lane index; otherwise a lane holds one token of every sequence at the
-        // same distance from the end of its run, and that distance is the plane
-        const bool pipedec_per_seq     = pipedec_stage2 && pipedec_group_tokens == 0 && !pipedec_defer_this;
-        uint32_t   pipedec_lane        = pipedec_row;
-        uint32_t   pipedec_plane_lane  = pipedec_row;
-        uint32_t   pipedec_plane_total = pipedec_total_planned;
-        if (pipedec_per_seq) {
-            const auto &   tok_ids  = balloc->get_tok_ids();
-            const int32_t  b0       = tok_ids[n_tokens_prev];
-            const uint32_t rollback = pipedec_seq_total[b0] - pipedec_seq_lane[b0] - 1;
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const int32_t b = tok_ids[n_tokens_prev + i];
-                GGML_ASSERT(ubatch.seq_id[i][0] == balloc->get_batch().seq_id[b][0]);
-                GGML_ASSERT(pipedec_seq_total[b] - pipedec_seq_lane[b] - 1 == rollback);
-            }
-            // the first lane at a distance takes the ring slot of that distance,
-            // so its graph repeats step after step; a second lane at the same
-            // distance (sequences on non-adjacent cells) goes past the ring
-            if (pipedec_ring_used.size() <= rollback) {
-                pipedec_ring_used.resize(rollback + 1, false);
-            }
-            if (!pipedec_ring_used[rollback]) {
-                pipedec_ring_used[rollback] = true;
-                pipedec_lane = rollback;
-            } else {
-                pipedec_lane = pipedec_ring_size + pipedec_ring_extra++;
-            }
-            pipedec_plane_lane  = 0;
-            pipedec_plane_total = rollback + 1;
-        }
+        const uint32_t pipedec_lane = pipedec_group_tokens + n_tokens_prev;
         if (pipedec_stage2) { PIPEDEC_STEP("loop: dispatch body lane=%u n_tokens=%u\n", pipedec_lane, ubatch.n_tokens); }
 
         // [fork] a decode-group ubatch (one token per sequence) rides its own
@@ -3154,6 +3112,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
             fprintf(stderr, "[dec] ubatch lane=%d n_tok=%u n_seq_tokens=%u n_seqs=%u n_outputs=%d\n",
                     decode_lane, ubatch.n_tokens, ubatch.n_seqs > 0 ? ubatch.n_seq_tokens : 0, ubatch.n_seqs, (int) n_outputs);
             fflush(stderr);
+        }
+
+        // a deferred group spans decode calls, so its planes stay on the global
+        // lane index; otherwise the token's own sequence run is the group
+        const bool     pipedec_per_seq     = pipedec_stage2 && pipedec_group_tokens == 0 && !pipedec_defer_this;
+        const uint32_t pipedec_plane_lane  = pipedec_per_seq ? pipedec_seq_lane [n_tokens_prev] : pipedec_lane;
+        const uint32_t pipedec_plane_total = pipedec_per_seq ? pipedec_seq_total[n_tokens_prev] : pipedec_total_planned;
+        if (pipedec_per_seq) {
+            GGML_ASSERT(ubatch.n_tokens == 1 && ubatch.seq_id[0][0] == balloc->get_batch().seq_id[n_tokens_prev][0]);
         }
 
         const auto * res = pipedec_stage2
@@ -3309,8 +3276,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // taps into the stable group buffers (a shared embd_layer_inp write
             // would be overwritten by the next lane while GETs are in flight)
             PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u begin\n", pipedec_lane);
-            pipedec_scheds_used.push_back(sched_pipedec_body[pipedec_lane][ubatch.n_tokens - 1].get());
-            extract_layer_inputs_pipedec(res, pipedec_scheds_used.back(), pipedec_row);
+            extract_layer_inputs_pipedec(res, sched_pipedec_body[pipedec_lane][0].get(), pipedec_lane);
             PIPEDEC_STEP("extract_layer_inputs_pipedec lane=%u end\n", pipedec_lane);
         } else {
             extract_layer_inputs(res,
@@ -3344,7 +3310,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(
-                        pipedec_stage2 ? sched_pipedec_body[pipedec_lane][ubatch.n_tokens - 1].get() : sched.get(), t_h_nextn);
+                        pipedec_stage2 ? sched_pipedec_body[pipedec_lane][0].get() : sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 // [fork, PipeDec] a body lane's row is as wide as the body left
@@ -3364,11 +3330,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // output_reserve would touch embd_nextn, so the destination must be
                 // stable. Rows are copied into embd_nextn at group close.
                 float * embd_nextn_out = pipedec_stage2
-                        ? pipedec_group_h.data() + (size_t) pipedec_row * n_embd
+                        ? pipedec_group_h.data() + (size_t) pipedec_lane * n_embd
                         : embd_nextn.data + offset*n_embd;
 
                 if (pipedec_stage2) {
-                    GGML_ASSERT((size_t) (pipedec_row + n_rows) * n_embd <= pipedec_group_h.size());
+                    GGML_ASSERT((size_t) (pipedec_lane + n_rows) * n_embd <= pipedec_group_h.size());
                 } else {
                     GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 }
@@ -3455,10 +3421,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t pipedec_total = pipedec_stage2 ? pipedec_group_tokens + n_tokens_all : 0;
 
-    // [fork, PipeDec] group rows are in lane order. Without deferred rows that
-    // is the ubatch order of this batch: row r holds batch token tok_ids[r].
-    const bool pipedec_rows_by_tok = pipedec_stage2 && pipedec_group_tokens == 0;
-
     if (pipedec_stage2) {
         const int64_t body_submit_us = ggml_time_us() - pipedec_body_t0;
         const int64_t body_drain_t0  = ggml_time_us();
@@ -3467,16 +3429,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // once after all bodies have been submitted, then reuse those host rows
         // as the input to one arch-specific deferred output-head graph.
         PIPEDEC_STEP("group-close: drain %u lanes\n", pipedec_total);
-        if (pipedec_rows_by_tok) {
-            for (ggml_backend_sched_t lane_sched : pipedec_scheds_used) {
-                ggml_backend_sched_synchronize(lane_sched);
-            }
-        } else {
-            for (uint32_t lane = 0; lane < pipedec_total; ++lane) {
-                GGML_ASSERT(sched_pipedec_body[lane][0]);
-                PIPEDEC_STEP("group-close: sync lane=%u\n", lane);
-                ggml_backend_sched_synchronize(sched_pipedec_body[lane][0].get());
-            }
+        for (uint32_t lane = 0; lane < pipedec_total; ++lane) {
+            GGML_ASSERT(sched_pipedec_body[lane][0]);
+            PIPEDEC_STEP("group-close: sync lane=%u\n", lane);
+            ggml_backend_sched_synchronize(sched_pipedec_body[lane][0].get());
         }
         PIPEDEC_STEP("group-close: drained\n");
         const int64_t body_drain_us = ggml_time_us() - body_drain_t0;
@@ -3493,8 +3449,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT((size_t) pipedec_total * n_embd <= embd_nextn.size);
             PIPEDEC_STEP("group-close: memcpy nextn total=%u n_embd=%u row=%u\n", pipedec_total, n_embd, n_row);
             for (uint32_t r = 0; r < pipedec_total; ++r) {
-                const uint32_t b = pipedec_rows_by_tok ? (uint32_t) balloc->get_tok_ids()[r] : r;
-                std::memcpy(embd_nextn.data + (size_t) b * n_embd, pipedec_group_h.data() + (size_t) r * n_row,
+                std::memcpy(embd_nextn.data + (size_t) r * n_embd, pipedec_group_h.data() + (size_t) r * n_row,
                         (size_t) n_row * sizeof(float));
             }
         }
@@ -3629,7 +3584,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         std::fill(output_ids.begin(), output_ids.end(), -1);
         for (uint32_t i = 0; i < pipedec_total; ++i) {
-            output_ids[pipedec_rows_by_tok ? balloc->get_tok_ids()[i] : i] = i;
+            output_ids[i] = i;
         }
 
         // every lane and the head were synchronized above, on their own schedulers
