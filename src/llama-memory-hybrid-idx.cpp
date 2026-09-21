@@ -872,7 +872,9 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             }
         }
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // [fork] cells outside the used range are empty, and this scan runs on
+        // every tree level: bound it instead of walking the whole cache
+        for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
             if (cells.is_empty(i)) {
                 continue;
             }
@@ -892,7 +894,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             }
             auto & sq = st.seqs[s];
             sq.strm = kv->get_stream(s);
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
                 if (!cells.is_empty(i) && cells.seq_has(i, s)) {
                     sq.cells.emplace_back(cells.pos_get(i), i);
                 }
