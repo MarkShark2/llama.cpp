@@ -802,16 +802,26 @@ bool llama_memory_hybrid_idx_context::next() {
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
+    // [fork] GGML_PIPEDEC_TREE_TRACE also splits the per-level memory work
+    static const bool trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
+    const int64_t t0 = trace ? ggml_time_us() : 0;
+
     bool res = llama_memory_hybrid_context::apply();
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();
     }
+    const int64_t t1 = trace ? ggml_time_us() : 0;
 
     // Fix the pool layout of this ubatch.
     if (res && kpool_track()) {
         kpool_st = std::make_unique<kpool_state>(kpool_build_state(get_ubatch()));
         i_kpool  = i_cur;
+        if (trace) {
+            const auto & st = *kpool_st;
+            fprintf(stderr, "[kpool] apply caches=%.2f state=%.2f ms prefix_pools=%u pools=%u new=%u\n",
+                    (t1 - t0)/1000.0, (ggml_time_us() - t1)/1000.0, st.n_prefix_pools, st.n_pool_real, st.n_new);
+        }
     }
 
     return res;
@@ -1255,6 +1265,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const uint32_t kpool = mem->get_kpool();
     const uint32_t n_kv  = get_idx()->get_n_kv();
 
+    static const bool trace = getenv("GGML_PIPEDEC_TREE_TRACE") != nullptr;
+    const int64_t t_in0 = trace ? ggml_time_us() : 0;
+
     const auto & st = kpool_cur();
 
     const uint32_t n_tokens = ubatch->n_tokens;
@@ -1469,6 +1482,10 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);
+    }
+
+    if (trace) {
+        fprintf(stderr, "[kpool] set_input tables+mask=%.2f ms n_pool=%u\n", (ggml_time_us() - t_in0)/1000.0, n_pool);
     }
 
     int32_t * tidx = (int32_t *) tail_idxs->data;
