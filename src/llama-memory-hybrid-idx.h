@@ -1,7 +1,9 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
+#include "llama-cparams.h"
 
+#include <bitset>
 #include <memory>
 #include <vector>
 
@@ -120,6 +122,10 @@ public:
     // uses it only after checking, cell by cell, that its sequence still holds
     // exactly these cells below the cut (LLAMA_KPOOL_PREFIX=0 turns it off,
     // LLAMA_KPOOL_PREFIX_VERIFY=1 checks every use against the full rebuild).
+    // That check is itself a walk over every cell, so a sequence that passed it
+    // is remembered in holders until a sequence edit or a write could have moved
+    // its cells below the cut, and while it is, only the cells outside the
+    // prefix's own index runs are scanned, for the tail.
     struct kpool_prefix {
         bool      valid   = false;
         uint64_t  gen     = 0; // bumped whenever the prefix is not an extension of the last one
@@ -128,6 +134,9 @@ public:
         std::vector<int32_t>   pcell;    // pool_cells rows
         std::vector<int32_t>   pidx;     // pool_idxs rows
         std::vector<llama_pos> pool_end; // last position of each pool
+        std::bitset<LLAMA_MAX_SEQ> holders;
+        std::vector<std::pair<uint32_t, uint32_t>> runs; // the cells as ascending [first, last) index runs
+        bool runs_ok = true;                             // false: too scattered, every use scans
     };
     kpool_prefix & get_kpool_prefix() { return kpool_pfx; }
 
@@ -137,6 +146,9 @@ public:
     const std::vector<int32_t> & get_mtp_dsa_selection() const { return mtp_dsa_selection; }
 
 private:
+    // [fork] seq_id (all if < 0) loses cells from p0 up: below the cut it is no holder any more
+    void kpool_prefix_seq_rm(llama_seq_id seq_id, llama_pos p0);
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);

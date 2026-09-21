@@ -206,12 +206,35 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
         mtp_dsa_selection.clear();
+        kpool_prefix_seq_rm(seq_id, p0);
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
+void llama_memory_hybrid_idx::kpool_prefix_seq_rm(llama_seq_id seq_id, llama_pos p0) {
+    if (p0 >= kpool_pfx.pos_min + (llama_pos) kpool_pfx.cells.size()) {
+        return;
+    }
+    if (seq_id < 0) {
+        kpool_pfx.holders.reset();
+    } else {
+        kpool_pfx.holders.reset(seq_id);
+    }
+}
+
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    // [fork] a copy from the cut up leaves dst's cells below it alone, and an
+    // empty dst that takes all of a holder's is one too
+    if (mem_idx && seq_id_src != seq_id_dst) {
+        const llama_pos pos_end = kpool_pfx.pos_min + (llama_pos) kpool_pfx.cells.size();
+        if (p0 < pos_end) {
+            const bool whole = mem_idx->get_n_stream() == 1 && kpool_pfx.holders.test(seq_id_src) &&
+                mem_idx->get_cells(0).seq_pos_min(seq_id_dst) < 0 && p0 <= kpool_pfx.pos_min && (p1 < 0 || p1 >= pos_end);
+            kpool_pfx.holders.set(seq_id_dst, whole);
+        }
+    }
+
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -235,6 +258,7 @@ bool llama_memory_hybrid_idx::seq_trim(llama_seq_id seq_id, llama_pos p0) {
 
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, -1);
+        kpool_prefix_seq_rm(seq_id, p0);
     }
 
     return true;
@@ -246,6 +270,9 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
         mtp_dsa_selection.clear();
+        const bool held = kpool_pfx.holders.test(seq_id);
+        kpool_pfx.holders.reset();
+        kpool_pfx.holders.set(seq_id, held);
     }
 }
 
@@ -739,6 +766,7 @@ thread_local bool kpool_prefix_bypass = false;
 constexpr size_t KPOOL_PREFIX_MIN_CELLS = 4096;
 constexpr size_t KPOOL_PREFIX_MARGIN    = 256;
 constexpr size_t KPOOL_PREFIX_GROW      = 1024;
+constexpr size_t KPOOL_PREFIX_MAX_RUNS  = 64;
 
 uint32_t kpool_pad(uint32_t n_pool, uint32_t kpool, uint32_t kv_size) {
     const uint32_t n_max = kv_size/std::max(1u, kpool) + 1;
@@ -1035,25 +1063,55 @@ bool llama_memory_hybrid_idx_context::kpool_layout_from_prefix(kpool_state & st,
     }
 
     std::vector<std::pair<llama_pos, uint32_t>> tail;
-    size_t n_below = 0;
-    for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
-        if (!cells.seq_has(i, s)) {
-            continue;
+
+    // a holder has the prefix's cells and no other below the cut: its tail is outside the runs
+    bool held = pfx.runs_ok && pfx.holders.test(s);
+    if (held) {
+        size_t ir = 0;
+        for (uint32_t i = cells.used_min(); i < cells.used_max_p1() && held; ++i) {
+            while (ir < pfx.runs.size() && pfx.runs[ir].second <= i) {
+                ir++;
+            }
+            if (ir < pfx.runs.size() && pfx.runs[ir].first <= i) {
+                i = pfx.runs[ir].second - 1;
+                continue;
+            }
+            if (!cells.seq_has(i, s)) {
+                continue;
+            }
+            const llama_pos p = cells.pos_get(i);
+            if (p >= pos_end) {
+                tail.emplace_back(p, i);
+            } else {
+                held = false;
+            }
         }
-        const llama_pos p = cells.pos_get(i);
-        if (p >= pos_end) {
-            tail.emplace_back(p, i);
-            continue;
+    }
+    if (!held) {
+        pfx.holders.reset(s);
+        tail.clear();
+
+        size_t n_below = 0;
+        for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
+            if (!cells.seq_has(i, s)) {
+                continue;
+            }
+            const llama_pos p = cells.pos_get(i);
+            if (p >= pos_end) {
+                tail.emplace_back(p, i);
+                continue;
+            }
+            if (p < pfx.pos_min || pfx.cells[(size_t) (p - pfx.pos_min)].second != i) {
+                pfx.valid = false;
+                return false;
+            }
+            n_below++;
         }
-        if (p < pfx.pos_min || pfx.cells[(size_t) (p - pfx.pos_min)].second != i) {
+        if (n_below != pfx.cells.size()) {
             pfx.valid = false;
             return false;
         }
-        n_below++;
-    }
-    if (n_below != pfx.cells.size()) {
-        pfx.valid = false;
-        return false;
+        pfx.holders.set(s);
     }
     std::sort(tail.begin(), tail.end());
 
@@ -1122,12 +1180,23 @@ void llama_memory_hybrid_idx_context::kpool_prefix_update(const kpool_state & st
     for (size_t pi = pfx.pcell.size(); pi < n_pools; ++pi) {
         const uint32_t j = sq.pools[pi];
         for (uint32_t k = 0; k < kpool; ++k) {
+            const uint32_t cell = sq.cells[j + k].second;
             pfx.cells.push_back(sq.cells[j + k]);
-            pfx.pidx.push_back((int32_t) sq.cells[j + k].second);
+            pfx.pidx.push_back((int32_t) cell);
+            if (!pfx.runs.empty() && pfx.runs.back().second == cell) {
+                pfx.runs.back().second++;
+            } else {
+                pfx.runs_ok = pfx.runs_ok && pfx.runs.size() < KPOOL_PREFIX_MAX_RUNS &&
+                    (pfx.runs.empty() || pfx.runs.back().second < cell);
+                pfx.runs.emplace_back(cell, cell + 1);
+            }
         }
         pfx.pcell.push_back((int32_t) sq.cells[j + kpool - 1].second);
         pfx.pool_end.push_back(sq.cells[j + kpool - 1].first);
     }
+    // only the sequence it was taken from is known to hold the cells added
+    pfx.holders.reset();
+    pfx.holders.set(st.seq_single);
     pfx.valid = true;
 }
 
@@ -1175,6 +1244,9 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
             // [fork] the kept prefix claims its pools are fresh: not once one of its cells is rewritten
             auto & pfx = mem->get_kpool_prefix();
+            if (p < pfx.pos_min + (llama_pos) pfx.cells.size()) {
+                pfx.holders.reset(s);
+            }
             if (pfx.valid && !kpool_prefix_bypass && p >= pfx.pos_min && (size_t) (p - pfx.pos_min) < pfx.cells.size() &&
                     pfx.cells[(size_t) (p - pfx.pos_min)].second == it->second) {
                 pfx.valid = false;
