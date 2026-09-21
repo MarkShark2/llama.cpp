@@ -204,6 +204,13 @@ private:
     std::vector<bool> lane_used;
     int32_t ring_cursor = 0;
 
+    // an index-sharing drafter's DSA selection (positions), from the decode of
+    // dsa_node, reused dsa_age times so far; see expand()
+    std::vector<int32_t> dsa_sel;
+    int32_t dsa_node    = -1;
+    int32_t dsa_age     = 0;
+    int32_t dsa_refresh = 8; // GGML_PIPEDEC_TREE_DSA_REFRESH, levels per scoring pass (<= 1: score on every level)
+
     // chain mode
     bool         chain      = false;
     llama_seq_id chain_seq  = -1; // the slot's seq: every node lives here

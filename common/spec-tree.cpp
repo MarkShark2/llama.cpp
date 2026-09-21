@@ -25,6 +25,10 @@ common_spec_tree::common_spec_tree(const common_spec_tree_params & params) : par
         this->params.branch = this->params.width;
     }
 
+    if (const char * s = getenv("GGML_PIPEDEC_TREE_DSA_REFRESH")) {
+        dsa_refresh = atoi(s);
+    }
+
     chain = params.spec != nullptr && common_speculative_tree_kind(params.spec) == COMMON_SPEC_TREE_BLOCK;
     if (chain) {
         GGML_ASSERT(this->params.width == 1 && "chain mode is width 1");
@@ -647,7 +651,19 @@ bool common_spec_tree::expand() {
         std::memcpy(batch_dft.embd + (size_t) (batch_dft.n_tokens - 1) * n_embd, n.h_in.data(), (size_t) n_embd * sizeof(float));
     }
 
+    // an index-sharing drafter (glm5-next) scores its indexer on the first step
+    // of a draft block and the steps after it take that selection. The tree has
+    // no blocks, only a lineage that grows a level at a time: the row under the
+    // node drafted last takes that node's selection, and a new lineage or every
+    // dsa_refresh-th level scores again. Staging fails unless the drafter shares.
+    const bool dsa_reuse = dsa_refresh > 1 && rows.size() == 1 && !dsa_sel.empty() &&
+        nodes[rows[0]].parent == dsa_node && dsa_age < dsa_refresh &&
+        llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel.data(), dsa_sel.size());
+
     const int32_t rc = llama_decode(params.ctx_dft, batch_dft);
+    if (dsa_reuse) {
+        llama_set_mtp_dsa_selection(params.ctx_dft, nullptr, 0);
+    }
     if (rc != 0) {
         LOG_ERR("%s: draft decode failed rc=%d (rows=%zu pos=%d)\n", __func__, rc, rows.size(), (int) nodes[rows[0]].pos);
         return false;
@@ -674,6 +690,18 @@ bool common_spec_tree::expand() {
         }
         n.expanded = true;
     }
+
+    // the sampling above drained the decode, so a selection it scored has landed
+    if (dsa_reuse) {
+        dsa_age++;
+    } else {
+        size_t n_sel = 0;
+        const int32_t * sel = dsa_refresh > 1 && rows.size() == 1 ? llama_get_mtp_dsa_selection(params.ctx_dft, &n_sel) : nullptr;
+        dsa_sel.assign(sel, sel + (sel != nullptr ? n_sel : 0));
+        dsa_age = 1;
+    }
+    dsa_node = rows[0];
+    TREE_TRC("expand rows=%zu pos=%d dsa_reuse=%d\n", rows.size(), (int) nodes[rows[0]].pos, (int) dsa_reuse);
 
     // children draft from their parent's draft output row
     for (size_t i = 0; i < rows.size(); ++i) {
