@@ -16,6 +16,8 @@ extern "C" {
 // patch 4: parked sessions (SESSION_DETACH / SESSION_RESUME) for fleet
 //          hibernation - the client disconnects, the server keeps the
 //          buffers, and the KV cache survives the host suspending to disk.
+// patch 5: SET lane payload dedupe (SET_TENSOR_DEDUPE).
+// patch 6: a dedupe miss sent as byte ranges against a stashed payload.
 // The patch level is not checked by the HELLO handshake; new clients only
 // attach lanes when the server reports patch >= 1, route peer traffic when
 // both endpoints report patch >= 2, reduce imatrix activations remotely at
@@ -23,7 +25,7 @@ extern "C" {
 // GRAPH_RECOMPUTE carry a graph uid for the multi-slot server graph cache at
 // every patch level, so this client does not interoperate with a stock
 // rpc-server; the fleet's daemons are deployed together with it.
-#define RPC_PROTO_PATCH_VERSION    5
+#define RPC_PROTO_PATCH_VERSION    6
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

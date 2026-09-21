@@ -151,6 +151,8 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 #define GGML_RPC_HIBERNATE_MIN_PATCH 4
 // ...and SET lane payload dedupe
 #define GGML_RPC_DEDUPE_MIN_PATCH 5
+// ...and a dedupe miss sent as byte ranges against a stashed payload
+#define GGML_RPC_DELTA_MIN_PATCH 6
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -665,6 +667,9 @@ struct rpc_dedupe_lru {
         uint64_t hash;
         size_t   size;
         std::vector<uint8_t> data; // server side only
+        // client side only: the wire message whose payload these bytes are, kept
+        // for the most recent entries as delta bases (see rpc_dedupe_delta)
+        std::shared_ptr<std::vector<uint8_t>> msg;
     };
     size_t max_entries = 64;
     size_t max_bytes   = 64ull << 20;
@@ -673,7 +678,7 @@ struct rpc_dedupe_lru {
     std::unordered_map<uint64_t, std::list<entry>::iterator> map;
 
     // a hit moves the entry to most recent
-    const entry * find(uint64_t hash) {
+    entry * find(uint64_t hash) {
         auto it = map.find(hash);
         if (it == map.end()) {
             return nullptr;
@@ -682,8 +687,8 @@ struct rpc_dedupe_lru {
         return &*it->second;
     }
 
-    void insert(uint64_t hash, size_t size, std::vector<uint8_t> data) {
-        order.push_back({hash, size, std::move(data)});
+    void insert(uint64_t hash, size_t size, std::vector<uint8_t> data, std::shared_ptr<std::vector<uint8_t>> msg = nullptr) {
+        order.push_back({hash, size, std::move(data), std::move(msg)});
         map[hash] = std::prev(order.end());
         bytes += size;
         while (order.size() > max_entries || bytes > max_bytes) {
@@ -702,10 +707,31 @@ static bool rpc_dedupe_enabled() {
     return enabled;
 }
 
+// [fork] a miss that differs from a recent payload of the same size in a few
+// byte ranges is sent as those ranges (GGML_RPC_SET_DELTA=1, the default). The
+// GLM pool tables grow by one pool every kpool tokens: at 200k context that is
+// 1.1 MB per board per new pool for a handful of changed bytes.
+static bool rpc_delta_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_RPC_SET_DELTA");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 // payload size window: below it the header costs more than the bytes it
 // saves, above it a stash entry would crowd out the tables this is for
 static const size_t RPC_DEDUPE_MIN_BYTES = 32u << 10;
 static const size_t RPC_DEDUPE_MAX_BYTES = 4u << 20;
+
+// client entries that keep their bytes as delta bases, and bases tried per miss
+static const size_t RPC_DELTA_KEEP  = 12;
+static const size_t RPC_DELTA_TRIES = 4;
+
+struct rpc_delta_range {
+    uint32_t off;
+    uint32_t len;
+};
 
 static uint64_t rpc_dedupe_hash(const uint8_t * data, size_t size) {
     uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t) size;
@@ -2484,17 +2510,95 @@ static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_dedupe(
     return msg;
 }
 
-// hashes the payload against the mirror and returns how many bytes to send
-static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, std::vector<uint8_t> & msg) {
-    const size_t   size = msg.size() - RPC_SET_TENSOR_DEDUPE_HDR;
-    const uint64_t hash = rpc_dedupe_hash(msg.data() + RPC_SET_TENSOR_DEDUPE_HDR, size);
-    memcpy(msg.data() + RPC_SET_TENSOR_HDR, &hash, sizeof(hash));
-    const bool hit = lru.find(hash) != nullptr;
-    if (!hit) {
-        lru.insert(hash, size, {});
+// the byte ranges where cur differs from base, merged across gaps of up to 64
+// bytes; false once ranges + bytes pass max_bytes
+static bool rpc_delta_ranges(const uint8_t * base, const uint8_t * cur, size_t size, size_t max_bytes,
+                             std::vector<rpc_delta_range> & ranges, size_t & n_bytes) {
+    ranges.clear();
+    n_bytes = 0;
+    for (size_t i = 0; i < size; i += 8) {
+        const size_t n = std::min<size_t>(8, size - i);
+        if (memcmp(base + i, cur + i, n) == 0) {
+            continue;
+        }
+        if (!ranges.empty() && i - (ranges.back().off + ranges.back().len) <= 64) {
+            n_bytes += i + n - (ranges.back().off + ranges.back().len);
+            ranges.back().len = (uint32_t) (i + n - ranges.back().off);
+        } else {
+            ranges.push_back({ (uint32_t) i, (uint32_t) n });
+            n_bytes += n;
+        }
+        if (n_bytes + ranges.size()*sizeof(rpc_delta_range) > max_bytes) {
+            return false;
+        }
     }
-    msg[RPC_SET_TENSOR_DEDUPE_HDR - 1] = hit ? 1 : 0;
-    return hit ? RPC_SET_TENSOR_DEDUPE_HDR : msg.size();
+    return true;
+}
+
+// serialized delta form of SET_TENSOR_DEDUPE (hit == 2):
+// | rpc_tensor | offset (8) | hash (8) | size (8) | 2 (1) | base hash (8) | n_ranges (4) | ranges | range bytes |
+// hashes the payload against the mirror and returns how many bytes of msg to
+// send, or 0 with the delta form in delta_msg
+static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, const std::shared_ptr<std::vector<uint8_t>> & msg_ptr,
+                                bool delta_ok, std::vector<uint8_t> & delta_msg) {
+    std::vector<uint8_t> & msg = *msg_ptr;
+    const uint8_t * payload = msg.data() + RPC_SET_TENSOR_DEDUPE_HDR;
+    const size_t    size    = msg.size() - RPC_SET_TENSOR_DEDUPE_HDR;
+    const uint64_t  hash    = rpc_dedupe_hash(payload, size);
+    memcpy(msg.data() + RPC_SET_TENSOR_HDR, &hash, sizeof(hash));
+
+    size_t n_send = 0;
+    if (rpc_dedupe_lru::entry * e = lru.find(hash)) {
+        e->msg = msg_ptr;
+        msg[RPC_SET_TENSOR_DEDUPE_HDR - 1] = 1;
+        n_send = RPC_SET_TENSOR_DEDUPE_HDR;
+    } else {
+        uint64_t base_hash = 0;
+        std::vector<rpc_delta_range> ranges;
+        size_t n_bytes = 0;
+        bool   found   = false;
+        if (delta_ok) {
+            size_t tries = 0;
+            for (auto it = lru.order.rbegin(); it != lru.order.rend() && tries < RPC_DELTA_TRIES && !found; ++it) {
+                if (it->size != size || !it->msg) {
+                    continue;
+                }
+                tries++;
+                found     = rpc_delta_ranges(it->msg->data() + RPC_SET_TENSOR_DEDUPE_HDR, payload, size, size/4, ranges, n_bytes);
+                base_hash = it->hash;
+            }
+        }
+        if (found) {
+            // the server touches the base before it inserts the result, so does the mirror
+            lru.find(base_hash);
+            const uint32_t n_ranges = (uint32_t) ranges.size();
+            delta_msg.resize(RPC_SET_TENSOR_DEDUPE_HDR + sizeof(base_hash) + sizeof(n_ranges) + n_ranges*sizeof(rpc_delta_range) + n_bytes);
+            uint8_t * p = delta_msg.data();
+            memcpy(p, msg.data(), RPC_SET_TENSOR_DEDUPE_HDR);
+            p[RPC_SET_TENSOR_DEDUPE_HDR - 1] = 2;
+            p += RPC_SET_TENSOR_DEDUPE_HDR;
+            memcpy(p, &base_hash, sizeof(base_hash)); p += sizeof(base_hash);
+            memcpy(p, &n_ranges,  sizeof(n_ranges));  p += sizeof(n_ranges);
+            memcpy(p, ranges.data(), n_ranges*sizeof(rpc_delta_range)); p += n_ranges*sizeof(rpc_delta_range);
+            for (const auto & r : ranges) {
+                memcpy(p, payload + r.off, r.len);
+                p += r.len;
+            }
+        } else {
+            msg[RPC_SET_TENSOR_DEDUPE_HDR - 1] = 0;
+            n_send = msg.size();
+        }
+        lru.insert(hash, size, {}, msg_ptr);
+    }
+
+    // only the most recent entries stay delta bases
+    size_t n_kept = 0;
+    for (auto it = lru.order.rbegin(); it != lru.order.rend(); ++it) {
+        if (it->msg && ++n_kept > RPC_DELTA_KEEP) {
+            it->msg.reset();
+        }
+    }
+    return n_send;
 }
 
 static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
@@ -2582,9 +2686,13 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         ep->set_enq++;
         const std::string endpoint = disp->endpoint;
         std::shared_ptr<rpc_dedupe_lru> lru = dedupe ? ep->dedupe : nullptr;
-        ep->set_lane->task([endpoint, cmd, wait_main, wait_get, msg, lru](const socket_ptr & lane) {
-            const size_t n = lru ? rpc_dedupe_finish(*lru, *msg) : msg->size();
-            if (!send_lane_cmd(lane, cmd, wait_main, wait_get, msg->data(), n)) {
+        const bool delta_ok = rpc_delta_enabled() && disp->patch >= GGML_RPC_DELTA_MIN_PATCH;
+        ep->set_lane->task([endpoint, cmd, wait_main, wait_get, msg, lru, delta_ok](const socket_ptr & lane) {
+            std::vector<uint8_t> delta_msg;
+            const size_t n = lru ? rpc_dedupe_finish(*lru, msg, delta_ok, delta_msg) : msg->size();
+            const bool sent = n > 0 ? send_lane_cmd(lane, cmd, wait_main, wait_get, msg->data(), n)
+                                    : send_lane_cmd(lane, cmd, wait_main, wait_get, delta_msg.data(), delta_msg.size());
+            if (!sent) {
                 GGML_ABORT("[rpc fdx] SET lane to %s lost", endpoint.c_str());
             }
             return true;
@@ -3794,6 +3902,7 @@ private:
     std::mutex     dedupe_mtx;
     rpc_dedupe_lru dedupe;
     size_t         dedupe_hits = 0, dedupe_hit_bytes = 0, dedupe_misses = 0;
+    size_t         dedupe_deltas = 0, dedupe_delta_bytes = 0;
 
     bool set_tensor_raw(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size);
     // [fork, PipeDec] deserialized graphs kept per backend, keyed by the
@@ -4235,10 +4344,50 @@ bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input) {
     memcpy(&offset, input.data() + sizeof(rpc_tensor),                      sizeof(offset));
     memcpy(&hash,   input.data() + sizeof(rpc_tensor) +   sizeof(uint64_t), sizeof(hash));
     memcpy(&size,   input.data() + sizeof(rpc_tensor) + 2*sizeof(uint64_t), sizeof(size));
-    const bool hit = input[hdr - 1] != 0;
+    const uint8_t hit = input[hdr - 1];
 
     std::lock_guard<std::mutex> l(dedupe_mtx);
     const void * data = nullptr;
+    if (hit == 2) {
+        // | base hash (8) | n_ranges (4) | ranges | range bytes |: the stashed base patched into the new payload
+        uint64_t base_hash;
+        uint32_t n_ranges;
+        if (input.size() < hdr + sizeof(base_hash) + sizeof(n_ranges)) {
+            return false;
+        }
+        memcpy(&base_hash, input.data() + hdr,                     sizeof(base_hash));
+        memcpy(&n_ranges,  input.data() + hdr + sizeof(base_hash), sizeof(n_ranges));
+        const size_t p_ranges = hdr + sizeof(base_hash) + sizeof(n_ranges);
+        if ((input.size() - p_ranges) / sizeof(rpc_delta_range) < n_ranges) {
+            return false;
+        }
+        const rpc_dedupe_lru::entry * base = dedupe.find(base_hash);
+        if (base == nullptr || base->size != size) {
+            GGML_LOG_ERROR("[rpc dedupe] delta base %016" PRIx64 " (%" PRIu64 " bytes) not in the stash - client mirror out of step\n", base_hash, size);
+            return false;
+        }
+        std::vector<uint8_t> patched = base->data;
+        const uint8_t * src = input.data() + p_ranges + n_ranges*sizeof(rpc_delta_range);
+        const uint8_t * end = input.data() + input.size();
+        for (uint32_t i = 0; i < n_ranges; ++i) {
+            rpc_delta_range r;
+            memcpy(&r, input.data() + p_ranges + i*sizeof(r), sizeof(r));
+            if ((uint64_t) r.off + r.len > size || (size_t) (end - src) < r.len) {
+                return false;
+            }
+            memcpy(patched.data() + r.off, src, r.len);
+            src += r.len;
+        }
+        if (src != end || rpc_dedupe_hash(patched.data(), patched.size()) != hash) {
+            GGML_LOG_ERROR("[rpc dedupe] delta against %016" PRIx64 " does not rebuild %016" PRIx64 "\n", base_hash, hash);
+            return false;
+        }
+        dedupe_deltas++;
+        dedupe_delta_bytes += size - (input.size() - hdr);
+        const bool ok = set_tensor_raw(*in_tensor, offset, patched.data(), size);
+        dedupe.insert(hash, size, std::move(patched));
+        return ok;
+    }
     if (hit) {
         const rpc_dedupe_lru::entry * e = dedupe.find(hash);
         if (e == nullptr || e->size != size) {
@@ -5445,8 +5594,9 @@ rpc_server::~rpc_server() {
                 cache_misses, cache_upload_bytes / double(1024ull * 1024ull * 1024ull));
     }
     if (dedupe_hits > 0 || dedupe_misses > 0) {
-        GGML_LOG_INFO("[rpc dedupe] hits=%zu (%.2f GiB skipped), misses=%zu\n",
-                dedupe_hits, dedupe_hit_bytes / double(1024ull * 1024ull * 1024ull), dedupe_misses);
+        GGML_LOG_INFO("[rpc dedupe] hits=%zu (%.2f GiB skipped), misses=%zu, deltas=%zu (%.2f GiB skipped)\n",
+                dedupe_hits, dedupe_hit_bytes / double(1024ull * 1024ull * 1024ull), dedupe_misses,
+                dedupe_deltas, dedupe_delta_bytes / double(1024ull * 1024ull * 1024ull));
     }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
