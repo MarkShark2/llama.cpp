@@ -190,6 +190,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
     mtp_dsa_selection.clear();
     std::fill(kpool_members.begin(), kpool_members.end(), UINT32_MAX);
+    kpool_pfx.valid = false;
 
     if (mem_idx) {
         mem_idx->clear(data);
@@ -254,6 +255,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
         mtp_dsa_selection.clear();
+        kpool_pfx.valid = false;
     }
 }
 
@@ -263,6 +265,7 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
         mtp_dsa_selection.clear();
+        kpool_pfx.valid = false;
     }
 }
 
@@ -299,6 +302,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     // the indexer restore adopts the attention cache's layout instead of searching for cells of its own
     // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
     llama_kv_cache::slot_info_vec_t sinfos_attn;
+
+    kpool_pfx.valid = false;
 
     try {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -692,6 +697,12 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_pool_real = 0;
     uint32_t n_new       = 0;
     bool cache_safe      = true;
+
+    // [fork] the sequence laid out alone (-1: several or none), and how many of
+    // its leading pools came from the memory's kpool_prefix, at which gen
+    llama_seq_id seq_single     = -1;
+    uint32_t     n_prefix_pools = 0;
+    uint64_t     prefix_gen     = 0;
 };
 
 namespace {
@@ -703,6 +714,32 @@ namespace {
 // alone it stepped every 256 prompt tokens, and every step was a new graph
 // shape past the reserved one: a galloc re-plan and a full fabric drain
 // (2.7 s) after every fourth 64-token ubatch on the nine-board GLM-5.3 split.
+// [fork] llama_memory_hybrid_idx::kpool_prefix switches
+bool kpool_prefix_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_KPOOL_PREFIX");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool kpool_prefix_verify() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_KPOOL_PREFIX_VERIFY");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
+// set while the verify pass rebuilds a state the full way
+thread_local bool kpool_prefix_bypass = false;
+
+// a prefix is taken from this many cells up, stops this far short of the
+// sequence end (the tree rewrites its tail) and is extended in steps
+constexpr size_t KPOOL_PREFIX_MIN_CELLS = 4096;
+constexpr size_t KPOOL_PREFIX_MARGIN    = 256;
+constexpr size_t KPOOL_PREFIX_GROW      = 1024;
+
 uint32_t kpool_pad(uint32_t n_pool, uint32_t kpool, uint32_t kv_size) {
     const uint32_t n_max = kv_size/std::max(1u, kpool) + 1;
     return llama_kv_bucket_pad(n_pool + 1, std::max(n_max, 64u), 64u, kpool);
@@ -872,16 +909,22 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             }
         }
 
+        if (ubatch != nullptr && active.size() == 1) {
+            st.seq_single = active[0];
+        }
+
         // [fork] cells outside the used range are empty, and this scan runs on
         // every tree level: bound it instead of walking the whole cache
-        for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
-            if (cells.is_empty(i)) {
-                continue;
-            }
-            const llama_pos p = cells.pos_get(i);
-            for (const llama_seq_id s : active) {
-                if (cells.seq_has(i, s)) {
-                    st.seqs[s].cells.emplace_back(p, i);
+        if (st.seq_single < 0 || !kpool_layout_from_prefix(st, st.seq_single, *ubatch)) {
+            for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
+                if (cells.is_empty(i)) {
+                    continue;
+                }
+                const llama_pos p = cells.pos_get(i);
+                for (const llama_seq_id s : active) {
+                    if (cells.seq_has(i, s)) {
+                        st.seqs[s].cells.emplace_back(p, i);
+                    }
                 }
             }
         }
@@ -906,14 +949,23 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
         if (sq.cells.empty()) {
             continue;
         }
-        if (!std::is_sorted(sq.cells.begin(), sq.cells.end())) {
+        if (st.n_prefix_pools == 0 && !std::is_sorted(sq.cells.begin(), sq.cells.end())) {
             std::sort(sq.cells.begin(), sq.cells.end());
         }
 
         sq.pos_min = sq.cells.front().first;
 
-        // Pools start at the first valid token
-        for (size_t j = 0; j + kpool <= sq.cells.size(); ) {
+        // Pools start at the first valid token. A prefix is whole pools of
+        // consecutive positions from pos_min, so the grouping resumes after it.
+        size_t j0 = 0;
+        if (st.n_prefix_pools > 0) {
+            sq.pools.resize(st.n_prefix_pools);
+            for (uint32_t pi = 0; pi < st.n_prefix_pools; ++pi) {
+                sq.pools[pi] = pi*kpool;
+            }
+            j0 = (size_t) st.n_prefix_pools*kpool;
+        }
+        for (size_t j = j0; j + kpool <= sq.cells.size(); ) {
             const llama_pos p0 = sq.cells[j].first;
             if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
                 ++j;
@@ -942,6 +994,131 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     }
 
     return st;
+}
+
+// [fork] Lay sequence s out from the memory's prefix plus a scan for its tail.
+// False (and the full scan runs) unless s holds exactly the prefix's cells below
+// the cut; a sequence that no longer does drops the prefix so the next full
+// pass can take a new one.
+bool llama_memory_hybrid_idx_context::kpool_layout_from_prefix(kpool_state & st, llama_seq_id s, const llama_ubatch & ubatch) const {
+    if (!kpool_prefix_enabled() || kpool_prefix_bypass) {
+        return false;
+    }
+    auto & pfx = mem->get_kpool_prefix();
+    if (!pfx.valid || !st.cache_safe) {
+        return false;
+    }
+
+    const auto & cells = mem->get_mem_idx()->get_cells(0);
+    const llama_pos pos_end = pfx.pos_min + (llama_pos) pfx.cells.size();
+
+    // a ubatch that writes below the cut re-pools there
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] < pos_end) {
+            pfx.valid = false;
+            return false;
+        }
+    }
+    if (cells.seq_pos_min(s) != pfx.pos_min) {
+        pfx.valid = false;
+        return false;
+    }
+
+    std::vector<std::pair<llama_pos, uint32_t>> tail;
+    size_t n_below = 0;
+    for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
+        if (!cells.seq_has(i, s)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(i);
+        if (p >= pos_end) {
+            tail.emplace_back(p, i);
+            continue;
+        }
+        if (p < pfx.pos_min || pfx.cells[(size_t) (p - pfx.pos_min)].second != i) {
+            pfx.valid = false;
+            return false;
+        }
+        n_below++;
+    }
+    if (n_below != pfx.cells.size()) {
+        pfx.valid = false;
+        return false;
+    }
+    std::sort(tail.begin(), tail.end());
+
+    auto & sq = st.seqs[s];
+    sq.cells.reserve(pfx.cells.size() + tail.size());
+    sq.cells.assign(pfx.cells.begin(), pfx.cells.end());
+    sq.cells.insert(sq.cells.end(), tail.begin(), tail.end());
+
+    st.n_prefix_pools = (uint32_t) pfx.pcell.size();
+    st.prefix_gen     = pfx.gen;
+    return true;
+}
+
+// [fork] Take or extend the prefix from a finished state: whole fresh pools of
+// consecutive positions from pos_min, one cell per position.
+void llama_memory_hybrid_idx_context::kpool_prefix_update(const kpool_state & st) const {
+    if (!kpool_prefix_enabled() || kpool_prefix_bypass || st.seq_single < 0 || !st.cache_safe) {
+        return;
+    }
+    if (mem->get_mem_idx()->get_n_stream() != 1) {
+        return;
+    }
+
+    const auto & sq = st.seqs[st.seq_single];
+    const uint32_t kpool = mem->get_kpool();
+    auto & pfx = mem->get_kpool_prefix();
+
+    if (sq.cells.size() < KPOOL_PREFIX_MIN_CELLS) {
+        return;
+    }
+    const bool extend = pfx.valid && st.n_prefix_pools > 0 && st.prefix_gen == pfx.gen && st.n_prefix_pools == pfx.pcell.size();
+    if (pfx.valid && !extend) {
+        return;
+    }
+    if (extend && sq.cells.size() - pfx.cells.size() < KPOOL_PREFIX_GROW + KPOOL_PREFIX_MARGIN) {
+        return;
+    }
+
+    const llama_pos p_lim = sq.cells.back().first - (llama_pos) KPOOL_PREFIX_MARGIN;
+
+    size_t n_pools = extend ? st.n_prefix_pools : 0;
+    while (n_pools < sq.pools.size()) {
+        const uint32_t j = sq.pools[n_pools];
+        if (j != n_pools*kpool || sq.is_new[n_pools] || sq.cells[j + kpool - 1].first > p_lim) {
+            break;
+        }
+        bool ok = true;
+        for (uint32_t k = 0; k < kpool && ok; ++k) {
+            ok = sq.cells[j + k].first == sq.pos_min + (llama_pos) (j + k);
+        }
+        if (!ok) {
+            break;
+        }
+        n_pools++;
+    }
+    if (extend ? n_pools == st.n_prefix_pools : n_pools*kpool < KPOOL_PREFIX_MIN_CELLS) {
+        return;
+    }
+
+    if (!extend) {
+        const uint64_t gen = pfx.gen + 1;
+        pfx = llama_memory_hybrid_idx::kpool_prefix{};
+        pfx.gen     = gen;
+        pfx.pos_min = sq.pos_min;
+    }
+    for (size_t pi = pfx.pcell.size(); pi < n_pools; ++pi) {
+        const uint32_t j = sq.pools[pi];
+        for (uint32_t k = 0; k < kpool; ++k) {
+            pfx.cells.push_back(sq.cells[j + k]);
+            pfx.pidx.push_back((int32_t) sq.cells[j + k].second);
+        }
+        pfx.pcell.push_back((int32_t) sq.cells[j + kpool - 1].second);
+        pfx.pool_end.push_back(sq.cells[j + kpool - 1].first);
+    }
+    pfx.valid = true;
 }
 
 // Layout of the cells as of this ubatch plus which pools it completes or rewrites.
@@ -985,6 +1162,13 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p, 0u));
             GGML_ASSERT(it != sq.cells.end() && it->first == p);
             std::fill_n(members.begin() + ((size_t) sq.strm*kv_size + it->second)*kpool, kpool, UINT32_MAX);
+
+            // [fork] the kept prefix claims its pools are fresh: not once one of its cells is rewritten
+            auto & pfx = mem->get_kpool_prefix();
+            if (pfx.valid && !kpool_prefix_bypass && p >= pfx.pos_min && (size_t) (p - pfx.pos_min) < pfx.cells.size() &&
+                    pfx.cells[(size_t) (p - pfx.pos_min)].second == it->second) {
+                pfx.valid = false;
+            }
         }
 
         sq.is_new.assign(sq.pools.size(), all_new ? 1 : 0);
@@ -993,7 +1177,9 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             continue;
         }
 
-        for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
+        // [fork] prefix pools were fresh when the prefix was taken and nothing has written them since
+        const size_t pi0 = s == st.seq_single ? st.n_prefix_pools : 0;
+        for (size_t pi = pi0; pi < sq.pools.size(); ++pi) {
             const uint32_t  j   = sq.pools[pi];
             const llama_pos p0  = sq.cells[j].first;
             const uint32_t  rep = sq.cells[j + kpool - 1].second;
@@ -1013,6 +1199,20 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             }
         }
     }
+
+    if (kpool_prefix_verify() && st.n_prefix_pools > 0 && !kpool_prefix_bypass) {
+        kpool_prefix_bypass = true;
+        const kpool_state ref = kpool_build_state(ubatch);
+        kpool_prefix_bypass = false;
+        const auto & a = st.seqs[st.seq_single];
+        const auto & b = ref.seqs[st.seq_single];
+        if (a.cells != b.cells || a.pools != b.pools || a.is_new != b.is_new || a.pos_min != b.pos_min ||
+                st.n_pool_real != ref.n_pool_real || st.n_new != ref.n_new || st.cache_safe != ref.cache_safe) {
+            GGML_ABORT("kpool prefix: the layout differs from the full rebuild");
+        }
+    }
+
+    kpool_prefix_update(st);
 
     return st;
 }
@@ -1145,7 +1345,37 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
         const bool inert = !gather && n_stream_kv > 1 && !seq_in_ub[s];
 
-        for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
+        // [fork] the rows of the prefix pools are the same on every level
+        size_t pi0 = 0;
+        {
+            const auto & pfx = mem->get_kpool_prefix();
+            const size_t n_pfx = s == st.seq_single ? st.n_prefix_pools : 0;
+            if (n_pfx > 0 && pfx.valid && pfx.gen == st.prefix_gen && pfx.pcell.size() >= n_pfx &&
+                    n_stream_kv == 1 && pool_end.empty() && n_pfx + 1 < n_pool && n_pfx <= sq.pools.size()) {
+                memcpy(pcell, pfx.pcell.data(), n_pfx*sizeof(int32_t));
+                memcpy(pidx,  pfx.pidx.data(),  n_pfx*kpool*sizeof(int32_t));
+                pool_end.assign(pfx.pool_end.begin(), pfx.pool_end.begin() + n_pfx);
+                last_sq = &sq;
+                last_j  = sq.pools[n_pfx - 1];
+                pi0 = n_pfx;
+
+                if (kpool_prefix_verify()) {
+                    for (size_t pi = 0; pi < n_pfx; ++pi) {
+                        const uint32_t j = sq.pools[pi];
+                        bool same = pcell[pi] == (int32_t) gcell(sq, sq.cells[j + kpool - 1].second) &&
+                                    pool_end[pi] == sq.cells[j + kpool - 1].first && !sq.is_new[pi];
+                        for (uint32_t k = 0; k < kpool && same; ++k) {
+                            same = pidx[pi*kpool + k] == (int32_t) (gather ? gcell(sq, sq.cells[j + k].second) : (int64_t) sq.cells[j + k].second);
+                        }
+                        if (!same) {
+                            GGML_ABORT("kpool prefix: the tables differ from the full rebuild");
+                        }
+                    }
+                }
+            }
+        }
+
+        for (size_t pi = pi0; pi < sq.pools.size(); ++pi) {
             const uint32_t j  = sq.pools[pi];
             const uint32_t ip = (uint32_t) pool_end.size();
             GGML_ASSERT(ip + 1 < n_pool);

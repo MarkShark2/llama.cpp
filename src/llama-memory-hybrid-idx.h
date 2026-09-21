@@ -110,6 +110,27 @@ public:
     // next ubatch, in every tree lane graph, on every level.
     std::vector<uint32_t> & get_kpool_members() { return kpool_members; }
 
+    // [fork] The pool layout of a long sequence is rebuilt for every ubatch, and a
+    // prediction tree runs one ubatch per level: at 200k context that was a scan,
+    // a 200k-entry vector, a freshness pass over 50k pools and 1.1 MB of tables,
+    // per level, for the target and again for the drafter. The front of the
+    // sequence does not change between levels, so it is kept here: positions
+    // pos_min .. pos_min + cells.size() - 1, one cell each, grouped into
+    // cells.size()/kpool pools that were all fresh when it was taken. A ubatch
+    // uses it only after checking, cell by cell, that its sequence still holds
+    // exactly these cells below the cut (LLAMA_KPOOL_PREFIX=0 turns it off,
+    // LLAMA_KPOOL_PREFIX_VERIFY=1 checks every use against the full rebuild).
+    struct kpool_prefix {
+        bool      valid   = false;
+        uint64_t  gen     = 0; // bumped whenever the prefix is not an extension of the last one
+        llama_pos pos_min = 0;
+        std::vector<std::pair<llama_pos, uint32_t>> cells;
+        std::vector<int32_t>   pcell;    // pool_cells rows
+        std::vector<int32_t>   pidx;     // pool_idxs rows
+        std::vector<llama_pos> pool_end; // last position of each pool
+    };
+    kpool_prefix & get_kpool_prefix() { return kpool_pfx; }
+
     void set_mtp_dsa_index_share(bool enabled);
     bool get_mtp_dsa_index_share() const { return mtp_dsa_index_share; }
     void set_mtp_dsa_selection(const int32_t * data, size_t size);
@@ -127,6 +148,7 @@ private:
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
     std::vector<uint32_t> kpool_members;
+    kpool_prefix kpool_pfx;
 
     bool mtp_dsa_index_share = false;
     std::vector<int32_t> mtp_dsa_selection;
@@ -208,6 +230,9 @@ private:
     // ubatch == nullptr lays out every live sequence (graph reservation)
     kpool_state kpool_build_layout(const llama_ubatch * ubatch) const;
     kpool_state kpool_build_state(const llama_ubatch & ubatch) const;
+    // [fork] see llama_memory_hybrid_idx::kpool_prefix
+    bool kpool_layout_from_prefix(kpool_state & st, llama_seq_id s, const llama_ubatch & ubatch) const;
+    void kpool_prefix_update(const kpool_state & st) const;
     const kpool_state & kpool_cur() const;
 
     // unique_ptr because kpool_state is incomplete here.
