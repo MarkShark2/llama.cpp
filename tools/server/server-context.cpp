@@ -186,6 +186,21 @@ struct server_batch {
         return true;
     }
 
+    // [fork] n prompt rows of one slot at consecutive positions from pos, no outputs
+    bool add_rows(int32_t id_slot, const float * rows, int32_t n, llama_pos pos) {
+        GGML_ASSERT(batch.pos != nullptr);
+        GGML_ASSERT(tokens.empty() || has_embd); // cannot mix tokens + embd in same batch
+        if ((int32_t)tokens.size() + n > n_tokens_alloc) {
+            return false;
+        }
+        for (int32_t i = 0; i < n; i++) {
+            tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos + i, false, true });
+        }
+        has_embd = true;
+        embd.insert(embd.end(), rows, rows + (size_t) n * n_embd);
+        return true;
+    }
+
     void clear() {
         tokens.clear();
         embd.clear();
@@ -1061,29 +1076,39 @@ static size_t media_run_end(const server_slot & slot, size_t idx) {
     return n_media > 1 ? end : idx;
 }
 
-// encode the run's images, lay them out with the text rows between them and decode it
-// in n_batch pieces, the drafter catching up after each piece as after an image chunk
-static int process_mtmd_run(const server_slot & slot, size_t idx, size_t end) {
+// [fork] the prompt from idx to its end holds media, and all of it is image chunks
+// a media run can carry: the whole rest of the prompt can go out as embedding rows
+static bool media_prompt_rows_ok(const server_slot & slot, size_t idx) {
+    const auto & toks = slot.task->tokens;
+    const size_t n    = slot.task->n_tokens();
+
+    bool any = false;
+    for (size_t pos = idx; pos < n; ) {
+        if (toks[pos] != LLAMA_TOKEN_NULL) {
+            pos++;
+            continue;
+        }
+        const auto & chunk = toks.find_chunk(pos);
+        if (mtmd_input_chunk_get_type(chunk.get()) != MTMD_INPUT_CHUNK_TYPE_IMAGE ||
+            mtmd_decode_use_non_causal(slot.mctx, chunk.get())) {
+            return false;
+        }
+        pos += mtmd_input_chunk_get_n_tokens(chunk.get());
+        any = true;
+    }
+    return any;
+}
+
+// [fork] the embedding rows of prompt positions [idx, end): images encoded, text as its
+// token-embedding rows. out holds (end - idx) rows of the model's input width.
+static int media_fill_rows(const server_slot & slot, size_t idx, size_t end, float * out) {
     const auto & toks = slot.task->tokens;
     const llama_model * model = llama_get_model(slot.ctx_tgt);
     const int32_t n_embd = llama_model_n_embd_inp(model);
-    const int32_t n_rows = (int32_t) (end - idx);
-
-    llama_batch batch = llama_batch_init(n_rows, n_embd, 1);
-    struct batch_guard { llama_batch & b; ~batch_guard() { llama_batch_free(b); } } guard{batch};
-
-    const llama_pos p0 = slot.prompt.tokens.pos_next();
-    for (int32_t i = 0; i < n_rows; i++) {
-        batch.pos     [i]    = p0 + i;
-        batch.n_seq_id[i]    = 1;
-        batch.seq_id  [i][0] = slot.id;
-        batch.logits  [i]    = false;
-    }
-    batch.n_tokens = n_rows;
 
     std::vector<llama_token> text;
     for (size_t pos = idx; pos < end; ) {
-        float * rows = batch.embd + (pos - idx) * n_embd;
+        float * rows = out + (pos - idx) * n_embd;
         if (toks[pos] == LLAMA_TOKEN_NULL) {
             const auto & chunk = toks.find_chunk(pos);
             const size_t n = mtmd_input_chunk_get_n_tokens(chunk.get());
@@ -1108,6 +1133,45 @@ static int process_mtmd_run(const server_slot & slot, size_t idx, size_t end) {
                 return -1;
             }
         }
+    }
+    return 0;
+}
+
+// [fork] record prompt positions [idx, end), decoded as embedding rows, in the slot's cache
+static void media_push_tokens(server_slot & slot, size_t idx, size_t end) {
+    const auto & toks = slot.task->tokens;
+    for (size_t p = idx; p < end; ) {
+        if (toks[p] == LLAMA_TOKEN_NULL) {
+            const auto & chunk = toks.find_chunk(p);
+            slot.prompt.tokens.push_back_placeholder(chunk.get());
+            p += mtmd_input_chunk_get_n_tokens(chunk.get());
+        } else {
+            slot.prompt.tokens.push_back(toks[p]);
+            p++;
+        }
+    }
+}
+
+// encode the run's images, lay them out with the text rows between them and decode it
+// in n_batch pieces, the drafter catching up after each piece as after an image chunk
+static int process_mtmd_run(const server_slot & slot, size_t idx, size_t end) {
+    const int32_t n_embd = llama_model_n_embd_inp(llama_get_model(slot.ctx_tgt));
+    const int32_t n_rows = (int32_t) (end - idx);
+
+    llama_batch batch = llama_batch_init(n_rows, n_embd, 1);
+    struct batch_guard { llama_batch & b; ~batch_guard() { llama_batch_free(b); } } guard{batch};
+
+    const llama_pos p0 = slot.prompt.tokens.pos_next();
+    for (int32_t i = 0; i < n_rows; i++) {
+        batch.pos     [i]    = p0 + i;
+        batch.n_seq_id[i]    = 1;
+        batch.seq_id  [i][0] = slot.id;
+        batch.logits  [i]    = false;
+    }
+    batch.n_tokens = n_rows;
+
+    if (media_fill_rows(slot, idx, end, batch.embd) != 0) {
+        return -1;
     }
 
     const int32_t n_batch = llama_n_batch(slot.ctx_tgt);
@@ -4193,6 +4257,23 @@ private:
         }
     }
 
+    // [fork] a slot whose whole remaining prompt can go into this round's batch as
+    // embedding rows (see media_prompt_rows_ok): prompt work pending, no embeddings
+    // out, no alora, and the rest of the prompt fits one batch. A slot that has not
+    // had its first round yet does not know its cached prefix, so its prompt counts
+    // whole.
+    bool media_prompt_candidate(const server_slot & slot, int32_t n_batch) const {
+        if (slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+            return false;
+        }
+        if (!media_run_enabled(slot) || slot.need_embd() || !slot.inp_embd.empty() || lora_all_alora(slot.lora)) {
+            return false;
+        }
+        const size_t beg = slot.state == SLOT_STATE_STARTED ? 0 : (size_t) slot.prompt.n_tokens();
+        const size_t n   = (size_t) slot.task->n_tokens();
+        return n - beg <= (size_t) n_batch && media_prompt_rows_ok(slot, beg);
+    }
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -4505,7 +4586,15 @@ private:
         // already flushed them, and keeping the batch prompt-only is what
         // holds the primary scheduler at one ubatch shape (see
         // chain_split_prompt). They resume on the lanes next round.
-        const bool deferred_generating = chain_defer_to_prompt();
+        //
+        // [fork] ...and while a media prompt goes into this round whole as
+        // embedding rows (see media_prompt_candidate), which cannot share a batch
+        // with tokens. Their drafts carry over to the next round.
+        bool media_round = false;
+        for (const auto & slot : slots) {
+            media_round = media_round || media_prompt_candidate(slot, llama_n_batch(ctx_tgt));
+        }
+        const bool deferred_generating = chain_defer_to_prompt() || media_round;
         if (!deferred_generating) {
             iterate(generating, [&](server_slot & slot) {
                 slot.handle_last_sampled_token(batch);
@@ -4573,6 +4662,11 @@ private:
 
                 // check if we can batch this slot with the previous one
                 if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                    return;
+                }
+
+                // [fork] a batch of embedding rows takes no tokens
+                if (batch.has_embd && !media_prompt_candidate(slot, n_batch)) {
                     return;
                 }
 
@@ -4929,6 +5023,37 @@ private:
 
                     bool has_mtmd = false;
 
+                    // [fork] the whole rest of a media prompt goes into this batch as
+                    // embedding rows, the images encoded in place and the text as its
+                    // token-embedding rows. The media loop below decodes on its own per
+                    // run of images, and the text around them is a batch of its own,
+                    // each a full fill and drain of a split model's pipeline; this is one
+                    // decode for the prompt, shared by every slot that qualifies. The
+                    // generating slots sit the round out (media_round).
+                    {
+                        const size_t beg = slot.prompt.n_tokens();
+                        const size_t end = slot.task->n_tokens();
+                        if (media_prompt_candidate(slot, n_batch) && (batch.size() == 0 || batch.has_embd) &&
+                            batch.size() + (int32_t) (end - beg) <= n_batch) {
+                            std::vector<float> rows((end - beg) * (size_t) llama_model_n_embd_inp(model_tgt));
+                            int32_t res = 0;
+                            queue_tasks.yield_to_queue([&]() {
+                                res = media_fill_rows(slot, beg, end, rows.data());
+                            });
+                            if (res != 0) {
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return;
+                            }
+                            GGML_ASSERT(batch.add_rows(slot.id, rows.data(), (int32_t) (end - beg), slot.prompt.tokens.pos_next()));
+                            media_push_tokens(slot, beg, end);
+                            SLT_INF(slot, "media prompt: %zu rows (positions %zu..%zu) as embeddings, batch now %d rows\n",
+                                    end - beg, beg, end, batch.size());
+                        } else if (batch.has_embd) {
+                            return;
+                        }
+                    }
+
                     // check if we should process the mtmd chunk
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -4973,16 +5098,7 @@ private:
                         // add the mtmd chunk(s), and the text of a run, to cache
                         // the chunks are already in the KV cache at this point, so we don't need to keep their data around
                         if (run_end > cur_token_idx) {
-                            for (size_t p = cur_token_idx; p < run_end; ) {
-                                if (input_tokens[p] == LLAMA_TOKEN_NULL) {
-                                    const auto & chunk = input_tokens.find_chunk(p);
-                                    slot.prompt.tokens.push_back_placeholder(chunk.get());
-                                    p += mtmd_input_chunk_get_n_tokens(chunk.get());
-                                } else {
-                                    slot.prompt.tokens.push_back(input_tokens[p]);
-                                    p++;
-                                }
-                            }
+                            media_push_tokens(slot, cur_token_idx, run_end);
                         } else {
                             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
                             slot.prompt.tokens.push_back_placeholder(chunk.get());
