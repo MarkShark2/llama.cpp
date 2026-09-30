@@ -1242,6 +1242,12 @@ struct mtmd_tokenizer {
                     if (res == 0) {
                         // OK, append the returned chunk; lazy part is not yet added
                         if (out_bm) {
+                            // [fork] the parts of a lazy source carry its id plus their index: video
+                            // frames came back without one, so any two videos with the same frame
+                            // count and size matched in the server's prompt cache
+                            if (out_bm->id.empty() && !p.bitmap->id.empty()) {
+                                out_bm->id = p.bitmap->id + "#" + std::to_string(i);
+                            }
                             auto & ptr = bm_from_lazy.emplace_back(out_bm); // remember to free it later
                             expanded.push_back({"", ptr.ptr.get()});
                             LOG_DBG("%s: lazy callback returned bitmap with dimensions %d x %d\n", __func__, out_bm->nx, out_bm->ny);
