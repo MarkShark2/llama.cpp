@@ -605,12 +605,58 @@ struct mtmd_helper_video {
     int32_t current_frame = 0;
 
     std::string prompt_start         = "Video:";
+    std::string prompt_end;                       // text after the last frame (model format)
     int32_t     timestamp_interval_ms = 5000; // emit a timestamp text every N ms (0 = disabled)
     float       next_timestamp_ms     = 0.0f; // next elapsed-ms threshold at which to emit
+
+    // model format: a timestamp after every group of N frames replaces the interval ones
+    int32_t     stamp_every_frames = 0;
+    int32_t     stamp_decimals     = 0;
+    std::string stamp_suffix;
 
     std::vector<uint8_t> frame_buf;
     std::string pending_text; // text queued to be returned before the next frame
     bool        start_emitted = false;
+    bool        end_emitted   = false;
+
+    void apply_format() {
+        const mtmd_video_format fmt = mtmd_get_video_format(mctx);
+        if (fmt.start) {
+            prompt_start = fmt.start;
+        }
+        if (fmt.end) {
+            prompt_end = fmt.end;
+        }
+        stamp_every_frames = fmt.stamp_every_frames;
+        stamp_decimals     = fmt.stamp_decimals;
+        stamp_suffix       = fmt.stamp_suffix ? fmt.stamp_suffix : "";
+    }
+
+    std::string group_stamp(int32_t first_frame) const {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.*f%s", stamp_decimals, (double) first_frame / info.fps, stamp_suffix.c_str());
+        return buf;
+    }
+
+    // after the last frame: the stamp of a short last group, then the end text, then EOF
+    int32_t finish(char ** out_text) {
+        if (current_frame == 0) {
+            return -2;
+        }
+        if (!end_emitted) {
+            end_emitted = true;
+            std::string text;
+            if (stamp_every_frames > 0 && current_frame % stamp_every_frames != 0) {
+                text = group_stamp(current_frame - current_frame % stamp_every_frames);
+            }
+            text += prompt_end;
+            if (!text.empty()) {
+                *out_text = strdup(text.c_str());
+                return *out_text ? 0 : -2;
+            }
+        }
+        return -1;
+    }
 
     bool is_buf_input() const {
         return !input_buf.empty();
@@ -813,7 +859,7 @@ struct mtmd_helper_video {
                 __func__, (int)sp.alive, (int)start_emitted, current_frame);
 
         if (!sp.alive) {
-            return (current_frame == 0) ? -2 : -1;
+            return finish(out_text);
         }
 
         if (!start_emitted) {
@@ -825,10 +871,15 @@ struct mtmd_helper_video {
         }
 
         mtmd_bitmap * frame = read_next_frame();
-        if (!frame) return -1;
+        if (!frame) return current_frame == 0 ? -1 : finish(out_text);
         *out_bitmap = frame;
 
-        if (timestamp_interval_ms > 0) {
+        if (stamp_every_frames > 0) {
+            // stamped after the group so the group's frames stay adjacent (they merge)
+            if (current_frame % stamp_every_frames == 0) {
+                pending_text = group_stamp(current_frame - stamp_every_frames);
+            }
+        } else if (timestamp_interval_ms > 0) {
             // current_frame was already incremented by read_next_frame(); undo for elapsed calc
             float elapsed_ms = (float)(current_frame - 1) / info.fps * 1000.0f;
             if (elapsed_ms >= next_timestamp_ms) {
@@ -932,6 +983,7 @@ mtmd_helper_video * mtmd_helper_video_init(
     ctx->ffmpeg_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin          = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->apply_format();
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, path);
@@ -967,6 +1019,7 @@ mtmd_helper_video * mtmd_helper_video_init_from_buf(
     ctx->ffmpeg_bin            = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->apply_format();
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);

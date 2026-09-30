@@ -161,6 +161,20 @@ MTMD_API const char * mtmd_get_marker(const mtmd_context * ctx);
 // adapter). returns NULL and *n_out = 0 when the mmproj carries no palette
 MTMD_API const int32_t * mtmd_get_routing_palette(const mtmd_context * ctx, size_t * n_out);
 
+// how a video is spelled around its frames: `start` before the first frame and `end`
+// after the last (NULL = the video helper's defaults); when `stamp_every_frames` > 0,
+// a timestamp follows every group of that many frames (the last group may be short),
+// written as the group's first-frame time in seconds with `stamp_decimals` decimals
+// plus `stamp_suffix`, instead of the helper's interval timestamps
+struct mtmd_video_format {
+    const char * start;
+    const char * end;
+    int32_t      stamp_every_frames;
+    int32_t      stamp_decimals;
+    const char * stamp_suffix;
+};
+MTMD_API struct mtmd_video_format mtmd_get_video_format(const mtmd_context * ctx);
+
 // mtmd_bitmap
 //
 // if bitmap is image:

@@ -9,7 +9,20 @@ ggml_cgraph * clip_graph_glm4v::build() {
     norm_type norm_t = NORM_TYPE_RMS;
 
     ggml_tensor * inp_raw = build_inp_raw();
-    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+
+    // the patch embedding is a Conv3D over 2 frames, split into two Conv2D kernels:
+    // a still image goes through both, a video frame pair sends one frame through each
+    GGML_ASSERT(n_batch == 1 || n_batch == 2);
+    ggml_tensor * inp_t0 = inp_raw;
+    ggml_tensor * inp_t1 = inp_raw;
+    if (n_batch == 2) {
+        const size_t nb1 = ggml_row_size(inp_raw->type, img.nx());
+        const size_t nb2 = ggml_row_size(inp_raw->type, img.nx() * img.ny());
+        inp_t0 = ggml_view_3d(ctx0, inp_raw, img.nx(), img.ny(), 3, nb1, nb2, 0);
+        inp_t1 = ggml_view_3d(ctx0, inp_raw, img.nx(), img.ny(), 3, nb1, nb2, nb2 * 3);
+    }
+
+    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_t0, patch_size, patch_size, 0, 0, 1, 1);
 
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
     ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches * 4);
@@ -21,7 +34,7 @@ ggml_cgraph * clip_graph_glm4v::build() {
 
     // second conv dimension
     {
-        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_t1, patch_size, patch_size, 0, 0, 1, 1);
         inp = ggml_add(ctx0, inp, inp_1);
 
         inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]

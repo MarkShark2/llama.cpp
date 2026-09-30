@@ -502,6 +502,13 @@ struct mtmd_context {
     std::string aud_beg;
     std::string aud_end;
 
+    // how the video helper spells a video, see mtmd_video_format (empty = helper defaults)
+    std::string vid_beg;
+    std::string vid_end;
+    int32_t     vid_stamp_frames   = 0;
+    int32_t     vid_stamp_decimals = 0;
+    std::string vid_stamp_suffix;
+
     // for llava-uhd style models, we need special tokens in-between slices
     // minicpmv calls them "slices", llama 4 calls them "tiles"
     mtmd_slice_tmpl slice_tmpl = MTMD_SLICE_TMPL_NONE;
@@ -878,6 +885,13 @@ struct mtmd_context {
                     img_beg = "<|begin_of_image|>";
                     img_end = "<|end_of_image|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_glm5v>(ctx_v);
+                    // a video is <|begin_of_video|>, then per frame pair (one temporal patch)
+                    // <|begin_of_image|> ... <|end_of_image|>{t:.1f} seconds, then <|end_of_video|>
+                    vid_beg            = "<|begin_of_video|>";
+                    vid_end            = "<|end_of_video|>";
+                    vid_stamp_frames   = clip_model_n_temporal_merge(ctx_v);
+                    vid_stamp_decimals = 1;
+                    vid_stamp_suffix   = " seconds";
                 } break;
             case PROJECTOR_TYPE_PADDLEOCR:
                 {
@@ -2231,6 +2245,16 @@ const int32_t * mtmd_get_routing_palette(const mtmd_context * ctx, size_t * n_ou
     }
     *n_out = palette.size();
     return palette.data();
+}
+
+mtmd_video_format mtmd_get_video_format(const mtmd_context * ctx) {
+    return {
+        /* start              */ ctx->vid_beg.empty() ? nullptr : ctx->vid_beg.c_str(),
+        /* end                */ ctx->vid_end.empty() ? nullptr : ctx->vid_end.c_str(),
+        /* stamp_every_frames */ ctx->vid_stamp_frames,
+        /* stamp_decimals     */ ctx->vid_stamp_decimals,
+        /* stamp_suffix       */ ctx->vid_stamp_suffix.c_str(),
+    };
 }
 
 //
