@@ -379,6 +379,13 @@ struct server_slot {
             return false;
         }
 
+        // [fork] a prompt whose own request asked for no caching is not worth the state
+        // read: over RPC that read is seconds, with every slot waiting on it
+        const auto & last = task ? task : task_prev;
+        if (last && !last->params.cache_prompt) {
+            return false;
+        }
+
         spec_sync();
 
         const size_t cur_size_tgt = io_tgt->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
