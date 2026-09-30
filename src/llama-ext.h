@@ -315,3 +315,8 @@ LLAMA_API uint32_t        llama_model_n_embd_spd_boundary(const struct llama_mod
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// the token-embedding rows of n_tokens tokens in F32, n_out floats per row (at least
+// n_embd; the tail is zero-filled, as the token path pads to the input width), the
+// rows an embedding batch needs to stand in for those tokens. returns 0, or -1 on error
+LLAMA_API int32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, int32_t n_tokens, float * out, int32_t n_out);

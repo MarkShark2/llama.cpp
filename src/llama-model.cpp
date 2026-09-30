@@ -3791,3 +3791,36 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+int32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, int32_t n_tokens, float * out, int32_t n_out) {
+    const ggml_tensor * tensor = model->tok_embd;
+    if (tensor == nullptr || n_out < tensor->ne[0]) {
+        return -1;
+    }
+    const int64_t n_embd = tensor->ne[0];
+
+    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+    std::vector<uint8_t> row(tensor->nb[1]);
+    for (int32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || tokens[i] >= tensor->ne[1]) {
+            return -1;
+        }
+        ggml_backend_tensor_get(tensor, row.data(), (size_t) tokens[i] * tensor->nb[1], row.size());
+
+        float * dst = out + (size_t) i * n_out;
+        if (tensor->type == GGML_TYPE_F32) {
+            memcpy(dst, row.data(), n_embd * sizeof(float));
+        } else if (tensor->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) row.data(), dst, n_embd);
+        } else if (tensor->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) row.data(), dst, n_embd);
+        } else if (ggml_is_quantized(tensor->type) && traits->to_float != nullptr) {
+            traits->to_float(row.data(), dst, n_embd);
+        } else {
+            return -1;
+        }
+        // the token path pads to the context's input width the same way
+        std::fill(dst + n_embd, dst + n_out, 0.0f);
+    }
+    return 0;
+}
