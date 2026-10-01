@@ -365,6 +365,12 @@ static void test_loops(testing & t) {
         json::object(),
         "012"
     );
+
+    test_template(t, "set in a loop body lasts one iteration",
+        "{% for m in items %}{% if m.r is defined %}{% set r = m.r %}{% endif %}[{{ r if r is defined else 'none' }}]{% endfor %}",
+        {{"items", json::array({json{{"r", "a"}}, json::object(), json{{"r", "c"}}, json::object()})}},
+        "[a][none][c][none]"
+    );
 }
 
 static void test_expressions(testing & t) {
