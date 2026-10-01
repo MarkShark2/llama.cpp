@@ -5710,6 +5710,10 @@ private:
             return;
         }
 
+        // the tree decodes the root at pos, so it joins the cache here like a
+        // classic `sampled`; tree_step pushes only the tokens sampled after it
+        slot.prompt.tokens.push_back(id);
+
         slot.tree_active = true;
         SLT_DBG(slot, "tree begin: root=%d pos=%d\n", id, pos);
     }
