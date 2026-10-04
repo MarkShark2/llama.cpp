@@ -129,6 +129,8 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
     fprintf(stderr, "  TTSTransformer backend: %s\n", device_name);
+    step_ffn_down_f32_ = !device ||
+        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "Vulkan") != 0;
 
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -1869,8 +1871,16 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = mul_mat_lora(ctx0, ffn_down_f32, layer.ffn_down_lora, cur);
+        // The f32 cast keeps ffn_down's outlier-heavy input from being
+        // narrowed by a quantized or f16 matmul, but it rewrites the whole
+        // weight on every step (1.4 GB per talker frame, 55 % of a V340's
+        // time per frame). A one-token Vulkan mat-vec of a q8_0 weight on
+        // these GPUs dequantizes in the shader against the f32 activation
+        // (Vega 10 has no integer dot, RDNA keeps q8_0 off that path), so
+        // the step graphs skip it there. Prefill graphs keep the cast.
+        struct ggml_tensor * ffn_down = step_ffn_down_f32_
+            ? ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32) : layer.ffn_down;
+        cur = mul_mat_lora(ctx0, ffn_down, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -2288,8 +2298,10 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * step_ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = mul_mat_lora(ctx0, step_ffn_down_f32, layer.ffn_down_lora, cur);
+        // no f32 cast on Vulkan, as in build_step_graph
+        struct ggml_tensor * ffn_down = step_ffn_down_f32_
+            ? ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32) : layer.ffn_down;
+        cur = mul_mat_lora(ctx0, ffn_down, layer.ffn_down_lora, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }

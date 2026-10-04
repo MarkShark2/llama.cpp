@@ -485,8 +485,12 @@ int main(int argc, char ** argv) {
 
     httplib::Server svr;
 
-    // log all requests
+    // log every request except a successful GET: clients poll /health and the
+    // model/voice lists every few seconds, which buried the synthesis lines
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
+        if (req.method == "GET" && res.status < 400) {
+            return;
+        }
         fprintf(stderr, "%s %s%s%s -> %d\n",
                 req.method.c_str(), req.path.c_str(),
                 req.params.empty() ? "" : "?",

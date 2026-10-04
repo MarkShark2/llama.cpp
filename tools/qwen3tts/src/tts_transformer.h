@@ -440,6 +440,9 @@ private:
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
     bool verbose_ = false;
+    // false on Vulkan: the one-token step graphs then feed ffn_down to its
+    // matmul as stored instead of casting it to f32 (see build_step_graph)
+    bool step_ffn_down_f32_ = true;
     frame_emit_fn frame_cb_;
 
     // Stats populated by generate()

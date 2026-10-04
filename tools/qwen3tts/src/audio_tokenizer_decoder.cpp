@@ -282,9 +282,18 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
+    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
+    if (!state_.backend) {
+        return false;
+    }
+    ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
+
+    // Weights go on the device the decoder computes on. This used to ask for
+    // an IGPU only: right on a BC-250, but a discrete GPU (skynet's V340)
+    // fell back to a CPU buffer and the whole vocoder ran on the host CPU.
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_,
-                                     GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+                                     device ? ggml_backend_dev_type(device) : GGML_BACKEND_DEVICE_TYPE_CPU)) {
         return false;
     }
     
@@ -349,12 +358,6 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
-    if (!state_.backend) {
-        return false;
-    }
-
-    ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
     fprintf(stderr, "  AudioTokenizerDecoder backend: %s\n", device_name);
     
