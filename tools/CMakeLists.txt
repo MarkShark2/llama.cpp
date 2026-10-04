@@ -46,5 +46,6 @@ else()
     if (LLAMA_BUILD_COMMON)
         # qwen3tts links cpp-httplib, which is only added under LLAMA_BUILD_COMMON
         add_subdirectory(qwen3tts)
+        add_subdirectory(breezetts)
     endif()
 endif()
