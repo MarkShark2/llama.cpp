@@ -438,15 +438,15 @@ ggml_tensor * decoder_layer(ggml_context * c, ggml_cgraph * gf, const dec_dims &
     q = rnd(c, ggml_rope_ext(c, q, pos, rope_factors, d.hd, GGML_ROPE_TYPE_NEOX, 0, d.theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f));
     k = rnd(c, ggml_rope_ext(c, k, pos, rope_factors, d.hd, GGML_ROPE_TYPE_NEOX, 0, d.theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f));
 
-    const int64_t n_ctx = kc->ne[2];
-    ggml_tensor * kc2 = ggml_view_2d(c, kc, kv_dim, n_ctx, kc->nb[2], 0);
+    // the K cache is a plain 2D leaf so rope + cache write stay three adjacent nodes the backend can fuse
+    const int64_t n_ctx = kc->ne[1];
     ggml_tensor * vc2 = ggml_view_2d(c, vc, kv_dim, n_ctx, vc->nb[2], 0);
     // a VIEW (not a reshape) with I64 row indices lets the Vulkan backend fuse rope + cache write
     ggml_tensor * k2 = ggml_view_2d(c, k, kv_dim, n, (size_t) kv_dim * sizeof(float), 0);
-    ggml_build_forward_expand(gf, ggml_set_rows(c, kc2, k2, rows64));
+    ggml_build_forward_expand(gf, ggml_set_rows(c, kc, k2, rows64));
     ggml_build_forward_expand(gf, ggml_set_rows(c, vc2, v2, rows64));
 
-    ggml_tensor * K = ggml_view_3d(c, kc, d.hd, d.kv_heads, n_kv, kc->nb[1], kc->nb[2], 0);
+    ggml_tensor * K = ggml_view_3d(c, kc, d.hd, d.kv_heads, n_kv, d.hd * ggml_type_size(kc->type), kc->nb[1], 0);
     ggml_tensor * V = ggml_view_3d(c, vc, d.hd, d.kv_heads, n_kv, vc->nb[1], vc->nb[2], 0);
     ggml_tensor * Q = ggml_permute(c, q, 0, 2, 1, 3);
     K = ggml_permute(c, K, 0, 2, 1, 3);
@@ -795,11 +795,11 @@ bool engine_impl::load(const std::string & model_path, const std::string & codec
     ggml_init_params cp = {ggml_tensor_overhead() * 256, nullptr, true};
     cache_ctx = ggml_init(cp);
     for (int il = 0; il < kLayers; il++) {
-        bb_k.push_back(ggml_new_tensor_3d(cache_ctx, GGML_TYPE_F16, kHeadDim, kKvHeads, n_ctx));
+        bb_k.push_back(ggml_new_tensor_2d(cache_ctx, GGML_TYPE_F16, kHeadDim * kKvHeads, n_ctx));
         bb_v.push_back(ggml_new_tensor_3d(cache_ctx, GGML_TYPE_F16, kHeadDim, kKvHeads, n_ctx));
     }
     for (int il = 0; il < kDLayers; il++) {
-        dp_k.push_back(ggml_new_tensor_3d(cache_ctx, GGML_TYPE_F16, kHeadDim, kDKvHeads, kDCtx));
+        dp_k.push_back(ggml_new_tensor_2d(cache_ctx, GGML_TYPE_F16, kHeadDim * kDKvHeads, kDCtx));
         dp_v.push_back(ggml_new_tensor_3d(cache_ctx, GGML_TYPE_F16, kHeadDim, kDKvHeads, kDCtx));
     }
     cache_buf = ggml_backend_alloc_ctx_tensors(cache_ctx, backend);
