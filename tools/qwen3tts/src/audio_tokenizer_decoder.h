@@ -317,7 +317,14 @@ private:
     std::vector<std::vector<float>> past_k_hosts_;
     std::vector<std::vector<float>> past_v_hosts_;
 
-    int32_t n_past_ = 0;  // current KV / tail history length
+    int32_t n_past_ = 0;  // absolute position of the next frame (history length)
+
+    // The pre-transformer attends over a sliding window of this many positions (the reference
+    // config's sliding_window), so the KV a streaming call keeps is bounded to window - 1 entries.
+    static constexpr int32_t kAttnWindow = 72;
+    // additive attention mask input (0 / -inf) of the graph being built; shared by all layers
+    struct ggml_tensor * attn_mask_ = nullptr;
+    void fill_attn_mask(struct ggml_cgraph * gf, int32_t n_frames, int32_t kv_past);
 
     // Create a causal-conv tail input tensor, concat it with x along dim 0,
     // register the input in tail_names_, and (in streaming mode) also emit

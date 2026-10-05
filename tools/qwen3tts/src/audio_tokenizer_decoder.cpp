@@ -542,9 +542,8 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
     
     struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
     KQ = ggml_scale(ctx, KQ, 1.0f / sqrtf((float)head_dim));
-    // Apply causal mask. n_past is the KV-cache length; with n_past=0
-    // this reduces to the original full causal mask.
-    KQ = ggml_diag_mask_inf(ctx, KQ, n_past);
+    // causal + sliding-window mask (additive 0 / -inf), filled by fill_attn_mask()
+    KQ = ggml_add(ctx, KQ, attn_mask_);
     KQ = ggml_soft_max(ctx, KQ);
     
     V = ggml_cont(ctx, ggml_transpose(ctx, V));
@@ -694,10 +693,10 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, out_channels, 1);
 
-     // Python CausalTransConvNet: left_pad = right_pad = kernel_size - stride.
-     // For Qwen decoder blocks kernel = 2*stride so left_pad == right_pad == stride.
+     // Python CausalTransConvNet: left_pad = 0, right_pad = kernel_size - stride, so a block
+     // maps L input samples to exactly L * stride output samples.
      int pad = kernel_size - upsample_rate;
-     int left_pad = pad;
+     int left_pad = 0;
      int right_pad = pad;
      int64_t out_seq_len = new_seq_len - left_pad - right_pad;
 
@@ -752,9 +751,8 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
              ctx, raw, new_seq_len - s, out_channels, 1,
              raw->nb[1], raw->nb[2], s * raw->nb[0]);
          struct ggml_tensor * combined = ggml_concat(ctx, head_plus, ggml_cont(ctx, rest_view), 0);
-         // emit [left_pad : new_seq_len - s] on the first chunk (n_past==0),
-         // else [0 : new_seq_len - s]. right-tail (last s) is always held back.
-         int64_t emit_start = (n_past_ == 0) ? (int64_t) left_pad : 0;
+         // emit [0 : new_seq_len - s]; the right-tail (last s) is always held back.
+         int64_t emit_start = 0;
          int64_t emit_len = (new_seq_len - s) - emit_start;
          x = ggml_view_3d(ctx, combined, emit_len, out_channels, 1,
                           combined->nb[1], combined->nb[2], emit_start * combined->nb[0]);
@@ -894,8 +892,14 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
     
+     // n_past is the absolute position; the KV a streaming call carries is bounded by the window
+     const int32_t kv_past = streaming_mode_ ? std::min(n_past, kAttnWindow - 1) : 0;
+     attn_mask_ = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kv_past + n_frames, n_frames);
+     ggml_set_name(attn_mask_, "attn_mask");
+     ggml_set_input(attn_mask_);
+
      for (int i = 0; i < cfg.n_pre_tfm_layers; ++i) {
-         cur = apply_pre_tfm_layer(ctx0, cur, model_.pre_tfm_layers[i], n_frames, n_past, i, positions);
+         cur = apply_pre_tfm_layer(ctx0, cur, model_.pre_tfm_layers[i], n_frames, kv_past, i, positions);
      }
      
      if (model_.pre_tfm_norm_w) {
@@ -951,7 +955,7 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      
      ggml_set_name(cur, "dec6_output");
     
-    cur = ggml_tanh(ctx0, cur);
+    cur = ggml_clamp(ctx0, cur, -1.0f, 1.0f);
     
     cur = ggml_reshape_1d(ctx0, cur, cur->ne[0]);
     
@@ -1076,6 +1080,8 @@ bool AudioTokenizerDecoder::decode_oneshot(const int32_t * codes, int32_t n_fram
     
 
     
+    fill_attn_mask(gf, n_frames, 0);
+
     struct ggml_tensor * positions_tensor = ggml_graph_get_tensor(gf, "positions");
     if (positions_tensor) {
         std::vector<int32_t> positions(n_frames);
@@ -1118,6 +1124,20 @@ bool AudioTokenizerDecoder::decode_oneshot(const int32_t * codes, int32_t n_fram
     ggml_backend_sched_reset(state_.sched);
 
     return true;
+}
+
+void AudioTokenizerDecoder::fill_attn_mask(struct ggml_cgraph * gf, int32_t n_frames, int32_t kv_past) {
+    struct ggml_tensor * t = ggml_graph_get_tensor(gf, "attn_mask");
+    if (!t) return;
+    const int32_t n_kv = kv_past + n_frames;
+    std::vector<float> m((size_t) n_kv * n_frames, 0.0f);
+    for (int32_t q = 0; q < n_frames; ++q) {
+        const int32_t qpos = kv_past + q;
+        for (int32_t k = 0; k < n_kv; ++k) {
+            if (k > qpos || qpos - k >= kAttnWindow) m[(size_t) q * n_kv + k] = -INFINITY;
+        }
+    }
+    ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(float));
 }
 
 void AudioTokenizerDecoder::stream_reset() {
@@ -1180,6 +1200,9 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
         }
         ggml_backend_tensor_set(cb_tensor, cb_codes.data(), 0, n_frames * sizeof(int32_t));
     }
+
+    const int32_t kv_past = std::min(n_past_, kAttnWindow - 1);
+    fill_attn_mask(gf, n_frames, kv_past);
 
     struct ggml_tensor * positions_tensor = ggml_graph_get_tensor(gf, "positions");
     if (positions_tensor) {
@@ -1261,11 +1284,14 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
         struct ggml_tensor * nk = ggml_graph_get_tensor(gf, kv.next_k_out.c_str());
         struct ggml_tensor * nv = ggml_graph_get_tensor(gf, kv.next_v_out.c_str());
         if (!nk || !nv) continue;
-        size_t n_elems = (size_t) head_dim * n_heads * (n_past_ + n_frames);
-        past_k_hosts_[i].assign(n_elems, 0.0f);
-        past_v_hosts_[i].assign(n_elems, 0.0f);
-        ggml_backend_tensor_get(nk, past_k_hosts_[i].data(), 0, ggml_nbytes(nk));
-        ggml_backend_tensor_get(nv, past_v_hosts_[i].data(), 0, ggml_nbytes(nv));
+        const size_t entry = (size_t) head_dim * n_heads;                    // floats per position
+        const int32_t have = kv_past + n_frames;                             // positions the graph returned
+        const int32_t keep = std::min(have, kAttnWindow - 1);                // positions that stay in the window
+        const size_t skip = (size_t) (have - keep) * entry;
+        past_k_hosts_[i].assign((size_t) keep * entry, 0.0f);
+        past_v_hosts_[i].assign((size_t) keep * entry, 0.0f);
+        ggml_backend_tensor_get(nk, past_k_hosts_[i].data(), skip * sizeof(float), past_k_hosts_[i].size() * sizeof(float));
+        ggml_backend_tensor_get(nv, past_v_hosts_[i].data(), skip * sizeof(float), past_v_hosts_[i].size() * sizeof(float));
     }
 
     n_past_ += n_frames;
