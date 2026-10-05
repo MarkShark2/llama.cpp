@@ -149,8 +149,7 @@ static void print_usage(const char * prog) {
             "  -m, --model <file>          Breeze-TTS-2 GGUF\n"
             "  -v, --vocoder <file>        Qwen3-TTS tokenizer GGUF (codec)\n"
             "      --lora <file>           LoRA GGUF (convert_lora.py), merged into the weights at load\n"
-            "      --plain-prompt          no instruction in the prompt (what a LoRA is trained on)
-"
+            "      --plain-prompt          no instruction in the prompt (what a LoRA is trained on)\n"
             "      --lora-strength <f>     multiplier of the trained alpha/rank scale (default 1)\n"
             "  -H, --host <host>           listen host (default 127.0.0.1)\n"
             "  -p, --port <port>           listen port (default 8080)\n"
