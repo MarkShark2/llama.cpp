@@ -125,6 +125,8 @@ static json error_json(const std::string & msg, const char * type) {
 
 struct server_params {
     std::string model, codec;
+    std::string lora;
+    float lora_strength = 1.0f;
     std::string instruction = "Speak clearly and naturally.";
     std::string voice_audio, voice_text;
     int64_t anchor_seed = -1;          // >= 0: synthesize the default voice from the instruction
@@ -145,6 +147,8 @@ static void print_usage(const char * prog) {
             "usage: %s -m <breeze.gguf> -v <qwen3-tts-tokenizer.gguf> [options]\n"
             "  -m, --model <file>          Breeze-TTS-2 GGUF\n"
             "  -v, --vocoder <file>        Qwen3-TTS tokenizer GGUF (codec)\n"
+            "      --lora <file>           LoRA GGUF (convert_lora.py), merged into the weights at load\n"
+            "      --lora-strength <f>     multiplier of the trained alpha/rank scale (default 1)\n"
             "  -H, --host <host>           listen host (default 127.0.0.1)\n"
             "  -p, --port <port>           listen port (default 8080)\n"
             "  -c, --ctx <n>               backbone context in frames/tokens (default 2048)\n"
@@ -173,6 +177,8 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         if (a == "-h" || a == "--help") { print_usage(argv[0]); exit(0); }
         else if (a == "-m" || a == "--model")        { if (!(v = next("model"))) return false; sp.model = v; }
         else if (a == "-v" || a == "--vocoder")      { if (!(v = next("vocoder"))) return false; sp.codec = v; }
+        else if (a == "--lora")                      { if (!(v = next("lora"))) return false; sp.lora = v; }
+        else if (a == "--lora-strength")             { if (!(v = next("lora-strength"))) return false; sp.lora_strength = std::stof(v); }
         else if (a == "-H" || a == "--host")         { if (!(v = next("host"))) return false; sp.host = v; }
         else if (a == "-p" || a == "--port")         { if (!(v = next("port"))) return false; sp.port = std::stoi(v); }
         else if (a == "-c" || a == "--ctx")          { if (!(v = next("ctx"))) return false; sp.n_ctx = std::stoi(v); }
@@ -218,6 +224,7 @@ int main(int argc, char ** argv) {
     breeze_tts::engine eng;
     fprintf(stderr, "loading model: %s\n", sp.model.c_str());
     std::string err;
+    if (!sp.lora.empty()) eng.set_lora(sp.lora, sp.lora_strength);
     if (!eng.load(sp.model, sp.codec, sp.n_ctx, err)) {
         fprintf(stderr, "fatal: %s\n", err.c_str());
         return 1;

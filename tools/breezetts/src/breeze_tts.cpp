@@ -24,6 +24,8 @@
 #include <functional>
 #include <random>
 #include <set>
+#include <thread>
+#include <thread>
 
 namespace breeze_tts {
 
@@ -255,6 +257,8 @@ public:
         data_off_ = gguf_get_data_offset(g_);
         return true;
     }
+    gguf_context * ctx() const { return g_; }
+    gguf_context * ctx() const { return g_; }
     bool find(const std::string & name, src_tensor & t) const {
         // names past ggml's 64-byte limit are stored as "_audiocpp.<index>", the index being
         // the position of the real name in the audiocpp.tensor_names array
@@ -318,6 +322,139 @@ private:
 struct upload {
     ggml_tensor * dst;
     std::function<bool(const gguf_file &, std::string &)> run;
+};
+
+// A LoRA adapter (convert_lora.py output) merged into the base weights while they load, so serving
+// pays nothing per step.  The stored matrix is dequantized, W += scale * B A, and requantized.
+struct lora_adapter {
+    gguf_file file;
+    float scale = 1.0f;
+    size_t merged = 0;
+
+    bool open(const std::string & path, float strength, std::string & err) {
+        if (!file.open(path, err)) return false;
+        const int64_t kr = gguf_find_key(file.ctx(), "breeze-tts.lora.rank");
+        const int64_t ka = gguf_find_key(file.ctx(), "breeze-tts.lora.alpha");
+        if (kr < 0 || ka < 0) {
+            err = "not a breeze-tts LoRA GGUF: " + path;
+            return false;
+        }
+        scale = gguf_get_val_f32(file.ctx(), ka) / (float) gguf_get_val_u32(file.ctx(), kr) * strength;
+        return true;
+    }
+    bool has(const std::string & key) const {
+        src_tensor t;
+        return file.find(key + ".lora_a", t);
+    }
+    // `raw` holds the stored bytes of the matrix `key` ("<weight name> minus .weight")
+    bool merge(const std::string & key, const src_tensor & s, uint8_t * raw, std::string & err) {
+        src_tensor ta, tb;
+        if (!file.find(key + ".lora_a", ta) || !file.find(key + ".lora_b", tb)) return true;
+        const int64_t in = s.ne[0], out = s.ne[1], r = ta.ne[1];
+        if (ta.ne[0] != in || tb.ne[1] != out || tb.ne[0] != r) {
+            err = "LoRA shape mismatch for " + key;
+            return false;
+        }
+        std::vector<float> A(in * r), B(out * r);
+        if (!file.read(ta.offset, A.data(), A.size() * sizeof(float)) ||
+            !file.read(tb.offset, B.data(), B.size() * sizeof(float))) {
+            err = "short read (LoRA " + key + ")";
+            return false;
+        }
+        const ggml_type_traits * tr = ggml_get_type_traits(s.type);
+        if (!tr || !tr->to_float) {
+            err = "cannot merge LoRA into this weight type: " + key;
+            return false;
+        }
+        const size_t row_bytes = ggml_row_size(s.type, in);
+        const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        auto work = [&](int64_t o0, int64_t o1) {
+            std::vector<float> row(in);
+            std::vector<uint8_t> q(row_bytes);
+            for (int64_t o = o0; o < o1; o++) {
+                uint8_t * dst = raw + o * row_bytes;
+                tr->to_float(dst, row.data(), in);
+                for (int64_t k = 0; k < r; k++) {
+                    const float c = scale * B[o * r + k];
+                    const float * a = &A[k * in];
+                    for (int64_t i = 0; i < in; i++) row[i] += c * a[i];
+                }
+                if (s.type == GGML_TYPE_F32) memcpy(dst, row.data(), row_bytes);
+                else ggml_quantize_chunk(s.type, row.data(), dst, 0, 1, in, nullptr);
+            }
+        };
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; t++) th.emplace_back(work, out * t / nt, out * (t + 1) / nt);
+        for (auto & t : th) t.join();
+        merged++;
+        return true;
+    }
+};
+
+// A LoRA adapter (convert_lora.py output) merged into the base weights while they load, so serving
+// pays nothing per step.  The stored matrix is dequantized, W += scale * B A, and requantized.
+struct lora_adapter {
+    gguf_file file;
+    float scale = 1.0f;
+    size_t merged = 0;
+
+    bool open(const std::string & path, float strength, std::string & err) {
+        if (!file.open(path, err)) return false;
+        const int64_t kr = gguf_find_key(file.ctx(), "breeze-tts.lora.rank");
+        const int64_t ka = gguf_find_key(file.ctx(), "breeze-tts.lora.alpha");
+        if (kr < 0 || ka < 0) {
+            err = "not a breeze-tts LoRA GGUF: " + path;
+            return false;
+        }
+        scale = gguf_get_val_f32(file.ctx(), ka) / (float) gguf_get_val_u32(file.ctx(), kr) * strength;
+        return true;
+    }
+    bool has(const std::string & key) const {
+        src_tensor t;
+        return file.find(key + ".lora_a", t);
+    }
+    // `raw` holds the stored bytes of the matrix `key` ("<weight name> minus .weight")
+    bool merge(const std::string & key, const src_tensor & s, uint8_t * raw, std::string & err) {
+        src_tensor ta, tb;
+        if (!file.find(key + ".lora_a", ta) || !file.find(key + ".lora_b", tb)) return true;
+        const int64_t in = s.ne[0], out = s.ne[1], r = ta.ne[1];
+        if (ta.ne[0] != in || tb.ne[1] != out || tb.ne[0] != r) {
+            err = "LoRA shape mismatch for " + key;
+            return false;
+        }
+        std::vector<float> A(in * r), B(out * r);
+        if (!file.read(ta.offset, A.data(), A.size() * sizeof(float)) ||
+            !file.read(tb.offset, B.data(), B.size() * sizeof(float))) {
+            err = "short read (LoRA " + key + ")";
+            return false;
+        }
+        const ggml_type_traits * tr = ggml_get_type_traits(s.type);
+        if (!tr || !tr->to_float) {
+            err = "cannot merge LoRA into this weight type: " + key;
+            return false;
+        }
+        const size_t row_bytes = ggml_row_size(s.type, in);
+        const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        auto work = [&](int64_t o0, int64_t o1) {
+            std::vector<float> row(in);
+            for (int64_t o = o0; o < o1; o++) {
+                uint8_t * dst = raw + o * row_bytes;
+                tr->to_float(dst, row.data(), in);
+                for (int64_t k = 0; k < r; k++) {
+                    const float c = scale * B[o * r + k];
+                    const float * a = &A[k * in];
+                    for (int64_t i = 0; i < in; i++) row[i] += c * a[i];
+                }
+                if (s.type == GGML_TYPE_F32) memcpy(dst, row.data(), row_bytes);
+                else ggml_quantize_chunk(s.type, row.data(), dst, 0, 1, in, nullptr);
+            }
+        };
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; t++) th.emplace_back(work, out * t / nt, out * (t + 1) / nt);
+        for (auto & t : th) t.join();
+        merged++;
+        return true;
+    }
 };
 
 std::vector<float> llama3_rope_factors(int head_dim, float theta, float factor,
@@ -529,6 +666,9 @@ struct engine_impl {
     model_weights w;
     bpe_tokenizer tok;
     int n_ctx = 2048;
+    std::string lora_path;
+    float lora_strength = 1.0f;
+    std::unique_ptr<lora_adapter> lora;
     int32_t bos = 2, s0 = 262146, ins_bos = 262156, ins_eos = 262157;
 
     // kv caches
@@ -589,6 +729,12 @@ bool engine_impl::load(const std::string & model_path, const std::string & codec
 
     gguf_file gf;
     if (!gf.open(model_path, e)) return false;
+    if (!lora_path.empty()) {
+        lora = std::make_unique<lora_adapter>();
+        if (!lora->open(lora_path, lora_strength, e)) return false;
+        fprintf(stderr, "breeze-tts: LoRA %s (scale %.3f)\n", lora_path.c_str(), lora->scale);
+    }
+    lora_adapter * lo = lora.get();
 
     std::string tj;
     if (!gf.embedded("tokenizer.json", tj)) {
@@ -623,7 +769,15 @@ bool engine_impl::load(const std::string & model_path, const std::string & codec
         if (!find(name, s)) return nullptr;
         ggml_tensor * t = ggml_new_tensor_2d(c, s.type, s.ne[0], s.ne[1]);
         ggml_set_name(t, name.c_str());
-        ups.push_back({t, [s, t](const gguf_file & f, std::string & er) {
+        const std::string key = name.substr(0, name.size() - 7);  // minus ".weight"
+        ups.push_back({t, [s, t, lo, key](const gguf_file & f, std::string & er) {
+            if (lo && lo->has(key)) {
+                std::vector<uint8_t> whole(s.size);
+                if (!f.read(s.offset, whole.data(), s.size)) { er = "short read"; return false; }
+                if (!lo->merge(key, s, whole.data(), er)) return false;
+                ggml_backend_tensor_set(t, whole.data(), 0, s.size);
+                return true;
+            }
             std::vector<uint8_t> buf(std::min<size_t>(s.size, 64u << 20));
             for (size_t off = 0; off < s.size; off += buf.size()) {
                 const size_t n = std::min(buf.size(), s.size - off);
@@ -644,12 +798,14 @@ bool engine_impl::load(const std::string & model_path, const std::string & codec
         }
         ggml_tensor * t = ggml_new_tensor_2d(c, ss[0].type, ss[0].ne[0], out);
         ggml_set_name(t, label.c_str());
-        ups.push_back({t, [ss, t](const gguf_file & f, std::string & er) {
+        ups.push_back({t, [ss, t, lo, names](const gguf_file & f, std::string & er) {
             size_t dst = 0;
             std::vector<uint8_t> buf;
-            for (const auto & s : ss) {
+            for (size_t si = 0; si < ss.size(); si++) {
+                const auto & s = ss[si];
                 buf.resize(s.size);
                 if (!f.read(s.offset, buf.data(), s.size)) { er = "short read"; return false; }
+                if (lo && !lo->merge(names[si].substr(0, names[si].size() - 7), s, buf.data(), er)) return false;
                 ggml_backend_tensor_set(t, buf.data(), dst, s.size);
                 dst += s.size;
             }
@@ -789,6 +945,7 @@ bool engine_impl::load(const std::string & model_path, const std::string & codec
             return false;
         }
     }
+    if (lora) fprintf(stderr, "breeze-tts: merged %zu LoRA matrices\n", lora->merged);
     fprintf(stderr, "breeze-tts: weights loaded in %lld ms\n", (long long) ms_since(t0));
 
     // ---- kv caches ---------------------------------------------------------------
@@ -1237,6 +1394,11 @@ tts_result engine_impl::synthesize(const std::string & text, const tts_params & 
 
 engine::engine() : impl_(new engine_impl()) {}
 engine::~engine() = default;
+
+void engine::set_lora(const std::string & path, float strength) {
+    impl_->lora_path = path;
+    impl_->lora_strength = strength;
+}
 
 bool engine::load(const std::string & model_path, const std::string & codec_path, int n_ctx, std::string & err) {
     return impl_->load(model_path, codec_path, n_ctx, err);

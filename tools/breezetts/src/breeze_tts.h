@@ -79,6 +79,10 @@ public:
     engine();
     ~engine();
 
+    // a convert_lora.py adapter merged into the weights at load; call before load().
+    // strength multiplies the trained alpha/rank scale
+    void set_lora(const std::string & path, float strength);
+
     // model: the audio.cpp Breeze-TTS-2 GGUF; codec: qwen3-tts-tokenizer GGUF
     bool load(const std::string & model_path, const std::string & codec_path,
               int n_ctx, std::string & err);
