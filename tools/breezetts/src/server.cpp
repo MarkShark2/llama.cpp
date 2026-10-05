@@ -126,6 +126,7 @@ static json error_json(const std::string & msg, const char * type) {
 struct server_params {
     std::string model, codec;
     std::string lora;
+    bool plain_prompt = false;
     float lora_strength = 1.0f;
     std::string instruction = "Speak clearly and naturally.";
     std::string voice_audio, voice_text;
@@ -148,6 +149,8 @@ static void print_usage(const char * prog) {
             "  -m, --model <file>          Breeze-TTS-2 GGUF\n"
             "  -v, --vocoder <file>        Qwen3-TTS tokenizer GGUF (codec)\n"
             "      --lora <file>           LoRA GGUF (convert_lora.py), merged into the weights at load\n"
+            "      --plain-prompt          no instruction in the prompt (what a LoRA is trained on)
+"
             "      --lora-strength <f>     multiplier of the trained alpha/rank scale (default 1)\n"
             "  -H, --host <host>           listen host (default 127.0.0.1)\n"
             "  -p, --port <port>           listen port (default 8080)\n"
@@ -178,6 +181,7 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         else if (a == "-m" || a == "--model")        { if (!(v = next("model"))) return false; sp.model = v; }
         else if (a == "-v" || a == "--vocoder")      { if (!(v = next("vocoder"))) return false; sp.codec = v; }
         else if (a == "--lora")                      { if (!(v = next("lora"))) return false; sp.lora = v; }
+        else if (a == "--plain-prompt")              { sp.plain_prompt = true; }
         else if (a == "--lora-strength")             { if (!(v = next("lora-strength"))) return false; sp.lora_strength = std::stof(v); }
         else if (a == "-H" || a == "--host")         { if (!(v = next("host"))) return false; sp.host = v; }
         else if (a == "-p" || a == "--port")         { if (!(v = next("port"))) return false; sp.port = std::stoi(v); }
@@ -261,6 +265,7 @@ int main(int argc, char ** argv) {
         // codes are the reference, so nothing passes through the lossy audio encoder.
         breeze_tts::tts_params ap;
         ap.instruction = sp.instruction;
+        ap.plain_prompt = sp.plain_prompt;
         ap.seed = sp.anchor_seed;
         ap.temperature = sp.temperature;
         auto ar = eng.synthesize(sp.anchor_text, ap, nullptr);
@@ -392,6 +397,7 @@ int main(int argc, char ** argv) {
 
         breeze_tts::tts_params p;
         p.instruction = body.value("instruction", sp.instruction);
+        p.plain_prompt = sp.plain_prompt;
         p.temperature = body.value("temperature", sp.temperature);
         p.depth_temperature = body.value("depth_temperature", sp.depth_temperature);
         p.top_k = body.value("top_k", sp.top_k);
@@ -489,6 +495,7 @@ int main(int argc, char ** argv) {
     {   // build the per-frame graphs and compile the kernels now rather than in the first request
         breeze_tts::tts_params wp;
         wp.instruction = sp.instruction;
+        wp.plain_prompt = sp.plain_prompt;
         wp.max_frames = 6;
         wp.seed = 0;
         const auto it = voices.find(default_voice);

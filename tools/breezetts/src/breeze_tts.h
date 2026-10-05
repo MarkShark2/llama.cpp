@@ -20,6 +20,7 @@ constexpr int kSampleRate = 24000;
 
 struct tts_params {
     std::string instruction;           // voice / style description
+    bool plain_prompt = false;         // no instruction segment: the prompt a LoRA was trained on
     int32_t max_frames = 1500;         // 12.5 frames per second
     float   temperature = 0.9f;        // first codebook
     float   depth_temperature = 0.9f;  // codebooks 1..15

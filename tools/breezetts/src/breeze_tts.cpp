@@ -1182,7 +1182,8 @@ tts_result engine_impl::synthesize(const std::string & text, const tts_params & 
     // ---- prompt ---------------------------------------------------------------
     const std::string instr = p.instruction.empty() ? "Speak clearly and naturally." : p.instruction;
     auto t0 = clk::now();
-    std::vector<int32_t> seg_instr = tok.encode("<bos>[S0]<ins_bos>" + instr + "<ins_eos>" + text);
+    std::vector<int32_t> seg_instr = tok.encode(p.plain_prompt ? "<bos>[S0]" + text
+                                                               : "<bos>[S0]<ins_bos>" + instr + "<ins_eos>" + text);
     std::vector<int32_t> seg_ref;
     if (ref) seg_ref = tok.encode("<bos>[S0]" + ref->text);
     r.t_tokenize_ms = ms_since(t0);
