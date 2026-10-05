@@ -86,33 +86,69 @@ static std::vector<float> to_24k(const std::vector<float> & in, int sr) {
     return out;
 }
 
-// Split long input at sentence ends into chunks of at most max_chars bytes. One synthesis call
-// holds the whole prompt and every generated frame in the backbone's context window, so an
-// unbounded input would be cut off when the window fills.
+// Split long input into chunks of at most max_chars bytes, never inside a sentence when the sentence
+// fits: sentences (ending . ! ? or a newline) are packed greedily, and a sentence longer than a chunk
+// is cut at clause punctuation, else at a space. Chunks stay near the clip length the model trains on
+// (a few seconds to ~15 s); longer generations drift in voice and prosody.
+static bool ends_unit(const std::string & s, size_t i, size_t n) {
+    // s[i] is the last byte of a candidate end; true when a sentence ends here
+    static const char * kEnds[] = {".", "!", "?", "\xE3\x80\x82", "\xEF\xBC\x81", "\xEF\xBC\x9F"};
+    if (s[i] == '\n') return true;
+    bool hit = false;
+    for (const char * e : kEnds) {
+        const size_t el = strlen(e);
+        if (i + 1 >= el && s.compare(i + 1 - el, el, e) == 0) hit = true;
+    }
+    if (!hit) return false;
+    size_t k = i + 1;
+    while (k < n && (s[k] == '"' || s[k] == '\'' || s[k] == ')')) k++;   // closing quote / bracket belongs here
+    return k >= n || s[k] == ' ' || s[k] == '\n';
+}
+
 static std::vector<std::string> split_text(const std::string & in, size_t max_chars) {
-    std::vector<std::string> out;
+    // 1. sentence units
+    std::vector<std::string> units;
     std::string cur;
-    auto flush = [&]() {
-        const size_t b = cur.find_first_not_of(" \t\r\n");
-        if (b != std::string::npos) out.push_back(cur.substr(b));
-        cur.clear();
-    };
-    static const char * kEnds[] = {".", "!", "?", "\n", "\xE3\x80\x82", "\xEF\xBC\x81", "\xEF\xBC\x9F"};
-    for (size_t i = 0; i < in.size();) {
-        size_t len = 1;
-        const unsigned char c = (unsigned char) in[i];
-        if (c >= 0xF0) len = 4; else if (c >= 0xE0) len = 3; else if (c >= 0xC0) len = 2;
-        len = std::min(len, in.size() - i);
-        cur.append(in, i, len);
-        i += len;
-        bool end = false;
-        for (const char * e : kEnds) {
-            const size_t el = strlen(e);
-            if (cur.size() >= el && cur.compare(cur.size() - el, el, e) == 0) end = true;
+    for (size_t i = 0; i < in.size(); i++) {
+        cur += in[i];
+        if (ends_unit(in, i, in.size())) {
+            units.push_back(cur);
+            cur.clear();
         }
-        const bool at_boundary = i >= in.size() || in[i] == ' ' || in[i] == '\n';
-        const bool too_long = cur.size() >= max_chars && (cur.back() == ' ' || cur.size() >= max_chars + 100);
-        if ((end && at_boundary && cur.size() >= max_chars * 2 / 3) || too_long) flush();
+    }
+    units.push_back(cur);
+    // 2. cut oversized units at clause punctuation (, ; : and the em dash), else at a space
+    std::vector<std::string> pieces;
+    for (auto & u : units) {
+        std::string rest = u;
+        while (rest.size() > max_chars) {
+            size_t cut = std::string::npos;
+            for (size_t i = 0; i < rest.size() && i < max_chars; i++) {
+                const char c = rest[i];
+                if ((c == ',' || c == ';' || c == ':') && i + 1 < rest.size() && rest[i + 1] == ' ') cut = i + 1;
+                else if (c == '\xE2' && i + 2 < rest.size() && rest[i + 1] == '\x80' && rest[i + 2] == '\x94') cut = i + 3;
+            }
+            if (cut == std::string::npos || cut < max_chars / 3) {
+                size_t sp = rest.rfind(' ', max_chars);
+                cut = (sp == std::string::npos || sp < max_chars / 3) ? max_chars : sp + 1;
+                while (cut < rest.size() && ((unsigned char) rest[cut] & 0xC0) == 0x80) cut++;   // not inside a UTF-8 sequence
+            }
+            pieces.push_back(rest.substr(0, cut));
+            rest = rest.substr(cut);
+        }
+        pieces.push_back(rest);
+    }
+    // 3. pack pieces up to the budget
+    std::vector<std::string> out;
+    std::string chunk;
+    auto flush = [&]() {
+        const size_t b = chunk.find_first_not_of(" \t\r\n");
+        if (b != std::string::npos) out.push_back(chunk.substr(b));
+        chunk.clear();
+    };
+    for (auto & pc : pieces) {
+        if (!chunk.empty() && chunk.size() + pc.size() > max_chars) flush();
+        chunk += pc;
     }
     flush();
     if (out.empty()) out.push_back(in);
@@ -422,9 +458,9 @@ int main(int argc, char ** argv) {
         breeze_tts::tts_result r;
         {
             std::lock_guard<std::mutex> lock(synth_mutex);
-            const auto chunks = split_text(input, 600);
+            const auto chunks = split_text(input, 220);
             std::vector<int32_t> last_codes;
-            if (ref_key != prev_key) {
+            if (!have_ref || ref_key != prev_key) {   // a request never continues from another request
                 prev = breeze_tts::reference_voice();
                 prev_key = ref_key;
             }
@@ -437,10 +473,11 @@ int main(int argc, char ** argv) {
                 }
                 breeze_tts::reference_voice use;
                 const breeze_tts::reference_voice * rp = nullptr;
-                if (have_ref) {
-                    use = ref;
+                if (have_ref || (sp.continuity && prev.n_frames > 0)) {
+                    if (have_ref) use = ref;
                     if (sp.continuity && prev.n_frames > 0) {
-                        use.text += " " + prev.text;
+                        if (!use.text.empty()) use.text += " ";
+                        use.text += prev.text;
                         use.codes.insert(use.codes.end(), prev.codes.begin(), prev.codes.end());
                         use.n_frames += prev.n_frames;
                     }
@@ -456,7 +493,7 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "chunk %zu/%zu: %.1fs + %.1fs (%d frames) \"%.50s...\"\n", ci + 1, chunks.size(),
                         ci == 0 ? 0.0 : (double) r.audio.size() / breeze_tts::kSampleRate,
                         (double) rc.audio.size() / breeze_tts::kSampleRate, rc.n_frames, chunks[ci].c_str());
-                if (have_ref && rc.n_frames <= 200) {
+                if (sp.continuity && rc.n_frames <= 300) {
                     prev.text = chunks[ci];
                     prev.codes = rc.codes;
                     prev.n_frames = rc.n_frames;
