@@ -156,6 +156,82 @@ static std::vector<std::string> split_text(const std::string & in, size_t max_ch
     return out;
 }
 
+// ---- pauses between chunks ------------------------------------------------------------------
+// A chunk ends where the model stopped, which can be right on the last phoneme. The wanted gap after
+// each chunk comes from how the text continues (paragraph break, sentence end, clause end, or a forced
+// split inside a clause = none); only what the audio does not already contain is added as silence.
+
+static int boundary_gap_ms(const std::string & in, const std::vector<std::string> & chunks, int pause_clause_ms, int pause_sentence_ms, int pause_paragraph_ms,
+                           std::vector<int> & gaps) {
+    gaps.assign(chunks.size(), 0);
+    size_t pos = 0;
+    std::vector<size_t> starts(chunks.size(), std::string::npos);
+    for (size_t i = 0; i < chunks.size(); i++) {
+        const size_t p = in.find(chunks[i], pos);
+        if (p == std::string::npos) continue;
+        starts[i] = p;
+        pos = p + chunks[i].size();
+    }
+    for (size_t i = 0; i + 1 < chunks.size(); i++) {
+        if (starts[i] == std::string::npos || starts[i + 1] == std::string::npos) continue;
+        const size_t end = starts[i] + chunks[i].size();
+        const std::string between = in.substr(end, starts[i + 1] - end);
+        size_t nl = 0;
+        for (char c : between) if (c == '\n') nl++;
+        for (char c : chunks[i]) if (c == '\n') nl++;
+        std::string t = chunks[i];
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\n' || t.back() == '\r' || t.back() == '"' ||
+                              t.back() == '\'' || t.back() == ')')) t.pop_back();
+        const char last = t.empty() ? ' ' : t.back();
+        const bool sentence = last == '.' || last == '!' || last == '?' ||
+                              (t.size() >= 3 && (t.compare(t.size() - 3, 3, "\xE3\x80\x82") == 0));
+        const bool clause = last == ',' || last == ';' || last == ':' ||
+                            (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xE2\x80\x94") == 0);
+        int g = 0;
+        if (nl >= 2) g = pause_paragraph_ms;
+        else if (sentence || nl == 1) g = pause_sentence_ms;
+        else if (clause) g = pause_clause_ms;
+        gaps[i] = g;
+    }
+    return 0;
+}
+
+static double rms_db(const float * x, size_t n) {
+    double e = 0;
+    for (size_t i = 0; i < n; i++) e += (double) x[i] * x[i];
+    return 10.0 * std::log10(e / std::max<size_t>(n, 1) + 1e-12);
+}
+
+// milliseconds of near-silence at the end (tail) or start of `a`, relative to the level of the edge region
+static int edge_silence_ms(const std::vector<float> & a, bool tail) {
+    const size_t win = breeze_tts::kSampleRate / 100;   // 10 ms
+    const size_t span = std::min<size_t>(a.size(), (size_t) breeze_tts::kSampleRate * 5);
+    if (span < win) return 0;
+    const float * base = tail ? a.data() + a.size() - span : a.data();
+    const double ref = rms_db(base, span);
+    int ms = 0;
+    for (size_t off = 0; off + win <= span && ms < 1000; off += win) {
+        const float * w = tail ? base + span - off - win : base + off;
+        if (rms_db(w, win) < ref - 25.0) ms += 10; else break;
+    }
+    return ms;
+}
+
+// join `next` onto `out` leaving `want_ms` of gap in total (silence already in either edge counts)
+static void append_with_gap(std::vector<float> & out, std::vector<float> & next, int want_ms) {
+    const int have = edge_silence_ms(out, true) + edge_silence_ms(next, false);
+    const int add = want_ms - have;
+    if (add > 0 && !out.empty() && !next.empty()) {
+        const size_t ramp = std::min<size_t>(breeze_tts::kSampleRate / 250, std::min(out.size(), next.size()));   // 4 ms
+        for (size_t i = 0; i < ramp; i++) {
+            out[out.size() - 1 - i] *= (float) i / (float) ramp;
+            next[i] *= (float) i / (float) ramp;
+        }
+        out.insert(out.end(), (size_t) add * breeze_tts::kSampleRate / 1000, 0.0f);
+    }
+    out.insert(out.end(), next.begin(), next.end());
+}
+
 static json error_json(const std::string & msg, const char * type) {
     return json{{"error", {{"message", msg}, {"type", type}}}};
 }
@@ -163,6 +239,9 @@ static json error_json(const std::string & msg, const char * type) {
 struct server_params {
     std::string model, codec;
     std::string lora;
+    int pause_clause_ms = 100;      // gap wanted after a chunk that ends at a clause
+    int pause_sentence_ms = 250;    // ... at a sentence end
+    int pause_paragraph_ms = 400;   // ... at a paragraph break
     bool plain_prompt = false;
     float lora_strength = 1.0f;
     std::string instruction = "Speak clearly and naturally.";
@@ -187,6 +266,9 @@ static void print_usage(const char * prog) {
             "  -v, --vocoder <file>        Qwen3-TTS tokenizer GGUF (codec)\n"
             "      --lora <file>           LoRA GGUF (convert_lora.py), merged into the weights at load\n"
             "      --plain-prompt          no instruction in the prompt (what a LoRA is trained on)\n"
+            "      --pause-clause-ms <n>   gap between chunks after a clause (default 100; 0 = none)\n"
+            "      --pause-sentence-ms <n> ... after a sentence (default 250)\n"
+            "      --pause-paragraph-ms <n> ... after a paragraph break (default 400)\n"
             "      --lora-strength <f>     multiplier of the trained alpha/rank scale (default 1)\n"
             "  -H, --host <host>           listen host (default 127.0.0.1)\n"
             "  -p, --port <port>           listen port (default 8080)\n"
@@ -217,6 +299,9 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         else if (a == "-m" || a == "--model")        { if (!(v = next("model"))) return false; sp.model = v; }
         else if (a == "-v" || a == "--vocoder")      { if (!(v = next("vocoder"))) return false; sp.codec = v; }
         else if (a == "--lora")                      { if (!(v = next("lora"))) return false; sp.lora = v; }
+        else if (a == "--pause-clause-ms")           { if (!(v = next("pause-clause-ms"))) return false; sp.pause_clause_ms = std::stoi(v); }
+        else if (a == "--pause-sentence-ms")         { if (!(v = next("pause-sentence-ms"))) return false; sp.pause_sentence_ms = std::stoi(v); }
+        else if (a == "--pause-paragraph-ms")        { if (!(v = next("pause-paragraph-ms"))) return false; sp.pause_paragraph_ms = std::stoi(v); }
         else if (a == "--plain-prompt")              { sp.plain_prompt = true; }
         else if (a == "--lora-strength")             { if (!(v = next("lora-strength"))) return false; sp.lora_strength = std::stof(v); }
         else if (a == "-H" || a == "--host")         { if (!(v = next("host"))) return false; sp.host = v; }
@@ -460,6 +545,8 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lock(synth_mutex);
             const auto chunks = split_text(input, 220);
+            std::vector<int> gaps;
+            boundary_gap_ms(input, chunks, sp.pause_clause_ms, sp.pause_sentence_ms, sp.pause_paragraph_ms, gaps);
             std::vector<int32_t> last_codes;
             if (!have_ref || ref_key != prev_key) {   // a request never continues from another request
                 prev = breeze_tts::reference_voice();
@@ -491,6 +578,8 @@ int main(int argc, char ** argv) {
                     break;
                 }
                 last_codes = rc.codes;
+                if (ci > 0) fprintf(stderr, "gap after chunk %zu: wanted %d ms, audio already had %d ms\n", ci, gaps[ci - 1],
+                                    edge_silence_ms(r.audio, true) + edge_silence_ms(rc.audio, false));
                 fprintf(stderr, "chunk %zu/%zu: %.1fs + %.1fs (%d frames) \"%.50s...\"\n", ci + 1, chunks.size(),
                         ci == 0 ? 0.0 : (double) r.audio.size() / breeze_tts::kSampleRate,
                         (double) rc.audio.size() / breeze_tts::kSampleRate, rc.n_frames, chunks[ci].c_str());
@@ -504,7 +593,7 @@ int main(int argc, char ** argv) {
                 if (ci == 0) {
                     r = std::move(rc);
                 } else {
-                    r.audio.insert(r.audio.end(), rc.audio.begin(), rc.audio.end());
+                    append_with_gap(r.audio, rc.audio, gaps[ci - 1]);
                     r.n_prompt_tokens += rc.n_prompt_tokens;
                     r.n_frames += rc.n_frames;
                     r.t_generate_ms += rc.t_generate_ms;
