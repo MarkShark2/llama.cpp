@@ -453,6 +453,9 @@ int main(int argc, char ** argv) {
                     break;
                 }
                 last_codes = rc.codes;
+                fprintf(stderr, "chunk %zu/%zu: %.1fs + %.1fs (%d frames) \"%.50s...\"\n", ci + 1, chunks.size(),
+                        ci == 0 ? 0.0 : (double) r.audio.size() / breeze_tts::kSampleRate,
+                        (double) rc.audio.size() / breeze_tts::kSampleRate, rc.n_frames, chunks[ci].c_str());
                 if (have_ref && rc.n_frames <= 200) {
                     prev.text = chunks[ci];
                     prev.codes = rc.codes;
