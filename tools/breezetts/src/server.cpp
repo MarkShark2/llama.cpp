@@ -112,6 +112,7 @@ static std::vector<std::string> split_text(const std::string & in, size_t max_ch
     for (size_t i = 0; i < in.size(); i++) {
         cur += in[i];
         if (ends_unit(in, i, in.size())) {
+            while (i + 1 < in.size() && (in[i + 1] == '"' || in[i + 1] == '\'' || in[i + 1] == ')')) cur += in[++i];
             units.push_back(cur);
             cur.clear();
         }
