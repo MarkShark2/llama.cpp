@@ -31,6 +31,9 @@ struct tts_params {
     // codes (frames * 16) of audio that precedes this utterance; the vocoder decodes them as left
     // context and drops their samples, so consecutive chunks join without a seam
     std::vector<int32_t> vocoder_context;
+    // decode with the vocoder's persistent streaming state instead of a left-context prefix: the
+    // caller calls vocoder_reset() before the first chunk of a request and after the last
+    bool vocoder_stream = false;
 };
 
 // A reference voice for cloning: its transcript and its 16-codebook codes.
@@ -90,6 +93,9 @@ public:
 
     tts_result synthesize(const std::string & text, const tts_params & params,
                           const reference_voice * ref = nullptr);
+
+    // drop the vocoder's streaming state (start / end of a request that uses vocoder_stream)
+    void vocoder_reset();
 
     // encode 24 kHz mono audio into a reference voice
     bool make_reference(const std::vector<float> & samples, const std::string & text,

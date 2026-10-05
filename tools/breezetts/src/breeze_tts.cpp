@@ -1303,11 +1303,26 @@ tts_result engine_impl::synthesize(const std::string & text, const tts_params & 
 
     // ---- vocoder ------------------------------------------------------------------
     t0 = clk::now();
-    const int32_t ctx_frames = (int32_t) (p.vocoder_context.size() / kNumCodebooks);
-    std::vector<int32_t> voc_codes = p.vocoder_context;
-    voc_codes.insert(voc_codes.end(), codes.begin(), codes.end());
-    if (!decoder.decode(voc_codes.data(), r.n_frames + ctx_frames, r.audio)) {
-        return fail("vocoder failed: " + decoder.get_error());
+    const int32_t ctx_frames = p.vocoder_stream ? 0 : (int32_t) (p.vocoder_context.size() / kNumCodebooks);
+    if (p.vocoder_stream) {
+        // the decoder keeps its attention window, convolution tails and transposed-conv overlaps from
+        // the previous chunk, so this chunk's audio continues the last one; bounded batches keep the
+        // compute buffer constant
+        const int32_t batch = 50;
+        for (int32_t off = 0; off < r.n_frames; off += batch) {
+            const int32_t n = std::min(batch, r.n_frames - off);
+            if (!decoder.stream_decode(codes.data() + (size_t) off * kNumCodebooks, n, r.audio)) {
+                const std::string derr = decoder.get_error();
+                decoder.stream_reset();
+                return fail("vocoder failed: " + derr);
+            }
+        }
+    } else {
+        std::vector<int32_t> voc_codes = p.vocoder_context;
+        voc_codes.insert(voc_codes.end(), codes.begin(), codes.end());
+        if (!decoder.decode(voc_codes.data(), r.n_frames + ctx_frames, r.audio)) {
+            return fail("vocoder failed: " + decoder.get_error());
+        }
     }
     if (ctx_frames > 0) {
         const size_t drop = (size_t) ctx_frames * (kSampleRate / 12.5);
@@ -1330,6 +1345,10 @@ engine::~engine() = default;
 void engine::set_lora(const std::string & path, float strength) {
     impl_->lora_path = path;
     impl_->lora_strength = strength;
+}
+
+void engine::vocoder_reset() {
+    impl_->decoder.stream_reset();
 }
 
 bool engine::load(const std::string & model_path, const std::string & codec_path, int n_ctx, std::string & err) {

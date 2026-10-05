@@ -239,6 +239,7 @@ static json error_json(const std::string & msg, const char * type) {
 struct server_params {
     std::string model, codec;
     std::string lora;
+    bool vocoder_stream = true;     // carry the vocoder's state across the chunks of a request
     int pause_clause_ms = 100;      // gap wanted after a chunk that ends at a clause
     int pause_sentence_ms = 250;    // ... at a sentence end
     int pause_paragraph_ms = 400;   // ... at a paragraph break
@@ -269,6 +270,7 @@ static void print_usage(const char * prog) {
             "      --pause-clause-ms <n>   gap between chunks after a clause (default 100; 0 = none)\n"
             "      --pause-sentence-ms <n> ... after a sentence (default 250)\n"
             "      --pause-paragraph-ms <n> ... after a paragraph break (default 400)\n"
+            "      --no-vocoder-stream     decode each chunk with a 25-frame left-context prefix instead of carrying vocoder state\n"
             "      --lora-strength <f>     multiplier of the trained alpha/rank scale (default 1)\n"
             "  -H, --host <host>           listen host (default 127.0.0.1)\n"
             "  -p, --port <port>           listen port (default 8080)\n"
@@ -302,6 +304,7 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         else if (a == "--pause-clause-ms")           { if (!(v = next("pause-clause-ms"))) return false; sp.pause_clause_ms = std::stoi(v); }
         else if (a == "--pause-sentence-ms")         { if (!(v = next("pause-sentence-ms"))) return false; sp.pause_sentence_ms = std::stoi(v); }
         else if (a == "--pause-paragraph-ms")        { if (!(v = next("pause-paragraph-ms"))) return false; sp.pause_paragraph_ms = std::stoi(v); }
+        else if (a == "--no-vocoder-stream")         { sp.vocoder_stream = false; }
         else if (a == "--plain-prompt")              { sp.plain_prompt = true; }
         else if (a == "--lora-strength")             { if (!(v = next("lora-strength"))) return false; sp.lora_strength = std::stof(v); }
         else if (a == "-H" || a == "--host")         { if (!(v = next("host"))) return false; sp.host = v; }
@@ -552,10 +555,12 @@ int main(int argc, char ** argv) {
                 prev = breeze_tts::reference_voice();
                 prev_key = ref_key;
             }
+            eng.vocoder_reset();
             for (size_t ci = 0; ci < chunks.size(); ci++) {
                 breeze_tts::tts_params pc = p;
+                pc.vocoder_stream = sp.vocoder_stream;
                 if (pc.seed >= 0) pc.seed += (int64_t) ci;
-                if (ci > 0 && !last_codes.empty()) {
+                if (!sp.vocoder_stream && ci > 0 && !last_codes.empty()) {
                     const size_t n = std::min(last_codes.size(), (size_t) 25 * breeze_tts::kNumCodebooks);
                     pc.vocoder_context.assign(last_codes.end() - n, last_codes.end());
                 }
@@ -601,6 +606,7 @@ int main(int argc, char ** argv) {
                     r.t_total_ms += rc.t_total_ms;
                 }
             }
+            eng.vocoder_reset();
         }
         if (!r.success) {
             res.status = 500;
