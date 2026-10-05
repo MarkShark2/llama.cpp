@@ -232,6 +232,39 @@ static void append_with_gap(std::vector<float> & out, std::vector<float> & next,
     out.insert(out.end(), next.begin(), next.end());
 }
 
+// ---- level ------------------------------------------------------------------------------------
+// Generated loudness lives in the codes: a chunk conditioned on a quieter previous chunk comes out
+// quieter still, and over a long request the level slides by many dB. The speech level (mean power of the
+// 10 ms windows within 25 dB of the loudest) of the first chunk is the target for the rest.
+
+static double speech_level_db(const std::vector<float> & a) {
+    const size_t win = breeze_tts::kSampleRate / 100;
+    std::vector<double> e;
+    for (size_t off = 0; off + win <= a.size(); off += win) {
+        double v = 0;
+        for (size_t i = 0; i < win; i++) v += (double) a[off + i] * a[off + i];
+        e.push_back(v / win);
+    }
+    if (e.empty()) return -120.0;
+    const double top = *std::max_element(e.begin(), e.end());
+    double sum = 0;
+    size_t n = 0;
+    for (double v : e) if (v >= top * 0.00316) { sum += v; n++; }   // within 25 dB of the loudest window
+    return 10.0 * std::log10(sum / std::max<size_t>(n, 1) + 1e-12);
+}
+
+// returns the gain applied in dB (0 when the chunk is left alone)
+static double match_level(std::vector<float> & a, double target_db) {
+    if (a.empty()) return 0.0;
+    double gain_db = std::max(-6.0, std::min(12.0, target_db - speech_level_db(a)));
+    float peak = 0;
+    for (float v : a) peak = std::max(peak, std::fabs(v));
+    float g = (float) std::pow(10.0, gain_db / 20.0);
+    if (peak * g > 0.98f) g = 0.98f / std::max(peak, 1e-6f);
+    for (float & v : a) v *= g;
+    return 20.0 * std::log10((double) g);
+}
+
 static json error_json(const std::string & msg, const char * type) {
     return json{{"error", {{"message", msg}, {"type", type}}}};
 }
@@ -239,6 +272,7 @@ static json error_json(const std::string & msg, const char * type) {
 struct server_params {
     std::string model, codec;
     std::string lora;
+    bool level_norm = true;         // bring every chunk's speech level to that of the request's first chunk
     bool vocoder_stream = true;     // carry the vocoder's state across the chunks of a request
     int pause_clause_ms = 100;      // gap wanted after a chunk that ends at a clause
     int pause_sentence_ms = 250;    // ... at a sentence end
@@ -271,6 +305,7 @@ static void print_usage(const char * prog) {
             "      --pause-sentence-ms <n> ... after a sentence (default 250)\n"
             "      --pause-paragraph-ms <n> ... after a paragraph break (default 400)\n"
             "      --no-vocoder-stream     decode each chunk with a 25-frame left-context prefix instead of carrying vocoder state\n"
+            "      --no-level-norm         leave each chunk at the level the model generated it at\n"
             "      --lora-strength <f>     multiplier of the trained alpha/rank scale (default 1)\n"
             "  -H, --host <host>           listen host (default 127.0.0.1)\n"
             "  -p, --port <port>           listen port (default 8080)\n"
@@ -305,6 +340,7 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         else if (a == "--pause-sentence-ms")         { if (!(v = next("pause-sentence-ms"))) return false; sp.pause_sentence_ms = std::stoi(v); }
         else if (a == "--pause-paragraph-ms")        { if (!(v = next("pause-paragraph-ms"))) return false; sp.pause_paragraph_ms = std::stoi(v); }
         else if (a == "--no-vocoder-stream")         { sp.vocoder_stream = false; }
+        else if (a == "--no-level-norm")             { sp.level_norm = false; }
         else if (a == "--plain-prompt")              { sp.plain_prompt = true; }
         else if (a == "--lora-strength")             { if (!(v = next("lora-strength"))) return false; sp.lora_strength = std::stof(v); }
         else if (a == "-H" || a == "--host")         { if (!(v = next("host"))) return false; sp.host = v; }
@@ -551,6 +587,7 @@ int main(int argc, char ** argv) {
             std::vector<int> gaps;
             boundary_gap_ms(input, chunks, sp.pause_clause_ms, sp.pause_sentence_ms, sp.pause_paragraph_ms, gaps);
             std::vector<int32_t> last_codes;
+            double level_target_db = 0;
             if (!have_ref || ref_key != prev_key) {   // a request never continues from another request
                 prev = breeze_tts::reference_voice();
                 prev_key = ref_key;
@@ -583,6 +620,15 @@ int main(int argc, char ** argv) {
                     break;
                 }
                 last_codes = rc.codes;
+                if (sp.level_norm) {
+                    if (ci == 0) {
+                        level_target_db = speech_level_db(rc.audio);
+                    } else {
+                        const double was = speech_level_db(rc.audio);
+                        const double g = match_level(rc.audio, level_target_db);
+                        fprintf(stderr, "chunk %zu level %.1f dB -> gain %+.1f dB\n", ci + 1, was, g);
+                    }
+                }
                 if (ci > 0) fprintf(stderr, "gap after chunk %zu: wanted %d ms, audio already had %d ms\n", ci, gaps[ci - 1],
                                     edge_silence_ms(r.audio, true) + edge_silence_ms(rc.audio, false));
                 fprintf(stderr, "chunk %zu/%zu: %.1fs + %.1fs (%d frames) \"%.50s...\"\n", ci + 1, chunks.size(),
