@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <system_error>
@@ -39,6 +40,44 @@ using clock_type = std::chrono::steady_clock;
 
 double seconds_since(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
+}
+
+uint64_t checkpoint_hash(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = (const uint8_t *) data;
+    for (size_t i = 0; i < size; ++i) {
+        hash = (hash ^ bytes[i])*UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t checkpoint_checksum(const std::vector<uint8_t> & data) {
+    return checkpoint_hash(UINT64_C(14695981039346656037), data.data(), data.size());
+}
+
+uint64_t model_checkpoint_identity(const llama_model * model, const llama_context_params & params) {
+    const uint64_t shape[] = {
+        llama_model_size(model), llama_model_n_params(model), (uint64_t) llama_model_ftype(model),
+        (uint64_t) llama_model_n_swa(model), (uint64_t) params.rope_scaling_type,
+        (uint64_t) params.attention_type, (uint64_t) params.type_k, (uint64_t) params.type_v,
+        params.yarn_orig_ctx, (uint64_t) params.swa_full,
+    };
+    const float rope[] = { params.rope_freq_base, params.rope_freq_scale, params.yarn_ext_factor,
+                           params.yarn_attn_factor, params.yarn_beta_fast, params.yarn_beta_slow };
+    uint64_t hash = checkpoint_hash(UINT64_C(14695981039346656037), shape, sizeof(shape));
+    hash = checkpoint_hash(hash, rope, sizeof(rope));
+    for (int32_t i = 0; i < llama_model_meta_count(model); ++i) {
+        const int32_t key_size = llama_model_meta_key_by_index(model, i, nullptr, 0);
+        const int32_t val_size = llama_model_meta_val_str_by_index(model, i, nullptr, 0);
+        if (key_size < 0 || val_size < 0) {
+            return 0;
+        }
+        std::vector<char> key((size_t) key_size + 1), value((size_t) val_size + 1);
+        llama_model_meta_key_by_index(model, i, key.data(), key.size());
+        llama_model_meta_val_str_by_index(model, i, value.data(), value.size());
+        hash = checkpoint_hash(hash, key.data(), key.size());
+        hash = checkpoint_hash(hash, value.data(), value.size());
+    }
+    return hash;
 }
 
 struct scope_timer {
@@ -311,7 +350,7 @@ struct common_spd_pipeline::impl {
     int32_t n_embd_boundary = 0; // width of the state handed between stages
     int32_t n_vocab = 0;
     int32_t n_layers = 0;
-    int32_t layers_per_stage = 0;
+    std::vector<int32_t> stage_bounds;
     int32_t target_n_pos_per_embd = 1;
     int32_t sidecar_n_embd_inp = 0;
     uint32_t stage_count = 0;
@@ -434,6 +473,9 @@ struct common_spd_pipeline::impl {
         llama_pos pos = -1; // cells cover [0, pos)
         std::array<std::vector<uint8_t>, SPD_MAX_STAGE_COUNT> blobs;
         std::array<uint8_t, SPD_MAX_STAGE_COUNT> have = {};
+        std::vector<uint8_t> sidecar_blob;
+        std::array<uint64_t, SPD_MAX_STAGE_COUNT> checksums = {};
+        uint64_t sidecar_checksum = 0;
 
         bool complete(uint32_t n) const {
             for (uint32_t i = 0; i < n; ++i) {
@@ -445,7 +487,7 @@ struct common_spd_pipeline::impl {
         }
 
         size_t bytes() const {
-            size_t total = 0;
+            size_t total = sidecar_blob.size();
             for (const auto & blob : blobs) {
                 total += blob.size();
             }
@@ -455,6 +497,7 @@ struct common_spd_pipeline::impl {
     std::vector<stage_checkpoint> checkpoints; // ascending pos
 
     std::string last_error;
+    std::mutex error_mutex;
     bool ready = false;
     bool used = false;
     // set by spd_state_io when foreign state is written over the caches, so
@@ -462,6 +505,8 @@ struct common_spd_pipeline::impl {
     bool state_replaced = false;
     bool static_decode_fast_path = true;
     bool light_rollback = false;
+    bool full_checkpoints = false; // GLM full-state bundles with compact live checkpoints
+    std::array<uint64_t, 2> checkpoint_identity = {};
     bool timing_enabled = false;
 
     // LLAMA_SPD_DUMP=<dir>: write every speculation input (selectors,
@@ -495,7 +540,7 @@ struct common_spd_pipeline::impl {
         ggml_tensor * inp = nullptr;      // consumer graph's wide embd input
         bool ready = false;               // consumer-side setup complete
         bool dead  = false;               // route refused or a transfer failed
-        int32_t  pushed_chunk = -1;       // last chunk delivered by push
+        int32_t  pushed_chunks[2] = { -1, -1 }; // exact chunk held by each staging slot
         int32_t  consumed_chunk = -1;     // last chunk the consumer finished
 
         // Decode twins. A decode step moves one token, so the prefill staging
@@ -538,7 +583,47 @@ struct common_spd_pipeline::impl {
             pb.pushed_pos[0] = -1;
             pb.pushed_pos[1] = -1;
         }
-        peer_push_pending.fill(false);
+        // A rejected delivery is stale, but its producer read must still finish.
+    }
+
+    bool guard_peer_output(uint32_t stage) {
+        if (!peer_push_pending[stage]) {
+            return true;
+        }
+        ggml_tensor * probe = llama_spd_peer_out_tensor(stages[stage]);
+        if (probe == nullptr || !ggml_backend_rpc_sync_peer_guard(probe)) {
+            return false;
+        }
+        peer_push_pending[stage] = false;
+        return true;
+    }
+
+    // Call after all stage workers stop, before reusing or freeing their tensors.
+    bool drain_peer_transfers() {
+        bool ok = true;
+        const uint32_t n_stages = std::min(stage_count, SPD_MAX_STAGE_COUNT);
+        for (uint32_t stage = 0; stage < n_stages; ++stage) {
+            if (!guard_peer_output(stage)) {
+                fail("SPD peer output drain failed for stage " + std::to_string(stage));
+                ok = false;
+            }
+        }
+        for (uint32_t stage = 1; stage < n_stages; ++stage) {
+            auto & pb = peer_links[stage];
+            const uint64_t ordinal = std::max({ pb.ordinals[0], pb.ordinals[1],
+                                                pb.dec_ordinals[0], pb.dec_ordinals[1] });
+            if (ordinal == 0) {
+                continue;
+            }
+            if (pb.inp == nullptr || !ggml_backend_rpc_sync_peer_fence(pb.inp, ordinal)) {
+                fail("SPD peer delivery drain failed for stage " + std::to_string(stage));
+                ok = false;
+                continue;
+            }
+            pb.ordinals[0] = pb.ordinals[1] = 0;
+            pb.dec_ordinals[0] = pb.dec_ordinals[1] = 0;
+        }
+        return ok;
     }
 
     struct phase_timing {
@@ -604,7 +689,7 @@ struct common_spd_pipeline::impl {
     phase_timing timing;
     size_t timing_active_count = 0;
 
-    impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params)
+    impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params, bool initialize_now = true)
         : model_target(model_target), model_spd(model_spd), params(params) {
         if (const char * value = std::getenv("LLAMA_SPD_STATIC_DECODE")) {
             static_decode_fast_path = std::atoi(value) != 0;
@@ -621,7 +706,9 @@ struct common_spd_pipeline::impl {
         if (const char * value = std::getenv("LLAMA_SPD_PEER")) {
             peer_boundaries_enabled = std::atoi(value) != 0;
         }
-        initialize();
+        if (initialize_now) {
+            initialize();
+        }
     }
 
     ~impl() {
@@ -629,6 +716,7 @@ struct common_spd_pipeline::impl {
         for (auto & worker : stage_workers) {
             worker.reset();
         }
+        synchronize_all();
         for (auto & pb : peer_links) {
             if (pb.staging_buf != nullptr) {
                 ggml_backend_buffer_free(pb.staging_buf);
@@ -640,8 +728,8 @@ struct common_spd_pipeline::impl {
         llama_free(sidecar);
         llama_free(embed);
         llama_free(head);
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            llama_free(stages[stage]);
+        for (llama_context * stage : stages) {
+            llama_free(stage);
         }
         llama_sampler_free(sidecar_sampler);
         llama_sampler_free(head_sampler);
@@ -661,6 +749,7 @@ struct common_spd_pipeline::impl {
     }
 
     void fail(std::string message) {
+        std::lock_guard<std::mutex> lock(error_mutex);
         // Log as well as record. This string is returned to the HTTP client and
         // used to be recorded *only* there, so an aborted generation left the
         // server log looking like a clean run that simply stopped -- prefill
@@ -990,6 +1079,10 @@ struct common_spd_pipeline::impl {
         cp.n_rs_seq = 0;
         cp.n_outputs_max = 0;
         cp.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        cp.spd_stage = 0;
+        cp.spd_stage_count = 0;
+        cp.spd_layer_start = 0;
+        cp.spd_layer_end = 0;
         cp.embeddings = false;
         cp.kv_unified = false;
         cp.samplers = nullptr;
@@ -1005,6 +1098,52 @@ struct common_spd_pipeline::impl {
         return cp;
     }
 
+    bool initialize_stage_bounds(const char * target_arch) {
+        if (n_layers <= 0) {
+            fail("SPD target has no trunk layers");
+            return false;
+        }
+        const uint32_t n_counts = llama_model_spd_stage_layers_n(model_spd);
+        const uint32_t * counts = llama_model_spd_stage_layers(model_spd);
+        std::vector<uint32_t> legacy_counts;
+        if (n_counts == 0) {
+            if (std::strcmp(target_arch, "qwen35") != 0 &&
+                    std::strcmp(target_arch, "qwen35moe") != 0 &&
+                    std::strcmp(target_arch, "deepseek4") != 0) {
+                fail("SPD sidecar requires explicit spd.stage_layers for target " + std::string(target_arch));
+                return false;
+            }
+            const int32_t width = (n_layers + (int32_t) stage_count - 1)/(int32_t) stage_count;
+            if (width*((int32_t) stage_count - 1) >= n_layers) {
+                fail("SPD legacy stage count leaves an empty trailing stage");
+                return false;
+            }
+            legacy_counts.assign(stage_count, (uint32_t) width);
+            legacy_counts.back() = n_layers - width*((int32_t) stage_count - 1);
+            counts = legacy_counts.data();
+        } else if (n_counts != stage_count || counts == nullptr) {
+            fail("SPD stage_layers must contain one layer count per stage");
+            return false;
+        }
+
+        stage_bounds.clear();
+        stage_bounds.push_back(0);
+        uint64_t end = 0;
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            end += counts[stage];
+            if (counts[stage] == 0 || end > (uint64_t) n_layers) {
+                fail("SPD stage_layers contains an empty stage or exceeds the target trunk");
+                return false;
+            }
+            stage_bounds.push_back((int32_t) end);
+        }
+        if (end != (uint64_t) n_layers) {
+            fail("SPD stage_layers must sum to the target trunk layer count " + std::to_string(n_layers));
+            return false;
+        }
+        return true;
+    }
+
     void initialize() {
         if (model_target == nullptr || model_spd == nullptr) {
             fail("SPD requires both a target model and a sidecar model");
@@ -1017,8 +1156,19 @@ struct common_spd_pipeline::impl {
             return;
         }
         rollback_tokens = stage_count - 1;
-        if (params.n_ctx > UINT32_MAX/stage_count) {
-            fail("SPD context length is too large for rollback sequence allocation");
+        char target_arch[64] = {};
+        const int32_t target_arch_len = llama_model_meta_val_str(
+                model_target, "general.architecture", target_arch, sizeof(target_arch));
+        if (target_arch_len <= 0 || target_arch_len >= (int32_t) sizeof(target_arch)) {
+            fail("SPD target architecture metadata is missing or invalid");
+            return;
+        }
+        char sidecar_target_arch[64] = {};
+        const int32_t sidecar_target_arch_len = llama_model_meta_val_str(
+                model_spd, "spd.target_architecture", sidecar_target_arch, sizeof(sidecar_target_arch));
+        if (sidecar_target_arch_len >= 0 && (sidecar_target_arch_len >= (int32_t) sizeof(sidecar_target_arch) ||
+                std::strcmp(target_arch, sidecar_target_arch) != 0)) {
+            fail("SPD sidecar target architecture does not match the target model");
             return;
         }
 
@@ -1033,55 +1183,77 @@ struct common_spd_pipeline::impl {
         // count and defeats the bounded rollback path entirely.
         light_rollback = llama_model_supports_rs_rollback(model_target) ||
                 (!llama_model_is_recurrent(model_target) && !llama_model_is_hybrid(model_target));
+        // GLM's rollback planes cover one decode call, not the SPD call history.
+        if (std::strcmp(target_arch, "glm5-next") == 0) {
+            light_rollback = false;
+            full_checkpoints = true;
+            checkpoint_identity = {
+                model_checkpoint_identity(model_target, params.target_context),
+                model_checkpoint_identity(model_spd, params.sidecar_context),
+            };
+        }
         if (const char * value = std::getenv("LLAMA_SPD_SEQCP_ROLLBACK")) {
             if (std::atoi(value) != 0) {
                 light_rollback = false;
             }
         }
+        if (!light_rollback && (full_checkpoints
+                ? params.n_ctx > (uint32_t) std::numeric_limits<llama_pos>::max() - rollback_tokens
+                : params.n_ctx > UINT32_MAX/stage_count)) {
+            fail("SPD context length is too large for rollback sequence allocation");
+            return;
+        }
 
         n_embd = llama_model_n_embd(model_target);
-        // What a stage hands the next one. Equal to n_embd for every
-        // single-stream architecture, but DeepSeek-V4 carries hc_mult
-        // hyper-connection streams between layers, so a mid-trunk boundary is
-        // that much wider. Anchors stay n_embd wide -- they are stream means.
+        // Hyper-connection boundaries carry all streams. Draft anchors stay n_embd wide and use their mean.
         n_embd_boundary = (int32_t) llama_model_n_embd_spd_boundary(model_target);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_target));
         n_layers = llama_model_n_layer(model_target);
-        // ceil, with the remainder on the last stage: 43 layers over 9 stages is
-        // 5x8 + 3. Matches llama_context's slicing and the trainer's presets.
-        layers_per_stage = (n_layers + (int32_t) stage_count - 1) / (int32_t) stage_count;
+        if (!initialize_stage_bounds(target_arch)) {
+            return;
+        }
         target_n_pos_per_embd = llama_model_n_pos_per_embd(model_target);
         sidecar_n_embd_inp = llama_model_n_embd_inp(model_spd);
-
-        if (static_decode_fast_path) {
-            decode_speculation_input.selectors.reserve(stage_count + 1);
-            decode_speculation_input.positions.reserve(stage_count + 1);
-            decode_speculation_input.features.reserve((size_t) (stage_count + 1)*sidecar_n_embd_inp);
+        if (n_embd <= 0 || n_embd_boundary < n_embd || n_embd_boundary % n_embd != 0) {
+            fail("SPD target boundary width is not a whole number of embedding streams");
+            return;
         }
 
         const uint32_t n_anchor = llama_model_target_layer_ids_n(model_spd);
         const int32_t * anchor_data = llama_model_target_layer_ids(model_spd);
-        if (n_layers <= 0 || layers_per_stage*((int32_t) stage_count - 1) >= n_layers) {
-            fail("SPD target layer count " + std::to_string(n_layers) + " leaves an empty stage at " +
-                    std::to_string(stage_count) + " stages");
-            return;
-        }
         if (n_anchor == 0 || anchor_data == nullptr) {
             fail("SPD sidecar has no target snapshot anchors");
             return;
         }
         anchors.assign(anchor_data, anchor_data + n_anchor);
-        if (anchors.front() != 0 || !std::is_sorted(anchors.begin(), anchors.end())) {
+        if (anchors.front() != 0 || anchors.back() > n_layers ||
+                !std::is_sorted(anchors.begin(), anchors.end()) ||
+                std::adjacent_find(anchors.begin(), anchors.end()) != anchors.end()) {
             fail("SPD sidecar snapshot anchors are invalid");
             return;
         }
-        if (sidecar_n_embd_inp != n_embd*(int32_t) anchors.size()) {
+        if (std::strcmp(target_arch, "glm5-next") == 0) {
+            for (int32_t anchor : anchors) {
+                if (!std::binary_search(stage_bounds.begin(), stage_bounds.end() - 1, anchor)) {
+                    fail("GLM5-Next SPD anchors must be stage inputs, excluding the final teacher tap");
+                    return;
+                }
+            }
+        }
+        if ((int64_t) sidecar_n_embd_inp != (int64_t) n_embd*(int64_t) anchors.size()) {
             fail("SPD sidecar input width does not match target embeddings and snapshot anchors");
             return;
         }
         if (llama_vocab_n_tokens(llama_model_get_vocab(model_spd)) != n_vocab) {
             fail("SPD target and sidecar vocabularies have different sizes");
             return;
+        }
+        fprintf(stderr, "SPD target: %u stages, rollback_mode=%s\n",
+                stage_count, light_rollback ? "seq_rm" : "seq_cp");
+        if (static_decode_fast_path) {
+            decode_speculation_input.selectors.reserve(stage_count + 1);
+            decode_speculation_input.positions.reserve(stage_count + 1);
+            decode_speculation_input.features.reserve((size_t) (stage_count + 1)*sidecar_n_embd_inp);
         }
 
         // Independent schedulers may overlap across distinct machines, but
@@ -1091,8 +1263,8 @@ struct common_spd_pipeline::impl {
         // resources in a stable order during concurrent advancement.
         std::map<std::string, size_t> resource_ids;
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            const int32_t layer_begin = (int32_t) stage*layers_per_stage;
-            const int32_t layer_end = std::min(layer_begin + layers_per_stage, n_layers);
+            const int32_t layer_begin = stage_bounds[stage];
+            const int32_t layer_end = stage_bounds[stage + 1];
             for (int32_t layer = layer_begin; layer < layer_end; ++layer) {
                 const std::string key = execution_resource_key(
                         llama_model_layer_device(model_target, layer));
@@ -1126,20 +1298,17 @@ struct common_spd_pipeline::impl {
             cp.ctx_type = LLAMA_CONTEXT_TYPE_SPD_STAGE;
             cp.spd_stage = stage;
             cp.spd_stage_count = stage_count;
+            cp.spd_layer_start = stage_bounds[stage];
+            cp.spd_layer_end = stage_bounds[stage + 1];
             if (!light_rollback) {
                 cp.n_seq_max = stage_count;
-                // llama_context derives n_ctx_seq by dividing total n_ctx by
-                // n_seq_max. SPD uses the extra sequence IDs as rollback aliases,
-                // but seq 0 must still retain the caller-requested context length.
-                // Without this expansion an 8192-token SPD context silently became
-                // an effective 1024-token context and diverged on longer prompts.
-                cp.n_ctx = params.n_ctx*stage_count;
+                // Separate streams divide total context by n_seq_max. GLM shares
+                // one prefix and only needs bounded slack for the speculative tail.
+                cp.n_ctx = full_checkpoints ? params.n_ctx + rollback_tokens : params.n_ctx*stage_count;
             }
-            // Keep seq 0 on the same per-sequence KV layout as an ordinary
-            // target context. Rollback snapshots use seq_cp aliases and do not
-            // require a unified cache; forcing one changes long-context target
-            // numerics enough to flip close greedy decisions.
-            cp.kv_unified = false;
+            // GLM aliases share prefix KV rows; only the recurrent state is copied.
+            // Other targets keep their existing per-sequence cache layout.
+            cp.kv_unified = full_checkpoints;
             // The light path rewinds the live sequence directly and therefore
             // needs the cache's bounded suffix-rollback snapshots. The recurrent
             // path already keeps one complete sequence alias per in-flight stage
@@ -1157,9 +1326,8 @@ struct common_spd_pipeline::impl {
             configure_static_context(stages[stage], true);
         }
 
-        for (int32_t anchor : anchors) {
-            const uint32_t stage = std::min<uint32_t>(anchor / layers_per_stage, stage_count - 1);
-            llama_set_embeddings_layer_inp(stages[stage], anchor, true);
+        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+            llama_set_embeddings_layer_inp(stages[anchor_stage(ai)], anchors[ai], true);
         }
 
         llama_context_params hp = make_context_params(std::max<uint32_t>(1, params.n_batch));
@@ -1222,9 +1390,13 @@ struct common_spd_pipeline::impl {
 
     void reset_memories() {
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            llama_memory_clear(llama_get_memory(stages[stage]), true);
+            if (stages[stage] != nullptr) {
+                llama_memory_clear(llama_get_memory(stages[stage]), true);
+            }
         }
-        llama_memory_clear(llama_get_memory(sidecar), true);
+        if (sidecar != nullptr) {
+            llama_memory_clear(llama_get_memory(sidecar), true);
+        }
         aggr_forget(0);
         for (auto & positions : checkpoint_pos) {
             positions.fill(-1);
@@ -1234,7 +1406,9 @@ struct common_spd_pipeline::impl {
         checkpoints.clear();
     }
 
-    static constexpr llama_state_seq_flags SPD_CKPT_FLAGS = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    llama_state_seq_flags checkpoint_flags() const {
+        return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    }
 
     // Every context whose state has to move as one unit: the target stages in
     // order, then the sidecar. The sidecar is included because a restored
@@ -1252,13 +1426,10 @@ struct common_spd_pipeline::impl {
         return out;
     }
 
-    // Whether this target's cache refuses deep partial removals. True exactly
-    // for the bounded-suffix-rollback archs (DSV4, Qwen3.5) -- everything else
-    // clamps n_rs_seq to 0 and can be cropped at any depth, so it reuses by
-    // cropping and would pay for state blobs it never reads. Checkpoints are
-    // therefore taken only where they are the sole working mechanism.
+    // Bounded rollback caches need snapshots for deep rewinds. GLM snapshots
+    // recurrent state while its shared attention and indexer prefix stays resident.
     bool needs_checkpoints() const {
-        return stages[0] != nullptr && llama_n_rs_seq(stages[0]) > 0;
+        return full_checkpoints || (stages[0] != nullptr && llama_n_rs_seq(stages[0]) > 0);
     }
 
     // Serialize every stage at `pos` from this thread and add it to the ring.
@@ -1297,30 +1468,59 @@ struct common_spd_pipeline::impl {
     //
     // Callers must hold the stage's resource locks -- this is an RPC round trip
     // on the same endpoint the stage decodes on.
-    bool capture_stage(stage_checkpoint & cp, uint32_t stage) {
+    bool capture_stage(stage_checkpoint & cp, uint32_t stage, llama_seq_id seq_id = 0) {
         // The state calls throw on a malformed blob. A checkpoint is an
         // optimisation -- losing one costs a re-prefill, so swallow the failure
         // rather than let it escape into a prefill worker, where it would take
         // down the request.
         try {
-            const size_t size = llama_state_seq_get_size_ext(stages[stage], 0, SPD_CKPT_FLAGS);
+            if (full_checkpoints && llama_memory_seq_pos_max(llama_get_memory(stages[stage]), seq_id) != cp.pos - 1) {
+                return false;
+            }
+            const size_t size = llama_state_seq_get_size_ext(stages[stage], seq_id, checkpoint_flags());
             if (size == 0) {
                 return false;
             }
             cp.blobs[stage].resize(size);
-            if (llama_state_seq_get_data_ext(stages[stage], cp.blobs[stage].data(), size, 0,
-                        SPD_CKPT_FLAGS) == 0) {
+            if (llama_state_seq_get_data_ext(stages[stage], cp.blobs[stage].data(), size, seq_id,
+                        checkpoint_flags()) != size) {
                 return false;
             }
         } catch (const std::exception &) {
             return false;
         }
+        if (full_checkpoints) {
+            cp.checksums[stage] = checkpoint_checksum(cp.blobs[stage]);
+        }
         cp.have[stage] = 1;
         return true;
     }
 
+    bool capture_sidecar(stage_checkpoint & cp) {
+        try {
+            if (llama_memory_seq_pos_max(llama_get_memory(sidecar), 0) != cp.pos - 1) {
+                return false;
+            }
+            const size_t size = llama_state_seq_get_size_ext(sidecar, 0, 0);
+            if (size == 0) {
+                return false;
+            }
+            cp.sidecar_blob.resize(size);
+            if (llama_state_seq_get_data_ext(sidecar, cp.sidecar_blob.data(), size, 0, 0) != size) {
+                cp.sidecar_blob.clear();
+                return false;
+            }
+        } catch (const std::exception &) {
+            cp.sidecar_blob.clear();
+            return false;
+        }
+        cp.sidecar_checksum = checkpoint_checksum(cp.sidecar_blob);
+        return true;
+    }
+
     void add_checkpoint(stage_checkpoint && cp, int32_t keep) {
-        if (keep <= 0 || cp.pos <= 0 || !cp.complete(stage_count)) {
+        if (keep <= 0 || cp.pos <= 0 || !cp.complete(stage_count) ||
+                (full_checkpoints && cp.sidecar_blob.empty())) {
             return;
         }
         for (const auto & existing : checkpoints) {
@@ -1376,17 +1576,36 @@ struct common_spd_pipeline::impl {
         return selected;
     }
 
-    // Restore every stage from `cp`. state_read_meta clears the destination
-    // sequence first (a full seq_rm, which DSV4 does allow), so this also
-    // discards everything above cp.pos.
-    bool restore_checkpoint(const stage_checkpoint & cp) {
+    // GLM restores recurrent state before cropping the resident KV prefix.
+    // Import validation leaves KV intact until all rewind checkpoints pass.
+    bool restore_checkpoint(const stage_checkpoint & cp, bool crop = true) {
         try {
             for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                if (full_checkpoints && !clear_rollback_aliases(stage)) {
+                    return false;
+                }
                 if (llama_state_seq_set_data_ext(stages[stage], cp.blobs[stage].data(),
-                            cp.blobs[stage].size(), 0, SPD_CKPT_FLAGS) == 0) {
+                            cp.blobs[stage].size(), 0, checkpoint_flags()) != cp.blobs[stage].size()) {
+                    return false;
+                }
+                if (full_checkpoints && (
+                        llama_memory_seq_pos_min(llama_get_memory(stages[stage]), 0) != cp.pos - 1 ||
+                        llama_memory_seq_pos_max(llama_get_memory(stages[stage]), 0) != cp.pos - 1)) {
+                    return false;
+                }
+                if (full_checkpoints && crop &&
+                        !llama_memory_seq_rm(llama_get_memory(stages[stage]), 0, cp.pos, -1)) {
                     return false;
                 }
                 stage_tail_pos[stage] = cp.pos - 1;
+            }
+            if (full_checkpoints && (cp.sidecar_blob.empty() ||
+                    llama_state_seq_set_data_ext(sidecar, cp.sidecar_blob.data(), cp.sidecar_blob.size(), 0, 0) !=
+                    cp.sidecar_blob.size())) {
+                return false;
+            }
+            if (full_checkpoints && llama_memory_seq_pos_max(llama_get_memory(sidecar), 0) != cp.pos - 1) {
+                return false;
             }
         } catch (const std::exception &) {
             // A half-restored fabric is not recoverable in place; the caller
@@ -1428,9 +1647,7 @@ struct common_spd_pipeline::impl {
     // restore, which gives up whatever sits between the checkpoint and the
     // match but has no depth limit.
     //
-    // Restricted to position-addressed caches. A recurrent or hybrid target
-    // carries state that neither mechanism can rewind (the same reason it needs
-    // the seq_cp rollback path), so it re-prefills.
+    // GLM restores recurrent state first, then crops its resident KV and indexer.
     int32_t reuse_prefix(const std::vector<llama_token> & prompt, bool enabled) {
         const int32_t n_prompt = (int32_t) prompt.size();
 
@@ -1439,7 +1656,7 @@ struct common_spd_pipeline::impl {
         // never reuse the whole prompt: the last position has to be decoded to
         // produce the hidden state the head turns into the first token
         limit = std::min<int32_t>(limit, n_prompt - 1);
-        if (!enabled || !prefix_reuse_enabled || !light_rollback || limit <= 0) {
+        if (!enabled || !prefix_reuse_enabled || (!light_rollback && !full_checkpoints) || limit <= 0) {
             reset_memories();
             return 0;
         }
@@ -1457,7 +1674,7 @@ struct common_spd_pipeline::impl {
         // and on DSV4 only within its rollback slack -- deeper than that seq_rm
         // rejects the call *before* mutating anything, so falling through to a
         // checkpoint is safe.
-        if (crop_all(n_match)) {
+        if (light_rollback && crop_all(n_match)) {
             drop_checkpoints_above(n_match);
             return n_match;
         }
@@ -1468,13 +1685,19 @@ struct common_spd_pipeline::impl {
                 continue;
             }
             const llama_pos restored = it->pos;
-            if (restore_checkpoint(*it) && llama_memory_seq_rm(llama_get_memory(sidecar), 0, restored, -1)) {
+            if (restore_checkpoint(*it) && (full_checkpoints ||
+                    llama_memory_seq_rm(llama_get_memory(sidecar), 0, restored, -1))) {
                 aggr_forget(restored);
                 for (auto & positions : checkpoint_pos) {
                     positions.fill(-1);
                 }
                 drop_checkpoints_above(restored);
                 return (int32_t) restored;
+            }
+            if (full_checkpoints) {
+                reset_memories();
+                fail("failed to restore SPD checkpoint at position " + std::to_string(restored));
+                return -1;
             }
             break;
         }
@@ -1553,6 +1776,44 @@ struct common_spd_pipeline::impl {
         cached_tokens.insert(cached_tokens.end(), generated.begin(), generated.begin() + (end_pos - n_prompt));
     }
 
+    void retain_hybrid_prefix(const std::vector<llama_token> & prompt,
+            const std::vector<llama_token> & generated, llama_pos end_pos,
+            const std::map<llama_pos, snapshot> & completed, int32_t keep) {
+        if (keep <= 0) {
+            reset_memories();
+            return;
+        }
+        const llama_pos n_prompt = (llama_pos) prompt.size();
+        end_pos = std::clamp<llama_pos>(end_pos, n_prompt, n_prompt + (llama_pos) generated.size());
+        if (!rollback(end_pos)) {
+            fprintf(stderr, "SPD warning: checkpoint at position %d dropped after target rollback failed\n", (int) end_pos);
+            reset_memories();
+            return;
+        }
+        if (!settle_sidecar(end_pos, completed)) {
+            fprintf(stderr, "SPD warning: checkpoint at position %d dropped after sidecar settlement failed\n", (int) end_pos);
+            reset_memories();
+            return;
+        }
+        stage_checkpoint cp;
+        cp.pos = end_pos;
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            if (!capture_stage(cp, stage)) {
+                fprintf(stderr, "SPD warning: checkpoint at position %d dropped after stage %u capture failed\n", (int) end_pos, stage);
+                reset_memories();
+                return;
+            }
+        }
+        if (!capture_sidecar(cp)) {
+            fprintf(stderr, "SPD warning: checkpoint at position %d dropped after sidecar capture failed\n", (int) end_pos);
+            reset_memories();
+            return;
+        }
+        cached_tokens = prompt;
+        cached_tokens.insert(cached_tokens.end(), generated.begin(), generated.begin() + (end_pos - n_prompt));
+        add_checkpoint(std::move(cp), keep);
+    }
+
     // Rewrite the sidecar's still-shallow tail rows at the full selector, so
     // every retained row is what a prefill would have produced.
     //
@@ -1569,9 +1830,9 @@ struct common_spd_pipeline::impl {
     // rollback slack and so turned the exact-match case into a guaranteed
     // re-prefill. Settling them costs one sidecar decode of at most stage_count
     // rows, once per request.
-    void settle_sidecar(llama_pos end_pos, const std::map<llama_pos, snapshot> & completed) {
+    bool settle_sidecar(llama_pos end_pos, const std::map<llama_pos, snapshot> & completed) {
         if (end_pos <= 0 || anchors.empty()) {
-            return;
+            return true;
         }
         const size_t selector = anchors.size() - 1;
 
@@ -1598,13 +1859,13 @@ struct common_spd_pipeline::impl {
             --from;
         }
         if (from >= end_pos) {
-            return;
+            return true;
         }
 
         // Same shape as run_speculation: crop to the first rewritten position
         // so the decode replaces those cells rather than appending duplicates.
         if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, from, -1)) {
-            return;
+            return false;
         }
         speculation_input rows;
         for (llama_pos pos = from; pos < end_pos; ++pos) {
@@ -1620,12 +1881,15 @@ struct common_spd_pipeline::impl {
         if (!sidecar_decode(rows, nullptr,
                     static_decode_fast_path ? &sidecar_decode_batch : nullptr)) {
             last_error = saved_error;
+            return false;
         }
+        return true;
     }
 
     // Which stage owns anchor `ai`, i.e. whose graph taps it as a layer input.
     uint32_t anchor_stage(size_t ai) const {
-        return (uint32_t) std::min<int32_t>(anchors[ai]/layers_per_stage, stage_count - 1);
+        return (uint32_t) (std::upper_bound(stage_bounds.begin(), stage_bounds.end() - 1, anchors[ai]) -
+                stage_bounds.begin() - 1);
     }
 
     // An anchor sitting exactly on a stage's first layer is that stage's own
@@ -1648,7 +1912,7 @@ struct common_spd_pipeline::impl {
         if (stage == 0) {
             return false;
         }
-        return anchors[ai] == std::min<int32_t>((int32_t) stage*layers_per_stage, n_layers);
+        return anchors[ai] == stage_bounds[stage];
     }
 
     // true when every anchor this stage taps is host-derived, so the decode can
@@ -1775,7 +2039,7 @@ struct common_spd_pipeline::impl {
     }
 
     size_t depth_to_anchor(int32_t depth) const {
-        const int32_t available_hf = std::min(n_layers, depth*layers_per_stage);
+        const int32_t available_hf = stage_bounds[std::clamp<int32_t>(depth, 0, (int32_t) stage_count)];
         size_t result = 0;
         for (size_t i = 1; i < anchors.size(); ++i) {
             if (anchors[i] > available_hf) {
@@ -1990,14 +2254,23 @@ struct common_spd_pipeline::impl {
     // asked for exactly [base, n_prompt). When base > prefill_len the loop is
     // empty, which is the short-continuation case -- everything the sidecar
     // needs is already resident and settled.
-    bool prefill_sidecar(const std::vector<std::vector<float>> & anchor_data, int32_t n_tokens, int32_t base) {
+    bool prefill_sidecar(const std::vector<std::vector<float>> & anchor_data, int32_t n_tokens, int32_t base,
+            std::vector<stage_checkpoint> & ckpt_out) {
         const int32_t prefill_len = std::max(0, n_tokens - (int32_t) stage_count + 1);
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
         const size_t selector = anchors.size() - 1;
 
         speculation_input rows;
-        for (int32_t begin = base; begin < prefill_len; begin += chunk_size) {
-            const int32_t count = std::min(chunk_size, prefill_len - begin);
+        for (int32_t begin = base; begin < prefill_len;) {
+            int32_t end = std::min(begin + chunk_size, prefill_len);
+            if (full_checkpoints) {
+                for (const auto & cp : ckpt_out) {
+                    if (cp.pos > begin && cp.pos < end) {
+                        end = cp.pos;
+                    }
+                }
+            }
+            const int32_t count = end - begin;
             rows.clear();
             for (int32_t row = 0; row < count; ++row) {
                 const size_t offset = (size_t) (begin + row - base)*n_embd;
@@ -2011,6 +2284,14 @@ struct common_spd_pipeline::impl {
                 dump_prefill_rows_left -= count;
                 dump_rows("prefill", rows.selectors, rows.positions, rows.features, LLAMA_TOKEN_NULL);
             }
+            if (full_checkpoints) {
+                for (auto & cp : ckpt_out) {
+                    if (cp.pos == end) {
+                        capture_sidecar(cp);
+                    }
+                }
+            }
+            begin = end;
         }
         return true;
     }
@@ -2090,10 +2371,25 @@ struct common_spd_pipeline::impl {
         return ok;
     }
 
+    bool clear_rollback_aliases(uint32_t stage) {
+        for (uint32_t i = 0; i < rollback_tokens; ++i) {
+            if (checkpoint_pos[stage][i] >= 0 &&
+                    !llama_memory_seq_rm(llama_get_memory(stages[stage]), (llama_seq_id) i + 1, -1, -1)) {
+                fail("failed to retire target SPD rollback alias " + std::to_string(stage));
+                return false;
+            }
+            checkpoint_pos[stage][i] = -1;
+        }
+        return true;
+    }
+
     bool rollback(llama_pos target_pos) {
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             const llama_pos restore_pos = target_pos - 1;
             if (stage_tail_pos[stage] == restore_pos) {
+                if (full_checkpoints && !clear_rollback_aliases(stage)) {
+                    return false;
+                }
                 continue;
             }
 
@@ -2129,6 +2425,9 @@ struct common_spd_pipeline::impl {
             }
             llama_memory_seq_cp(memory, restore_seq, 0, -1, -1);
             stage_tail_pos[stage] = restore_pos;
+            if (full_checkpoints && !clear_rollback_aliases(stage)) {
+                return false;
+            }
         }
         if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, target_pos, -1)) {
             fail("failed to roll back SPD sidecar");
@@ -2149,7 +2448,7 @@ struct common_spd_pipeline::impl {
         ggml_tensor * inp = llama_spd_peer_inp_tensor(stages[stage]);
         const char * why = nullptr;
         if (inp == nullptr) {
-            why = "no input tensor on the last graph";
+            why = "no persistent input tensor";
         } else if (inp->buffer == nullptr) {
             why = "input tensor has no buffer";
         } else if (inp->type != GGML_TYPE_F32) {
@@ -2215,11 +2514,8 @@ struct common_spd_pipeline::impl {
         }
     }
 
-    // Decodes prompt positions [base, n_prompt); the caches already hold
-    // [0, base). `hidden` and `anchor_data` cover only the decoded range and
-    // are therefore indexed by (pos - base) -- at 9 anchors of n_embd floats
-    // per token, sizing them for the whole prompt would cost gigabytes of host
-    // RAM for rows nothing reads.
+    // GLM streams completed chunks to the sidecar through a bounded ring.
+    // Only the final boundary and decode-window anchors survive prefill.
     bool prefill_target(
             const std::vector<llama_token> & prompt,
             int32_t base,
@@ -2230,7 +2526,20 @@ struct common_spd_pipeline::impl {
         const int32_t n_prompt = (int32_t) prompt.size();
         const int32_t n_new = n_prompt - base;
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
-        const int32_t n_chunks = (n_new + chunk_size - 1)/chunk_size;
+        std::vector<int32_t> chunk_bounds = { base };
+        for (int32_t begin = base; begin < n_prompt;) {
+            int32_t end = std::min(begin + chunk_size, n_prompt);
+            if (full_checkpoints) {
+                for (llama_pos pos : ckpt_at) {
+                    if (pos > begin && pos < end) {
+                        end = pos;
+                    }
+                }
+            }
+            chunk_bounds.push_back(end);
+            begin = end;
+        }
+        const int32_t n_chunks = (int32_t) chunk_bounds.size() - 1;
         // The peer path moves whole chunks: the staging twin, the push and the
         // failed-push recovery all address one chunk of boundary rows. But
         // spd_peer_out_tensor() is the *last graph's* t_embd, and a stage
@@ -2245,10 +2554,35 @@ struct common_spd_pipeline::impl {
         // peer boundaries are untouched -- their graphs are one token wide.
         const bool peer_chunk_capable =
                 (int32_t) llama_n_ubatch(stages[0]) >= chunk_size;
-        hidden.resize((size_t) n_new*n_embd_boundary);
-        anchor_data.assign(anchors.size(), std::vector<float>((size_t) n_new*n_embd));
+        const int32_t retained_base = full_checkpoints
+                ? std::max(base, n_prompt - (int32_t) stage_count + 1) : base;
+        const int32_t ring_size = full_checkpoints ? std::min(n_chunks, (int32_t) stage_count + 1) : 0;
+        const int32_t slot_rows = std::min(chunk_size, n_new);
+        struct prefill_slot {
+            std::vector<float> hidden;
+            std::vector<std::vector<float>> anchors;
+        };
+        std::vector<prefill_slot> ring;
+        try {
+            hidden.resize((size_t) (full_checkpoints ? 1 : n_new)*n_embd_boundary);
+            anchor_data.resize(anchors.size());
+            for (auto & rows : anchor_data) {
+                rows.resize((size_t) (n_prompt - retained_base)*n_embd);
+            }
+            ring.resize(ring_size);
+            for (auto & slot : ring) {
+                slot.hidden.resize((size_t) slot_rows*n_embd_boundary);
+                slot.anchors.resize(anchors.size());
+                for (auto & rows : slot.anchors) {
+                    rows.resize((size_t) slot_rows*n_embd);
+                }
+            }
+        } catch (const std::exception &) {
+            fail("failed to allocate SPD prefill buffers");
+            return false;
+        }
         for (auto & pb : peer_links) {
-            pb.pushed_chunk   = -1;
+            pb.pushed_chunks[0] = pb.pushed_chunks[1] = -1;
             pb.ordinals[0]    = 0;
             pb.ordinals[1]    = 0;
             pb.consumed_chunk = -1;
@@ -2268,263 +2602,371 @@ struct common_spd_pipeline::impl {
         std::mutex progress_mutex;
         std::condition_variable progress_cv;
         std::vector<int32_t> chunks_done((size_t) stage_count, 0);
+        int32_t chunks_consumed = 0;
         bool aborted = false;
+        std::exception_ptr prefill_failure;
+        auto abort_with_exception = [&]() {
+            {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                if (prefill_failure == nullptr) {
+                    prefill_failure = std::current_exception();
+                }
+                aborted = true;
+            }
+            progress_cv.notify_all();
+        };
 
         std::vector<std::thread> workers;
         workers.reserve(stage_count);
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            workers.emplace_back([&, stage]() {
-                std::vector<std::pair<size_t, std::vector<float> *>> wanted;
-                std::vector<float> chunk_output;
-                std::vector<std::vector<float>> chunk_anchors(anchors.size());
-                // set after a deferred-ack push; the next decode must be
-                // ordered behind the push's local read of the output tensor
-                ggml_tensor * guard_probe = nullptr;
-
-                for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
-                    // Stage 0 paces the ladder, so its check is enough: once it
-                    // stops producing, every later stage drains what is in
-                    // flight and exits through the abort wakeup below.
-                    if (stage == 0 && should_cancel && should_cancel()) {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        prefill_cancelled = true;
-                        aborted = true;
-                        progress_cv.notify_all();
-                        return;
-                    }
-                    const auto wait_start = clock_type::now();
-                    {
-                        std::unique_lock<std::mutex> lock(progress_mutex);
-                        progress_cv.wait(lock, [&] {
-                            return aborted || stage == 0 || chunks_done[stage - 1] > chunk;
-                        });
-                        if (aborted) {
-                            return;
-                        }
-                    }
-                    const auto lock_start = clock_type::now();
-
-                    const int32_t begin = base + chunk*chunk_size;
-                    const int32_t count = std::min(chunk_size, n_prompt - begin);
-                    wanted.clear();
-                    for (size_t ai = 0; ai < anchors.size(); ++ai) {
-                        if ((uint32_t) std::min<int32_t>(anchors[ai] / layers_per_stage, stage_count - 1) == stage) {
-                            wanted.push_back({ ai, &chunk_anchors[ai] });
-                        }
-                    }
-
-                    // Peer-boundary roles for this cell, decided under the
-                    // progress lock: does the input arrive by push (consumer),
-                    // does the output leave by push (producer). Partial final
-                    // chunks stay on the host path (different graph shape).
-                    peer_boundary * pb_in  = stage > 0 ? &peer_links[stage] : nullptr;
-                    peer_boundary * pb_out = stage + 1 < stage_count ? &peer_links[stage + 1] : nullptr;
-                    bool peer_in = false, peer_out = false;
-                    if (peer_boundaries_enabled && peer_chunk_capable) {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        peer_in  = pb_in  != nullptr && pb_in->ready && !pb_in->dead &&
-                                   pb_in->pushed_chunk >= chunk && pb_in->inp != nullptr;
-                        peer_out = pb_out != nullptr && pb_out->ready && !pb_out->dead &&
-                                   count == chunk_size;
-                    }
-
-                    std::string error;
-                    bool ok = false;
-                    const auto busy_start = clock_type::now();
-                    {
-                        std::vector<std::unique_lock<std::mutex>> resource_locks;
-                        resource_locks.reserve(stage_resources[stage].size());
-                        for (size_t resource : stage_resources[stage]) {
-                            resource_locks.emplace_back(*resource_mutexes[resource]);
-                        }
-                        ok = true;
-                        if (guard_probe != nullptr) {
-                            ggml_backend_rpc_sync_peer_guard(guard_probe);
-                            guard_probe = nullptr;
-                        }
-                        if (peer_in) {
-                            // stall the endpoint's command loop until the push
-                            // has been applied, then move it from staging into
-                            // the graph's input tensor on-server
-                            const auto peer_start = clock_type::now();
-                            ggml_tensor * slot = pb_in->staging[chunk & 1];
-                            ok = ggml_backend_rpc_sync_peer_fence(slot, pb_in->ordinals[chunk & 1]);
-                            if (ok) {
-                                ggml_backend_tensor_copy(slot, pb_in->inp);
-                            } else {
-                                error = "SPD peer fence failed for stage " + std::to_string(stage);
-                            }
-                            timing.prefill_peer_in[stage] += seconds_since(peer_start);
-                        }
-                        if (ok) {
-                            llama_set_spd_peer_io(stages[stage], peer_in, peer_out, false);
-                            const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
-                            const float * embeddings = stage == 0
-                                    ? nullptr
-                                    : hidden.data() + (size_t) (begin - base)*n_embd_boundary;
-                            ok = decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error,
-                                    nullptr, &timing.prefill_decode[stage], &timing.prefill_read[stage],
-                                    /*read_output =*/ !peer_out);
-                            llama_set_spd_peer_io(stages[stage], false, false, false);
-                        }
-                        if (ok && peer_in) {
-                            // a rebuild would have read a different input tensor
-                            // than the copy filled; that cell would be garbage,
-                            // so surface it loudly instead
-                            if (llama_spd_peer_inp_tensor(stages[stage]) != pb_in->inp) {
-                                error = "SPD peer boundary input tensor moved under stage " + std::to_string(stage);
-                                ok = false;
-                            }
-                        } else if (ok && pb_in != nullptr && pb_in->ready && count == chunk_size) {
-                            // host-path cell on a peer-capable stage: keep the
-                            // captured input tensor current for the next push
-                            std::lock_guard<std::mutex> lock(progress_mutex);
-                            pb_in->inp = llama_spd_peer_inp_tensor(stages[stage]);
-                        }
-                    }
-                    timing.prefill_dep_wait[stage] += std::chrono::duration<double>(lock_start - wait_start).count();
-                    timing.prefill_lock[stage] += std::chrono::duration<double>(busy_start - lock_start).count();
-                    timing.prefill_busy[stage] += seconds_since(busy_start);
-                    ++timing.prefill_calls[stage];
-
-                    if (!ok) {
-                        {
-                            std::lock_guard<std::mutex> lock(progress_mutex);
-                            aborted = true;
-                            fail(std::move(error));
-                        }
-                        progress_cv.notify_all();
-                        return;
-                    }
-
-                    // Producer side: ship the boundary straight to the next
-                    // stage's staging tensor. The graph is known complete (the
-                    // anchor readback inside llama_decode is a sync round-trip
-                    // behind GRAPH_COMPUTE on the same socket).
-                    bool pushed = false;
-                    if (peer_out) {
-                        const auto push_start = clock_type::now();
-                        {
-                            // never overwrite a staging slot before the
-                            // consumer drained it (two slots -> two ahead)
-                            std::unique_lock<std::mutex> lock(progress_mutex);
-                            progress_cv.wait(lock, [&] {
-                                return aborted || pb_out->consumed_chunk >= chunk - 2;
-                            });
-                            if (aborted) {
+        try {
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                workers.emplace_back([&, stage]() {
+                    try {
+                        std::vector<std::pair<size_t, std::vector<float> *>> wanted;
+                        std::vector<float> chunk_output;
+                        std::vector<std::vector<float>> chunk_anchors(anchors.size());
+                        for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
+                            // Stage 0 paces the ladder, so its check is enough: once it
+                            // stops producing, every later stage drains what is in
+                            // flight and exits through the abort wakeup below.
+                            if (stage == 0 && should_cancel && should_cancel()) {
+                                std::lock_guard<std::mutex> lock(progress_mutex);
+                                prefill_cancelled = true;
+                                aborted = true;
+                                progress_cv.notify_all();
                                 return;
                             }
-                        }
-                        ggml_tensor * out = llama_spd_peer_out_tensor(stages[stage]);
-                        ggml_tensor * slot = pb_out->staging[chunk & 1];
-                        uint64_t ordinal = 0;
-                        if (out != nullptr && slot != nullptr &&
-                            ggml_nbytes(out) == ggml_nbytes(slot) &&
-                            ggml_backend_rpc_sync_peer_push(out, slot, &ordinal)) {
+                            const auto wait_start = clock_type::now();
                             {
-                                std::lock_guard<std::mutex> lock(progress_mutex);
-                                pb_out->ordinals[chunk & 1] = ordinal;
-                                pb_out->pushed_chunk = chunk;
+                                std::unique_lock<std::mutex> lock(progress_mutex);
+                                progress_cv.wait(lock, [&] {
+                                    return aborted || (stage == 0
+                                            ? !full_checkpoints || chunk < chunks_consumed + ring_size
+                                            : chunks_done[stage - 1] > chunk);
+                                });
+                                if (aborted) {
+                                    return;
+                                }
                             }
-                            pushed = true;
-                            guard_probe = out;
-                            ++timing.prefill_pushes[stage];
-                        } else {
-                            // recover the boundary for the host path and stop
-                            // trying this pair
+                            const auto lock_start = clock_type::now();
+
+                            const int32_t begin = chunk_bounds[chunk];
+                            const int32_t count = chunk_bounds[chunk + 1] - begin;
+                            wanted.clear();
+                            for (size_t ai = 0; ai < anchors.size(); ++ai) {
+                                if (anchor_stage(ai) == stage) {
+                                    wanted.push_back({ ai, &chunk_anchors[ai] });
+                                }
+                            }
+
+                            // Peer-boundary roles for this cell, decided under the
+                            // progress lock: does the input arrive by push (consumer),
+                            // does the output leave by push (producer). Partial final
+                            // chunks stay on the host path (different graph shape).
+                            peer_boundary * pb_in  = stage > 0 ? &peer_links[stage] : nullptr;
+                            peer_boundary * pb_out = stage + 1 < stage_count ? &peer_links[stage + 1] : nullptr;
+                            bool peer_in = false, peer_out = false;
+                            if (peer_boundaries_enabled && peer_chunk_capable) {
+                                std::lock_guard<std::mutex> lock(progress_mutex);
+                                peer_in  = pb_in  != nullptr && pb_in->ready && count == chunk_size &&
+                                           pb_in->pushed_chunks[chunk & 1] == chunk && pb_in->inp != nullptr;
+                                peer_out = pb_out != nullptr && pb_out->ready && !pb_out->dead &&
+                                           count == chunk_size;
+                            }
+
+                            std::string error;
+                            bool ok = false;
+                            const auto busy_start = clock_type::now();
                             {
-                                std::lock_guard<std::mutex> lock(progress_mutex);
-                                pb_out->dead = true;
+                                std::vector<std::unique_lock<std::mutex>> resource_locks;
+                                resource_locks.reserve(stage_resources[stage].size());
+                                for (size_t resource : stage_resources[stage]) {
+                                    resource_locks.emplace_back(*resource_mutexes[resource]);
+                                }
+                                ok = guard_peer_output(stage);
+                                if (!ok) {
+                                    error = "SPD peer guard failed for prefill stage " + std::to_string(stage);
+                                }
+                                if (ok && peer_in) {
+                                    // stall the endpoint's command loop until the push
+                                    // has been applied, then move it from staging into
+                                    // the graph's input tensor on-server
+                                    const auto peer_start = clock_type::now();
+                                    ggml_tensor * slot = pb_in->staging[chunk & 1];
+                                    ok = ggml_backend_rpc_sync_peer_fence(slot, pb_in->ordinals[chunk & 1]);
+                                    if (ok) {
+                                        ggml_backend_tensor_copy(slot, pb_in->inp);
+                                    } else {
+                                        error = "SPD peer fence failed for stage " + std::to_string(stage);
+                                    }
+                                    timing.prefill_peer_in[stage] += seconds_since(peer_start);
+                                }
+                                if (ok) {
+                                    llama_set_spd_peer_io(stages[stage], peer_in, peer_out, false);
+                                    const llama_token * tokens = stage == 0 ? prompt.data() + begin : nullptr;
+                                    const float * embeddings = stage == 0
+                                            ? nullptr
+                                            : full_checkpoints ? ring[chunk % ring_size].hidden.data()
+                                                              : hidden.data() + (size_t) (begin - base)*n_embd_boundary;
+                                    ok = decode_stage(stage, tokens, embeddings, count, begin, chunk_output, wanted, error,
+                                            nullptr, &timing.prefill_decode[stage], &timing.prefill_read[stage],
+                                            /*read_output =*/ !peer_out);
+                                    llama_set_spd_peer_io(stages[stage], false, false, false);
+                                }
+                                if (ok && peer_in) {
+                                    // a rebuild would have read a different input tensor
+                                    // than the copy filled; that cell would be garbage,
+                                    // so surface it loudly instead
+                                    if (llama_spd_peer_inp_tensor(stages[stage]) != pb_in->inp) {
+                                        error = "SPD peer boundary input tensor moved under stage " + std::to_string(stage);
+                                        ok = false;
+                                    }
+                                } else if (ok && pb_in != nullptr && pb_in->ready && count == chunk_size) {
+                                    // host-path cell on a peer-capable stage: keep the
+                                    // captured input tensor current for the next push
+                                    std::lock_guard<std::mutex> lock(progress_mutex);
+                                    pb_in->inp = llama_spd_peer_inp_tensor(stages[stage]);
+                                }
                             }
-                            // The boundary is only recoverable from `out` if it
-                            // actually covers the chunk. Anything else must be
-                            // a clean failure, not a read past the tensor.
-                            chunk_output.resize((size_t) count*n_embd_boundary);
-                            if (out == nullptr ||
-                                ggml_nbytes(out) != chunk_output.size()*sizeof(float)) {
+                            timing.prefill_dep_wait[stage] += std::chrono::duration<double>(lock_start - wait_start).count();
+                            timing.prefill_lock[stage] += std::chrono::duration<double>(busy_start - lock_start).count();
+                            timing.prefill_busy[stage] += seconds_since(busy_start);
+                            ++timing.prefill_calls[stage];
+
+                            if (!ok) {
                                 {
                                     std::lock_guard<std::mutex> lock(progress_mutex);
                                     aborted = true;
-                                    fail(out == nullptr
-                                            ? "SPD peer push failed with no output tensor to recover from"
-                                            : "SPD peer push failed and the output tensor does not cover the chunk");
+                                    fail(std::move(error));
                                 }
                                 progress_cv.notify_all();
                                 return;
                             }
-                            ggml_backend_tensor_get(out, chunk_output.data(), 0,
-                                    chunk_output.size()*sizeof(float));
-                        }
-                        timing.prefill_push[stage] += seconds_since(push_start);
-                    }
 
-                    if (!pushed) {
-                        std::copy(chunk_output.begin(), chunk_output.end(),
-                                hidden.begin() + (size_t) (begin - base)*n_embd_boundary);
-                    }
-                    for (auto & item : wanted) {
-                        std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
-                                anchor_data[item.first].begin() + (size_t) (begin - base)*n_embd);
-                    }
+                            // Producer side: ship the boundary straight to the next
+                            // stage's staging tensor. The graph is known complete (the
+                            // anchor readback inside llama_decode is a sync round-trip
+                            // behind GRAPH_COMPUTE on the same socket).
+                            bool pushed = false;
+                            if (peer_out) {
+                                const auto push_start = clock_type::now();
+                                {
+                                    // never overwrite a staging slot before the
+                                    // consumer drained it (two slots -> two ahead)
+                                    std::unique_lock<std::mutex> lock(progress_mutex);
+                                    progress_cv.wait(lock, [&] {
+                                        return aborted || pb_out->consumed_chunk >= chunk - 2;
+                                    });
+                                    if (aborted) {
+                                        return;
+                                    }
+                                }
+                                std::vector<std::unique_lock<std::mutex>> resource_locks;
+                                resource_locks.reserve(stage_resources[stage].size());
+                                for (size_t resource : stage_resources[stage]) {
+                                    resource_locks.emplace_back(*resource_mutexes[resource]);
+                                }
+                                ggml_tensor * out = llama_spd_peer_out_tensor(stages[stage]);
+                                ggml_tensor * slot = pb_out->staging[chunk & 1];
+                                uint64_t ordinal = 0;
+                                if (out != nullptr && slot != nullptr &&
+                                    ggml_nbytes(out) == ggml_nbytes(slot) &&
+                                    ggml_backend_rpc_sync_peer_push(out, slot, &ordinal)) {
+                                    {
+                                        std::lock_guard<std::mutex> lock(progress_mutex);
+                                        pb_out->ordinals[chunk & 1] = ordinal;
+                                        pb_out->pushed_chunks[chunk & 1] = chunk;
+                                    }
+                                    pushed = true;
+                                    peer_push_pending[stage] = true;
+                                    ++timing.prefill_pushes[stage];
+                                } else {
+                                    // recover the boundary for the host path and stop
+                                    // trying this pair
+                                    {
+                                        std::lock_guard<std::mutex> lock(progress_mutex);
+                                        pb_out->dead = true;
+                                    }
+                                    // The boundary is only recoverable from `out` if it
+                                    // actually covers the chunk. Anything else must be
+                                    // a clean failure, not a read past the tensor.
+                                    chunk_output.resize((size_t) count*n_embd_boundary);
+                                    if (out == nullptr ||
+                                        ggml_nbytes(out) != chunk_output.size()*sizeof(float)) {
+                                        {
+                                            std::lock_guard<std::mutex> lock(progress_mutex);
+                                            aborted = true;
+                                            fail(out == nullptr
+                                                    ? "SPD peer push failed with no output tensor to recover from"
+                                                    : "SPD peer push failed and the output tensor does not cover the chunk");
+                                        }
+                                        progress_cv.notify_all();
+                                        return;
+                                    }
+                                    ggml_backend_tensor_get(out, chunk_output.data(), 0,
+                                            chunk_output.size()*sizeof(float));
+                                }
+                                timing.prefill_push[stage] += seconds_since(push_start);
+                            }
 
-                    // consumer-side setup, once, after the first full-chunk
-                    // decode so the input tensor exists
-                    if (peer_boundaries_enabled && peer_chunk_capable && stage > 0 && count == chunk_size) {
-                        bool need_setup;
-                        {
-                            std::lock_guard<std::mutex> lock(progress_mutex);
-                            need_setup = !pb_in->ready && !pb_in->dead;
-                        }
-                        if (need_setup) {
-                            setup_peer_boundary(*pb_in, stage, progress_mutex);
-                        }
-                    }
+                            if (!pushed) {
+                                float * output = full_checkpoints ? ring[chunk % ring_size].hidden.data()
+                                                                  : hidden.data() + (size_t) (begin - base)*n_embd_boundary;
+                                std::copy(chunk_output.begin(), chunk_output.end(),
+                                        output);
+                            }
+                            for (auto & item : wanted) {
+                                float * output = full_checkpoints ? ring[chunk % ring_size].anchors[item.first].data()
+                                                                  : anchor_data[item.first].data() + (size_t) (begin - base)*n_embd;
+                                std::copy(chunk_anchors[item.first].begin(), chunk_anchors[item.first].end(),
+                                        output);
+                            }
 
+                            // consumer-side setup, once, after the first full-chunk
+                            // decode so the input tensor exists
+                            if (peer_boundaries_enabled && peer_chunk_capable && stage > 0 && count == chunk_size) {
+                                bool need_setup;
+                                {
+                                    std::lock_guard<std::mutex> lock(progress_mutex);
+                                    need_setup = !pb_in->ready && !pb_in->dead;
+                                }
+                                if (need_setup) {
+                                    std::vector<std::unique_lock<std::mutex>> resource_locks;
+                                    resource_locks.reserve(stage_resources[stage].size());
+                                    for (size_t resource : stage_resources[stage]) {
+                                        resource_locks.emplace_back(*resource_mutexes[resource]);
+                                    }
+                                    setup_peer_boundary(*pb_in, stage, progress_mutex);
+                                }
+                            }
+
+                            {
+                                std::lock_guard<std::mutex> lock(progress_mutex);
+                                chunks_done[stage] = chunk + 1;
+                                if (pb_in != nullptr) {
+                                    pb_in->consumed_chunk = chunk;
+                                }
+                            }
+                            progress_cv.notify_all();
+
+                            // Interval checkpoint. This stage's cache now holds exactly
+                            // [0, begin + count) and only this thread ever writes it, so
+                            // its slice can be taken here; the other stages reach the
+                            // same position at their own pace and fill their own slices.
+                            // Nothing waits on anyone, which is what lets checkpoints be
+                            // taken mid-prefill at all -- a barrier per checkpoint would
+                            // give back what removing barriers from prefill bought.
+                            //
+                            // After the progress publish on purpose: the downstream
+                            // stage is already free to start this chunk, so the state
+                            // read stays off the inter-stage critical path and only
+                            // delays this stage's own next chunk.
+                            if (!ckpt_at.empty()) {
+                                const llama_pos chunk_end = begin + count;
+                                for (size_t ci = 0; ci < ckpt_at.size(); ++ci) {
+                                    if (ckpt_at[ci] != chunk_end) {
+                                        continue;
+                                    }
+                                    const auto ckpt_start = clock_type::now();
+                                    std::vector<std::unique_lock<std::mutex>> ckpt_locks;
+                                    ckpt_locks.reserve(stage_resources[stage].size());
+                                    for (size_t resource : stage_resources[stage]) {
+                                        ckpt_locks.emplace_back(*resource_mutexes[resource]);
+                                    }
+                                    capture_stage(ckpt_out[ci], stage);
+                                    timing.prefill_ckpt[stage] += seconds_since(ckpt_start);
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (...) {
+                        abort_with_exception();
+                    }
+                });
+            }
+            if (full_checkpoints) {
+                const int32_t prefill_len = std::max(0, n_prompt - (int32_t) stage_count + 1);
+                const size_t selector = anchors.size() - 1;
+                speculation_input rows;
+                for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
                     {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        chunks_done[stage] = chunk + 1;
-                        if (pb_in != nullptr) {
-                            pb_in->consumed_chunk = chunk;
-                        }
-                    }
-                    progress_cv.notify_all();
-
-                    // Interval checkpoint. This stage's cache now holds exactly
-                    // [0, begin + count) and only this thread ever writes it, so
-                    // its slice can be taken here; the other stages reach the
-                    // same position at their own pace and fill their own slices.
-                    // Nothing waits on anyone, which is what lets checkpoints be
-                    // taken mid-prefill at all -- a barrier per checkpoint would
-                    // give back what removing barriers from prefill bought.
-                    //
-                    // After the progress publish on purpose: the downstream
-                    // stage is already free to start this chunk, so the state
-                    // read stays off the inter-stage critical path and only
-                    // delays this stage's own next chunk.
-                    if (!ckpt_at.empty()) {
-                        const llama_pos chunk_end = begin + count;
-                        for (size_t ci = 0; ci < ckpt_at.size(); ++ci) {
-                            if (ckpt_at[ci] != chunk_end) {
-                                continue;
-                            }
-                            const auto ckpt_start = clock_type::now();
-                            std::vector<std::unique_lock<std::mutex>> ckpt_locks;
-                            ckpt_locks.reserve(stage_resources[stage].size());
-                            for (size_t resource : stage_resources[stage]) {
-                                ckpt_locks.emplace_back(*resource_mutexes[resource]);
-                            }
-                            capture_stage(ckpt_out[ci], stage);
-                            timing.prefill_ckpt[stage] += seconds_since(ckpt_start);
+                        std::unique_lock<std::mutex> lock(progress_mutex);
+                        progress_cv.wait(lock, [&] { return aborted || chunks_done.back() > chunk; });
+                        if (aborted) {
                             break;
                         }
                     }
+                    const int32_t begin = chunk_bounds[chunk];
+                    const int32_t end = chunk_bounds[chunk + 1];
+                    const int32_t sidecar_end = std::min(end, prefill_len);
+                    const auto & slot = ring[chunk % ring_size];
+                    if (begin < sidecar_end) {
+                        rows.clear();
+                        for (int32_t pos = begin; pos < sidecar_end; ++pos) {
+                            append_row(rows, pos, selector, [&](size_t ai) {
+                                return slot.anchors[ai].data() + (size_t) (pos - begin)*n_embd;
+                            }, false);
+                        }
+                        if (!sidecar_decode(rows, nullptr)) {
+                            {
+                                std::lock_guard<std::mutex> lock(progress_mutex);
+                                aborted = true;
+                            }
+                            progress_cv.notify_all();
+                            break;
+                        }
+                        if (!dump_dir.empty() && dump_prefill_rows_left >= sidecar_end - begin) {
+                            dump_prefill_rows_left -= sidecar_end - begin;
+                            dump_rows("prefill", rows.selectors, rows.positions, rows.features, LLAMA_TOKEN_NULL);
+                        }
+                        for (auto & cp : ckpt_out) {
+                            if (cp.pos == sidecar_end) {
+                                std::vector<std::unique_lock<std::mutex>> resource_locks;
+                                for (size_t resource : sidecar_resources) {
+                                    resource_locks.emplace_back(*resource_mutexes[resource]);
+                                }
+                                capture_sidecar(cp);
+                            }
+                        }
+                    }
+                    const int32_t keep_from = std::max(begin, retained_base);
+                    if (keep_from < end) {
+                        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+                            std::copy(slot.anchors[ai].begin() + (size_t) (keep_from - begin)*n_embd,
+                                    slot.anchors[ai].begin() + (size_t) (end - begin)*n_embd,
+                                    anchor_data[ai].begin() + (size_t) (keep_from - retained_base)*n_embd);
+                        }
+                    }
+                    if (end == n_prompt) {
+                        std::copy_n(slot.hidden.data() + (size_t) (end - begin - 1)*n_embd_boundary,
+                                n_embd_boundary, hidden.data());
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        chunks_consumed = chunk + 1;
+                    }
+                    progress_cv.notify_all();
                 }
-            });
+            }
+        } catch (...) {
+            abort_with_exception();
         }
         for (auto & worker : workers) {
             worker.join();
         }
+        if (!drain_peer_transfers()) {
+            aborted = true;
+        }
         timing.prefill_wall += seconds_since(prefill_start);
+        if (prefill_failure != nullptr) {
+            try {
+                std::rethrow_exception(prefill_failure);
+            } catch (const std::exception & error) {
+                fail(std::string("SPD prefill failed: ") + error.what());
+            } catch (...) {
+                fail("SPD prefill failed");
+            }
+        }
         if (aborted) {
             return false;
         }
@@ -2614,12 +3056,10 @@ struct common_spd_pipeline::impl {
         // works and nothing has to survive a rebuild.
         if (peer_push_pending[stage]) {
             scope_timer guard_timer(timing.stage_guard[stage]);
-            ggml_tensor * probe = llama_spd_peer_out_tensor(stages[stage]);
-            if (probe == nullptr || !ggml_backend_rpc_sync_peer_guard(probe)) {
+            if (!guard_peer_output(stage)) {
                 error = "SPD peer guard failed for decode stage " + std::to_string(stage);
                 return false;
             }
-            peer_push_pending[stage] = false;
         }
 
         const bool peer_in = pb_in != nullptr && pb_in->ready && pb_in->dec_ready &&
@@ -2641,6 +3081,10 @@ struct common_spd_pipeline::impl {
         if (!light_rollback) {
             const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
             const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
+            if (full_checkpoints && !llama_memory_seq_rm(llama_get_memory(stages[stage]), checkpoint_seq, -1, -1)) {
+                error = "failed to replace target SPD rollback alias " + std::to_string(stage);
+                return false;
+            }
             llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
             checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
         }
@@ -2718,7 +3162,7 @@ struct common_spd_pipeline::impl {
         // one stream and take a plain copy.
         {
             scope_timer tap_timer(timing.stage_tap[stage]);
-            const int32_t end_layer = std::min<int32_t>((int32_t) (stage + 1)*layers_per_stage, n_layers);
+            const int32_t end_layer = stage_bounds[stage + 1];
             for (size_t ai = 0; ai < anchors.size(); ++ai) {
                 if (anchors[ai] != end_layer) {
                     continue;
@@ -2751,13 +3195,23 @@ struct common_spd_pipeline::impl {
         return true;
     }
 
-    void synchronize_all() {
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            llama_synchronize(stages[stage]);
+    bool synchronize_all() {
+        const bool peers_ok = drain_peer_transfers();
+        for (llama_context * stage : stages) {
+            if (stage != nullptr) {
+                llama_synchronize(stage);
+            }
         }
-        llama_synchronize(head);
-        llama_synchronize(embed);
-        llama_synchronize(sidecar);
+        if (head != nullptr) {
+            llama_synchronize(head);
+        }
+        if (embed != nullptr) {
+            llama_synchronize(embed);
+        }
+        if (sidecar != nullptr) {
+            llama_synchronize(sidecar);
+        }
+        return peers_ok;
     }
 
     bool generate(const std::vector<llama_token> & prompt,
@@ -2828,6 +3282,9 @@ struct common_spd_pipeline::impl {
         // validated against `cached_tokens`, so give up reuse rather than hand
         // the next request a prefix that may not be there.
         const int32_t n_keep = reuse_prefix(prompt, gparams.prefix_reuse);
+        if (n_keep < 0) {
+            return false;
+        }
         cached_tokens.clear();
         aggr_forget(0);
         result.n_prompt_reused    = n_keep;
@@ -2849,15 +3306,25 @@ struct common_spd_pipeline::impl {
         // checkpoint, which is the one the next chat turn resumes from.
         std::vector<llama_pos> ckpt_at;
         std::vector<stage_checkpoint> ckpt_out;
-        if (needs_checkpoints()) {
+        if (needs_checkpoints() && (!full_checkpoints || (prefix_reuse_enabled && gparams.prefix_reuse))) {
             // clamped before the -1: --ctx-checkpoints takes any int, and
             // INT32_MIN - 1 is undefined behaviour that wraps to INT32_MAX on
             // the usual toolchains -- i.e. "disable checkpoints" would plan the
             // maximum number of them.
             const int32_t keep = std::max<int32_t>(0, gparams.n_ctx_checkpoints) - 1;
-            ckpt_at = plan_prefill_checkpoints(n_keep, n_prompt,
+            const int32_t checkpoint_end = full_checkpoints
+                    ? std::max(0, n_prompt - (int32_t) stage_count + 1) : n_prompt;
+            ckpt_at = plan_prefill_checkpoints(n_keep, checkpoint_end,
                     std::max<int32_t>(1, params.n_batch),
                     keep, gparams.checkpoint_min_step);
+            if (full_checkpoints) {
+                // Budget both pending prefill snapshots and the final snapshot
+                // before allocating their recurrent and sidecar payloads.
+                const size_t old_budget = (size_t) std::max<int32_t>(0, keep - (int32_t) ckpt_at.size());
+                if (checkpoints.size() > old_budget) {
+                    checkpoints.erase(checkpoints.begin(), checkpoints.end() - old_budget);
+                }
+            }
             ckpt_out.resize(ckpt_at.size());
             for (size_t i = 0; i < ckpt_at.size(); ++i) {
                 ckpt_out[i].pos = ckpt_at[i];
@@ -2867,12 +3334,15 @@ struct common_spd_pipeline::impl {
         std::vector<float> prompt_hidden;
         std::vector<std::vector<float>> prompt_anchors;
         if (!prefill_target(prompt, n_keep, prompt_hidden, prompt_anchors, ckpt_at, ckpt_out) ||
-            !prefill_sidecar(prompt_anchors, n_prompt, n_keep)) {
+            (!full_checkpoints && !prefill_sidecar(prompt_anchors, n_prompt, n_keep, ckpt_out))) {
             result.cancelled = prefill_cancelled;
             return false;
         }
         // Workers have joined, so every slice that landed is visible here.
         for (auto & cp : ckpt_out) {
+            if (full_checkpoints && (!cp.complete(stage_count) || cp.sidecar_blob.empty())) {
+                fprintf(stderr, "SPD warning: incomplete prefill checkpoint at position %d skipped\n", (int) cp.pos);
+            }
             add_checkpoint(std::move(cp), gparams.n_ctx_checkpoints);
         }
         if (static_decode_fast_path) {
@@ -3008,13 +3478,15 @@ struct common_spd_pipeline::impl {
 
         std::map<llama_pos, snapshot> completed;
         const int32_t retained_begin = std::max(0, n_prompt - (int32_t) stage_count + 1);
+        const int32_t anchor_base = full_checkpoints ? std::max(n_keep, retained_begin) : n_keep;
         for (int32_t pos = retained_begin; pos < n_prompt; ++pos) {
-            completed.emplace(pos, snapshot_at(prompt_anchors, pos, n_keep));
+            completed.emplace(pos, snapshot_at(prompt_anchors, pos, anchor_base));
         }
 
+        const size_t hidden_offset = full_checkpoints ? 0 : (size_t) (n_prompt - 1 - n_keep)*n_embd_boundary;
         std::vector<float> last_hidden(
-                prompt_hidden.begin() + (size_t) (n_prompt - 1 - n_keep)*n_embd_boundary,
-                prompt_hidden.begin() + (size_t) (n_prompt - n_keep)*n_embd_boundary);
+                prompt_hidden.begin() + hidden_offset,
+                prompt_hidden.begin() + hidden_offset + n_embd_boundary);
         llama_token first_token;
         if (!target_head(last_hidden, first_token)) {
             return false;
@@ -3358,23 +3830,24 @@ struct common_spd_pipeline::impl {
         result.tokens.resize(n_final);
         result.accepted.resize(n_final);
 
-        // Hand the caches to the next request: drop the in-flight tail, then
-        // record what the retained cells actually hold. This also covers an
-        // early stop -- the caller cut generation short, but the pipeline had
-        // already decoded past it, and those cells have to go too. A target
-        // that cannot be cropped has its contexts rebuilt before the next
-        // request regardless, so there is nothing to hand over.
+        // Keep only the verified frontier and retire all GLM rollback aliases.
         // Also gated on the caller's own flag: a caller that has opted out of
         // reuse has no use for the retained prefix, and preserving it is not
         // free -- the end-of-request checkpoint serializes every stage. The
         // benchmark runner re-sends one prompt in a loop with reuse off, and
         // was paying for a full pipeline state capture on every iteration of a
         // wall-clock measurement.
-        if (prefix_reuse_enabled && light_rollback && gparams.prefix_reuse) {
-            retain_through(prompt, result.tokens, cached_upto, completed);
+        if (prefix_reuse_enabled && (light_rollback || full_checkpoints) && gparams.prefix_reuse) {
+            if (full_checkpoints) {
+                retain_hybrid_prefix(prompt, result.tokens, cached_upto, completed, gparams.n_ctx_checkpoints);
+            } else {
+                retain_through(prompt, result.tokens, cached_upto, completed);
+            }
             result.n_cached_tokens = (int32_t) cached_tokens.size();
             // End of the request: what the next chat turn resumes from.
-            capture_checkpoint((llama_pos) cached_tokens.size(), gparams.n_ctx_checkpoints);
+            if (!full_checkpoints) {
+                capture_checkpoint((llama_pos) cached_tokens.size(), gparams.n_ctx_checkpoints);
+            }
             if (timing_enabled && !checkpoints.empty()) {
                 size_t total = 0;
                 for (const auto & cp : checkpoints) {
@@ -3391,6 +3864,7 @@ struct common_spd_pipeline::impl {
 
 constexpr uint32_t SPD_STATE_MAGIC   = 0x53504453; // "SPDS"
 constexpr uint32_t SPD_STATE_VERSION = 1;
+constexpr uint32_t SPD_STATE_FULL_VERSION = 2;
 
 // The pipeline as one llama_context-shaped state source. Frames the stages and
 // the sidecar end to end so the layers above can treat SPD like any other
@@ -3409,6 +3883,245 @@ struct spd_state_io : common_state_seq_io {
     // header: magic, version, context count
     static constexpr size_t header_size() { return 3*sizeof(uint32_t); }
 
+    template <typename write_fn>
+    size_t write_full_bundle(write_fn write, bool with_checksum = true) {
+        try {
+            return write_full_bundle_impl(write, with_checksum);
+        } catch (const std::exception &) {
+            return 0;
+        }
+    }
+
+    template <typename write_fn>
+    size_t write_full_bundle_impl(write_fn write, bool with_checksum) {
+        const auto * state = owner();
+        const auto & tokens = state->cached_tokens;
+        const auto & checkpoints = state->checkpoints;
+        if (tokens.empty() != checkpoints.empty() ||
+                (!checkpoints.empty() && checkpoints.back().pos != (llama_pos) tokens.size())) {
+            return 0;
+        }
+        size_t total = 0;
+        uint64_t hash = UINT64_C(14695981039346656037);
+        auto part = [&](const void * data, size_t size) {
+            if (size > std::numeric_limits<size_t>::max() - total || !write(data, size)) {
+                return false;
+            }
+            if (with_checksum) {
+                hash = checkpoint_hash(hash, data, size);
+            }
+            total += size;
+            return true;
+        };
+        const uint32_t head[3] = { SPD_STATE_MAGIC, SPD_STATE_FULL_VERSION, state->stage_count + 1 };
+        const int32_t layout[] = { state->n_embd, state->n_embd_boundary, state->n_vocab,
+                                  state->n_layers, state->sidecar_n_embd_inp, (int32_t) state->anchors.size() };
+        const uint64_t n_tokens = tokens.size();
+        const uint32_t n_checkpoints = (uint32_t) checkpoints.size();
+        if (!part(head, sizeof(head)) || !part(state->checkpoint_identity.data(), sizeof(state->checkpoint_identity)) ||
+                !part(layout, sizeof(layout)) ||
+                !part(state->stage_bounds.data(), state->stage_bounds.size()*sizeof(int32_t)) ||
+                !part(state->anchors.data(), state->anchors.size()*sizeof(int32_t)) ||
+                !part(&n_tokens, sizeof(n_tokens)) ||
+                !part(tokens.data(), tokens.size()*sizeof(llama_token))) {
+            return 0;
+        }
+        std::vector<uint8_t> full_state;
+        if (n_tokens > 0) {
+            for (llama_context * ctx : state->state_contexts()) {
+                if (ctx == nullptr || llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != (llama_pos) n_tokens - 1) {
+                    return 0;
+                }
+                const size_t size = llama_state_seq_get_size_ext(ctx, 0, 0);
+                if (size == 0) {
+                    return 0;
+                }
+                uint64_t checksum = 0;
+                if (with_checksum) {
+                    full_state.resize(size);
+                    if (llama_state_seq_get_data_ext(ctx, full_state.data(), size, 0, 0) != size) {
+                        return 0;
+                    }
+                    checksum = checkpoint_checksum(full_state);
+                }
+                const uint64_t n_bytes = size;
+                if (!part(&n_bytes, sizeof(n_bytes)) || !part(&checksum, sizeof(checksum)) ||
+                        !part(with_checksum ? full_state.data() : nullptr, size)) {
+                    return 0;
+                }
+            }
+        }
+        if (!part(&n_checkpoints, sizeof(n_checkpoints))) {
+            return 0;
+        }
+        for (const auto & cp : checkpoints) {
+            if (!cp.complete(state->stage_count) || cp.sidecar_blob.empty() || !part(&cp.pos, sizeof(cp.pos))) {
+                return 0;
+            }
+            for (uint32_t stage = 0; stage <= state->stage_count; ++stage) {
+                const auto & blob = stage < state->stage_count ? cp.blobs[stage] : cp.sidecar_blob;
+                const uint64_t size = blob.size();
+                const uint64_t checksum = stage < state->stage_count ? cp.checksums[stage] : cp.sidecar_checksum;
+                if (!part(&size, sizeof(size)) || !part(&checksum, sizeof(checksum)) || !part(blob.data(), blob.size())) {
+                    return 0;
+                }
+            }
+        }
+        const uint64_t final_hash = hash;
+        if (!part(&final_hash, sizeof(final_hash))) {
+            return 0;
+        }
+        return total;
+    }
+
+    template <typename read_fn>
+    size_t read_full_bundle(size_t size, read_fn read) {
+        invalidate();
+        // Old aliases and queued stream copies must never reach an imported prefix.
+        owner()->used = true;
+        bool replaced = false;
+        bool accepted = false;
+        struct import_guard {
+            spd_state_io * self;
+            const bool & replaced;
+            const bool & accepted;
+            ~import_guard() {
+                if (replaced && !accepted && self->owner()->ready) {
+                    self->owner()->reset_memories();
+                }
+            }
+        } guard{ this, replaced, accepted };
+        size_t off = 0;
+        uint64_t hash = UINT64_C(14695981039346656037);
+        auto part = [&](void * data, size_t count) {
+            if (count > size - off || !read(data, count)) {
+                return false;
+            }
+            hash = checkpoint_hash(hash, data, count);
+            off += count;
+            return true;
+        };
+        try {
+            uint32_t head[3] = {};
+            std::array<uint64_t, 2> identity = {};
+            int32_t layout[6] = {};
+            const int32_t expected[] = { owner()->n_embd, owner()->n_embd_boundary, owner()->n_vocab,
+                                        owner()->n_layers, owner()->sidecar_n_embd_inp, (int32_t) owner()->anchors.size() };
+            uint64_t n_tokens = 0;
+            if (!part(head, sizeof(head)) || head[0] != SPD_STATE_MAGIC ||
+                    head[1] != SPD_STATE_FULL_VERSION || head[2] != owner()->stage_count + 1 ||
+                    !part(identity.data(), sizeof(identity)) || identity != owner()->checkpoint_identity ||
+                    !part(layout, sizeof(layout)) || std::memcmp(layout, expected, sizeof(layout)) != 0) {
+                return 0;
+            }
+            std::vector<int32_t> stage_bounds(owner()->stage_bounds.size());
+            std::vector<int32_t> anchors(owner()->anchors.size());
+            if (!part(stage_bounds.data(), stage_bounds.size()*sizeof(int32_t)) || stage_bounds != owner()->stage_bounds ||
+                    !part(anchors.data(), anchors.size()*sizeof(int32_t)) || anchors != owner()->anchors ||
+                    !part(&n_tokens, sizeof(n_tokens)) || n_tokens > owner()->params.n_ctx ||
+                    n_tokens > (size - off)/sizeof(llama_token)) {
+                return 0;
+            }
+            std::vector<llama_token> tokens((size_t) n_tokens);
+            if (!part(tokens.data(), tokens.size()*sizeof(llama_token))) {
+                return 0;
+            }
+            for (llama_token token : tokens) {
+                if (token < 0 || token >= owner()->n_vocab) {
+                    return 0;
+                }
+            }
+            if (!owner()->synchronize_all()) {
+                return 0;
+            }
+            llama_model * model_target = owner()->model_target;
+            llama_model * model_spd = owner()->model_spd;
+            const common_spd_params params = owner()->params;
+            auto replacement = std::make_unique<common_spd_pipeline::impl>(model_target, model_spd, params, false);
+            // Keep a valid owner on allocation failure, without overlapping GPU contexts.
+            pipeline->pimpl = std::move(replacement);
+            replaced = true;
+            owner()->initialize();
+            if (!owner()->ready) {
+                return 0;
+            }
+            if (n_tokens > 0) {
+                std::vector<uint8_t> full_state;
+                const auto contexts = owner()->state_contexts();
+                for (size_t stage = 0; stage < contexts.size(); ++stage) {
+                    uint64_t count = 0;
+                    uint64_t checksum = 0;
+                    if (!part(&count, sizeof(count)) || !part(&checksum, sizeof(checksum)) || count == 0 || count > size - off) {
+                        return 0;
+                    }
+                    full_state.resize((size_t) count);
+                    if (!part(full_state.data(), full_state.size()) || checkpoint_checksum(full_state) != checksum ||
+                            llama_state_seq_set_data_ext(contexts[stage], full_state.data(), full_state.size(), 0, 0) != full_state.size()) {
+                        return 0;
+                    }
+                    llama_memory_t memory = llama_get_memory(contexts[stage]);
+                    if (llama_memory_seq_pos_max(memory, 0) != (llama_pos) n_tokens - 1 ||
+                            (stage < owner()->stage_count && llama_memory_seq_pos_min(memory, 0) != (llama_pos) n_tokens - 1)) {
+                        return 0;
+                    }
+                }
+            }
+            uint32_t n_checkpoints = 0;
+            if (!part(&n_checkpoints, sizeof(n_checkpoints)) || n_checkpoints > n_tokens ||
+                    (n_tokens == 0) != (n_checkpoints == 0)) {
+                return 0;
+            }
+            std::vector<common_spd_pipeline::impl::stage_checkpoint> checkpoints;
+            llama_pos previous = 0;
+            for (uint32_t i = 0; i < n_checkpoints; ++i) {
+                common_spd_pipeline::impl::stage_checkpoint cp;
+                if (!part(&cp.pos, sizeof(cp.pos)) || cp.pos <= previous || (uint64_t) cp.pos > n_tokens) {
+                    return 0;
+                }
+                for (uint32_t stage = 0; stage <= owner()->stage_count; ++stage) {
+                    uint64_t count = 0;
+                    uint64_t checksum = 0;
+                    if (!part(&count, sizeof(count)) || !part(&checksum, sizeof(checksum)) || count == 0 || count > size - off) {
+                        return 0;
+                    }
+                    auto & blob = stage < owner()->stage_count ? cp.blobs[stage] : cp.sidecar_blob;
+                    blob.resize((size_t) count);
+                    if (!part(blob.data(), blob.size()) || checkpoint_checksum(blob) != checksum) {
+                        return 0;
+                    }
+                    if (stage < owner()->stage_count) {
+                        cp.have[stage] = 1;
+                        cp.checksums[stage] = checksum;
+                    } else {
+                        cp.sidecar_checksum = checksum;
+                    }
+                }
+                previous = cp.pos;
+                checkpoints.push_back(std::move(cp));
+            }
+            const uint64_t expected_hash = hash;
+            uint64_t final_hash = 0;
+            if (!part(&final_hash, sizeof(final_hash)) || final_hash != expected_hash ||
+                    off != size || (uint64_t) previous != n_tokens) {
+                return 0;
+            }
+            // Validate recurrent rewind states without cropping the full current
+            // KV prefix. The newest checkpoint restores the current frontier last.
+            for (const auto & cp : checkpoints) {
+                if (!owner()->restore_checkpoint(cp, false)) {
+                    return 0;
+                }
+            }
+            owner()->cached_tokens = std::move(tokens);
+            owner()->checkpoints = std::move(checkpoints);
+            owner()->state_replaced = true;
+            accepted = true;
+            return off;
+        } catch (const std::exception &) {
+            return 0;
+        }
+    }
+
     // Anything written through this interface replaces the caches wholesale, so
     // the pipeline's own record of what they hold is now describing state that
     // no longer exists -- and its checkpoints were captured over it. Matching a
@@ -3418,6 +4131,7 @@ struct spd_state_io : common_state_seq_io {
         owner()->cached_tokens.clear();
         owner()->checkpoints.clear();
         owner()->stage_tail_pos.fill(-1);
+        owner()->aggr_forget(0);
         for (auto & positions : owner()->checkpoint_pos) {
             positions.fill(-1);
         }
@@ -3428,6 +4142,10 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t get_size(llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->full_checkpoints) {
+            return seq_id == 0 && flags == 0
+                    ? write_full_bundle([](const void *, size_t) { return true; }, false) : 0;
+        }
         size_t total = header_size();
         for (llama_context * ctx : owner()->state_contexts()) {
             total += sizeof(uint64_t) + llama_state_seq_get_size_ext(ctx, seq_id, flags);
@@ -3436,6 +4154,22 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t get_data(uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->full_checkpoints) {
+            if (seq_id != 0 || flags != 0) {
+                return 0;
+            }
+            size_t off = 0;
+            return write_full_bundle([&](const void * data, size_t count) {
+                if (count > size - off) {
+                    return false;
+                }
+                if (count > 0) {
+                    std::memcpy(dst + off, data, count);
+                }
+                off += count;
+                return true;
+            });
+        }
         const auto ctxs = owner()->state_contexts();
         if (size < header_size()) {
             return 0;
@@ -3467,6 +4201,21 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t set_data(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->full_checkpoints) {
+            if (seq_id != 0 || flags != 0) {
+                invalidate();
+                owner()->used = true;
+                return 0;
+            }
+            size_t off = 0;
+            return read_full_bundle(size, [&](void * data, size_t count) {
+                if (count > 0) {
+                    std::memcpy(data, src + off, count);
+                }
+                off += count;
+                return true;
+            });
+        }
         const auto ctxs = owner()->state_contexts();
         if (size < header_size()) {
             return 0;
@@ -3529,6 +4278,20 @@ struct spd_state_io : common_state_seq_io {
         if (!out) {
             return 0;
         }
+        if (owner()->full_checkpoints) {
+            if (seq_id != 0 || flags != 0) {
+                return 0;
+            }
+            const size_t total = write_full_bundle([&](const void * data, size_t count) {
+                if (count > 0) {
+                    out.write((const char *) data, (std::streamsize) count);
+                }
+                return (bool) out;
+            });
+            out.close();
+            ok = total > 0 && !out.fail();
+            return ok ? total : 0;
+        }
         const uint32_t head[3] = { SPD_STATE_MAGIC, SPD_STATE_VERSION, (uint32_t) ctxs.size() };
         out.write((const char *) head, sizeof(head));
         size_t total = sizeof(head);
@@ -3561,6 +4324,25 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t load_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->full_checkpoints) {
+            invalidate();
+            owner()->used = true;
+            std::ifstream in(path, std::ios::binary | std::ios::ate);
+            if (!in || seq_id != 0 || flags != 0) {
+                return 0;
+            }
+            const std::streamoff size = in.tellg();
+            if (size < 0 || (uint64_t) size > std::numeric_limits<size_t>::max()) {
+                return 0;
+            }
+            in.seekg(0);
+            return read_full_bundle((size_t) size, [&](void * data, size_t count) {
+                if (count > 0) {
+                    in.read((char *) data, (std::streamsize) count);
+                }
+                return (bool) in;
+            });
+        }
         const auto ctxs = owner()->state_contexts();
         std::ifstream in(path, std::ios::binary);
         if (!in) {
@@ -3625,6 +4407,14 @@ void common_spd_pipeline::note_resident_prefix(const std::vector<llama_token> & 
     }
     pimpl->state_replaced = false;
 
+    if (pimpl->full_checkpoints) {
+        if (tokens != pimpl->cached_tokens) {
+            pimpl->cached_tokens.clear();
+            pimpl->checkpoints.clear();
+        }
+        return;
+    }
+
     // The stages hold exactly these positions after a restore, so the tail
     // bookkeeping follows from the length. Checkpoints stay cleared: they
     // belonged to the state that was just overwritten, and the restored state
@@ -3654,6 +4444,23 @@ uint32_t common_spd_pipeline::stage_count() const {
     return pimpl->stage_count;
 }
 
+bool common_spd_pipeline::has_full_checkpoint_state() const {
+    return pimpl->full_checkpoints;
+}
+
+const std::vector<llama_token> & common_spd_pipeline::cached_tokens() const {
+    return pimpl->cached_tokens;
+}
+
+void common_spd_pipeline::forget_prefix() {
+    pimpl->cached_tokens.clear();
+    pimpl->checkpoints.clear();
+    pimpl->state_replaced = false;
+    if (pimpl->synchronize_all()) {
+        pimpl->reset_memories();
+    }
+}
+
 bool common_spd_pipeline::generate(
         const std::vector<llama_token> & prompt,
         const common_spd_gen_params & gparams,
@@ -3662,37 +4469,38 @@ bool common_spd_pipeline::generate(
     if (!pimpl->ready) {
         return false;
     }
-    // The rebuild below destroys the contexts, and with them the KV cache, so
-    // it and prompt-prefix reuse are mutually exclusive: keeping it means every
-    // request re-prefills its whole prompt. It exists for the hybrid recurrent
-    // rollback aliases, which only the seq_cp path allocates -- a
-    // position-addressed target has none to go stale, so it keeps its caches.
-    const bool keep_contexts = pimpl->prefix_reuse_enabled && pimpl->light_rollback;
+    // GLM's shared KV prefix survives after rollback aliases are retired.
+    const bool keep_contexts = pimpl->prefix_reuse_enabled && (pimpl->light_rollback || pimpl->full_checkpoints);
     if (pimpl->used && !keep_contexts) {
         // Hybrid recurrent rollback aliases are deliberately short-lived.
         // Recreate only the contexts between requests while retaining both
         // loaded model objects and their weight buffers. This avoids carrying
         // backend cache/alias state across requests, which is unsafe for the
         // staged RPC schedulers and previously caused repeat-request crashes.
-        pimpl->synchronize_all();
+        if (!pimpl->synchronize_all()) {
+            return false;
+        }
         llama_model * model_target = pimpl->model_target;
         llama_model * model_spd = pimpl->model_spd;
         common_spd_params params = pimpl->params;
+        auto replacement = std::make_unique<impl>(model_target, model_spd, params, false);
         // Destroy before constructing. Assigning a freshly built impl over the
         // old one holds both alive across the swap, so every device carries two
         // full sets of stage contexts at the peak. A stage device sized to the
         // model -- 3 DSV4 layers on an 8 GB card leaves ~318 MiB -- cannot
         // allocate the second copy and the request fails with "failed to
         // initialize target SPD stage N" on the *second* request of a session.
-        pimpl.reset();
-        pimpl = std::make_unique<impl>(model_target, model_spd, params);
+        pimpl = std::move(replacement);
+        pimpl->initialize();
         if (!pimpl->ready) {
             return false;
         }
     } else if (pimpl->used) {
         // The rebuild used to be what drained the backends between requests.
         // Keep the drain even though the contexts now survive.
-        pimpl->synchronize_all();
+        if (!pimpl->synchronize_all()) {
+            return false;
+        }
     }
 
     pimpl->used = true;

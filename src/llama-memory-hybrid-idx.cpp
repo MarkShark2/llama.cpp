@@ -331,6 +331,12 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     kpool_pfx.valid = false;
+    mtp_dsa_selection.clear();
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        // Restored rows may move, and pool membership is not part of the serialized state.
+        // Partial restores retain indexer rows; subsequent writes invalidate their touched pools.
+        std::fill(kpool_members.begin(), kpool_members.end(), UINT32_MAX);
+    }
 
     try {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {

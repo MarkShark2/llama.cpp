@@ -193,24 +193,30 @@ llama_context::llama_context(
         if (cparams.spd_stage_count == 0 || cparams.spd_stage >= cparams.spd_stage_count) {
             throw std::runtime_error("invalid SPD stage index/count");
         }
-        // The trunk need not divide evenly. DeepSeek-V4 has 43 layers -- a prime
-        // -- so no stage count between 2 and 42 is uniform and requiring
-        // divisibility excluded the architecture outright. Every stage takes
-        // ceil(n_layer / count) layers and the last takes the remainder, which
-        // is exactly the layout the offline trainer's STAGE_PRESETS collect
-        // against (43 over 9 stages -> 5x8 + 3) and reduces to the old even
-        // split whenever the count does divide.
-        const uint32_t n_layer          = hparams.n_layer();
-        const uint32_t layers_per_stage = (n_layer + cparams.spd_stage_count - 1) / cparams.spd_stage_count;
-
-        if (layers_per_stage*(cparams.spd_stage_count - 1) >= n_layer) {
-            throw std::runtime_error("SPD stage count leaves an empty trailing stage");
+        const uint32_t n_layer = hparams.n_layer();
+        if (cparams.spd_stage_count > n_layer) {
+            throw std::runtime_error("SPD stage count exceeds the number of trunk layers");
         }
-
-        cparams.spd_layer_start = cparams.spd_stage * layers_per_stage;
-        cparams.spd_layer_end   = cparams.spd_layer_start + layers_per_stage < n_layer
-                                ? cparams.spd_layer_start + layers_per_stage
-                                : n_layer;
+        if (params.spd_layer_start != 0 || params.spd_layer_end != 0) {
+            if (params.spd_layer_start >= params.spd_layer_end || params.spd_layer_end > n_layer ||
+                (cparams.spd_stage == 0 && params.spd_layer_start != 0) ||
+                (cparams.spd_stage + 1 == cparams.spd_stage_count && params.spd_layer_end != n_layer)) {
+                throw std::runtime_error("invalid explicit SPD trunk layer range");
+            }
+            cparams.spd_layer_start = params.spd_layer_start;
+            cparams.spd_layer_end   = params.spd_layer_end;
+        } else {
+            if (model.arch == LLM_ARCH_GLM5_NEXT) {
+                throw std::runtime_error("GLM5-Next SPD requires explicit trunk layer ranges");
+            }
+            // Legacy heads use ceil-sized stages with the remainder on the last stage.
+            const uint32_t layers_per_stage = (n_layer + cparams.spd_stage_count - 1) / cparams.spd_stage_count;
+            if (layers_per_stage*(cparams.spd_stage_count - 1) >= n_layer) {
+                throw std::runtime_error("SPD stage count leaves an empty trailing stage");
+            }
+            cparams.spd_layer_start = cparams.spd_stage * layers_per_stage;
+            cparams.spd_layer_end   = std::min(cparams.spd_layer_start + layers_per_stage, n_layer);
+        }
 
         // DeepSeek-V4's first hash_layer_count layers route experts by token id
         // (ffn_gate_tid2eid gathered with the raw token). Only stage 0 is fed
@@ -221,13 +227,25 @@ llama_context::llama_context(
             throw std::runtime_error("SPD stage split puts a DeepSeek-V4 hash layer past stage 0, "
                                      "which receives no token ids");
         }
+
+        if (model.arch == LLM_ARCH_GLM5_NEXT) {
+            if (cparams.n_rs_seq > 0) {
+                throw std::runtime_error("GLM5-Next SPD requires sequence-copy rollback, not recurrent history planes");
+            }
+            bool has_full_indexer = false;
+            for (uint32_t il = cparams.spd_layer_start; il < cparams.spd_layer_end; ++il) {
+                if (!hparams.is_recr(il)) {
+                    has_full_indexer = has_full_indexer || hparams.is_indexer_full(il);
+                    if (!has_full_indexer) {
+                        throw std::runtime_error("GLM5-Next SPD stage starts with a shared DSA indexer from another stage");
+                    }
+                }
+            }
+        }
     }
 
-    // Width of one row of batch.embd for this context. An SPD stage past 0 is
-    // handed the previous stage's raw residual, and the SPD head the last
-    // stage's, so both take the model's stage-boundary width -- which on
-    // DeepSeek-V4 is hc_mult streams wide, not n_embd. Stage 0 still takes
-    // tokens and keeps the ordinary width.
+    // SPD stages past 0 and the head take the full residual, including all hyper-connection streams.
+    // Stage 0 takes tokens and keeps the ordinary input width.
     cparams.n_embd_inp_ctx = hparams.n_embd_inp();
     if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE && cparams.spd_stage > 0) ||
          cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD) {
@@ -1509,7 +1527,9 @@ float * llama_context::get_embeddings_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        const uint32_t n_embd_out = model.hparams.n_embd_out();
+        const uint32_t n_embd_out = cparams.n_embd_out_ctx > 0
+                ? cparams.n_embd_out_ctx
+                : model.hparams.n_embd_out();
         return embd.data + j*n_embd_out;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
@@ -1806,10 +1826,7 @@ const float * llama_context::chain_tap_row(uint32_t lid, int32_t row) const {
 }
 
 ggml_tensor * llama_context::spd_peer_inp_tensor() const {
-    if (cparams.spd_boundary_inp != nullptr) {
-        return cparams.spd_boundary_inp;
-    }
-    return gf_res_prev ? gf_res_prev->t_inp_embd_wide : nullptr;
+    return cparams.spd_boundary_inp;
 }
 
 ggml_tensor * llama_context::spd_peer_out_tensor() const {
@@ -5636,6 +5653,8 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.spd_stage                   =*/ 0,
         /*.spd_stage_count             =*/ 0,
+        /*.spd_layer_start             =*/ 0,
+        /*.spd_layer_end               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -5760,8 +5779,8 @@ llama_context * llama_init_from_model(
     if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
-        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_DEEPSEEK4) {
-        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 or DeepSeek-V4 model\n", __func__);
+        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_DEEPSEEK4 && model->arch != LLM_ARCH_GLM5_NEXT) {
+        LLAMA_LOG_WARN("%s: SPD target contexts require a Qwen3.5, DeepSeek-V4 or GLM5-Next model\n", __func__);
         return nullptr;
     }
 

@@ -499,8 +499,39 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * cur;
 
+    const bool is_spd_stage = params.gtype == LLM_GRAPH_TYPE_SPD_STAGE;
+    const bool is_spd_head  = params.gtype == LLM_GRAPH_TYPE_SPD_HEAD;
+    const bool is_spd_embed = params.gtype == LLM_GRAPH_TYPE_SPD_EMBED;
+    const int64_t hc = hparams.dsv4_hc_mult;
+
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     cb(inp, "inp_embd", -1);
+
+    if (is_spd_embed) {
+        res->t_embd = inp;
+        ggml_build_forward_expand(gf, inp);
+        return;
+    }
+
+    if (is_spd_head) {
+        ggml_tensor * h = ggml_reshape_3d(ctx0, res->t_inp_embd_wide, n_embd, hc, n_tokens);
+        cur = build_hc_mean(h);
+        cb(cur, "hc_head", -1);
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    const int layer_start = is_spd_stage ? (int) cparams.spd_layer_start : 0;
+    const int layer_end   = is_spd_stage ? (int) cparams.spd_layer_end   : n_layer;
 
     // recurrent state + K-only MLA cache through the generic hybrid input, plus the indexer cache
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
@@ -508,11 +539,11 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_hyb   = build_inp_mem_hybrid_k();
     auto * inp_rs    = inp_hyb->get_recr();
     auto * inp_attn  = inp_hyb->get_attn();
-    auto * inp_kpool = build_inp_kpool(mctx_hyb);
+    auto * inp_kpool = mctx_hyb->get_idx() ? build_inp_kpool(mctx_hyb) : nullptr;
 
     // [fork, PipeDec] a body lane returns every hidden row and never gathers output
     // rows, so it must not register an out_ids input that set_inputs() would fill
-    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY
+    ggml_tensor * inp_out_ids = (params.gtype == LLM_GRAPH_TYPE_DECODER_PIPEDEC_BODY || is_spd_stage)
             ? nullptr
             : build_inp_out_ids();
 
@@ -527,10 +558,15 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL;
+    if (is_spd_stage && cparams.spd_stage > 0) {
+        inpL = ggml_reshape_3d(ctx0, res->t_inp_embd_wide, n_embd, hc, n_tokens);
+        cb(inpL, "hc_carry", -1);
+    } else {
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
+    }
 
     ggml_tensor * prev_sel = nullptr;
 
@@ -546,7 +582,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         ggml_build_forward_expand(gf, res->t_layer_inp[il]);
     };
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         const auto & layer = model.layers[il];
         capture_layer_inp(il, inpL);
 
@@ -615,8 +651,16 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         cb(inpL, "l_out", il);
     }
 
-    // the teacher tap: the pre-norm trunk output, before any row narrowing
-    capture_layer_inp(n_layer, inpL);
+    // Capture the boundary before the target head or output-row selection.
+    capture_layer_inp(layer_end, inpL);
+
+    if (is_spd_stage) {
+        ggml_tensor * out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, inpL), n_embd*hc, n_tokens);
+        cb(out, "spd_stage_output", -1);
+        res->t_embd = out;
+        ggml_build_forward_expand(gf, out);
+        return;
+    }
 
     // narrow to the output tokens, then collapse the streams
     // Unmasked nextn embeddings need all rows.

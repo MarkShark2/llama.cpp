@@ -281,6 +281,7 @@ struct server_slot {
     common_state_seq_io_ctx io_ctx_dft;
     common_state_seq_io * io_tgt = nullptr;
     common_state_seq_io * io_dft = nullptr;
+    common_spd_pipeline * spd_prefix = nullptr;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -390,6 +391,9 @@ struct server_slot {
 
         const size_t cur_size_tgt = io_tgt->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = io_dft->get_size(id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (spd_prefix && cur_size_tgt == 0) {
+            return false;
+        }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -429,7 +433,12 @@ struct server_slot {
                 cur->data.file_drft = std::make_shared<common_state_file>(path_dft, n_dft);
             }
         } else {
-            io_tgt->get_data(cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t n_tgt = io_tgt->get_data(cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (spd_prefix && n_tgt != cur_size_tgt) {
+                SRV_ERR("%s", "failed to save SPD prompt checkpoint state\n");
+                prompt_cache.states.pop_back();
+                return false;
+            }
             if (cur_size_dft > 0) {
                 io_dft->get_data(cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             }
@@ -454,6 +463,9 @@ struct server_slot {
 
         spec_sync();
         mem.seq_rm(id, -1, -1);
+        if (spd_prefix) {
+            spd_prefix->forget_prefix();
+        }
 
         prompt.clear();
     }
@@ -2043,6 +2055,7 @@ private:
             slot.io_tgt = spd_mode ? &spd_pipeline->state_io()
                                    : static_cast<common_state_seq_io *>(&slot.io_ctx_tgt);
             slot.io_dft = &slot.io_ctx_dft;
+            slot.spd_prefix = spd_mode && spd_pipeline->has_full_checkpoint_state() ? spd_pipeline.get() : nullptr;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3555,18 +3568,27 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    const bool spd_full_state = slot->spd_prefix != nullptr;
                     std::vector<char> packed;
                     try {
-                        packed = slot->prompt.tokens.serialize();
+                        if (spd_full_state) {
+                            if (slot->prompt.tokens.get_text_tokens() != slot->spd_prefix->cached_tokens()) {
+                                throw std::runtime_error("SPD slot tokens do not match its checkpoint state");
+                            }
+                        } else {
+                            packed = slot->prompt.tokens.serialize();
+                        }
                     } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
+                        send_error(task, err.what(), spd_full_state ? ERROR_TYPE_SERVER : ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    const size_t nwrite = spd_full_state
+                        ? slot->io_tgt->save_file(filepath, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE)
+                        : llama_state_seq_save_file(
+                            ctx_tgt, filepath.c_str(), slot->id,
+                            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
@@ -3574,7 +3596,7 @@ private:
 
                     // [fork] the drafter's cache and its pending hidden row travel
                     // with the slot, so a restore needs no catch-up decode
-                    if (ctx_dft != nullptr) {
+                    if (!spd_full_state && ctx_dft != nullptr) {
                         const size_t n_dft = state_io_dft().save_file(filepath + ".dft", slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
                         const float * h = spec ? common_speculative_mtp_pending_h(spec.get(), slot->id) : nullptr;
                         if (n_dft != 0 && h != nullptr) {
@@ -3585,7 +3607,7 @@ private:
                     }
                     // ...and the in-RAM context checkpoints, so a slot saved after a
                     // generation still restores to the end of its prompt
-                    {
+                    if (!spd_full_state) {
                         std::ofstream ofs(filepath + ".ckpt", std::ios::binary);
                         uint32_t n = 0;
                         for (const auto & c : slot->prompt.checkpoints) {
@@ -3648,17 +3670,28 @@ private:
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                        const bool spd_full_state = slot->spd_prefix != nullptr;
+                        if (spd_full_state) {
+                            nread = slot->io_tgt->load_file(filepath, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            packed = slot->spd_prefix->cached_tokens();
+                            n_packed = packed.size();
+                        } else {
+                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                            if (nread != 0) {
+                                packed.resize(std::max<size_t>(1, n_packed));
+                                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            }
                         }
                         if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
+                            throw std::runtime_error(spd_full_state
+                                ? "Invalid or incompatible SPD slot checkpoint file"
+                                : "No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
 
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+                        server_tokens restored = spd_full_state
+                            ? server_tokens(packed, false)
+                            : server_tokens::deserialize(packed, mctx != nullptr);
 
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
@@ -3675,7 +3708,7 @@ private:
                         // beside the file: a hybrid memory reuses a cached prompt only
                         // through a checkpoint (its state cannot be rewound), so without
                         // them the next request re-processes all of it
-                        if (ctx_dft != nullptr) {
+                        if (!spd_full_state && ctx_dft != nullptr) {
                             const size_t n_dft = state_io_dft().load_file(filepath + ".dft", slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
                             std::vector<float> h((size_t) llama_model_n_embd(model_tgt));
                             std::ifstream ifs(filepath + ".mtp", std::ios::binary);
@@ -3687,7 +3720,7 @@ private:
                                 SLT_WRN(*slot, "no draft state beside the slot file (dft = %zu bytes, pending row = %d) - drafts degrade until the next prompt\n", n_dft, (int) has_h);
                             }
                         }
-                        {
+                        if (!spd_full_state) {
                             std::ifstream ifs(filepath + ".ckpt", std::ios::binary);
                             uint32_t n = 0;
                             auto get = [&](std::vector<uint8_t> & v) {
@@ -3973,6 +4006,9 @@ private:
 
             common_spd_gen_params gparams;
             gparams.n_predict               = n_predict;
+            if (slot.spd_prefix) {
+                gparams.prefix_reuse = slot.task->params.cache_prompt;
+            }
             gparams.ignore_eos              = slot.task->params.sampling.ignore_eos;
             gparams.reasoning_budget_start  = slot.task->params.sampling.reasoning_budget_start;
             gparams.reasoning_budget_end    = slot.task->params.sampling.reasoning_budget_end;
@@ -4070,6 +4106,9 @@ private:
                     slot.prompt.tokens.keep_first(spd_result.n_cached_tokens);
                     slot.release();
                     return;
+                }
+                if (slot.spd_prefix) {
+                    slot.prompt_clear();
                 }
                 send_error(slot, "SPD generation failed: " + spd_pipeline->error(), ERROR_TYPE_SERVER);
                 slot.release();

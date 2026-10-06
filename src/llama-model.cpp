@@ -2391,16 +2391,31 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_GLM5_NEXT:
             {
                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
-                // tThe Nextn block is never attended by the trunk graph
+                // The NextN block is never attended by the trunk graph.
+                const auto in_trunk = [&](uint32_t il) {
+                    return il < hparams.n_layer() &&
+                        (params.ctx_type != LLAMA_CONTEXT_TYPE_SPD_STAGE ||
+                         (il >= cparams.spd_layer_start && il < cparams.spd_layer_end));
+                };
                 llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
-                    return il < hparams.n_layer() && !hparams.is_recr(il);
+                    return in_trunk(il) && !hparams.is_recr(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
-                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                    return in_trunk(il) && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
-                    return il < hparams.n_layer() && hparams.is_recr(il);
+                    return in_trunk(il) && hparams.is_recr(il);
                 };
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+                    bool has_indexer = false;
+                    for (uint32_t il = cparams.spd_layer_start; il < cparams.spd_layer_end; ++il) {
+                        has_indexer = has_indexer || filter_idx(il);
+                    }
+                    if (!has_indexer) {
+                        filter_idx = nullptr;
+                    }
+                }
 
                 // the draft head is a single DSA layer
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
@@ -3741,17 +3756,28 @@ uint32_t llama_model_spd_stage_count(const struct llama_model * model) {
     return static_cast<const llama_model_spd *>(model)->stage_count;
 }
 
+const uint32_t * llama_model_spd_stage_layers(const struct llama_model * model) {
+    if (model == nullptr || model->arch != LLM_ARCH_SPD) {
+        return nullptr;
+    }
+    const auto & layers = static_cast<const llama_model_spd *>(model)->stage_layers;
+    return layers.empty() ? nullptr : layers.data();
+}
+
+uint32_t llama_model_spd_stage_layers_n(const struct llama_model * model) {
+    if (model == nullptr || model->arch != LLM_ARCH_SPD) {
+        return 0;
+    }
+    return (uint32_t) static_cast<const llama_model_spd *>(model)->stage_layers.size();
+}
+
 uint32_t llama_model_n_embd_spd_boundary(const struct llama_model * model) {
     if (model == nullptr) {
         return 0;
     }
-    // What one stage hands the next is the raw inter-layer residual. On
-    // DeepSeek-V4 that residual is [n_embd, hc_mult, n_tokens] -- the streams
-    // only collapse at the very end of the trunk, via the learned hc_head -- so
-    // a mid-trunk boundary is hc_mult times wider. Collapsing at the boundary
-    // and re-expanding is not available: SPD stages are the verifier and have
-    // to stay bit-exact against a plain decode.
-    if (model->arch == LLM_ARCH_DEEPSEEK4 && model->hparams.dsv4_hc_mult > 0) {
+    // Hyper-connection stages carry every residual stream until the target head.
+    if ((model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_GLM5_NEXT) &&
+            model->hparams.dsv4_hc_mult > 0) {
         return model->hparams.n_embd*model->hparams.dsv4_hc_mult;
     }
     return model->hparams.n_embd_inp();

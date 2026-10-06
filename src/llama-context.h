@@ -117,8 +117,7 @@ struct llama_context {
     int32_t       chain_last_lane_get() const { return chain_last_lane; }
     void          chain_arm(int32_t lane) { chain_armed_lane = lane; }
 
-    // [fork, SPD peer boundaries] the persistent boundary input tensor (or the
-    // last graph's raw embd input as a fallback) and the last graph's embd
+    // [fork, SPD peer boundaries] the persistent boundary input tensor and the last graph's embd
     // output tensor, for direct device-to-device boundary pushes; and the
     // per-decode host-transfer skip toggles
     ggml_tensor * spd_peer_inp_tensor() const;

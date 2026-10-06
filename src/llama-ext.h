@@ -175,10 +175,9 @@ LLAMA_API int32_t llama_rpc_endpoints  (const char ** out_names, int32_t * out_c
 // keyed on exactly those pointers.
 LLAMA_API void llama_graphs_invalidate(struct llama_context * ctx);
 
-// [fork, SPD peer boundaries] the last graph's raw (un-narrowed) embd input
-// tensor and embd output tensor -- the device-resident endpoints of a stage
-// boundary. Valid until the context builds a different graph; callers must
-// re-fetch after every decode. And the per-decode host-transfer skips: with
+// [fork, SPD peer boundaries] the persistent boundary input (null when unavailable)
+// and the last graph's embd output. Only the output must be re-fetched after every decode.
+// And the per-decode host-transfer skips: with
 // skip_inp the embd upload in set_input is suppressed (the data was placed on
 // device by a peer push + local copy), with skip_out the embeddings readback
 // in decode is suppressed (the boundary leaves via a peer push), and with
@@ -323,9 +322,12 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 // returns the number of target pipeline stages encoded by an SPD sidecar, or zero for other architectures
 LLAMA_API uint32_t        llama_model_spd_stage_count   (const struct llama_model * model);
+// explicit per-stage trunk layer counts, or nullptr/zero for legacy sidecars
+LLAMA_API const uint32_t * llama_model_spd_stage_layers (const struct llama_model * model);
+LLAMA_API uint32_t         llama_model_spd_stage_layers_n(const struct llama_model * model);
 // width of one token's state as handed from one SPD stage to the next. This is
 // n_embd for every architecture whose residual is a single stream, but
-// DeepSeek-V4 carries hc_mult hyper-connection streams between layers and a
+// hyper-connection models carry multiple streams between layers and a
 // mid-trunk boundary is that much wider.
 LLAMA_API uint32_t        llama_model_n_embd_spd_boundary(const struct llama_model * model);
 

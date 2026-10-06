@@ -1,4 +1,5 @@
 #include "models.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cmath>
@@ -160,6 +161,23 @@ void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SPD_CHECKPOINT_VERSION, checkpoint_version);
     ml.get_key(LLM_KV_SPD_STAGE_COUNT, stage_count);
     ml.get_key(LLM_KV_SPD_USE_DEEPEST, use_deepest);
+
+    const int64_t target_arch_key = gguf_find_key(ml.metadata, "spd.target_architecture");
+    if (target_arch_key >= 0 && gguf_get_kv_type(ml.metadata, target_arch_key) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("SPD target_architecture must be a string");
+    }
+    const int64_t stage_layers_key = gguf_find_key(ml.metadata, "spd.stage_layers");
+    if (stage_layers_key >= 0) {
+        if (gguf_get_kv_type(ml.metadata, stage_layers_key) != GGUF_TYPE_ARRAY ||
+                gguf_get_arr_type(ml.metadata, stage_layers_key) != GGUF_TYPE_UINT32) {
+            throw std::runtime_error("SPD stage_layers must be a uint32 array");
+        }
+        ml.get_arr("spd.stage_layers", stage_layers);
+        if (stage_layers.size() != stage_count ||
+                std::find(stage_layers.begin(), stage_layers.end(), 0) != stage_layers.end()) {
+            throw std::runtime_error("SPD stage_layers must contain one positive layer count per stage");
+        }
+    }
 
     // The sidecar is trained on fixed-length windows cut out of the corpus
     // (train_offline.py --chunk), so it has never attended across more than

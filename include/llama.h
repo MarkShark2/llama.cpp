@@ -381,6 +381,8 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         uint32_t spd_stage;             // zero-based logical stage for LLAMA_CONTEXT_TYPE_SPD_STAGE [EXPERIMENTAL]
         uint32_t spd_stage_count;       // total logical stages for LLAMA_CONTEXT_TYPE_SPD_STAGE [EXPERIMENTAL]
+        uint32_t spd_layer_start;       // inclusive trunk layer for this SPD stage (both bounds 0 = legacy split) [EXPERIMENTAL]
+        uint32_t spd_layer_end;         // exclusive trunk layer for this SPD stage [EXPERIMENTAL]
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 

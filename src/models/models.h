@@ -1432,6 +1432,7 @@ struct llama_model_spd : public llama_model_base {
 
     uint32_t checkpoint_version = 0;
     uint32_t stage_count = 0;
+    std::vector<uint32_t> stage_layers;
     bool use_deepest = false;
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
