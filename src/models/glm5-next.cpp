@@ -261,7 +261,8 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
                                  int64_t mem_size, int64_t n_rs_seq,
-                                 uint32_t pipedec_lane, uint32_t pipedec_total) {
+                                 uint32_t pipedec_lane, uint32_t pipedec_total,
+                                 ggml_tensor * s_dst) {
     const int64_t d_inner         = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t n_embd_r_total  = 3 * conv_state_size;
@@ -281,6 +282,17 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
     auto write_plane = [&](int64_t s_idx, int64_t s_slot) {
         ggml_tensor * conv_window = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
+
+        if (s_dst) {
+            // [fork] sparse cells: this q/k/v block of each seq's own conv row
+            GGML_ASSERT(s_slot == 0 && pipedec_total == 0);
+            ggml_tensor * rows = ggml_cont_2d(ctx0, conv_window, conv_state_size, n_seqs);
+            ggml_tensor * dst  = ggml_view_2d(ctx0, conv_states_all, conv_state_size, mem_size,
+                n_embd_r_total * ggml_element_size(conv_states_all),
+                qkv * conv_state_size * ggml_element_size(conv_states_all));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, rows, s_dst));
+            return;
+        }
 
         ggml_tensor * conv_update = ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
             (d_conv - 1)   * ggml_element_size(conv_states_all),
@@ -522,8 +534,21 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * prev_sel = nullptr;
 
+    // [fork, SPD collection] layer-input taps: the residual is hc streams wide,
+    // the tapped state is their mean (as on deepseek4), over every row
+    const auto capture_layer_inp = [&](int il, ggml_tensor * h) {
+        if ((size_t) il >= cparams.embeddings_layer_inp.size() || !cparams.embeddings_layer_inp[il]) {
+            return;
+        }
+        ggml_tensor * mean = ggml_cont(ctx0, ggml_permute(ctx0, h, 1, 0, 2, 3)); // [hc, n_embd, n_tokens]
+        mean = ggml_mean(ctx0, mean);                                            // [1, n_embd, n_tokens]
+        res->t_layer_inp[il] = ggml_reshape_2d(ctx0, mean, n_embd, ggml_nelements(mean)/n_embd);
+        ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+        capture_layer_inp(il, inpL);
 
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
@@ -589,6 +614,9 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
     }
+
+    // the teacher tap: the pre-norm trunk output, before any row narrowing
+    capture_layer_inp(n_layer, inpL);
 
     // narrow to the output tokens, then collapse the streams
     // Unmasked nextn embeddings need all rows.
@@ -676,9 +704,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total);
+    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total, inp_rs->s_dst);
+    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total, inp_rs->s_dst);
+    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, n_rs_seq, pipedec_lane, pipedec_total, inp_rs->s_dst);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);

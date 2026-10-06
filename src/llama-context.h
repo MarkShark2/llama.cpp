@@ -111,6 +111,7 @@ struct llama_context {
     // wait on one lane and read that cohort's rows without draining the rest
     void          chain_lane_sync(int32_t lane);
     const float * chain_logits_row(int32_t row) const;
+    int32_t       chain_argmax_row(int32_t row) const;
     const float * chain_tap_row(uint32_t lid, int32_t row) const;
     int32_t       chain_last_lane_get() const { return chain_last_lane; }
     void          chain_arm(int32_t lane) { chain_armed_lane = lane; }
@@ -541,6 +542,11 @@ private:
     std::vector<std::vector<std::pair<ggml_backend_t, uint64_t>>> chain_lane_reads;
     std::vector<ggml_backend_t> chain_read_backends; // scratch, current call
     int32_t chain_last_lane = -1;
+    // [fork] LLAMA_CHAIN_ARGMAX=1: lane graphs end in argmax(t_logits) and a
+    // chain call reads back one i32 per row instead of its logits row, keyed
+    // by seq id like the logits rows it replaces
+    std::vector<int32_t> chain_argmax;
+    void chain_argmax_add(llm_graph_result * res, ggml_cgraph * gf) const;
     // one-shot per-call opt-in (llama_chain_arm): without it a classic caller's
     // single-token decode would be silently staged seq-keyed while the caller
     // reads packed rows via output_ids. Value = the lane this call rides

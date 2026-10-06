@@ -119,7 +119,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch_impl(
                 // A tree level of several rows keeps the equal split.
                 ubatch = token_lanes && n_ubatch == 1
                         ? balloc.split_seq(1)
-                        : balloc.split_equal(n_ubatch, !unified, n_keep_tail);
+                        : balloc.split_equal(n_ubatch, !unified, n_keep_tail, llama_batch_allocr::ubatch_seq_cap());
             }
 
             if (ubatch.n_tokens == 0) {
@@ -768,8 +768,12 @@ constexpr size_t KPOOL_PREFIX_MARGIN    = 256;
 constexpr size_t KPOOL_PREFIX_GROW      = 1024;
 constexpr size_t KPOOL_PREFIX_MAX_RUNS  = 64;
 
-uint32_t kpool_pad(uint32_t n_pool, uint32_t kpool, uint32_t kv_size) {
-    const uint32_t n_max = kv_size/std::max(1u, kpool) + 1;
+// kv_cells is the cache's cells over ALL streams: n_pool counts the pools of
+// every sequence, and with one stream per slot (--parallel N, non-unified) a
+// single stream's size capped the table below what N slots hold, so the
+// layout overran it once the slots together outgrew one stream
+uint32_t kpool_pad(uint32_t n_pool, uint32_t kpool, uint32_t kv_cells) {
+    const uint32_t n_max = kv_cells/std::max(1u, kpool) + 1;
     return llama_kv_bucket_pad(n_pool + 1, std::max(n_max, 64u), 64u, kpool);
 }
 
@@ -790,7 +794,12 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     if (kpool_track()) {
         kpool_st = std::make_unique<kpool_state>(kpool_build_layout(nullptr));
         // Reserve pool inputs for the full cache, including before any cells are occupied.
-        kpool_st->n_pool_real = mem->get_mem_idx()->get_size()/mem->get_kpool();
+        // one stream per sequence when non-unified, so the widest ubatch holds
+        // the pools of at most min(streams, LLAMA_UBATCH_SEQS) of them
+        const uint32_t n_stream = mem->get_mem_idx()->get_n_stream();
+        const uint32_t cap      = llama_batch_allocr::ubatch_seq_cap();
+        const uint32_t n_seqs   = cap > 0 ? std::min(n_stream, cap) : n_stream;
+        kpool_st->n_pool_real = mem->get_mem_idx()->get_size()*n_seqs/mem->get_kpool();
         i_kpool  = 0;
     }
 }
@@ -1306,7 +1315,8 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real, mem->get_kpool(), mem->get_mem_idx()->get_size());
+    return kpool_pad(kpool_cur().n_pool_real, mem->get_kpool(),
+            mem->get_mem_idx()->get_size()*mem->get_mem_idx()->get_n_stream());
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -1346,7 +1356,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
     const uint32_t n_new    = st.n_new;
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real, kpool, mem->get_mem_idx()->get_size()));
+    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real, kpool,
+            mem->get_mem_idx()->get_size()*mem->get_mem_idx()->get_n_stream()));
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);

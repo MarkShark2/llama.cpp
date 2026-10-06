@@ -293,6 +293,9 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // [fork] LLAMA_RS_SPARSE: cell id each ubatch seq's new state is written to
+    ggml_tensor * s_dst = nullptr; // I32 [n_seqs]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -977,6 +980,7 @@ public:
     // stage's hc_mult-wide residual.
     ggml_tensor * t_inp_embd_wide = nullptr;
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_argmax      = nullptr; // [fork] chained lanes, LLAMA_CHAIN_ARGMAX: [n_outputs] i32
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm

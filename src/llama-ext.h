@@ -222,6 +222,9 @@ bool ggml_backend_rpc_imatrix_sqsum(
 extern "C" {
 LLAMA_API void          llama_chain_lane_sync (struct llama_context * ctx, int32_t lane);
 LLAMA_API const float * llama_chain_logits_row(struct llama_context * ctx, int32_t row);
+// LLAMA_CHAIN_ARGMAX=1: the row's greedy token, computed in the lane graph on
+// the output device; the logits row is then NOT read back. -1 when off.
+LLAMA_API int32_t       llama_chain_argmax_row(struct llama_context * ctx, int32_t row);
 LLAMA_API const float * llama_chain_tap_row   (struct llama_context * ctx, uint32_t lid, int32_t row);
 // lane the last llama_decode staged as a chain call, or -1 if it took the
 // classic path - callers MUST check this after every chained submit (a silent

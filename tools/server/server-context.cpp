@@ -5404,10 +5404,28 @@ private:
 
     // a slot the lanes can carry: plain generating, no speculation, probs,
     // embeddings or lora
+    static bool chain_argmax_on() {
+        static const bool on = [] {
+            const char * e = std::getenv("LLAMA_CHAIN_ARGMAX");
+            return e && std::atoi(e) != 0;
+        }();
+        return on;
+    }
+
+    // LLAMA_CHAIN_ARGMAX: the lane hands back argmax(logits), so a chained slot
+    // must sample exactly that - temp <= 0 with nothing ahead of the greedy
+    // pick in its sampler chain that can reorder the logits
+    static bool chain_greedy_ok(const common_params_sampling & sp) {
+        return sp.temp <= 0.0f && sp.grammar.empty() && sp.logit_bias.empty() && !sp.ignore_eos &&
+                sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f &&
+                sp.dry_multiplier == 0.0f && sp.reasoning_budget_tokens < 0 && !sp.reasoning_control;
+    }
+
     static bool chain_slot_ok(const server_slot & slot) {
         return slot.state == SLOT_STATE_GENERATING && !slot.can_speculate() &&
                 slot.spec_draft.empty() && !slot.need_embd() &&
-                slot.task->params.sampling.n_probs == 0 && slot.lora.empty();
+                slot.task->params.sampling.n_probs == 0 && slot.lora.empty() &&
+                (!chain_argmax_on() || chain_greedy_ok(slot.task->params.sampling));
     }
 
     bool chain_prompt_pending() {
@@ -5528,15 +5546,16 @@ private:
 
             chain_harvest_slot(slot);
 
-            const float * row = llama_chain_logits_row(ctx_tgt, id);
+            const llama_token tok_am = llama_chain_argmax_row(ctx_tgt, id);
+            const float * row = tok_am >= 0 ? nullptr : llama_chain_logits_row(ctx_tgt, id);
             llama_token tok;
             {
                 scoped_timer t(t_sampl, n_sampl);
-                tok = common_sampler_sample_row(slot.smpl.get(), vocab, row);
+                tok = tok_am >= 0 ? tok_am : common_sampler_sample_row(slot.smpl.get(), vocab, row);
             }
 
             static const bool chain_trace = std::getenv("LLAMA_CHAIN_TRACE") != nullptr;
-            if (chain_trace) {
+            if (chain_trace && row != nullptr) {
                 int32_t amax = 0;
                 const int32_t nv = llama_vocab_n_tokens(vocab);
                 for (int32_t v = 1; v < nv; ++v) {

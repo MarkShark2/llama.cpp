@@ -35,6 +35,14 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    {
+        const char * e = getenv("LLAMA_RS_SPARSE");
+        sparse = e && atoi(e) != 0 && n_rs_seq == 0;
+        if (sparse) {
+            LLAMA_LOG_INFO("%s: sparse cells (LLAMA_RS_SPARSE): states gathered/scattered by cell id\n", __func__);
+        }
+    }
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -646,6 +654,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
+    if (sparse && !static_cells) {
+        return find_slot_sparse(ubatch);
+    }
+
 #ifndef NDEBUG
     {
         std::vector<int32_t> tails_verif;
@@ -815,6 +827,107 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // sanity check
     return n >= n_seqs;
+}
+
+bool llama_memory_recurrent::find_slot_sparse(const llama_ubatch & ubatch) {
+    const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+    const uint32_t n_seqs       = ubatch.n_seqs;
+
+    sparse_cells.assign(n_seqs, -1);
+
+    // a seq that owns its tail cell stays there; one without a cell, or one
+    // whose cell is shared after a seq_cp, takes the next empty cell and
+    // copies the shared state in through its src
+    uint32_t next_empty = 0;
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id[s*n_seq_tokens][0];
+        auto & seq_meta = cells[seq_id];
+
+        if (seq_meta.tail >= 0 && cells[seq_meta.tail].seq_id.size() == 1) {
+            GGML_ASSERT(cells[seq_meta.tail].has_seq_id(seq_id));
+            sparse_cells[s] = seq_meta.tail;
+            continue;
+        }
+
+        while (next_empty < size && !cells[next_empty].is_empty()) {
+            next_empty++;
+        }
+        if (next_empty >= size) {
+            LLAMA_LOG_ERROR("%s: no free recurrent cell for seq %d\n", __func__, seq_id);
+            return false;
+        }
+
+        auto & cell = cells[next_empty];
+        cell.src = -1;
+        cell.pos = -1;
+        if (seq_meta.tail >= 0) {
+            auto & orig = cells[seq_meta.tail];
+            cell.pos = orig.pos;
+            cell.src = orig.src;
+            orig.seq_id.erase(seq_id);
+            GGML_ASSERT(!orig.is_empty());
+        }
+        cell.seq_id.insert(seq_id);
+        seq_meta.tail = next_empty;
+        sparse_cells[s] = next_empty;
+    }
+
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const uint32_t i = s*n_seq_tokens;
+        const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
+        const int32_t cell_id = sparse_cells[s];
+        auto & cell = cells[cell_id];
+
+        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+        }
+        cell.pos = last_pos;
+        cell.seq_id.clear();
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            cell.seq_id.insert(seq_id);
+            cells[seq_id].tail = cell_id;
+        }
+    }
+
+    // the zeroed state: a fresh cell of this ubatch that no other cell still
+    // copies from (it is cleared in place before the gather)
+    rs_z = -1;
+    {
+        std::vector<int32_t> refcounts(size, 0);
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].src >= 0) {
+                refcounts[cells[i].src] += 1;
+            }
+        }
+        for (uint32_t s = 0; s < n_seqs && rs_z < 0; ++s) {
+            const int32_t c = sparse_cells[s];
+            if (cells[c].src < 0 && refcounts[c] == 0) {
+                rs_z = c;
+            }
+        }
+    }
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        auto & cell = cells[sparse_cells[s]];
+        if (cell.src < 0) {
+            if (rs_z < 0) {
+                LLAMA_LOG_ERROR("%s: no unreferenced fresh cell to zero\n", __func__);
+                return false;
+            }
+            cell.src0 = rs_z;
+        } else {
+            cell.src0 = cell.src;
+        }
+        cell.src = sparse_cells[s];
+    }
+
+    head = 0;
+    n    = n_seqs;
+    used = std::count_if(cells.begin(), cells.end(),
+        [](const mem_cell & cell){ return !cell.is_empty(); });
+
+    return true;
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -1407,7 +1520,18 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+bool llama_memory_recurrent_context::is_sparse() const {
+    return mem->sparse && !mem->static_cells;
+}
+
+int32_t llama_memory_recurrent_context::s_dst(int i) const {
+    return mem->sparse_cells[i];
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
+    if (is_sparse() && !is_full) {
+        return mem->cells[mem->sparse_cells[i]].src0;
+    }
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 

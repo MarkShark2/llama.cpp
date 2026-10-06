@@ -727,6 +727,17 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+// [fork] sequences a worst-case reserve plans for. With LLAMA_UBATCH_SEQS a
+// live ubatch never carries more than the cap, and a reserve planned at
+// n_seq_max is a different graph (64 seqs x 1 token takes the autoregressive
+// recurrent path, 8 x 8 the chunked one): every capped prompt ubatch then
+// failed to fit the plan and re-planned with a full fabric drain - 34 of 37
+// prompt ubatches, 88 s of a 20 min GLM collection run, drains up to 8.4 s.
+static uint32_t reserve_n_seqs(uint32_t n_seq_max) {
+    const uint32_t cap = llama_batch_allocr::ubatch_seq_cap();
+    return cap > 0 ? std::min(n_seq_max, cap) : n_seq_max;
+}
+
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -817,7 +828,7 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs = reserve_n_seqs(cparams.n_seq_max);
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     // graph meta only: a non-causal ubatch may be n_ubatch_nc wide
@@ -1114,7 +1125,7 @@ void llama_context::galloc_restore_worstcase() {
     }
     galloc_epoch_seen = epoch;
 
-    const uint32_t n_seqs        = cparams.n_seq_max;
+    const uint32_t n_seqs        = reserve_n_seqs(cparams.n_seq_max);
     const uint32_t n_tokens      = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -1166,7 +1177,11 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
         return;
     }
 
-    const uint32_t n_seqs = std::min(cparams.n_seq_max, cparams.n_ubatch);
+    uint32_t n_seqs = std::min(cparams.n_seq_max, cparams.n_ubatch);
+    // [fork] a capped split never hands a lane more sequences than the cap
+    if (llama_batch_allocr::ubatch_seq_cap() > 0) {
+        n_seqs = std::min(n_seqs, llama_batch_allocr::ubatch_seq_cap());
+    }
     if (n_seqs == 0) {
         return;
     }
@@ -1200,6 +1215,9 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
             ctx_type_to_graph_type(cparams.ctx_type), lane_sched.get());
 
     auto * gf = model.build_graph(gparams);
+    if (gf) {
+        chain_argmax_add(res, gf);
+    }
 
     this->n_outputs = save_n_outputs;
 
@@ -1208,6 +1226,32 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
     } else {
         LLAMA_LOG_INFO("%s: lane %u reserved at n_seqs = %u in %.2f s\n",
                 __func__, lane, n_seqs, (ggml_time_us() - t0) / 1e6);
+        if (lane == 0 && getenv("LLAMA_LANE_DUMP")) {
+            // [fork diag] the biggest tensors the lane graph places on the first stage
+            std::vector<std::pair<size_t, const ggml_tensor *>> big;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                if (ggml_backend_sched_get_tensor_backend(lane_sched.get(), const_cast<ggml_tensor *>(t)) == backend_ptrs[0]) {
+                    big.emplace_back(ggml_nbytes(t), t);
+                }
+            }
+            std::sort(big.begin(), big.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            for (size_t i = 0; i < big.size() && i < 25; ++i) {
+                const ggml_tensor * t = big[i].second;
+                LLAMA_LOG_INFO("%s: lane0 %8.2f MiB %-12s %-40s [%lld,%lld,%lld,%lld]\n", __func__,
+                        big[i].first / 1024.0 / 1024.0, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+            }
+        }
+        if (lane == 0) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t size = ggml_backend_sched_get_buffer_size(lane_sched.get(), backend_ptrs[i]);
+                if (size > 1) {
+                    LLAMA_LOG_INFO("%s: %10s lane compute buffer size = %8.2f MiB\n", __func__,
+                            ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0);
+                }
+            }
+        }
     }
 
     // the reserve graph must not be mistaken for a reusable live one
@@ -1307,7 +1351,7 @@ bool llama_context::memory_update(bool optimize) {
     // clears the signature, forcing the next one through.
     // LLAMA_MEM_RESERVE_ALWAYS=1 restores the unconditional behaviour for A/B.
     {
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = reserve_n_seqs(cparams.n_seq_max);
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -1637,6 +1681,36 @@ const float * llama_context::chain_logits_row(int32_t row) const {
     const int64_t n_vocab = model.vocab.n_tokens();
     GGML_ASSERT((int64_t) (row + 1)*n_vocab <= (int64_t) logits.size);
     return logits.data + (int64_t) row*n_vocab;
+}
+
+// [fork] LLAMA_CHAIN_ARGMAX=1: greedy tokens computed on the output device.
+// A chain cohort's logits rows are n_vocab f32 each; over a 1 GbE board link
+// 8 rows are 2.5-4.9 MB per cohort, read on the critical path of every
+// cohort. argmax shrinks that to 4 bytes a row. Greedy slots only - the
+// server keeps anything that samples off the logits on the classic path.
+static bool chain_argmax_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_CHAIN_ARGMAX");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+void llama_context::chain_argmax_add(llm_graph_result * res, ggml_cgraph * gf) const {
+    if (!chain_argmax_on() || res->t_logits == nullptr) {
+        return;
+    }
+    res->t_argmax = ggml_argmax(res->get_ctx(), res->t_logits);
+    ggml_set_name(res->t_argmax, "result_argmax");
+    ggml_set_output(res->t_argmax);
+    ggml_build_forward_expand(gf, res->t_argmax);
+}
+
+int32_t llama_context::chain_argmax_row(int32_t row) const {
+    if (!chain_argmax_on() || row < 0 || (size_t) row >= chain_argmax.size()) {
+        return -1;
+    }
+    return chain_argmax[row];
 }
 
 const float * llama_context::chain_tap_row(uint32_t lid, int32_t row) const {
@@ -2229,6 +2303,7 @@ llm_graph_result * llama_context::process_ubatch_decode_lane(
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        chain_argmax_add(res, gf);
         if (!ggml_backend_sched_alloc_graph(lane_sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph for decode lane %u\n", __func__, lane);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -3183,7 +3258,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            if (chain_call) {
+            if (chain_call && res->t_argmax != nullptr) {
+                ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(
+                        sched_decode_lane[decode_lane].get(), res->t_argmax);
+                GGML_ASSERT(backend_am != nullptr);
+                if (chain_argmax.size() < cparams.n_seq_max) {
+                    chain_argmax.assign(cparams.n_seq_max, -1);
+                }
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const int64_t row = ubatch.seq_id[i][0];
+                    GGML_ASSERT(row >= 0 && (size_t) row < chain_argmax.size());
+                    ggml_backend_tensor_get_async(backend_am, res->t_argmax,
+                            chain_argmax.data() + row, (size_t) i*sizeof(int32_t), sizeof(int32_t));
+                }
+                chain_read_note(backend_am);
+            } else if (chain_call) {
                 // rows keyed by seq id so concurrent cohort calls stay disjoint;
                 // the buffer holds n_seq_max rows (output_reserve floor)
                 for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -6474,6 +6563,10 @@ void llama_chain_lane_sync(llama_context * ctx, int32_t lane) {
 
 const float * llama_chain_logits_row(llama_context * ctx, int32_t row) {
     return ctx->chain_logits_row(row);
+}
+
+int32_t llama_chain_argmax_row(llama_context * ctx, int32_t row) {
+    return ctx->chain_argmax_row(row);
 }
 
 const float * llama_chain_tap_row(llama_context * ctx, uint32_t lid, int32_t row) {
