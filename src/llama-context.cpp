@@ -1645,6 +1645,54 @@ void llama_context::chain_read_note(ggml_backend_t backend) {
     }
 }
 
+static int32_t llama_decode_lanes_max();
+
+// LLAMA_CHAIN_STAGE=0: per-row seq-keyed GETs (the pre-staging path), for A/B
+static bool chain_stage_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_CHAIN_STAGE");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
+void llama_context::chain_stage_begin(int32_t lane) {
+    // sized for every lane once: growing it later would copy the deques
+    // (MSVC's deque move is not noexcept) out from under in-flight reads
+    if (chain_stage_bufs.empty()) {
+        const size_t n_lanes = (size_t) std::max<int32_t>(llama_decode_lanes_max(), lane + 1);
+        chain_stage_bufs.resize(n_lanes);
+        chain_stage_used.resize(n_lanes, 0);
+        chain_stage_copies.resize(n_lanes);
+    }
+    GGML_ASSERT((size_t) lane < chain_stage_bufs.size());
+    // the previous cohort on this lane must land before its staging is reused
+    if (!chain_stage_copies[lane].empty()) {
+        static const bool trace = getenv("LLAMA_CHAIN_STAGE_TRACE") != nullptr;
+        const int64_t t0 = ggml_time_us();
+        const size_t n_pending = chain_stage_copies[lane].size();
+        chain_lane_sync(lane);
+        if (trace) {
+            fprintf(stderr, "[chain-stage] lane %d resubmitted with %zu copies pending: sync %.1f ms\n",
+                    lane, n_pending, (ggml_time_us() - t0) / 1000.0);
+        }
+    }
+    chain_stage_used[lane] = 0;
+}
+
+uint8_t * llama_context::chain_stage(int32_t lane, size_t nbytes) {
+    auto & bufs = chain_stage_bufs[lane];
+    size_t & used = chain_stage_used[lane];
+    if (used == bufs.size()) {
+        bufs.emplace_back(); // deque: earlier buffers never move
+    }
+    auto & buf = bufs[used++];
+    if (buf.size() < nbytes) {
+        buf.resize(nbytes);
+    }
+    return buf.data();
+}
+
 void llama_context::chain_lane_sync(int32_t lane) {
     // wait only on this lane's own read fences: an endpoint-global
     // ggml_backend_synchronize would also fence every younger cohort's
@@ -1661,19 +1709,22 @@ void llama_context::chain_lane_sync(int32_t lane) {
         if ((size_t) lane < chain_lane_reads.size()) {
             chain_lane_reads[lane].clear();
         }
-        return;
-    }
-    if ((size_t) lane >= chain_lane_reads.size()) {
-        return;
-    }
-    for (auto & fence : chain_lane_reads[lane]) {
-        if (ggml_backend_is_rpc(fence.first)) {
-            ggml_backend_rpc_read_wait(fence.first, fence.second);
-        } else {
-            ggml_backend_synchronize(fence.first);
+    } else if ((size_t) lane < chain_lane_reads.size()) {
+        for (auto & fence : chain_lane_reads[lane]) {
+            if (ggml_backend_is_rpc(fence.first)) {
+                ggml_backend_rpc_read_wait(fence.first, fence.second);
+            } else {
+                ggml_backend_synchronize(fence.first);
+            }
         }
+        chain_lane_reads[lane].clear();
     }
-    chain_lane_reads[lane].clear();
+    if ((size_t) lane < chain_stage_copies.size()) {
+        for (const auto & c : chain_stage_copies[lane]) {
+            memcpy(c.dst, c.src, c.n);
+        }
+        chain_stage_copies[lane].clear();
+    }
 }
 
 const float * llama_context::chain_logits_row(int32_t row) const {
@@ -3027,6 +3078,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     chain_armed_lane = -1;
     // unconditional: also self-heals a leaked suppress from an aborted call
     dsv4_decode_split_suppress(chain_armed_call >= 0);
+    // once per call: a cohort can split into several ubatches on its lane,
+    // and their staged rows land together at the caller's lane sync
+    bool chain_stage_begun = false;
     if (!mtp_dsa_sel_raw.empty()) {
         synchronize();
     }
@@ -3181,6 +3235,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const bool chain_call = chain_armed_call >= 0 && decode_lane >= 0;
         if (chain_call) {
             decode_lane = chain_armed_call % llama_decode_lanes_max();
+            if (!chain_stage_begun) {
+                chain_stage_begin(decode_lane);
+                chain_stage_begun = true;
+            }
         }
 
         if (decode_trace) {
@@ -3258,7 +3316,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            if (chain_call && res->t_argmax != nullptr) {
+            if (chain_call && res->t_argmax != nullptr && !chain_stage_on()) {
                 ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(
                         sched_decode_lane[decode_lane].get(), res->t_argmax);
                 GGML_ASSERT(backend_am != nullptr);
@@ -3270,6 +3328,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     GGML_ASSERT(row >= 0 && (size_t) row < chain_argmax.size());
                     ggml_backend_tensor_get_async(backend_am, res->t_argmax,
                             chain_argmax.data() + row, (size_t) i*sizeof(int32_t), sizeof(int32_t));
+                }
+                chain_read_note(backend_am);
+            } else if (chain_call && res->t_argmax != nullptr) {
+                ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(
+                        sched_decode_lane[decode_lane].get(), res->t_argmax);
+                GGML_ASSERT(backend_am != nullptr);
+                if (chain_argmax.size() < cparams.n_seq_max) {
+                    chain_argmax.assign(cparams.n_seq_max, -1);
+                }
+                const size_t nb = (size_t) ubatch.n_tokens*sizeof(int32_t);
+                uint8_t * stage = chain_stage(decode_lane, nb);
+                ggml_backend_tensor_get_async(backend_am, res->t_argmax, stage, 0, nb);
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const int64_t row = ubatch.seq_id[i][0];
+                    GGML_ASSERT(row >= 0 && (size_t) row < chain_argmax.size());
+                    chain_stage_copies[decode_lane].push_back({ chain_argmax.data() + row, stage + i*sizeof(int32_t), sizeof(int32_t) });
                 }
                 chain_read_note(backend_am);
             } else if (chain_call) {
@@ -3370,7 +3444,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         } else {
             extract_layer_inputs(res,
                     decode_lane >= 0 ? sched_decode_lane[decode_lane].get() : sched.get(),
-                    ubatch, n_tokens_prev, chain_call);
+                    ubatch, n_tokens_prev, chain_call ? decode_lane : -1);
         }
 
         // [fork] chained cohort call: snapshot the read fences now that every
@@ -3907,7 +3981,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, bool chain_rows) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, int32_t chain_lane) {
     // [fork, SPD] the tap stays in the graph (prefill reads it, and toggling it
     // per phase would reshape the stage graph); this only drops the blocking
     // readback for stages whose anchors the host already has.
@@ -3939,15 +4013,25 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_back
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(res_sched, t);
         GGML_ASSERT(backend != nullptr);
 
-        if (chain_rows) {
-            // chained cohort call: rows keyed by seq id, so cohort calls in
-            // flight together write disjoint regions. No (seq,pos) metadata -
-            // the caller reads rows by seq id and tracks positions itself.
+        if (chain_lane >= 0 && !chain_stage_on()) {
             for (uint32_t i = 0; i < n_tokens; ++i) {
                 const size_t row = (size_t) ubatch.seq_id[i][0];
                 GGML_ASSERT((row + 1) * row_floats <= embd_layer_inp[il].size);
                 ggml_backend_tensor_get_async(backend, t,
                         embd_layer_inp[il].data + row*row_floats, i*row_floats*sizeof(float), row_floats*sizeof(float));
+            }
+            chain_read_note(backend);
+        } else if (chain_lane >= 0) {
+            // chained cohort call: rows keyed by seq id, so cohort calls in
+            // flight together write disjoint regions. No (seq,pos) metadata -
+            // the caller reads rows by seq id and tracks positions itself.
+            uint8_t * stage = chain_stage(chain_lane, nbytes);
+            ggml_backend_tensor_get_async(backend, t, stage, 0, nbytes);
+            const size_t row_bytes = row_floats*sizeof(float);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const size_t row = (size_t) ubatch.seq_id[i][0];
+                GGML_ASSERT((row + 1) * row_floats <= embd_layer_inp[il].size);
+                chain_stage_copies[chain_lane].push_back({ embd_layer_inp[il].data + row*row_floats, stage + i*row_bytes, row_bytes });
             }
             chain_read_note(backend);
         } else {
@@ -3960,7 +4044,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_back
 
     // [fork, SPD collect] publish (seq_id, pos) per extracted row - collectors
     // must map rows by this, never by batch index (ubatch order differs)
-    if (extracted && !chain_rows) {
+    if (extracted && chain_lane < 0) {
         GGML_ASSERT(embd_layer_inp_seq.size() == token_offset);
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             embd_layer_inp_seq.push_back(ubatch.seq_id[i][0]);

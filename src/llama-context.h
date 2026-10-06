@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <deque>
 #include <map>
 #include <vector>
 
@@ -350,7 +351,7 @@ private:
     // scheduler the ubatch actually ran on (a decode lane's tensors are not
     // resolvable against the shared scheduler); the ubatch supplies the
     // per-row (seq_id, pos) metadata published to collectors.
-    void extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, bool chain_rows = false);
+    void extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, int32_t chain_lane = -1);
 
     // [fork, PipeDec] stage-2 variant: async-GET each enabled layer-input row of a
     // single-token body lane into the stable per-group buffers (published to
@@ -555,6 +556,17 @@ private:
     int32_t chain_armed_lane = -1;
 
     void chain_read_note(ggml_backend_t backend);
+
+    // [fork] chained cohort reads go one GET per tensor into lane-owned
+    // staging, and the seq-keyed rows are copied out once the lane's read
+    // fence passes (chain_lane_sync). Per-row GETs were 8 x (taps + 1) RPC
+    // round trips per cohort on the same dispatcher as the peer pushes.
+    struct chain_stage_copy { void * dst; const uint8_t * src; size_t n; };
+    std::vector<std::deque<std::vector<uint8_t>>> chain_stage_bufs;
+    std::vector<size_t>                           chain_stage_used;
+    std::vector<std::vector<chain_stage_copy>>    chain_stage_copies;
+    void      chain_stage_begin(int32_t lane);
+    uint8_t * chain_stage(int32_t lane, size_t nbytes);
 
     // Stage 2 keeps the deferred output head on a separate scheduler so
     // switching to the tiny head graph does not evict the reusable 4k-node

@@ -5414,14 +5414,28 @@ private:
 
     // LLAMA_CHAIN_ARGMAX: the lane hands back argmax(logits), so a chained slot
     // must sample exactly that - temp <= 0 with nothing ahead of the greedy
-    // pick in its sampler chain that can reorder the logits
-    static bool chain_greedy_ok(const common_params_sampling & sp) {
-        return sp.temp <= 0.0f && sp.grammar.empty() && sp.logit_bias.empty() && !sp.ignore_eos &&
+    // pick in its sampler chain that can reorder the logits. Top-k/p, min-p
+    // and top-n-sigma always keep the max; XTC and typical-p can drop it,
+    // dynatemp can lift temp above 0, and the GGUF's suppress tokens become
+    // a logit bias the request never shows
+    bool chain_greedy_ok(const common_params_sampling & sp) const {
+        if (!(sp.temp <= 0.0f && sp.grammar.empty() && sp.logit_bias.empty() && !sp.ignore_eos &&
                 sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f &&
-                sp.dry_multiplier == 0.0f && sp.reasoning_budget_tokens < 0 && !sp.reasoning_control;
+                sp.dry_multiplier == 0.0f && sp.reasoning_budget_tokens < 0 && !sp.reasoning_control &&
+                sp.xtc_probability <= 0.0f && sp.typ_p >= 1.0f && sp.dynatemp_range <= 0.0f && sp.mirostat == 0)) {
+            return false;
+        }
+        for (const auto t : sp.samplers) {
+            if (t == COMMON_SAMPLER_TYPE_ADAPTIVE_P || t == COMMON_SAMPLER_TYPE_INFILL) {
+                return false;
+            }
+        }
+        int32_t n_suppress = 0;
+        llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        return n_suppress == 0;
     }
 
-    static bool chain_slot_ok(const server_slot & slot) {
+    bool chain_slot_ok(const server_slot & slot) const {
         return slot.state == SLOT_STATE_GENERATING && !slot.can_speculate() &&
                 slot.spec_draft.empty() && !slot.need_embd() &&
                 slot.task->params.sampling.n_probs == 0 && slot.lora.empty() &&
