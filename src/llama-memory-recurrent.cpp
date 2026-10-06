@@ -1241,6 +1241,16 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             return false;
         }
 
+        // [fork] a sparse slot leaves head at 0 for the graph; the restore
+        // reads and writes the one cell it actually picked
+        if (sparse && !static_cells) {
+            if (cell_count != 1) {
+                LLAMA_LOG_ERROR("%s: sparse recurrent cells restore one cell per seq, got %u\n", __func__, cell_count);
+                return false;
+            }
+            head = sparse_cells[0];
+        }
+
         // DEBUG CHECK: kv.head should be our first cell, kv.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
         // Assume that this is one contiguous block of cells
         GGML_ASSERT(head + cell_count <= size);
