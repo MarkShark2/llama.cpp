@@ -4965,6 +4965,48 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// [fork] MUL_MAT_ID with the k_tri hint (the SPD aggregation bank): expert e may
+// stop its K loop at (e+1)*k_block, so B is zeroed past that to keep the
+// reference (which ignores the hint) exact.
+extern "C" {
+void ggml_mul_mat_id_set_k_tri(struct ggml_tensor * a, int32_t k_block);
+}
+
+struct test_mul_mat_id_k_tri : public test_mul_mat_id {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_K_TRI";
+    }
+
+    test_mul_mat_id_k_tri(ggml_type type_a, int n_mats, int64_t m, int64_t n, int64_t k_block)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, 1, true, m, n, n_mats*k_block) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_mul_mat_id_set_k_tri(out, (int32_t) (k/n_mats));
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        ggml_tensor * b   = ggml_get_tensor(ctx, "b");
+        std::vector<int32_t> idv(ggml_nelements(ids));
+        std::vector<float>   bv(ggml_nelements(b));
+        ggml_backend_tensor_get(ids, idv.data(), 0, ggml_nbytes(ids));
+        ggml_backend_tensor_get(b,   bv.data(),  0, ggml_nbytes(b));
+        const int64_t k_block = k/n_mats;
+        for (int64_t j = 0; j < n; ++j) {
+            // SPD decode order: the oldest in-flight row has the deepest anchor
+            const int64_t e = n_mats - 1 - j % n_mats;
+            idv[j*n_mats] = (int32_t) e;
+            std::fill(bv.begin() + j*k + (e + 1)*k_block, bv.begin() + (j + 1)*k, 0.0f);
+        }
+        ggml_backend_tensor_set(ids, idv.data(), 0, ggml_nbytes(ids));
+        ggml_backend_tensor_set(b, bv.data(), 0, ggml_nbytes(b));
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -8791,6 +8833,14 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [fork] k_tri hint: grouped (n > 8) and per-column (n <= 8) id paths
+    for (int n_pat : { 9, 13 }) {
+        for (int n : { 4, 10, n_pat + 1 }) {
+            test_cases.emplace_back(new test_mul_mat_id_k_tri(GGML_TYPE_Q8_0, n_pat, 256, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_k_tri(GGML_TYPE_F16,  n_pat, 64,  n, 96));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -10791,6 +10841,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [fork] SPD sidecar shapes: one decode call computes stage_count+1 rows,
+    // each through its own anchor-pattern expert of the aggregation bank
+    // (k = n_patterns*4096, zero-padded past the row's anchors), then two
+    // 4096-wide layers (32/8 heads, ffn 8192) and a 24576-row draft LM head.
+    // DSV4: 9 patterns, 10 rows; GLM-5.3: 13 patterns, 14 rows.
+    for (auto [n_pat, n_rows] : { std::pair<int, int>{9, 10}, std::pair<int, int>{13, 14} }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_pat, 1, true, 4096, n_rows, (int64_t) n_pat*4096));
+        for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0 }) {
+            test_cases.emplace_back(new test_mul_mat_id_k_tri(t, n_pat, 4096, n_rows, 4096));
+        }
+        if (n_pat == 9) {
+            test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {129280, 1, 1, 1}));
+        }
+        for (auto [m, k] : { std::pair<int64_t, int64_t>{4096, 4096}, {1024, 4096}, {8192, 4096}, {4096, 8192}, {24576, 4096} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n_rows, k, {1, 1}, {1, 1}));
+            if (n_pat == 9) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 8, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

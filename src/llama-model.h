@@ -685,6 +685,10 @@ struct llama_model {
 
     // speculative pipeline decoding
     struct ggml_tensor * spd_aggr = nullptr;
+    // shared-block bank: aggr_e(x) = (sum_{k<=e} blk_k x_k) * scale_e + bias_e
+    struct ggml_tensor * spd_aggr_blk   = nullptr;
+    struct ggml_tensor * spd_aggr_scale = nullptr;
+    struct ggml_tensor * spd_aggr_bias  = nullptr;
 
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;

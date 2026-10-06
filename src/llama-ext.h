@@ -188,6 +188,22 @@ LLAMA_API struct ggml_tensor * llama_spd_peer_inp_tensor(struct llama_context * 
 LLAMA_API struct ggml_tensor * llama_spd_peer_out_tensor(struct llama_context * ctx);
 LLAMA_API void llama_set_spd_peer_io(struct llama_context * ctx, bool skip_inp, bool skip_out, bool skip_layer_inp);
 
+// [fork, SPD shared aggregation bank] a sidecar whose bank is one block per
+// anchor keeps each in-flight position's running block sum on the device.
+// n_slots > 0 means this context has that ring (slot = pos % n_slots); 0 is
+// the per-pattern bank, fed through batch.embd as before.
+//
+// With the ring, every sidecar decode is described by a plan set just before
+// it, and the batch carries only the pattern selectors as tokens (embd NULL).
+// Per row, by position: `held` anchors are already in the slot (0 = start the
+// slot over, -1 = untracked: start over in a scratch column the ring never
+// keeps), and `n_new` anchors follow, anchors max(held,0) .. +n_new-1, packed
+// back to back in `feat` (n_embd floats each). The row's selector must be its
+// last new anchor. The plan stays in force until the next call.
+LLAMA_API uint32_t llama_spd_aggr_n_slots(const struct llama_context * ctx);
+LLAMA_API bool     llama_spd_aggr_set_plan(struct llama_context * ctx, int32_t n, const llama_pos * pos,
+                                           const int32_t * held, const int32_t * n_new, const float * feat);
+
 // [fork, SPD peer boundaries] synchronous peer-push entry points, implemented
 // in ggml-rpc.cpp (exported from the RPC backend, declared here so the SPD
 // pipeline can drive them; see the "Synchronous peer push" block there for

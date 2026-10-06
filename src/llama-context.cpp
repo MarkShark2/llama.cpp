@@ -550,6 +550,32 @@ llama_context::llama_context(
             }
         }
 
+        // [fork, SPD shared aggregation bank] a sidecar whose bank is one block
+        // per anchor keeps every in-flight position's running sum on the bank's
+        // device, so a speculation step adds only the anchors that arrived since
+        // the last one. Ring of n_slots columns (slot = pos % n_slots) plus one
+        // scratch column for untracked rows.
+        if (model.spd_aggr_blk != nullptr && model.spd_aggr_blk->buffer != nullptr) {
+            const uint32_t n_slots = 64;
+            ggml_init_params ip = { ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+            spd_aggr_ctx = ggml_init(ip);
+            ggml_tensor * state = ggml_new_tensor_2d(spd_aggr_ctx, GGML_TYPE_F32,
+                    model.spd_aggr_blk->ne[1], (int64_t) n_slots + 1);
+            ggml_set_name(state, "spd_aggr_state");
+            spd_aggr_buf = ggml_backend_alloc_ctx_tensors_from_buft(spd_aggr_ctx,
+                    ggml_backend_buffer_get_type(model.spd_aggr_blk->buffer));
+            if (spd_aggr_buf == nullptr) {
+                throw std::runtime_error("failed to allocate the SPD aggregation state");
+            }
+            // the scratch column is read under a zero keep, and 0 * NaN is not 0
+            ggml_backend_buffer_clear(spd_aggr_buf, 0);
+            spd_aggr_plan_data.n_slots = n_slots;
+            cparams.spd_aggr_state = state;
+            cparams.spd_aggr_plan  = &spd_aggr_plan_data;
+            LLAMA_LOG_INFO("%s: SPD shared aggregation bank: %u-slot state, %.1f MiB on %s\n", __func__,
+                    n_slots, ggml_nbytes(state)/(1024.0*1024.0), ggml_backend_buffer_name(spd_aggr_buf));
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -706,6 +732,12 @@ llama_context::~llama_context() {
     }
     if (spd_boundary_ctx != nullptr) {
         ggml_free(spd_boundary_ctx);
+    }
+    if (spd_aggr_buf != nullptr) {
+        ggml_backend_buffer_free(spd_aggr_buf);
+    }
+    if (spd_aggr_ctx != nullptr) {
+        ggml_free(spd_aggr_ctx);
     }
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1733,6 +1765,36 @@ ggml_tensor * llama_context::spd_peer_out_tensor() const {
     return gf_res_prev ? gf_res_prev->t_embd : nullptr;
 }
 
+bool llama_context::set_spd_aggr_plan(int32_t n, const llama_pos * pos, const int32_t * held,
+        const int32_t * n_new, const float * feat) {
+    if (cparams.spd_aggr_state == nullptr || n < 0) {
+        return false;
+    }
+    const int64_t n_embd = cparams.spd_aggr_state->ne[0];
+    const int32_t n_aggr = (int32_t) model.spd_aggr_blk->ne[2];
+    auto & plan = spd_aggr_plan_data;
+    plan.pos.assign(pos, pos + n);
+    plan.held.assign(held, held + n);
+    plan.n_new.assign(n_new, n_new + n);
+    plan.off.resize(n);
+    size_t total = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        // a row may add nothing (its selector did not move), but it must end
+        // up with at least anchor 0 and at most every anchor
+        const int32_t total_anchors = std::max(held[i], 0) + n_new[i];
+        if (held[i] < -1 || n_new[i] < 0 || total_anchors < 1 || total_anchors > n_aggr) {
+            LLAMA_LOG_ERROR("%s: row %d (pos %d): held %d + %d new anchors does not fit %d\n",
+                    __func__, i, pos[i], held[i], n_new[i], n_aggr);
+            plan.pos.clear();
+            return false;
+        }
+        plan.off[i] = total;
+        total += (size_t) n_new[i]*n_embd;
+    }
+    plan.feat.assign(feat, feat + total);
+    return true;
+}
+
 void llama_context::set_spd_peer_io(bool skip_inp, bool skip_out, bool skip_layer_inp) {
     cparams.spd_peer_skip_inp  = skip_inp;
     cparams.spd_peer_skip_out  = skip_out;
@@ -2142,7 +2204,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
+    const bool pu_reused = graph_reuse_allowed(ubatch) && res->can_reuse(gparams);
+    if (pu_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2209,9 +2272,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (pu_trace) {
         const int64_t pu_t3 = ggml_time_us();
-        if (pu_t3 - pu_t0 > 300*1000) {
-            fprintf(stderr, "[pu] n_tok=%d apply+build+alloc=%.1fms set_inputs=%.1fms compute_submit=%.1fms\n",
-                    (int) ubatch.n_tokens, (pu_t1 - pu_t0) / 1000.0, (pu_t2 - pu_t1) / 1000.0, (pu_t3 - pu_t2) / 1000.0);
+        // 2 = every ubatch (small-graph host overhead, e.g. the SPD sidecar)
+        if (pu_trace >= 2 || pu_t3 - pu_t0 > 300*1000) {
+            fprintf(stderr, "[pu] n_tok=%d reused=%d apply+build+alloc=%.3fms set_inputs=%.3fms compute_submit=%.3fms\n",
+                    (int) ubatch.n_tokens, pu_reused ? 1 : 0, (pu_t1 - pu_t0) / 1000.0, (pu_t2 - pu_t1) / 1000.0, (pu_t3 - pu_t2) / 1000.0);
             fflush(stderr);
         }
     }
@@ -6593,6 +6657,15 @@ ggml_tensor * llama_spd_peer_out_tensor(llama_context * ctx) {
 
 void llama_set_spd_peer_io(llama_context * ctx, bool skip_inp, bool skip_out, bool skip_layer_inp) {
     ctx->set_spd_peer_io(skip_inp, skip_out, skip_layer_inp);
+}
+
+uint32_t llama_spd_aggr_n_slots(const llama_context * ctx) {
+    return ctx->spd_aggr_n_slots();
+}
+
+bool llama_spd_aggr_set_plan(llama_context * ctx, int32_t n, const llama_pos * pos,
+        const int32_t * held, const int32_t * n_new, const float * feat) {
+    return ctx->set_spd_aggr_plan(n, pos, held, n_new, feat);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

@@ -3370,6 +3370,27 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// [fork] declared by its users (no public-header change). Marks a MUL_MAT_ID
+// whose expert e only ever sees non-zero b in its first (e+1)*k_block columns
+// (the SPD sidecar's anchor-pattern bank: pattern e concatenates anchors 0..e
+// and the rest of the row is zero), so a backend may stop its K loop there.
+// The product is unchanged, so ignoring the hint is always correct.
+#define GGML_MMID_K_TRI_MAGIC 0x4b545249 // 'KTRI'
+
+GGML_API void ggml_mul_mat_id_set_k_tri(struct ggml_tensor * a, int32_t k_block) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(k_block > 0 && a->src[0]->ne[0] % k_block == 0);
+    ggml_set_op_params_i32(a, 2, GGML_MMID_K_TRI_MAGIC);
+    ggml_set_op_params_i32(a, 3, k_block);
+}
+
+GGML_API int32_t ggml_mul_mat_id_get_k_tri(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_MUL_MAT_ID || ggml_get_op_params_i32(a, 2) != GGML_MMID_K_TRI_MAGIC) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 3);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

@@ -18,9 +18,9 @@ uint a_offset, b_offset, d_offset, y_offset;
 
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
-    OOB_y = lastiter && (iybs + iqs + y_offset >= p.ncols);
-    OOB_z = lastiter && (iybs + iqs + y_offset*2 >= p.ncols);
-    OOB_w = lastiter && (iybs + iqs + y_offset*3 >= p.ncols);
+    OOB_y = lastiter && (iybs + iqs + y_offset >= ncols_k);
+    OOB_z = lastiter && (iybs + iqs + y_offset*2 >= ncols_k);
+    OOB_w = lastiter && (iybs + iqs + y_offset*3 >= ncols_k);
 
     if (!OOB_w) {
         return vec4(FLOAT_TYPE(data_b[b_off[j] + iybs + iqs]),
@@ -42,6 +42,50 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, 
     }
 }
 
+#if K_PER_ITER == 8
+// [fork] rows outer, columns inner: each A block is dequantized once and
+// reused by every B column (columns-outer redid it NUM_COLS times, which made
+// the multi-column kernel ALU-bound on GCN).
+void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
+{
+    const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+    const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
+    const uint iybs = col - col%QUANT_K; // y block start index
+
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = (ibi + col)/QUANT_K; // block index
+        ibi += p.ncols;
+
+        vec4 v = dequantize4(ib, iqs, a_offset);
+        vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+
+        const vec2 dm = get_dm(ib, a_offset);
+        if (dm.y != 0) { // quant has min component
+            v = v * dm.x + dm.y;
+            v2 = v2 * dm.x + dm.y;
+        } else {
+            v *= dm.x;
+            v2 *= dm.x;
+        }
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#if QUANT_R == 2
+            // Note that we end up fetching bogus elements here, but its fine as they'll be
+            // within an accessible block.
+            const vec4 bv02 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
+            const vec4 bv13 = vec4(data_b_v4[(b_off[j] + iybs + iqs + y_offset) / 4]);
+            const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+            const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+#else
+            const vec4 bv0 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
+            const vec4 bv1 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4 + 1]);
+#endif
+            temp[j][n] += dot(bv0, v) + dot(bv1, v2);
+        }
+    }
+}
+#else
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
 {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -49,49 +93,16 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
         const uint iybs = col - col%QUANT_K; // y block start index
 
-#if K_PER_ITER == 8
-#if QUANT_R == 2
-        // Note that we end up fetching bogus elements here, but its fine as they'll be
-        // within an accessible block.
-        const vec4 bv02 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
-        const vec4 bv13 = vec4(data_b_v4[(b_off[j] + iybs + iqs + y_offset) / 4]);
-        const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
-        const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
-#else
-        const vec4 bv0 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
-        const vec4 bv1 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4 + 1]);
-#endif
-#else
         bool OOB_y;
         bool OOB_z;
         bool OOB_w;
 
         const vec4 b = load_b(j, iybs, iqs, lastiter, OOB_y, OOB_z, OOB_w);
-#endif
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint ib = (ibi + col)/QUANT_K; // block index
             ibi += p.ncols;
 
-#if K_PER_ITER == 8
-            vec4 v = dequantize4(ib, iqs, a_offset);
-            vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
-
-            const vec2 dm = get_dm(ib, a_offset);
-            if (dm.y != 0) { // quant has min component
-                v = v * dm.x + dm.y;
-                v2 = v2 * dm.x + dm.y;
-            }
-
-            // matrix multiplication
-            FLOAT_TYPE rowtmp = dot(bv0, v);
-            rowtmp += dot(bv1, v2);
-
-            if (dm.y == 0)
-                rowtmp *= dm.x;
-
-            temp[j][n] += rowtmp;
-#else
             if (!OOB_w) {
                 const vec4 v = dequantize4(ib, iqs, a_offset);
                 temp[j][n] += dot(v, b);
@@ -109,10 +120,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 const FLOAT_TYPE v = dequantize1(ib, iqs, a_offset);
                 temp[j][n] = fma(v, b.x, temp[j][n]);
             }
-#endif
         }
     }
 }
+#endif
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
@@ -144,7 +155,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     get_offsets(a_offset, b_offset, d_offset);
     const bool is_aligned_nonquant =
         p.batch_stride_b % 4 == 0 && b_offset % 4 == 0 &&
-        p.ncols % 4 == 0 && BLOCK_SIZE % 4 == 0 &&
+        ncols_k % 4 == 0 && BLOCK_SIZE % 4 == 0 &&
         K_PER_ITER == 4;
 
     y_offset = QUANT_R == 1 ? 1 : QUANT_K/2;
@@ -157,8 +168,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
-    if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
+    uint num_iters = ncols_k / (K_PER_ITER * BLOCK_SIZE);
+    if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < ncols_k) {
         num_iters++;
     }
     int unroll_count = 4;
@@ -169,7 +180,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 #if K_PER_ITER == 4
     // If the K dimension is odd, we need lastiter==true on the last iteration
     // so OOB is computed correctly. Skip some unrolling to make that happen.
-    if ((p.ncols & 3) != 0 &&
+    if ((ncols_k & 3) != 0 &&
         unrolled_iters == num_iters &&
         unrolled_iters > 0) {
         unrolled_iters -= unroll_count;
@@ -199,7 +210,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     unrolled_iters = num_iters & ~(unroll_count - 1);
 
 #if K_PER_ITER == 4
-    if ((p.ncols & 3) != 0 &&
+    if ((ncols_k & 3) != 0 &&
         unrolled_iters == num_iters &&
         unrolled_iters > 0) {
         unrolled_iters -= unroll_count;

@@ -38,9 +38,12 @@ def copy_tokenizer_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter) ->
         writer.add_key_value(key, field.contents(), field.types[0], subtype)
 
 
+AGGR_PREFIXES = ("aggr_projs.", "aggr_blocks.", "aggr_scale", "aggr_bias")
+
+
 def checkpoint_tensor_name(name: str) -> str:
-    if re.fullmatch(r"aggr_projs\.\d+\.weight", name):
-        raise ValueError("aggregation projections are packed into aggr.weight")
+    if name.startswith(AGGR_PREFIXES):
+        raise ValueError("aggregation tensors are packed into aggr.weight / aggr_blk.weight")
     if name == "lm_head.weight":
         return "output.weight"
 
@@ -205,9 +208,16 @@ def validate_checkpoint(
             raise ValueError(
                 f"aggr_feature_bound {anchors} does not match stage boundaries {bounds}")
 
-    for index in range(num_aggr_types):
-        key = f"aggr_projs.{index}.weight"
-        expected = (hidden_size, hidden_size * (index + 1))
+    aggr_shared = bool(config.get("aggr_shared", False))
+    if aggr_shared:
+        expected_shapes = {f"aggr_blocks.{index}.weight": (hidden_size, hidden_size)
+                           for index in range(num_aggr_types)}
+        expected_shapes["aggr_scale"] = (num_aggr_types, hidden_size)
+        expected_shapes["aggr_bias"] = (num_aggr_types, hidden_size)
+    else:
+        expected_shapes = {f"aggr_projs.{index}.weight": (hidden_size, hidden_size * (index + 1))
+                           for index in range(num_aggr_types)}
+    for key, expected in expected_shapes.items():
         if key not in state_dict or tuple(state_dict[key].shape) != expected:
             actual = None if key not in state_dict else tuple(state_dict[key].shape)
             raise ValueError(f"{key} has shape {actual}, expected {expected}")
@@ -229,7 +239,7 @@ def validate_checkpoint(
     mapped_names = [
         checkpoint_tensor_name(name)
         for name in state_dict
-        if not name.startswith("aggr_projs.")
+        if not name.startswith(AGGR_PREFIXES)
     ]
     if len(mapped_names) != len(set(mapped_names)):
         raise ValueError("multiple checkpoint tensors map to the same GGUF tensor name")
@@ -242,6 +252,7 @@ def validate_checkpoint(
         "num_stages": num_stages,
         "num_spec_layers": num_spec_layers,
         "num_aggr_types": num_aggr_types,
+        "aggr_shared": aggr_shared,
         "anchors": anchors,
         "use_deepest": use_deepest,
         "trunk_blocks": trunk_blocks,
@@ -349,23 +360,40 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
 
     num_aggr_types = int(meta["num_aggr_types"])
     hidden_size = int(meta["hidden_size"])
-    aggr = torch.zeros(
-        (num_aggr_types, hidden_size, num_aggr_types * hidden_size),
-        dtype=torch.float32,
-    )
-    for index in range(num_aggr_types):
-        source = state_dict[f"aggr_projs.{index}.weight"]
-        aggr[index, :, : source.shape[1]] = source.to(dtype=torch.float32)
-    LOGGER.info("%-64s -> %s", "aggr_projs.*.weight", "aggr.weight")
-    writer.add_tensor(
-        "aggr.weight",
-        gguf.quantize(aggr.numpy(), gguf.GGMLQuantizationType.BF16),
-        raw_dtype=gguf.GGMLQuantizationType.BF16,
-    )
-    del aggr
+    if meta["aggr_shared"]:
+        # one block per anchor (expert k = anchor k) plus the per-type affine;
+        # the sidecar keeps per-position block sums on the device. scale/bias
+        # carry no ".weight" suffix so llama-quantize leaves them f32.
+        blocks = torch.stack([state_dict[f"aggr_blocks.{index}.weight"].to(torch.float32)
+                              for index in range(num_aggr_types)])
+        LOGGER.info("%-64s -> %s", "aggr_blocks.*.weight", "aggr_blk.weight")
+        writer.add_tensor(
+            "aggr_blk.weight",
+            gguf.quantize(blocks.numpy(), gguf.GGMLQuantizationType.BF16),
+            raw_dtype=gguf.GGMLQuantizationType.BF16,
+        )
+        del blocks
+        for name in ("aggr_scale", "aggr_bias"):
+            LOGGER.info("%-64s -> %s", name, name)
+            writer.add_tensor(name, state_dict[name].detach().to(device="cpu", dtype=torch.float32).numpy())
+    else:
+        aggr = torch.zeros(
+            (num_aggr_types, hidden_size, num_aggr_types * hidden_size),
+            dtype=torch.float32,
+        )
+        for index in range(num_aggr_types):
+            source = state_dict[f"aggr_projs.{index}.weight"]
+            aggr[index, :, : source.shape[1]] = source.to(dtype=torch.float32)
+        LOGGER.info("%-64s -> %s", "aggr_projs.*.weight", "aggr.weight")
+        writer.add_tensor(
+            "aggr.weight",
+            gguf.quantize(aggr.numpy(), gguf.GGMLQuantizationType.BF16),
+            raw_dtype=gguf.GGMLQuantizationType.BF16,
+        )
+        del aggr
 
     for source_name, tensor in state_dict.items():
-        if source_name.startswith("aggr_projs."):
+        if source_name.startswith(AGGR_PREFIXES):
             continue
         output_name = checkpoint_tensor_name(source_name)
         LOGGER.info("%-64s -> %s", source_name, output_name)

@@ -127,6 +127,16 @@ struct llama_context {
     ggml_context         * spd_boundary_ctx = nullptr;
     ggml_backend_buffer_t  spd_boundary_buf = nullptr;
 
+    // [fork, SPD shared aggregation bank] the device-resident running-sum ring
+    // (cparams.spd_aggr_state) and the host plan for the next decode
+    uint32_t spd_aggr_n_slots() const { return cparams.spd_aggr_state != nullptr ? spd_aggr_plan_data.n_slots : 0; }
+    bool     set_spd_aggr_plan(int32_t n, const llama_pos * pos, const int32_t * held,
+                               const int32_t * n_new, const float * feat);
+
+    ggml_context         * spd_aggr_ctx = nullptr;
+    ggml_backend_buffer_t  spd_aggr_buf = nullptr;
+    llama_spd_aggr_plan    spd_aggr_plan_data;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 

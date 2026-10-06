@@ -147,6 +147,27 @@ struct batch_storage {
         GGML_ASSERT(features.size() == selectors.size()*(size_t) n_embd);
         GGML_ASSERT(pos.size() == selectors.size());
     }
+
+    // selectors only: a shared-bank sidecar takes its anchors through
+    // llama_spd_aggr_set_plan, not batch.embd
+    void set(
+            const std::vector<llama_token> & selectors,
+            const std::vector<llama_pos> & pos) {
+        batch = {};
+        batch.n_tokens = (int32_t) selectors.size();
+        tokens = selectors;
+        embeddings.clear();
+        positions = pos;
+        logits.assign(selectors.size(), 0);
+        if (!logits.empty()) {
+            logits.back() = 1;
+        }
+        batch.token = tokens.data();
+        batch.pos = positions.data();
+        batch.logits = logits.data();
+
+        GGML_ASSERT(pos.size() == selectors.size());
+    }
 };
 
 class fixed_worker {
@@ -245,11 +266,25 @@ struct common_spd_pipeline::impl {
         snapshot snap;
     };
 
+    // One sidecar decode. With the per-pattern bank `features` is a full
+    // sidecar_n_embd_inp row per position; with the shared bank it is only the
+    // new anchors, packed, and held/n_new say which ones (see append_row).
     struct speculation_input {
         std::vector<llama_token> selectors;
         std::vector<llama_pos> positions;
         std::vector<float> features;
+        std::vector<int32_t> held;
+        std::vector<int32_t> n_new;
         llama_pos min_pos = -1;
+
+        void clear() {
+            selectors.clear();
+            positions.clear();
+            features.clear();
+            held.clear();
+            n_new.clear();
+            min_pos = -1;
+        }
     };
 
     struct stage_decode_job {
@@ -310,6 +345,13 @@ struct common_spd_pipeline::impl {
     batch_storage embed_decode_batch;
     batch_storage sidecar_decode_batch;
     speculation_input decode_speculation_input;
+    // Shared aggregation bank (llama_spd_aggr_n_slots > 0): the sidecar keeps
+    // each tracked position's running anchor-block sum in ring slot
+    // pos % aggr_slots. This mirrors which position each slot sums and over how
+    // many anchors, so a row ships only the anchors its slot is missing.
+    uint32_t aggr_slots = 0;
+    std::vector<llama_pos> aggr_slot_pos;
+    std::vector<int32_t> aggr_slot_held;
     std::array<std::unique_ptr<fixed_worker>, SPD_MAX_STAGE_COUNT> stage_workers;
     std::unique_ptr<fixed_worker> sidecar_worker;
     llama_context * head = nullptr;
@@ -508,6 +550,11 @@ struct common_spd_pipeline::impl {
         double rollback = 0.0;
         double step_total = 0.0;
         double sidecar_run = 0.0;
+        // [fork] sidecar_run split: KV crop, batch copy, llama_decode, sampled-token wait
+        double sidecar_crop = 0.0;
+        double sidecar_set = 0.0;
+        double sidecar_decode = 0.0;
+        double sidecar_sample = 0.0;
         uint64_t head_calls = 0;
         uint64_t embed_calls = 0;
         uint64_t sidecar_calls = 0;
@@ -1160,6 +1207,9 @@ struct common_spd_pipeline::impl {
                     sidecar_eog_masked, sidecar_mask_unsupported, sidecar_sampler_capable, false);
         }
         configure_static_context(sidecar, false);
+        aggr_slots = llama_spd_aggr_n_slots(sidecar);
+        aggr_slot_pos.assign(aggr_slots, -1);
+        aggr_slot_held.assign(aggr_slots, 0);
 
         if (static_decode_fast_path && params.parallel_stages) {
             for (uint32_t stage = 0; stage < stage_count; ++stage) {
@@ -1175,6 +1225,7 @@ struct common_spd_pipeline::impl {
             llama_memory_clear(llama_get_memory(stages[stage]), true);
         }
         llama_memory_clear(llama_get_memory(sidecar), true);
+        aggr_forget(0);
         for (auto & positions : checkpoint_pos) {
             positions.fill(-1);
         }
@@ -1418,6 +1469,7 @@ struct common_spd_pipeline::impl {
             }
             const llama_pos restored = it->pos;
             if (restore_checkpoint(*it) && llama_memory_seq_rm(llama_get_memory(sidecar), 0, restored, -1)) {
+                aggr_forget(restored);
                 for (auto & positions : checkpoint_pos) {
                     positions.fill(-1);
                 }
@@ -1458,6 +1510,7 @@ struct common_spd_pipeline::impl {
             reset_memories();
             return false;
         }
+        aggr_forget(pos);
         for (auto & positions : checkpoint_pos) {
             positions.fill(-1);
         }
@@ -1548,20 +1601,15 @@ struct common_spd_pipeline::impl {
             return;
         }
 
-        const int32_t count = (int32_t) (end_pos - from);
-        std::vector<llama_token> selectors(count, (llama_token) selector);
-        std::vector<llama_pos> positions(count);
-        std::vector<float> features;
-        features.reserve((size_t) count*sidecar_n_embd_inp);
-        for (int32_t row = 0; row < count; ++row) {
-            positions[row] = from + row;
-            append_feature_row(features, completed.at(from + row), selector);
-        }
-
         // Same shape as run_speculation: crop to the first rewritten position
         // so the decode replaces those cells rather than appending duplicates.
         if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, from, -1)) {
             return;
+        }
+        speculation_input rows;
+        for (llama_pos pos = from; pos < end_pos; ++pos) {
+            const snapshot & snap = completed.at(pos);
+            append_row(rows, pos, selector, [&](size_t i) { return snap.values[i].data(); }, true);
         }
         // Losing this is a draft-quality cost on the next request, not a
         // correctness one -- the target verifies every token -- so a failure
@@ -1569,7 +1617,7 @@ struct common_spd_pipeline::impl {
         // leave behind an error message that the next real failure would then
         // be reported under (fail() keeps the first message, not the last).
         const std::string saved_error = last_error;
-        if (!sidecar_decode(selectors, features, positions, nullptr,
+        if (!sidecar_decode(rows, nullptr,
                     static_decode_fast_path ? &sidecar_decode_batch : nullptr)) {
             last_error = saved_error;
         }
@@ -1752,21 +1800,63 @@ struct common_spd_pipeline::impl {
         return 0;
     }
 
-    void append_feature_row(std::vector<float> & features, const snapshot & snap, size_t selector) const {
-        const size_t old_size = features.size();
-        features.resize(old_size + sidecar_n_embd_inp, 0.0f);
-        float * dst = features.data() + old_size;
-        for (size_t i = 0; i <= selector; ++i) {
-            std::memcpy(dst + i*n_embd, snap.values[i].data(), (size_t) n_embd*sizeof(float));
+    bool shared_bank() const {
+        return aggr_slots > 0;
+    }
+
+    // The ring no longer describes positions >= from.
+    void aggr_forget(llama_pos from) {
+        for (uint32_t slot = 0; slot < aggr_slots; ++slot) {
+            if (aggr_slot_pos[slot] >= from) {
+                aggr_slot_pos[slot] = -1;
+            }
+        }
+    }
+
+    // Queue one sidecar row at anchor depth `selector`; anchor(i) is anchor i's
+    // n_embd vector. Per-pattern bank: the whole anchor prefix in its fixed
+    // layout. Shared bank: only the anchors the position's ring slot does not
+    // hold yet, and the slot is recorded as holding the full prefix from here
+    // on -- this commits the row, so it must be decoded. An untracked row
+    // (track = false: prefill) ships the prefix and never touches the ring.
+    template <typename anchor_fn>
+    void append_row(speculation_input & input, llama_pos pos, size_t selector, anchor_fn anchor, bool track) {
+        input.selectors.push_back((llama_token) selector);
+        input.positions.push_back(pos);
+        const size_t old_size = input.features.size();
+        if (!shared_bank()) {
+            input.features.resize(old_size + sidecar_n_embd_inp, 0.0f);
+            float * dst = input.features.data() + old_size;
+            for (size_t i = 0; i <= selector; ++i) {
+                std::memcpy(dst + i*n_embd, anchor(i), (size_t) n_embd*sizeof(float));
+            }
+            return;
+        }
+        const int32_t want = (int32_t) selector + 1;
+        int32_t held = -1;
+        if (track) {
+            // a slot summed past `want` (the selector moved back) cannot be
+            // trimmed, only restarted
+            const size_t slot = (size_t) (pos % (llama_pos) aggr_slots);
+            held = aggr_slot_pos[slot] == pos && aggr_slot_held[slot] <= want ? aggr_slot_held[slot] : 0;
+            aggr_slot_pos[slot] = pos;
+            aggr_slot_held[slot] = want;
+        }
+        const int32_t first = std::max(held, 0);
+        input.held.push_back(held);
+        input.n_new.push_back(want - first);
+        input.features.resize(old_size + (size_t) (want - first)*n_embd);
+        float * dst = input.features.data() + old_size;
+        for (int32_t i = first; i < want; ++i) {
+            std::memcpy(dst + (size_t) (i - first)*n_embd, anchor((size_t) i), (size_t) n_embd*sizeof(float));
         }
     }
 
     bool sidecar_decode(
-            const std::vector<llama_token> & selectors,
-            const std::vector<float> & features,
-            const std::vector<llama_pos> & positions,
+            const speculation_input & rows,
             llama_token * sampled,
             batch_storage * reusable_storage = nullptr) {
+        const std::vector<llama_token> & selectors = rows.selectors;
         std::vector<std::unique_lock<std::mutex>> resource_locks;
         resource_locks.reserve(sidecar_resources.size());
         for (size_t resource : sidecar_resources) {
@@ -1774,11 +1864,27 @@ struct common_spd_pipeline::impl {
         }
         batch_storage local_storage;
         batch_storage & storage = reusable_storage != nullptr ? *reusable_storage : local_storage;
-        storage.set(selectors, features, sidecar_n_embd_inp, positions);
-        if (llama_decode(sidecar, storage.batch) != 0) {
-            fail("SPD sidecar decode failed");
-            return false;
+        {
+            scope_timer set_timer(timing.sidecar_set);
+            if (shared_bank()) {
+                if (!llama_spd_aggr_set_plan(sidecar, (int32_t) selectors.size(), rows.positions.data(),
+                            rows.held.data(), rows.n_new.data(), rows.features.data())) {
+                    fail("SPD sidecar rejected its aggregation plan");
+                    return false;
+                }
+                storage.set(selectors, rows.positions);
+            } else {
+                storage.set(selectors, rows.features, sidecar_n_embd_inp, rows.positions);
+            }
         }
+        {
+            scope_timer decode_timer(timing.sidecar_decode);
+            if (llama_decode(sidecar, storage.batch) != 0) {
+                fail("SPD sidecar decode failed");
+                return false;
+            }
+        }
+        scope_timer sample_timer(timing.sidecar_sample);
         if (sampled != nullptr) {
             if (sidecar_backend_sampling) {
                 *sampled = llama_get_sampled_token_ith(sidecar, -1);
@@ -1841,7 +1947,8 @@ struct common_spd_pipeline::impl {
             const std::vector<llama_pos> & positions,
             const std::vector<float> & features,
             llama_token sampled) {
-        FILE * index = dump_open_index();
+        // replay reads full sidecar_n_embd_inp rows; shared-bank rows are deltas
+        FILE * index = shared_bank() ? nullptr : dump_open_index();
         if (index == nullptr) {
             return;
         }
@@ -1888,26 +1995,21 @@ struct common_spd_pipeline::impl {
         const int32_t chunk_size = std::max<int32_t>(1, params.n_batch);
         const size_t selector = anchors.size() - 1;
 
+        speculation_input rows;
         for (int32_t begin = base; begin < prefill_len; begin += chunk_size) {
             const int32_t count = std::min(chunk_size, prefill_len - begin);
-            std::vector<llama_token> selectors(count, (llama_token) selector);
-            std::vector<llama_pos> positions(count);
-            std::vector<float> features((size_t) count*sidecar_n_embd_inp, 0.0f);
-
+            rows.clear();
             for (int32_t row = 0; row < count; ++row) {
-                positions[row] = begin + row;
-                float * dst = features.data() + (size_t) row*sidecar_n_embd_inp;
-                for (size_t ai = 0; ai < anchors.size(); ++ai) {
-                    const float * src = anchor_data[ai].data() + (size_t) (begin + row - base)*n_embd;
-                    std::memcpy(dst + ai*n_embd, src, (size_t) n_embd*sizeof(float));
-                }
+                const size_t offset = (size_t) (begin + row - base)*n_embd;
+                append_row(rows, begin + row, selector,
+                        [&](size_t ai) { return anchor_data[ai].data() + offset; }, false);
             }
-            if (!sidecar_decode(selectors, features, positions, nullptr)) {
+            if (!sidecar_decode(rows, nullptr)) {
                 return false;
             }
             if (!dump_dir.empty() && dump_prefill_rows_left >= count) {
                 dump_prefill_rows_left -= count;
-                dump_rows("prefill", selectors, positions, features, LLAMA_TOKEN_NULL);
+                dump_rows("prefill", rows.selectors, rows.positions, rows.features, LLAMA_TOKEN_NULL);
             }
         }
         return true;
@@ -1933,17 +2035,13 @@ struct common_spd_pipeline::impl {
         // window reaches full width on its own as generation advances.
         const llama_pos oldest_needed = std::max<llama_pos>(0, newest_pos - (llama_pos) stage_count + 1);
 
-        input.selectors.clear();
-        input.positions.clear();
-        input.features.clear();
-        input.min_pos = -1;
+        input.clear();
         const bool has_evicted = prev_evicted != nullptr;
 
         if (has_evicted) {
             const size_t selector = choose_anchor(*prev_evicted, stage_count);
-            input.selectors.push_back((llama_token) selector);
-            input.positions.push_back(prev_evicted_pos);
-            append_feature_row(input.features, *prev_evicted, selector);
+            append_row(input, prev_evicted_pos, selector,
+                    [&](size_t i) { return prev_evicted->values[i].data(); }, true);
         }
 
         for (llama_pos pos = oldest_needed; pos <= newest_pos; ++pos) {
@@ -1966,9 +2064,7 @@ struct common_spd_pipeline::impl {
             const int32_t nominal_depth = newest_pos - pos;
             const int32_t search_hi = nominal_depth == 0 ? 0 : has_evicted ? stage_count - 1 : stage_count;
             const size_t selector = choose_anchor(*snap, search_hi);
-            input.selectors.push_back((llama_token) selector);
-            input.positions.push_back(pos);
-            append_feature_row(input.features, *snap, selector);
+            append_row(input, pos, selector, [&](size_t i) { return snap->values[i].data(); }, true);
         }
 
         input.min_pos = input.positions.front();
@@ -1978,11 +2074,14 @@ struct common_spd_pipeline::impl {
     bool run_speculation(const speculation_input & input, llama_token & sampled) {
         scope_timer sidecar_timer(timing.sidecar_run);
         ++timing.sidecar_calls;
-        if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, input.min_pos, -1)) {
-            fail("failed to crop SPD sidecar cache at position " + std::to_string(input.min_pos));
-            return false;
+        {
+            scope_timer crop_timer(timing.sidecar_crop);
+            if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, input.min_pos, -1)) {
+                fail("failed to crop SPD sidecar cache at position " + std::to_string(input.min_pos));
+                return false;
+            }
         }
-        const bool ok = sidecar_decode(input.selectors, input.features, input.positions, &sampled,
+        const bool ok = sidecar_decode(input, &sampled,
                 static_decode_fast_path ? &sidecar_decode_batch : nullptr);
         if (ok && !dump_dir.empty() && dump_step < dump_limit) {
             dump_rows("spec", input.selectors, input.positions, input.features, sampled);
@@ -2035,6 +2134,9 @@ struct common_spd_pipeline::impl {
             fail("failed to roll back SPD sidecar");
             return false;
         }
+        // the rejected positions come back with different tokens, so whatever
+        // their slots summed is now wrong
+        aggr_forget(target_pos);
         return true;
     }
 
@@ -2727,6 +2829,7 @@ struct common_spd_pipeline::impl {
         // the next request a prefix that may not be there.
         const int32_t n_keep = reuse_prefix(prompt, gparams.prefix_reuse);
         cached_tokens.clear();
+        aggr_forget(0);
         result.n_prompt_reused    = n_keep;
         result.n_prompt_processed = n_prompt - n_keep;
 
@@ -3185,6 +3288,11 @@ struct common_spd_pipeline::impl {
             fprintf(stderr, "SPD timing: sidecar_run %.2fs/%" PRIu64 " calls (%.1f ms/call)\n",
                     timing.sidecar_run, timing.sidecar_calls,
                     timing.sidecar_calls > 0 ? 1e3*timing.sidecar_run/(double) timing.sidecar_calls : 0.0);
+            if (timing.sidecar_calls > 0) {
+                const double per = 1e3/(double) timing.sidecar_calls;
+                fprintf(stderr, "SPD timing: sidecar split ms/call: crop %.2f | set %.2f | decode %.2f | sample %.2f\n",
+                        per*timing.sidecar_crop, per*timing.sidecar_set, per*timing.sidecar_decode, per*timing.sidecar_sample);
+            }
             for (uint32_t stage = 0; stage < stage_count; ++stage) {
                 if (timing.stage_calls[stage] == 0) {
                     continue;

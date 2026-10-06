@@ -701,6 +701,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FC,                                     "fc" },
     { LLM_TENSOR_D2T,                                    "d2t" },
     { LLM_TENSOR_SPD_AGGR,                               "aggr" },
+    { LLM_TENSOR_SPD_AGGR_BLK,                           "aggr_blk" },
+    { LLM_TENSOR_SPD_AGGR_SCALE,                         "aggr_scale" },
+    { LLM_TENSOR_SPD_AGGR_BIAS,                          "aggr_bias" },
     { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
     { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
@@ -999,6 +1002,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // mul_mat_id every speculation step - it must live on the output device,
     // not in the host input-layer buffer (24 ms/step on CPU vs ~1 ms on GPU)
     {LLM_TENSOR_SPD_AGGR,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT_ID}},
+    // shared-block form of the same bank: one block per anchor, plus a
+    // per-pattern affine picked by get_rows
+    {LLM_TENSOR_SPD_AGGR_BLK,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_SPD_AGGR_SCALE,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_SPD_AGGR_BIAS,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     // dspark
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
