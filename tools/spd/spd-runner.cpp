@@ -644,6 +644,19 @@ void check_prefix_reuse(llama_model * target, llama_model * sidecar, const commo
         throw std::runtime_error("token callback stop failed");
     }
     check("early-stop recovery", 2, true);
+
+    callbacks = 0;
+    const size_t stop_after = (size_t) stage_count + 1;
+    if (!pipeline->generate(prompts[2], gparams, stopped, [&](llama_token token, size_t index) {
+                if (index != callbacks || token != expected[2].tokens.at(index)) {
+                    throw std::runtime_error("wrong token in filled-pipeline stop check");
+                }
+                return ++callbacks < stop_after;
+            }) || stopped.cancelled || callbacks != stop_after || stopped.tokens.size() != stop_after ||
+            !std::equal(stopped.tokens.begin(), stopped.tokens.end(), expected[2].tokens.begin())) {
+        throw std::runtime_error("filled-pipeline callback stop failed");
+    }
+    check("filled-pipeline stop recovery", 2, true);
     std::printf("PASS: prefix reuse, full-bundle restore and interrupted-request recovery match cold greedy output\n");
 }
 

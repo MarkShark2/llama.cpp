@@ -633,6 +633,7 @@ struct common_spd_pipeline::impl {
         double head = 0.0;
         double embed = 0.0;
         double rollback = 0.0;
+        double rollback_sidecar = 0.0;
         double step_total = 0.0;
         double sidecar_run = 0.0;
         // [fork] sidecar_run split: KV crop, batch copy, llama_decode, sampled-token wait
@@ -643,6 +644,7 @@ struct common_spd_pipeline::impl {
         uint64_t head_calls = 0;
         uint64_t embed_calls = 0;
         uint64_t sidecar_calls = 0;
+        uint64_t rollback_calls = 0;
         std::array<double, SPD_MAX_STAGE_COUNT> stage_busy = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_lock = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_decode = {};
@@ -650,13 +652,15 @@ struct common_spd_pipeline::impl {
         // [fork] the per-stage decode work that sits OUTSIDE llama_decode, split
         // by protocol round trip. The guard, the fence and the staging->input
         // copy are each a blocking command on the endpoint's single command
-        // loop, so `busy - decode` is three round trips plus the host-side tap,
-        // not bookkeeping. Sized before deciding what to cut.
+        // loop. Alias snapshots also update the host cache metadata.
         std::array<double, SPD_MAX_STAGE_COUNT> stage_guard = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_fence = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_copy  = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_push  = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_tap   = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_snapshot = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_rollback_restore = {};
+        std::array<double, SPD_MAX_STAGE_COUNT> stage_rollback_retire = {};
         std::array<uint64_t, SPD_MAX_STAGE_COUNT> stage_calls = {};
         // prefill is a separate regime from decode: chunks of n_batch tokens
         // walked as a stage/chunk grid, so it gets its own counters
@@ -2371,8 +2375,13 @@ struct common_spd_pipeline::impl {
         return ok;
     }
 
+    uint32_t stage_rollback_tokens(uint32_t stage) const {
+        // The last stage is the verified frontier; earlier stages can lead it by this many tokens.
+        return full_checkpoints ? stage_count - 1 - stage : rollback_tokens;
+    }
+
     bool clear_rollback_aliases(uint32_t stage) {
-        for (uint32_t i = 0; i < rollback_tokens; ++i) {
+        for (uint32_t i = 0; i < stage_rollback_tokens(stage); ++i) {
             if (checkpoint_pos[stage][i] >= 0 &&
                     !llama_memory_seq_rm(llama_get_memory(stages[stage]), (llama_seq_id) i + 1, -1, -1)) {
                 fail("failed to retire target SPD rollback alias " + std::to_string(stage));
@@ -2384,16 +2393,28 @@ struct common_spd_pipeline::impl {
     }
 
     bool rollback(llama_pos target_pos) {
+        if (timing_enabled) {
+            ++timing.rollback_calls;
+        }
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            auto retire_aliases = [&]() {
+                const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
+                const bool ok = clear_rollback_aliases(stage);
+                if (timing_enabled) {
+                    timing.stage_rollback_retire[stage] += seconds_since(start);
+                }
+                return ok;
+            };
             const llama_pos restore_pos = target_pos - 1;
             if (stage_tail_pos[stage] == restore_pos) {
-                if (full_checkpoints && !clear_rollback_aliases(stage)) {
+                if (full_checkpoints && !retire_aliases()) {
                     return false;
                 }
                 continue;
             }
 
             if (light_rollback) {
+                const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
                 // Position-addressed attention cache: dropping every cell at or
                 // past the rejected position restores the checkpoint exactly.
                 if (!llama_memory_seq_rm(llama_get_memory(stages[stage]), 0, target_pos, -1)) {
@@ -2402,11 +2423,14 @@ struct common_spd_pipeline::impl {
                     return false;
                 }
                 stage_tail_pos[stage] = restore_pos;
+                if (timing_enabled) {
+                    timing.stage_rollback_restore[stage] += seconds_since(start);
+                }
                 continue;
             }
 
             llama_seq_id restore_seq = -1;
-            for (uint32_t i = 0; i < rollback_tokens; ++i) {
+            for (uint32_t i = 0; i < stage_rollback_tokens(stage); ++i) {
                 if (checkpoint_pos[stage][i] == restore_pos) {
                     restore_seq = (llama_seq_id) i + 1;
                     break;
@@ -2419,16 +2443,21 @@ struct common_spd_pipeline::impl {
             }
 
             llama_memory_t memory = llama_get_memory(stages[stage]);
+            const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
             if (!llama_memory_seq_rm(memory, 0, -1, -1)) {
                 fail("failed to clear target SPD stage " + std::to_string(stage) + " before restore");
                 return false;
             }
             llama_memory_seq_cp(memory, restore_seq, 0, -1, -1);
             stage_tail_pos[stage] = restore_pos;
-            if (full_checkpoints && !clear_rollback_aliases(stage)) {
+            if (timing_enabled) {
+                timing.stage_rollback_restore[stage] += seconds_since(start);
+            }
+            if (full_checkpoints && !retire_aliases()) {
                 return false;
             }
         }
+        const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
         if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, target_pos, -1)) {
             fail("failed to roll back SPD sidecar");
             return false;
@@ -2436,6 +2465,9 @@ struct common_spd_pipeline::impl {
         // the rejected positions come back with different tokens, so whatever
         // their slots summed is now wrong
         aggr_forget(target_pos);
+        if (timing_enabled) {
+            timing.rollback_sidecar += seconds_since(start);
+        }
         return true;
     }
 
@@ -3078,8 +3110,10 @@ struct common_spd_pipeline::impl {
             ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
         }
 
-        if (!light_rollback) {
-            const uint32_t checkpoint_slot = (uint32_t) (item.pos % rollback_tokens);
+        const uint32_t n_rollback = stage_rollback_tokens(stage);
+        if (!light_rollback && n_rollback > 0) {
+            const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
+            const uint32_t checkpoint_slot = (uint32_t) (item.pos % n_rollback);
             const llama_seq_id checkpoint_seq = (llama_seq_id) checkpoint_slot + 1;
             if (full_checkpoints && !llama_memory_seq_rm(llama_get_memory(stages[stage]), checkpoint_seq, -1, -1)) {
                 error = "failed to replace target SPD rollback alias " + std::to_string(stage);
@@ -3087,6 +3121,9 @@ struct common_spd_pipeline::impl {
             }
             llama_memory_seq_cp(llama_get_memory(stages[stage]), 0, checkpoint_seq, -1, -1);
             checkpoint_pos[stage][checkpoint_slot] = stage_tail_pos[stage];
+            if (timing_enabled) {
+                timing.stage_snapshot[stage] += seconds_since(start);
+            }
         }
 
         std::vector<float> local_output;
@@ -3487,6 +3524,18 @@ struct common_spd_pipeline::impl {
         std::vector<float> last_hidden(
                 prompt_hidden.begin() + hidden_offset,
                 prompt_hidden.begin() + hidden_offset + n_embd_boundary);
+        std::array<int32_t, SPD_MAX_STAGE_COUNT> stage_reused_before = {};
+        int32_t sidecar_reused_before = 0;
+        int32_t head_reused_before = 0;
+        int32_t embed_reused_before = 0;
+        if (timing_enabled) {
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                stage_reused_before[stage] = llama_perf_context(stages[stage]).n_reused;
+            }
+            sidecar_reused_before = llama_perf_context(sidecar).n_reused;
+            head_reused_before = llama_perf_context(head).n_reused;
+            embed_reused_before = llama_perf_context(embed).n_reused;
+        }
         llama_token first_token;
         if (!target_head(last_hidden, first_token)) {
             return false;
@@ -3776,23 +3825,33 @@ struct common_spd_pipeline::impl {
                         1e3*timing.stage_busy[stage]/(double) timing.stage_calls[stage],
                         timing.stage_decode[stage], timing.stage_read[stage], timing.stage_lock[stage],
                         timing.decode_pushes[stage],
-                        llama_perf_context(stages[stage]).n_reused);
+                        llama_perf_context(stages[stage]).n_reused - stage_reused_before[stage]);
                 const double calls = (double) timing.stage_calls[stage];
                 fprintf(stderr,
                         "SPD timing: stage %u outside-decode ms/call: guard %.2f | fence %.2f | copy %.2f | "
-                        "push %.2f | tap %.2f | sum %.2f (busy-decode %.2f)\n",
+                        "push %.2f | tap %.2f | snapshot %.2f | sum %.2f (busy-decode %.2f)\n",
                         stage,
                         1e3*timing.stage_guard[stage]/calls, 1e3*timing.stage_fence[stage]/calls,
                         1e3*timing.stage_copy[stage]/calls,  1e3*timing.stage_push[stage]/calls,
-                        1e3*timing.stage_tap[stage]/calls,
+                        1e3*timing.stage_tap[stage]/calls, 1e3*timing.stage_snapshot[stage]/calls,
                         1e3*(timing.stage_guard[stage] + timing.stage_fence[stage] + timing.stage_copy[stage] +
-                             timing.stage_push[stage] + timing.stage_tap[stage])/calls,
+                             timing.stage_push[stage] + timing.stage_tap[stage] + timing.stage_snapshot[stage])/calls,
                         1e3*(timing.stage_busy[stage] - timing.stage_decode[stage])/calls);
+                if (timing.rollback_calls > 0) {
+                    const double per = 1e3/(double) timing.rollback_calls;
+                    fprintf(stderr, "SPD timing: rollback stage %u ms/event: restore %.2f | retire %.2f | aliases %u\n",
+                            stage, per*timing.stage_rollback_restore[stage], per*timing.stage_rollback_retire[stage],
+                            light_rollback ? 0 : stage_rollback_tokens(stage));
+                }
             }
-            fprintf(stderr, "SPD timing: graphs_reused sidecar %d | head %d | embed %d\n",
-                    llama_perf_context(sidecar).n_reused,
-                    llama_perf_context(head).n_reused,
-                    llama_perf_context(embed).n_reused);
+            if (timing.rollback_calls > 0) {
+                fprintf(stderr, "SPD timing: rollback events=%" PRIu64 " | sidecar %.2f ms/event\n",
+                        timing.rollback_calls, 1e3*timing.rollback_sidecar/(double) timing.rollback_calls);
+            }
+            fprintf(stderr, "SPD timing: graphs_reused sidecar %d | head %d | embed %d (generation only)\n",
+                    llama_perf_context(sidecar).n_reused - sidecar_reused_before,
+                    llama_perf_context(head).n_reused - head_reused_before,
+                    llama_perf_context(embed).n_reused - embed_reused_before);
             for (uint32_t stage = 0; stage < stage_count; ++stage) {
                 char row[512];
                 size_t off = (size_t) snprintf(row, sizeof(row), "SPD timing: stage %u ms/call by active:", stage);

@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -2446,6 +2447,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* filter_attn       */ std::move(filter_attn),
                     /* filter_recr       */ std::move(filter_recr),
                     /* filter_idx        */ std::move(filter_idx));
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE) {
+                    auto * mem_recr = static_cast<llama_memory_hybrid_idx *>(res)->get_mem_recr();
+                    // Keep rollback aliases; address changing recurrent cells through graph inputs.
+                    if (mem_recr->n_rs_seq == 0 && !mem_recr->static_cells && std::getenv("LLAMA_RS_SPARSE") == nullptr) {
+                        mem_recr->sparse = true;
+                        LLAMA_LOG_INFO("%s: GLM SPD stage %u uses sparse recurrent cells\n", __func__, cparams.spd_stage);
+                    }
+                }
             } break;
         case LLM_ARCH_HY_V4:
             {
