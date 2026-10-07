@@ -1101,13 +1101,37 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
 
+    ggml_free(sched->ctx);
+    sched->ctx = NULL;
+
+    // [fork] upper bound on the tensors this graph can add to the split context:
+    // per source edge, an input copy and a view base copy for each pipeline copy,
+    // plus the dependency view; per node, at most one keep-dependency view
+    {
+        size_t n_edges = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                n_edges += graph->nodes[i]->src[j] != NULL;
+            }
+        }
+        const size_t n_tensors = n_edges*(2*(size_t) sched->n_copies + 1) + (size_t) graph->n_nodes + 64;
+        const size_t need = n_tensors*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph->size, false);
+        if (need > sched->context_buffer_size) {
+            char * grown = (char *) malloc(need);
+            if (grown == NULL) {
+                GGML_ABORT("%s: failed to allocate %zu bytes for the split context\n", __func__, need);
+            }
+            free(sched->context_buffer);
+            sched->context_buffer = grown;
+            sched->context_buffer_size = need;
+        }
+    }
+
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
         /* .mem_buffer = */ sched->context_buffer,
         /* .no_alloc =   */ true
     };
-
-    ggml_free(sched->ctx);
 
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
@@ -2292,8 +2316,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_prev_graph_size = 0;
     sched->galloc_reserve_epoch = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+    // [fork] the split context holds the input copies and dependency views. The
+    // worst case (64 inputs for every possible split) is ~43 KB per graph node,
+    // GBs per decode lane; ggml_backend_sched_split_graph grows the buffer to
+    // what the graph in hand needs.
+    sched->context_buffer_size = 1024*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    if (sched->context_buffer == NULL) {
+        GGML_ABORT("%s: failed to allocate %zu bytes for the split context\n", __func__, sched->context_buffer_size);
+    }
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));

@@ -175,10 +175,9 @@ LLAMA_API int32_t llama_rpc_endpoints  (const char ** out_names, int32_t * out_c
 // keyed on exactly those pointers.
 LLAMA_API void llama_graphs_invalidate(struct llama_context * ctx);
 
-// [fork, SPD peer boundaries] the last graph's raw (un-narrowed) embd input
-// tensor and embd output tensor -- the device-resident endpoints of a stage
-// boundary. Valid until the context builds a different graph; callers must
-// re-fetch after every decode. And the per-decode host-transfer skips: with
+// [fork, SPD peer boundaries] the persistent boundary input (null when unavailable)
+// and the last graph's embd output. Only the output must be re-fetched after every decode.
+// And the per-decode host-transfer skips: with
 // skip_inp the embd upload in set_input is suppressed (the data was placed on
 // device by a peer push + local copy), with skip_out the embeddings readback
 // in decode is suppressed (the boundary leaves via a peer push), and with
@@ -187,6 +186,22 @@ LLAMA_API void llama_graphs_invalidate(struct llama_context * ctx);
 LLAMA_API struct ggml_tensor * llama_spd_peer_inp_tensor(struct llama_context * ctx);
 LLAMA_API struct ggml_tensor * llama_spd_peer_out_tensor(struct llama_context * ctx);
 LLAMA_API void llama_set_spd_peer_io(struct llama_context * ctx, bool skip_inp, bool skip_out, bool skip_layer_inp);
+
+// [fork, SPD shared aggregation bank] a sidecar whose bank is one block per
+// anchor keeps each in-flight position's running block sum on the device.
+// n_slots > 0 means this context has that ring (slot = pos % n_slots); 0 is
+// the per-pattern bank, fed through batch.embd as before.
+//
+// With the ring, every sidecar decode is described by a plan set just before
+// it, and the batch carries only the pattern selectors as tokens (embd NULL).
+// Per row, by position: `held` anchors are already in the slot (0 = start the
+// slot over, -1 = untracked: start over in a scratch column the ring never
+// keeps), and `n_new` anchors follow, anchors max(held,0) .. +n_new-1, packed
+// back to back in `feat` (n_embd floats each). The row's selector must be its
+// last new anchor. The plan stays in force until the next call.
+LLAMA_API uint32_t llama_spd_aggr_n_slots(const struct llama_context * ctx);
+LLAMA_API bool     llama_spd_aggr_set_plan(struct llama_context * ctx, int32_t n, const llama_pos * pos,
+                                           const int32_t * held, const int32_t * n_new, const float * feat);
 
 // [fork, SPD peer boundaries] synchronous peer-push entry points, implemented
 // in ggml-rpc.cpp (exported from the RPC backend, declared here so the SPD
@@ -222,6 +237,9 @@ bool ggml_backend_rpc_imatrix_sqsum(
 extern "C" {
 LLAMA_API void          llama_chain_lane_sync (struct llama_context * ctx, int32_t lane);
 LLAMA_API const float * llama_chain_logits_row(struct llama_context * ctx, int32_t row);
+// LLAMA_CHAIN_ARGMAX=1: the row's greedy token, computed in the lane graph on
+// the output device; the logits row is then NOT read back. -1 when off.
+LLAMA_API int32_t       llama_chain_argmax_row(struct llama_context * ctx, int32_t row);
 LLAMA_API const float * llama_chain_tap_row   (struct llama_context * ctx, uint32_t lid, int32_t row);
 // lane the last llama_decode staged as a chain call, or -1 if it took the
 // classic path - callers MUST check this after every chained submit (a silent
@@ -304,9 +322,12 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 // returns the number of target pipeline stages encoded by an SPD sidecar, or zero for other architectures
 LLAMA_API uint32_t        llama_model_spd_stage_count   (const struct llama_model * model);
+// explicit per-stage trunk layer counts, or nullptr/zero for legacy sidecars
+LLAMA_API const uint32_t * llama_model_spd_stage_layers (const struct llama_model * model);
+LLAMA_API uint32_t         llama_model_spd_stage_layers_n(const struct llama_model * model);
 // width of one token's state as handed from one SPD stage to the next. This is
 // n_embd for every architecture whose residual is a single stream, but
-// DeepSeek-V4 carries hc_mult hyper-connection streams between layers and a
+// hyper-connection models carry multiple streams between layers and a
 // mid-trunk boundary is that much wider.
 LLAMA_API uint32_t        llama_model_n_embd_spd_boundary(const struct llama_model * model);
 

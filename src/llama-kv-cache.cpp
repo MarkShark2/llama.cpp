@@ -2906,7 +2906,14 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    // [fork] LLAMA_UBATCH_SEQS: no live ubatch spans more streams than the cap,
+    // so a reserve over every stream plans a different graph - and with more
+    // streams than ubatch tokens an invalid one (glm5-next's sparse DSA splits
+    // n_tokens over the view's streams: 64 tokens / 96 streams = 0 per stream)
+    uint32_t n_stream = kv->get_n_stream();
+    if (llama_batch_allocr::ubatch_seq_cap() > 0) {
+        n_stream = std::min(n_stream, llama_batch_allocr::ubatch_seq_cap());
+    }
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);

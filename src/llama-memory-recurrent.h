@@ -64,6 +64,18 @@ public:
     // still in flight. Requires n_rs_seq == 0 and size >= n_seq_max.
     bool static_cells = false;
 
+    // [fork] LLAMA_RS_SPARSE=1: cells never move. Each seq keeps one cell and
+    // the graph gathers the ubatch's states by cell id (s_copy) and scatters
+    // them back the same way (s_dst), so a ubatch touches exactly n_seqs
+    // states. The default path packs a ubatch into a contiguous cell range by
+    // swapping cells, then copies every state between the old scattered tails
+    // ("extra" rows): with repacked decode cohorts over 64 slots that is up to
+    // 56 extra 4 MB states per recurrent layer, and the lane reserve
+    // (init_full) holds memory for all of them. Requires n_rs_seq == 0.
+    bool sparse = false;
+    std::vector<int32_t> sparse_cells; // cell of each ubatch seq, last find_slot
+    bool find_slot_sparse(const llama_ubatch & ubatch);
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
@@ -188,6 +200,10 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // [fork] LLAMA_RS_SPARSE: graph rows are cells by id, not a head range
+    bool    is_sparse() const;
+    int32_t s_dst(int i) const;
 
 private:
     const llama_memory_status status;

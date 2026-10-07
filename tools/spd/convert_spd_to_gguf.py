@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
+import math
 import re
 import sys
 from pathlib import Path
@@ -38,9 +40,12 @@ def copy_tokenizer_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter) ->
         writer.add_key_value(key, field.contents(), field.types[0], subtype)
 
 
+AGGR_PREFIXES = ("aggr_projs.", "aggr_blocks.", "aggr_scale", "aggr_bias")
+
+
 def checkpoint_tensor_name(name: str) -> str:
-    if re.fullmatch(r"aggr_projs\.\d+\.weight", name):
-        raise ValueError("aggregation projections are packed into aggr.weight")
+    if name.startswith(AGGR_PREFIXES):
+        raise ValueError("aggregation tensors are packed into aggr.weight / aggr_blk.weight")
     if name == "lm_head.weight":
         return "output.weight"
 
@@ -84,19 +89,27 @@ def add_checkpoint_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tens
     )
 
 
-SUPPORTED_TARGET_ARCHS = ("qwen35", "deepseek4")
+SUPPORTED_TARGET_ARCHS = ("qwen35", "deepseek4", "glm5-next")
+
+
+def load_hashed_source(path: Path, *, weights_only: bool) -> tuple[Any, str]:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        value = torch.load(source, map_location="cpu", weights_only=weights_only)
+        source.seek(0)
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return value, digest.hexdigest()
+
+
+def checkpoint_uint(value: Any, name: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or not minimum <= value <= 0xFFFFFFFF:
+        raise ValueError(f"{name} must be an integer in [{minimum}, 4294967295], got {value!r}")
+    return int(value)
 
 
 def spd_stage_layers(trunk_blocks: int, num_stages: int) -> list[int]:
-    """Layer count per SPD stage.
-
-    Stages are NOT required to be uniform. DeepSeek-V4 has 43 trunk blocks -- a
-    prime -- so no stage count between 2 and 42 divides it evenly, and demanding
-    divisibility excluded the architecture outright. Every stage takes
-    ceil(trunk / stages) layers and the last takes the remainder, matching both
-    llama_context's slicing and the offline trainer's STAGE_PRESETS (43 over 9
-    stages -> 5x8 + 3). Reduces to an even split whenever the count divides.
-    """
+    """Legacy ceil-sized stages with the remainder in the last stage."""
     per = -(-trunk_blocks // num_stages)
     return [per]*(num_stages - 1) + [trunk_blocks - per*(num_stages - 1)]
 
@@ -151,19 +164,21 @@ def validate_checkpoint(
             f"checkpoint target vocabulary {config['vocab_size']} does not match target GGUF {target_vocab_size}"
         )
 
-    draft_token_ids = np.asarray(config["draft_token_ids"], dtype=np.int64)
-    draft_vocab_size = int(config["draft_vocab_size"])
+    draft_token_ids = np.asarray(config["draft_token_ids"])
+    draft_vocab_size = checkpoint_uint(config["draft_vocab_size"], "draft_vocab_size", 1)
     if draft_token_ids.ndim != 1 or draft_token_ids.size != draft_vocab_size:
         raise ValueError("draft_token_ids must be a one-dimensional draft-vocabulary mapping")
+    if not np.issubdtype(draft_token_ids.dtype, np.integer):
+        raise ValueError("draft_token_ids must contain integer target token ids")
     if np.any((draft_token_ids < 0) | (draft_token_ids >= target_vocab_size)):
         raise ValueError("draft_token_ids contains a target token outside the target vocabulary")
     if np.unique(draft_token_ids).size != draft_token_ids.size:
         raise ValueError("draft_token_ids contains duplicates")
 
-    num_stages = int(config["num_stages"])
-    num_spec_layers = int(config["num_spec_layers"])
-    num_aggr_types = int(config["num_aggr_types"])
-    anchors = [int(value) for value in config["aggr_feature_bound"]]
+    num_stages = checkpoint_uint(config["num_stages"], "num_stages", 1)
+    num_spec_layers = checkpoint_uint(config["num_spec_layers"], "num_spec_layers", 1)
+    num_aggr_types = checkpoint_uint(config["num_aggr_types"], "num_aggr_types", 1)
+    anchors = [checkpoint_uint(value, "aggr_feature_bound") for value in config["aggr_feature_bound"]]
     use_deepest = bool(config["trained_with_use_deepest"])
     if not use_deepest:
         raise ValueError("only checkpoints trained with deepest available snapshots are supported")
@@ -172,49 +187,100 @@ def validate_checkpoint(
 
     target_blocks = int(field_value(target, f"{target_arch}.block_count"))
     nextn_field = target.get_field(f"{target_arch}.nextn_predict_layers")
+    if target_arch == "glm5-next" and nextn_field is None:
+        raise ValueError("glm5-next target GGUF must declare nextn_predict_layers to identify its trunk")
     nextn_blocks = 0 if nextn_field is None else int(nextn_field.contents())
     trunk_blocks = target_blocks - nextn_blocks
-    if trunk_blocks <= 0 or num_stages <= 0:
+    if nextn_blocks < 0 or trunk_blocks <= 0 or num_stages > trunk_blocks:
         raise ValueError(
             f"target trunk block count {trunk_blocks} cannot be divided into {num_stages} SPD stages"
         )
 
-    expected_stage_layers = spd_stage_layers(trunk_blocks, num_stages)
-    if expected_stage_layers[-1] <= 0:
-        raise ValueError(
-            f"{num_stages} SPD stages over {trunk_blocks} trunk blocks leaves an empty trailing stage"
-        )
-    if anchors[0] != 0 or anchors[-1] >= trunk_blocks:
+    if (anchors[0] != 0 or anchors[-1] >= trunk_blocks
+            or any(a >= b for a, b in zip(anchors, anchors[1:]))):
         raise ValueError(f"invalid SPD anchors for {trunk_blocks} target trunk blocks: {anchors}")
 
     stage_layers = config.get("stage_layers")
-    if stage_layers is not None:
-        stage_layers = [int(x) for x in stage_layers]
+    if stage_layers is None:
+        if target_arch == "glm5-next":
+            raise ValueError("glm5-next checkpoints must declare explicit stage_layers")
+        stage_layers = spd_stage_layers(trunk_blocks, num_stages)
+        if stage_layers[-1] <= 0:
+            raise ValueError(
+                f"{num_stages} SPD stages over {trunk_blocks} trunk blocks leaves an empty trailing stage")
+    else:
+        if not isinstance(stage_layers, (list, tuple)) or len(stage_layers) != num_stages:
+            raise ValueError("stage_layers must contain exactly num_stages layer counts")
+        stage_layers = [checkpoint_uint(value, "stage_layers", 1) for value in stage_layers]
         if sum(stage_layers) != trunk_blocks:
-            raise ValueError(
-                f"checkpoint stage_layers {stage_layers} do not sum to the target trunk ({trunk_blocks})")
-        if stage_layers != expected_stage_layers:
-            raise ValueError(
-                f"checkpoint stage_layers {stage_layers} do not match the layout the decode path "
-                f"slices ({expected_stage_layers}); the head must be trained against "
-                f"ceil(trunk/stages) layers per stage with the remainder last")
-        bounds = [0]
-        for count in stage_layers[:-1]:
-            bounds.append(bounds[-1] + count)
-        if anchors != bounds[: len(anchors)]:
-            raise ValueError(
-                f"aggr_feature_bound {anchors} does not match stage boundaries {bounds}")
+            raise ValueError(f"checkpoint stage_layers {stage_layers} do not sum to the target trunk ({trunk_blocks})")
+    bounds = [0]
+    for count in stage_layers[:-1]:
+        bounds.append(bounds[-1] + count)
+    if config.get("stage_layers") is not None and any(anchor not in bounds for anchor in anchors):
+        raise ValueError(f"aggr_feature_bound {anchors} must be stage-input boundaries from {bounds}")
 
-    for index in range(num_aggr_types):
-        key = f"aggr_projs.{index}.weight"
-        expected = (hidden_size, hidden_size * (index + 1))
-        if key not in state_dict or tuple(state_dict[key].shape) != expected:
-            actual = None if key not in state_dict else tuple(state_dict[key].shape)
+    spec_attn = config.get("spec_attn")
+    if target_arch == "glm5-next":
+        if config.get("model_type") != "glm5-next-offline":
+            raise ValueError("glm5-next checkpoints must declare model_type 'glm5-next-offline'")
+        if spec_attn is None:
+            raise ValueError("glm5-next checkpoints must declare the sidecar's spec_attn geometry")
+
+    aggr_shared = bool(config.get("aggr_shared", False))
+    expected_shapes: dict[str, tuple[int, ...]]
+    if aggr_shared:
+        expected_shapes = {f"aggr_blocks.{index}.weight": (hidden_size, hidden_size)
+                           for index in range(num_aggr_types)}
+        expected_shapes["aggr_scale"] = (num_aggr_types, hidden_size)
+        expected_shapes["aggr_bias"] = (num_aggr_types, hidden_size)
+    else:
+        expected_shapes = {f"aggr_projs.{index}.weight": (hidden_size, hidden_size * (index + 1))
+                           for index in range(num_aggr_types)}
+
+    unexpected_aggr = {name for name in state_dict if name.startswith(AGGR_PREFIXES)} - set(expected_shapes)
+    if unexpected_aggr:
+        raise ValueError(f"unexpected aggregation tensors for aggr_shared={aggr_shared}: {sorted(unexpected_aggr)}")
+
+    if spec_attn is not None:
+        if not isinstance(spec_attn, dict):
+            raise ValueError("spec_attn must contain the sidecar's attention geometry")
+        dims = {}
+        for key in ("num_heads", "num_kv_heads", "head_dim", "intermediate_size"):
+            dims[key] = checkpoint_uint(spec_attn.get(key), f"spec_attn.{key}", 1)
+        if dims["num_heads"] % dims["num_kv_heads"] != 0 or dims["head_dim"] % 2 != 0:
+            raise ValueError("spec_attn requires an even head_dim and num_heads divisible by num_kv_heads")
+        for key in ("rms_norm_eps", "rope_theta"):
+            value = spec_attn.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"spec_attn.{key} must be finite and positive")
+        q_width = dims["num_heads"] * dims["head_dim"]
+        kv_width = dims["num_kv_heads"] * dims["head_dim"]
+        intermediate_size = dims["intermediate_size"]
+        layer_shapes = {
+            "input_layernorm.weight": (hidden_size,),
+            "post_attention_layernorm.weight": (hidden_size,),
+            "self_attn.q_proj.weight": (q_width, hidden_size),
+            "self_attn.k_proj.weight": (kv_width, hidden_size),
+            "self_attn.v_proj.weight": (kv_width, hidden_size),
+            "self_attn.o_proj.weight": (hidden_size, q_width),
+            "self_attn.q_norm.weight": (dims["head_dim"],),
+            "self_attn.k_norm.weight": (dims["head_dim"],),
+            "mlp.gate_proj.weight": (intermediate_size, hidden_size),
+            "mlp.up_proj.weight": (intermediate_size, hidden_size),
+            "mlp.down_proj.weight": (hidden_size, intermediate_size),
+        }
+        for index in range(num_spec_layers):
+            expected_shapes.update({f"spec_layers.{index}.{name}": shape for name, shape in layer_shapes.items()})
+
+    expected_shapes["lm_head.weight"] = (draft_vocab_size, hidden_size)
+    for key, expected in expected_shapes.items():
+        tensor = state_dict.get(key)
+        if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != expected:
+            actual = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else None
             raise ValueError(f"{key} has shape {actual}, expected {expected}")
-
-    output_shape = (draft_vocab_size, hidden_size)
-    if "lm_head.weight" not in state_dict or tuple(state_dict["lm_head.weight"].shape) != output_shape:
-        raise ValueError(f"lm_head.weight must have shape {output_shape}")
+        if not tensor.is_floating_point():
+            raise ValueError(f"{key} must be a floating-point tensor")
 
     layer_ids = {
         int(match.group(1))
@@ -229,7 +295,7 @@ def validate_checkpoint(
     mapped_names = [
         checkpoint_tensor_name(name)
         for name in state_dict
-        if not name.startswith("aggr_projs.")
+        if not name.startswith(AGGR_PREFIXES)
     ]
     if len(mapped_names) != len(set(mapped_names)):
         raise ValueError("multiple checkpoint tensors map to the same GGUF tensor name")
@@ -242,11 +308,11 @@ def validate_checkpoint(
         "num_stages": num_stages,
         "num_spec_layers": num_spec_layers,
         "num_aggr_types": num_aggr_types,
+        "aggr_shared": aggr_shared,
         "anchors": anchors,
         "use_deepest": use_deepest,
         "trunk_blocks": trunk_blocks,
-        "stage_blocks": expected_stage_layers[0],
-        "stage_layers": expected_stage_layers,
+        "stage_layers": stage_layers,
         "version": version,
     }
 
@@ -254,9 +320,10 @@ def validate_checkpoint(
 def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
             assets_path: Path | None = None, train_span: int | None = None) -> None:
     LOGGER.info("Loading SPD checkpoint: %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if not isinstance(checkpoint, dict) or set(checkpoint) != {"config", "state_dict"}:
-        raise ValueError("SPD checkpoint must contain exactly config and state_dict")
+    checkpoint, checkpoint_sha256 = load_hashed_source(checkpoint_path, weights_only=True)
+    if (not isinstance(checkpoint, dict) or not {"config", "state_dict"}.issubset(checkpoint)
+            or set(checkpoint) - {"config", "state_dict", "training_step"}):
+        raise ValueError("SPD checkpoint must contain config and state_dict, with optional training_step")
     config = checkpoint["config"]
     state_dict = checkpoint["state_dict"]
     if not isinstance(config, dict) or not isinstance(state_dict, dict):
@@ -267,13 +334,27 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
     meta = validate_checkpoint(config, state_dict, target)
     span = resolve_train_span(config, train_span)
 
+    if meta["target_arch"] == "glm5-next" and assets_path is None:
+        raise ValueError("glm5-next conversion requires --assets to fold the trained target final norm into the output head")
+
+    assets_sha256 = None
     if assets_path is not None:
         # Training computes spec logits as lm_head(target_final_norm(g0)); the
         # fork sidecar graph has no norm before its output head. RMS norm's
         # per-row 1/rms scalar cannot change the argmax, but the elementwise
-        # norm weight can - fold it into the output weight so greedy drafts
-        # match training exactly.
-        assets = torch.load(assets_path, map_location="cpu", weights_only=False)
+        # norm weight can - fold it into the output weight for greedy drafts.
+        assets, assets_sha256 = load_hashed_source(assets_path, weights_only=False)
+        if meta["target_arch"] == "glm5-next":
+            if not isinstance(assets, dict) or not isinstance(assets.get("meta"), dict):
+                raise ValueError("glm5-next assets must include target metadata")
+            asset_meta = assets["meta"]
+            for key, expected in (("arch", "glm5-next"), ("n_embd", meta["hidden_size"]),
+                                  ("vocab_size", meta["target_vocab_size"]), ("n_layer", meta["trunk_blocks"])):
+                if asset_meta.get(key) != expected:
+                    raise ValueError(f"assets {key} is {asset_meta.get(key)!r}, expected {expected!r}")
+            norm = assets.get("final_norm.weight")
+            if not isinstance(norm, torch.Tensor) or not norm.is_floating_point() or not torch.isfinite(norm).all():
+                raise ValueError("assets final_norm.weight must be a finite floating-point tensor")
         norm_w = assets["final_norm.weight"].to(torch.float32)
         head_w = state_dict["lm_head.weight"]
         if norm_w.ndim != 1 or norm_w.shape[0] != head_w.shape[1]:
@@ -282,12 +363,13 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
                 f"lm_head.weight {tuple(head_w.shape)}")
         state_dict["lm_head.weight"] = head_w.to(torch.float32) * norm_w.unsqueeze(0)
         LOGGER.info("folded the target final-norm weight into output.weight (argmax-preserving)")
+        LOGGER.warning("folding final-norm weights preserves greedy argmax, not normalized logits or probabilities")
 
     LOGGER.info(
-        "Validated SPD v%s: %s stages x %s target blocks, %s speculative layers, %s aggregation types",
+        "Validated SPD v%s: %s stages with layer counts %s, %s speculative layers, %s aggregation types",
         meta["version"],
         meta["num_stages"],
-        meta["stage_blocks"],
+        meta["stage_layers"],
         meta["num_spec_layers"],
         meta["num_aggr_types"],
     )
@@ -333,8 +415,15 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
         writer.add_rope_freq_base(float(field_value(target, f"{target_arch}.rope.freq_base")))
     writer.add_target_layers(meta["anchors"])  # type: ignore[arg-type]
     writer.add_target_hidden_size(int(meta["hidden_size"]))
+    writer.add_string(f"{SPD_ARCH}.target_architecture", target_arch)
+    writer.add_string(f"{SPD_ARCH}.checkpoint_sha256", checkpoint_sha256)
+    if assets_sha256 is not None:
+        writer.add_string(f"{SPD_ARCH}.assets_sha256", assets_sha256)
+    if "training_step" in checkpoint:
+        writer.add_uint32(f"{SPD_ARCH}.training_step", checkpoint_uint(checkpoint["training_step"], "training_step"))
     writer.add_spd_checkpoint_version(int(meta["version"]))
     writer.add_spd_stage_count(int(meta["num_stages"]))
+    writer.add_key_value(f"{SPD_ARCH}.stage_layers", meta["stage_layers"], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT32)
     writer.add_spd_use_deepest(bool(meta["use_deepest"]))
     if span > 0:
         writer.add_spd_train_span(span)
@@ -349,23 +438,40 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
 
     num_aggr_types = int(meta["num_aggr_types"])
     hidden_size = int(meta["hidden_size"])
-    aggr = torch.zeros(
-        (num_aggr_types, hidden_size, num_aggr_types * hidden_size),
-        dtype=torch.float32,
-    )
-    for index in range(num_aggr_types):
-        source = state_dict[f"aggr_projs.{index}.weight"]
-        aggr[index, :, : source.shape[1]] = source.to(dtype=torch.float32)
-    LOGGER.info("%-64s -> %s", "aggr_projs.*.weight", "aggr.weight")
-    writer.add_tensor(
-        "aggr.weight",
-        gguf.quantize(aggr.numpy(), gguf.GGMLQuantizationType.BF16),
-        raw_dtype=gguf.GGMLQuantizationType.BF16,
-    )
-    del aggr
+    if meta["aggr_shared"]:
+        # one block per anchor (expert k = anchor k) plus the per-type affine;
+        # the sidecar keeps per-position block sums on the device. scale/bias
+        # carry no ".weight" suffix so llama-quantize leaves them f32.
+        blocks = torch.stack([state_dict[f"aggr_blocks.{index}.weight"].to(torch.float32)
+                              for index in range(num_aggr_types)])
+        LOGGER.info("%-64s -> %s", "aggr_blocks.*.weight", "aggr_blk.weight")
+        writer.add_tensor(
+            "aggr_blk.weight",
+            gguf.quantize(blocks.numpy(), gguf.GGMLQuantizationType.BF16),
+            raw_dtype=gguf.GGMLQuantizationType.BF16,
+        )
+        del blocks
+        for name in ("aggr_scale", "aggr_bias"):
+            LOGGER.info("%-64s -> %s", name, name)
+            writer.add_tensor(name, state_dict[name].detach().to(device="cpu", dtype=torch.float32).numpy())
+    else:
+        aggr = torch.zeros(
+            (num_aggr_types, hidden_size, num_aggr_types * hidden_size),
+            dtype=torch.float32,
+        )
+        for index in range(num_aggr_types):
+            source = state_dict[f"aggr_projs.{index}.weight"]
+            aggr[index, :, : source.shape[1]] = source.to(dtype=torch.float32)
+        LOGGER.info("%-64s -> %s", "aggr_projs.*.weight", "aggr.weight")
+        writer.add_tensor(
+            "aggr.weight",
+            gguf.quantize(aggr.numpy(), gguf.GGMLQuantizationType.BF16),
+            raw_dtype=gguf.GGMLQuantizationType.BF16,
+        )
+        del aggr
 
     for source_name, tensor in state_dict.items():
-        if source_name.startswith("aggr_projs."):
+        if source_name.startswith(AGGR_PREFIXES):
             continue
         output_name = checkpoint_tensor_name(source_name)
         LOGGER.info("%-64s -> %s", source_name, output_name)
@@ -389,7 +495,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
     parser.add_argument("--assets", type=Path, default=None,
                         help="spd-train assets .pt; folds the target final-norm weight "
-                             "into output.weight (required for spd-train checkpoints)")
+                             "into output.weight (required for glm5-next; needed for offline-trained greedy parity)")
     parser.add_argument("--train-span", type=int, default=None,
                         help="window length the head was trained on, in tokens (the trainer's "
                              "--chunk). Overrides the value recorded in the checkpoint; needed "

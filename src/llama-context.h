@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <deque>
 #include <map>
 #include <vector>
 
@@ -111,12 +112,12 @@ struct llama_context {
     // wait on one lane and read that cohort's rows without draining the rest
     void          chain_lane_sync(int32_t lane);
     const float * chain_logits_row(int32_t row) const;
+    int32_t       chain_argmax_row(int32_t row) const;
     const float * chain_tap_row(uint32_t lid, int32_t row) const;
     int32_t       chain_last_lane_get() const { return chain_last_lane; }
     void          chain_arm(int32_t lane) { chain_armed_lane = lane; }
 
-    // [fork, SPD peer boundaries] the persistent boundary input tensor (or the
-    // last graph's raw embd input as a fallback) and the last graph's embd
+    // [fork, SPD peer boundaries] the persistent boundary input tensor and the last graph's embd
     // output tensor, for direct device-to-device boundary pushes; and the
     // per-decode host-transfer skip toggles
     ggml_tensor * spd_peer_inp_tensor() const;
@@ -125,6 +126,16 @@ struct llama_context {
 
     ggml_context         * spd_boundary_ctx = nullptr;
     ggml_backend_buffer_t  spd_boundary_buf = nullptr;
+
+    // [fork, SPD shared aggregation bank] the device-resident running-sum ring
+    // (cparams.spd_aggr_state) and the host plan for the next decode
+    uint32_t spd_aggr_n_slots() const { return cparams.spd_aggr_state != nullptr ? spd_aggr_plan_data.n_slots : 0; }
+    bool     set_spd_aggr_plan(int32_t n, const llama_pos * pos, const int32_t * held,
+                               const int32_t * n_new, const float * feat);
+
+    ggml_context         * spd_aggr_ctx = nullptr;
+    ggml_backend_buffer_t  spd_aggr_buf = nullptr;
+    llama_spd_aggr_plan    spd_aggr_plan_data;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -349,7 +360,7 @@ private:
     // scheduler the ubatch actually ran on (a decode lane's tensors are not
     // resolvable against the shared scheduler); the ubatch supplies the
     // per-row (seq_id, pos) metadata published to collectors.
-    void extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, bool chain_rows = false);
+    void extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, int32_t chain_lane = -1);
 
     // [fork, PipeDec] stage-2 variant: async-GET each enabled layer-input row of a
     // single-token body lane into the stable per-group buffers (published to
@@ -541,6 +552,11 @@ private:
     std::vector<std::vector<std::pair<ggml_backend_t, uint64_t>>> chain_lane_reads;
     std::vector<ggml_backend_t> chain_read_backends; // scratch, current call
     int32_t chain_last_lane = -1;
+    // [fork] LLAMA_CHAIN_ARGMAX=1: lane graphs end in argmax(t_logits) and a
+    // chain call reads back one i32 per row instead of its logits row, keyed
+    // by seq id like the logits rows it replaces
+    std::vector<int32_t> chain_argmax;
+    void chain_argmax_add(llm_graph_result * res, ggml_cgraph * gf) const;
     // one-shot per-call opt-in (llama_chain_arm): without it a classic caller's
     // single-token decode would be silently staged seq-keyed while the caller
     // reads packed rows via output_ids. Value = the lane this call rides
@@ -549,6 +565,17 @@ private:
     int32_t chain_armed_lane = -1;
 
     void chain_read_note(ggml_backend_t backend);
+
+    // [fork] chained cohort reads go one GET per tensor into lane-owned
+    // staging, and the seq-keyed rows are copied out once the lane's read
+    // fence passes (chain_lane_sync). Per-row GETs were 8 x (taps + 1) RPC
+    // round trips per cohort on the same dispatcher as the peer pushes.
+    struct chain_stage_copy { void * dst; const uint8_t * src; size_t n; };
+    std::vector<std::deque<std::vector<uint8_t>>> chain_stage_bufs;
+    std::vector<size_t>                           chain_stage_used;
+    std::vector<std::vector<chain_stage_copy>>    chain_stage_copies;
+    void      chain_stage_begin(int32_t lane);
+    uint8_t * chain_stage(int32_t lane, size_t nbytes);
 
     // Stage 2 keeps the deferred output head on a separate scheduler so
     // switching to the tiny head graph does not evict the reusable 4k-node

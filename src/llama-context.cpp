@@ -193,24 +193,30 @@ llama_context::llama_context(
         if (cparams.spd_stage_count == 0 || cparams.spd_stage >= cparams.spd_stage_count) {
             throw std::runtime_error("invalid SPD stage index/count");
         }
-        // The trunk need not divide evenly. DeepSeek-V4 has 43 layers -- a prime
-        // -- so no stage count between 2 and 42 is uniform and requiring
-        // divisibility excluded the architecture outright. Every stage takes
-        // ceil(n_layer / count) layers and the last takes the remainder, which
-        // is exactly the layout the offline trainer's STAGE_PRESETS collect
-        // against (43 over 9 stages -> 5x8 + 3) and reduces to the old even
-        // split whenever the count does divide.
-        const uint32_t n_layer          = hparams.n_layer();
-        const uint32_t layers_per_stage = (n_layer + cparams.spd_stage_count - 1) / cparams.spd_stage_count;
-
-        if (layers_per_stage*(cparams.spd_stage_count - 1) >= n_layer) {
-            throw std::runtime_error("SPD stage count leaves an empty trailing stage");
+        const uint32_t n_layer = hparams.n_layer();
+        if (cparams.spd_stage_count > n_layer) {
+            throw std::runtime_error("SPD stage count exceeds the number of trunk layers");
         }
-
-        cparams.spd_layer_start = cparams.spd_stage * layers_per_stage;
-        cparams.spd_layer_end   = cparams.spd_layer_start + layers_per_stage < n_layer
-                                ? cparams.spd_layer_start + layers_per_stage
-                                : n_layer;
+        if (params.spd_layer_start != 0 || params.spd_layer_end != 0) {
+            if (params.spd_layer_start >= params.spd_layer_end || params.spd_layer_end > n_layer ||
+                (cparams.spd_stage == 0 && params.spd_layer_start != 0) ||
+                (cparams.spd_stage + 1 == cparams.spd_stage_count && params.spd_layer_end != n_layer)) {
+                throw std::runtime_error("invalid explicit SPD trunk layer range");
+            }
+            cparams.spd_layer_start = params.spd_layer_start;
+            cparams.spd_layer_end   = params.spd_layer_end;
+        } else {
+            if (model.arch == LLM_ARCH_GLM5_NEXT) {
+                throw std::runtime_error("GLM5-Next SPD requires explicit trunk layer ranges");
+            }
+            // Legacy heads use ceil-sized stages with the remainder on the last stage.
+            const uint32_t layers_per_stage = (n_layer + cparams.spd_stage_count - 1) / cparams.spd_stage_count;
+            if (layers_per_stage*(cparams.spd_stage_count - 1) >= n_layer) {
+                throw std::runtime_error("SPD stage count leaves an empty trailing stage");
+            }
+            cparams.spd_layer_start = cparams.spd_stage * layers_per_stage;
+            cparams.spd_layer_end   = std::min(cparams.spd_layer_start + layers_per_stage, n_layer);
+        }
 
         // DeepSeek-V4's first hash_layer_count layers route experts by token id
         // (ffn_gate_tid2eid gathered with the raw token). Only stage 0 is fed
@@ -221,13 +227,25 @@ llama_context::llama_context(
             throw std::runtime_error("SPD stage split puts a DeepSeek-V4 hash layer past stage 0, "
                                      "which receives no token ids");
         }
+
+        if (model.arch == LLM_ARCH_GLM5_NEXT) {
+            if (cparams.n_rs_seq > 0) {
+                throw std::runtime_error("GLM5-Next SPD requires sequence-copy rollback, not recurrent history planes");
+            }
+            bool has_full_indexer = false;
+            for (uint32_t il = cparams.spd_layer_start; il < cparams.spd_layer_end; ++il) {
+                if (!hparams.is_recr(il)) {
+                    has_full_indexer = has_full_indexer || hparams.is_indexer_full(il);
+                    if (!has_full_indexer) {
+                        throw std::runtime_error("GLM5-Next SPD stage starts with a shared DSA indexer from another stage");
+                    }
+                }
+            }
+        }
     }
 
-    // Width of one row of batch.embd for this context. An SPD stage past 0 is
-    // handed the previous stage's raw residual, and the SPD head the last
-    // stage's, so both take the model's stage-boundary width -- which on
-    // DeepSeek-V4 is hc_mult streams wide, not n_embd. Stage 0 still takes
-    // tokens and keeps the ordinary width.
+    // SPD stages past 0 and the head take the full residual, including all hyper-connection streams.
+    // Stage 0 takes tokens and keeps the ordinary input width.
     cparams.n_embd_inp_ctx = hparams.n_embd_inp();
     if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE && cparams.spd_stage > 0) ||
          cparams.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD) {
@@ -550,6 +568,32 @@ llama_context::llama_context(
             }
         }
 
+        // [fork, SPD shared aggregation bank] a sidecar whose bank is one block
+        // per anchor keeps every in-flight position's running sum on the bank's
+        // device, so a speculation step adds only the anchors that arrived since
+        // the last one. Ring of n_slots columns (slot = pos % n_slots) plus one
+        // scratch column for untracked rows.
+        if (model.spd_aggr_blk != nullptr && model.spd_aggr_blk->buffer != nullptr) {
+            const uint32_t n_slots = 64;
+            ggml_init_params ip = { ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+            spd_aggr_ctx = ggml_init(ip);
+            ggml_tensor * state = ggml_new_tensor_2d(spd_aggr_ctx, GGML_TYPE_F32,
+                    model.spd_aggr_blk->ne[1], (int64_t) n_slots + 1);
+            ggml_set_name(state, "spd_aggr_state");
+            spd_aggr_buf = ggml_backend_alloc_ctx_tensors_from_buft(spd_aggr_ctx,
+                    ggml_backend_buffer_get_type(model.spd_aggr_blk->buffer));
+            if (spd_aggr_buf == nullptr) {
+                throw std::runtime_error("failed to allocate the SPD aggregation state");
+            }
+            // the scratch column is read under a zero keep, and 0 * NaN is not 0
+            ggml_backend_buffer_clear(spd_aggr_buf, 0);
+            spd_aggr_plan_data.n_slots = n_slots;
+            cparams.spd_aggr_state = state;
+            cparams.spd_aggr_plan  = &spd_aggr_plan_data;
+            LLAMA_LOG_INFO("%s: SPD shared aggregation bank: %u-slot state, %.1f MiB on %s\n", __func__,
+                    n_slots, ggml_nbytes(state)/(1024.0*1024.0), ggml_backend_buffer_name(spd_aggr_buf));
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -707,6 +751,12 @@ llama_context::~llama_context() {
     if (spd_boundary_ctx != nullptr) {
         ggml_free(spd_boundary_ctx);
     }
+    if (spd_aggr_buf != nullptr) {
+        ggml_backend_buffer_free(spd_aggr_buf);
+    }
+    if (spd_aggr_ctx != nullptr) {
+        ggml_free(spd_aggr_ctx);
+    }
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -725,6 +775,17 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+// [fork] sequences a worst-case reserve plans for. With LLAMA_UBATCH_SEQS a
+// live ubatch never carries more than the cap, and a reserve planned at
+// n_seq_max is a different graph (64 seqs x 1 token takes the autoregressive
+// recurrent path, 8 x 8 the chunked one): every capped prompt ubatch then
+// failed to fit the plan and re-planned with a full fabric drain - 34 of 37
+// prompt ubatches, 88 s of a 20 min GLM collection run, drains up to 8.4 s.
+static uint32_t reserve_n_seqs(uint32_t n_seq_max) {
+    const uint32_t cap = llama_batch_allocr::ubatch_seq_cap();
+    return cap > 0 ? std::min(n_seq_max, cap) : n_seq_max;
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -817,7 +878,7 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs = reserve_n_seqs(cparams.n_seq_max);
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     // graph meta only: a non-causal ubatch may be n_ubatch_nc wide
@@ -1114,7 +1175,7 @@ void llama_context::galloc_restore_worstcase() {
     }
     galloc_epoch_seen = epoch;
 
-    const uint32_t n_seqs        = cparams.n_seq_max;
+    const uint32_t n_seqs        = reserve_n_seqs(cparams.n_seq_max);
     const uint32_t n_tokens      = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -1166,7 +1227,11 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
         return;
     }
 
-    const uint32_t n_seqs = std::min(cparams.n_seq_max, cparams.n_ubatch);
+    uint32_t n_seqs = std::min(cparams.n_seq_max, cparams.n_ubatch);
+    // [fork] a capped split never hands a lane more sequences than the cap
+    if (llama_batch_allocr::ubatch_seq_cap() > 0) {
+        n_seqs = std::min(n_seqs, llama_batch_allocr::ubatch_seq_cap());
+    }
     if (n_seqs == 0) {
         return;
     }
@@ -1200,6 +1265,9 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
             ctx_type_to_graph_type(cparams.ctx_type), lane_sched.get());
 
     auto * gf = model.build_graph(gparams);
+    if (gf) {
+        chain_argmax_add(res, gf);
+    }
 
     this->n_outputs = save_n_outputs;
 
@@ -1208,6 +1276,32 @@ void llama_context::decode_lane_reserve(uint32_t lane) {
     } else {
         LLAMA_LOG_INFO("%s: lane %u reserved at n_seqs = %u in %.2f s\n",
                 __func__, lane, n_seqs, (ggml_time_us() - t0) / 1e6);
+        if (lane == 0 && getenv("LLAMA_LANE_DUMP")) {
+            // [fork diag] the biggest tensors the lane graph places on the first stage
+            std::vector<std::pair<size_t, const ggml_tensor *>> big;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                if (ggml_backend_sched_get_tensor_backend(lane_sched.get(), const_cast<ggml_tensor *>(t)) == backend_ptrs[0]) {
+                    big.emplace_back(ggml_nbytes(t), t);
+                }
+            }
+            std::sort(big.begin(), big.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            for (size_t i = 0; i < big.size() && i < 25; ++i) {
+                const ggml_tensor * t = big[i].second;
+                LLAMA_LOG_INFO("%s: lane0 %8.2f MiB %-12s %-40s [%lld,%lld,%lld,%lld]\n", __func__,
+                        big[i].first / 1024.0 / 1024.0, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+            }
+        }
+        if (lane == 0) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t size = ggml_backend_sched_get_buffer_size(lane_sched.get(), backend_ptrs[i]);
+                if (size > 1) {
+                    LLAMA_LOG_INFO("%s: %10s lane compute buffer size = %8.2f MiB\n", __func__,
+                            ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0);
+                }
+            }
+        }
     }
 
     // the reserve graph must not be mistaken for a reusable live one
@@ -1307,7 +1401,7 @@ bool llama_context::memory_update(bool optimize) {
     // clears the signature, forcing the next one through.
     // LLAMA_MEM_RESERVE_ALWAYS=1 restores the unconditional behaviour for A/B.
     {
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = reserve_n_seqs(cparams.n_seq_max);
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -1433,7 +1527,9 @@ float * llama_context::get_embeddings_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        const uint32_t n_embd_out = model.hparams.n_embd_out();
+        const uint32_t n_embd_out = cparams.n_embd_out_ctx > 0
+                ? cparams.n_embd_out_ctx
+                : model.hparams.n_embd_out();
         return embd.data + j*n_embd_out;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
@@ -1601,6 +1697,54 @@ void llama_context::chain_read_note(ggml_backend_t backend) {
     }
 }
 
+static int32_t llama_decode_lanes_max();
+
+// LLAMA_CHAIN_STAGE=0: per-row seq-keyed GETs (the pre-staging path), for A/B
+static bool chain_stage_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_CHAIN_STAGE");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
+void llama_context::chain_stage_begin(int32_t lane) {
+    // sized for every lane once: growing it later would copy the deques
+    // (MSVC's deque move is not noexcept) out from under in-flight reads
+    if (chain_stage_bufs.empty()) {
+        const size_t n_lanes = (size_t) std::max<int32_t>(llama_decode_lanes_max(), lane + 1);
+        chain_stage_bufs.resize(n_lanes);
+        chain_stage_used.resize(n_lanes, 0);
+        chain_stage_copies.resize(n_lanes);
+    }
+    GGML_ASSERT((size_t) lane < chain_stage_bufs.size());
+    // the previous cohort on this lane must land before its staging is reused
+    if (!chain_stage_copies[lane].empty()) {
+        static const bool trace = getenv("LLAMA_CHAIN_STAGE_TRACE") != nullptr;
+        const int64_t t0 = ggml_time_us();
+        const size_t n_pending = chain_stage_copies[lane].size();
+        chain_lane_sync(lane);
+        if (trace) {
+            fprintf(stderr, "[chain-stage] lane %d resubmitted with %zu copies pending: sync %.1f ms\n",
+                    lane, n_pending, (ggml_time_us() - t0) / 1000.0);
+        }
+    }
+    chain_stage_used[lane] = 0;
+}
+
+uint8_t * llama_context::chain_stage(int32_t lane, size_t nbytes) {
+    auto & bufs = chain_stage_bufs[lane];
+    size_t & used = chain_stage_used[lane];
+    if (used == bufs.size()) {
+        bufs.emplace_back(); // deque: earlier buffers never move
+    }
+    auto & buf = bufs[used++];
+    if (buf.size() < nbytes) {
+        buf.resize(nbytes);
+    }
+    return buf.data();
+}
+
 void llama_context::chain_lane_sync(int32_t lane) {
     // wait only on this lane's own read fences: an endpoint-global
     // ggml_backend_synchronize would also fence every younger cohort's
@@ -1617,19 +1761,22 @@ void llama_context::chain_lane_sync(int32_t lane) {
         if ((size_t) lane < chain_lane_reads.size()) {
             chain_lane_reads[lane].clear();
         }
-        return;
-    }
-    if ((size_t) lane >= chain_lane_reads.size()) {
-        return;
-    }
-    for (auto & fence : chain_lane_reads[lane]) {
-        if (ggml_backend_is_rpc(fence.first)) {
-            ggml_backend_rpc_read_wait(fence.first, fence.second);
-        } else {
-            ggml_backend_synchronize(fence.first);
+    } else if ((size_t) lane < chain_lane_reads.size()) {
+        for (auto & fence : chain_lane_reads[lane]) {
+            if (ggml_backend_is_rpc(fence.first)) {
+                ggml_backend_rpc_read_wait(fence.first, fence.second);
+            } else {
+                ggml_backend_synchronize(fence.first);
+            }
         }
+        chain_lane_reads[lane].clear();
     }
-    chain_lane_reads[lane].clear();
+    if ((size_t) lane < chain_stage_copies.size()) {
+        for (const auto & c : chain_stage_copies[lane]) {
+            memcpy(c.dst, c.src, c.n);
+        }
+        chain_stage_copies[lane].clear();
+    }
 }
 
 const float * llama_context::chain_logits_row(int32_t row) const {
@@ -1637,6 +1784,36 @@ const float * llama_context::chain_logits_row(int32_t row) const {
     const int64_t n_vocab = model.vocab.n_tokens();
     GGML_ASSERT((int64_t) (row + 1)*n_vocab <= (int64_t) logits.size);
     return logits.data + (int64_t) row*n_vocab;
+}
+
+// [fork] LLAMA_CHAIN_ARGMAX=1: greedy tokens computed on the output device.
+// A chain cohort's logits rows are n_vocab f32 each; over a 1 GbE board link
+// 8 rows are 2.5-4.9 MB per cohort, read on the critical path of every
+// cohort. argmax shrinks that to 4 bytes a row. Greedy slots only - the
+// server keeps anything that samples off the logits on the classic path.
+static bool chain_argmax_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_CHAIN_ARGMAX");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+void llama_context::chain_argmax_add(llm_graph_result * res, ggml_cgraph * gf) const {
+    if (!chain_argmax_on() || res->t_logits == nullptr) {
+        return;
+    }
+    res->t_argmax = ggml_argmax(res->get_ctx(), res->t_logits);
+    ggml_set_name(res->t_argmax, "result_argmax");
+    ggml_set_output(res->t_argmax);
+    ggml_build_forward_expand(gf, res->t_argmax);
+}
+
+int32_t llama_context::chain_argmax_row(int32_t row) const {
+    if (!chain_argmax_on() || row < 0 || (size_t) row >= chain_argmax.size()) {
+        return -1;
+    }
+    return chain_argmax[row];
 }
 
 const float * llama_context::chain_tap_row(uint32_t lid, int32_t row) const {
@@ -1649,14 +1826,41 @@ const float * llama_context::chain_tap_row(uint32_t lid, int32_t row) const {
 }
 
 ggml_tensor * llama_context::spd_peer_inp_tensor() const {
-    if (cparams.spd_boundary_inp != nullptr) {
-        return cparams.spd_boundary_inp;
-    }
-    return gf_res_prev ? gf_res_prev->t_inp_embd_wide : nullptr;
+    return cparams.spd_boundary_inp;
 }
 
 ggml_tensor * llama_context::spd_peer_out_tensor() const {
     return gf_res_prev ? gf_res_prev->t_embd : nullptr;
+}
+
+bool llama_context::set_spd_aggr_plan(int32_t n, const llama_pos * pos, const int32_t * held,
+        const int32_t * n_new, const float * feat) {
+    if (cparams.spd_aggr_state == nullptr || n < 0) {
+        return false;
+    }
+    const int64_t n_embd = cparams.spd_aggr_state->ne[0];
+    const int32_t n_aggr = (int32_t) model.spd_aggr_blk->ne[2];
+    auto & plan = spd_aggr_plan_data;
+    plan.pos.assign(pos, pos + n);
+    plan.held.assign(held, held + n);
+    plan.n_new.assign(n_new, n_new + n);
+    plan.off.resize(n);
+    size_t total = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        // a row may add nothing (its selector did not move), but it must end
+        // up with at least anchor 0 and at most every anchor
+        const int32_t total_anchors = std::max(held[i], 0) + n_new[i];
+        if (held[i] < -1 || n_new[i] < 0 || total_anchors < 1 || total_anchors > n_aggr) {
+            LLAMA_LOG_ERROR("%s: row %d (pos %d): held %d + %d new anchors does not fit %d\n",
+                    __func__, i, pos[i], held[i], n_new[i], n_aggr);
+            plan.pos.clear();
+            return false;
+        }
+        plan.off[i] = total;
+        total += (size_t) n_new[i]*n_embd;
+    }
+    plan.feat.assign(feat, feat + total);
+    return true;
 }
 
 void llama_context::set_spd_peer_io(bool skip_inp, bool skip_out, bool skip_layer_inp) {
@@ -2068,7 +2272,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (graph_reuse_allowed(ubatch) && res->can_reuse(gparams)) {
+    const bool pu_reused = graph_reuse_allowed(ubatch) && res->can_reuse(gparams);
+    if (pu_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2135,9 +2340,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (pu_trace) {
         const int64_t pu_t3 = ggml_time_us();
-        if (pu_t3 - pu_t0 > 300*1000) {
-            fprintf(stderr, "[pu] n_tok=%d apply+build+alloc=%.1fms set_inputs=%.1fms compute_submit=%.1fms\n",
-                    (int) ubatch.n_tokens, (pu_t1 - pu_t0) / 1000.0, (pu_t2 - pu_t1) / 1000.0, (pu_t3 - pu_t2) / 1000.0);
+        // 2 = every ubatch (small-graph host overhead, e.g. the SPD sidecar)
+        if (pu_trace >= 2 || pu_t3 - pu_t0 > 300*1000) {
+            fprintf(stderr, "[pu] n_tok=%d reused=%d apply+build+alloc=%.3fms set_inputs=%.3fms compute_submit=%.3fms\n",
+                    (int) ubatch.n_tokens, pu_reused ? 1 : 0, (pu_t1 - pu_t0) / 1000.0, (pu_t2 - pu_t1) / 1000.0, (pu_t3 - pu_t2) / 1000.0);
             fflush(stderr);
         }
     }
@@ -2229,6 +2435,7 @@ llm_graph_result * llama_context::process_ubatch_decode_lane(
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        chain_argmax_add(res, gf);
         if (!ggml_backend_sched_alloc_graph(lane_sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph for decode lane %u\n", __func__, lane);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2952,6 +3159,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     chain_armed_lane = -1;
     // unconditional: also self-heals a leaked suppress from an aborted call
     dsv4_decode_split_suppress(chain_armed_call >= 0);
+    // once per call: a cohort can split into several ubatches on its lane,
+    // and their staged rows land together at the caller's lane sync
+    bool chain_stage_begun = false;
     if (!mtp_dsa_sel_raw.empty()) {
         synchronize();
     }
@@ -3106,6 +3316,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const bool chain_call = chain_armed_call >= 0 && decode_lane >= 0;
         if (chain_call) {
             decode_lane = chain_armed_call % llama_decode_lanes_max();
+            if (!chain_stage_begun) {
+                chain_stage_begin(decode_lane);
+                chain_stage_begun = true;
+            }
         }
 
         if (decode_trace) {
@@ -3183,7 +3397,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            if (chain_call) {
+            if (chain_call && res->t_argmax != nullptr && !chain_stage_on()) {
+                ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(
+                        sched_decode_lane[decode_lane].get(), res->t_argmax);
+                GGML_ASSERT(backend_am != nullptr);
+                if (chain_argmax.size() < cparams.n_seq_max) {
+                    chain_argmax.assign(cparams.n_seq_max, -1);
+                }
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const int64_t row = ubatch.seq_id[i][0];
+                    GGML_ASSERT(row >= 0 && (size_t) row < chain_argmax.size());
+                    ggml_backend_tensor_get_async(backend_am, res->t_argmax,
+                            chain_argmax.data() + row, (size_t) i*sizeof(int32_t), sizeof(int32_t));
+                }
+                chain_read_note(backend_am);
+            } else if (chain_call && res->t_argmax != nullptr) {
+                ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(
+                        sched_decode_lane[decode_lane].get(), res->t_argmax);
+                GGML_ASSERT(backend_am != nullptr);
+                if (chain_argmax.size() < cparams.n_seq_max) {
+                    chain_argmax.assign(cparams.n_seq_max, -1);
+                }
+                const size_t nb = (size_t) ubatch.n_tokens*sizeof(int32_t);
+                uint8_t * stage = chain_stage(decode_lane, nb);
+                ggml_backend_tensor_get_async(backend_am, res->t_argmax, stage, 0, nb);
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const int64_t row = ubatch.seq_id[i][0];
+                    GGML_ASSERT(row >= 0 && (size_t) row < chain_argmax.size());
+                    chain_stage_copies[decode_lane].push_back({ chain_argmax.data() + row, stage + i*sizeof(int32_t), sizeof(int32_t) });
+                }
+                chain_read_note(backend_am);
+            } else if (chain_call) {
                 // rows keyed by seq id so concurrent cohort calls stay disjoint;
                 // the buffer holds n_seq_max rows (output_reserve floor)
                 for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -3281,7 +3525,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         } else {
             extract_layer_inputs(res,
                     decode_lane >= 0 ? sched_decode_lane[decode_lane].get() : sched.get(),
-                    ubatch, n_tokens_prev, chain_call);
+                    ubatch, n_tokens_prev, chain_call ? decode_lane : -1);
         }
 
         // [fork] chained cohort call: snapshot the read fences now that every
@@ -3818,7 +4062,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, bool chain_rows) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_backend_sched_t res_sched, const llama_ubatch & ubatch, size_t token_offset, int32_t chain_lane) {
     // [fork, SPD] the tap stays in the graph (prefill reads it, and toggling it
     // per phase would reshape the stage graph); this only drops the blocking
     // readback for stages whose anchors the host already has.
@@ -3850,15 +4094,25 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_back
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(res_sched, t);
         GGML_ASSERT(backend != nullptr);
 
-        if (chain_rows) {
-            // chained cohort call: rows keyed by seq id, so cohort calls in
-            // flight together write disjoint regions. No (seq,pos) metadata -
-            // the caller reads rows by seq id and tracks positions itself.
+        if (chain_lane >= 0 && !chain_stage_on()) {
             for (uint32_t i = 0; i < n_tokens; ++i) {
                 const size_t row = (size_t) ubatch.seq_id[i][0];
                 GGML_ASSERT((row + 1) * row_floats <= embd_layer_inp[il].size);
                 ggml_backend_tensor_get_async(backend, t,
                         embd_layer_inp[il].data + row*row_floats, i*row_floats*sizeof(float), row_floats*sizeof(float));
+            }
+            chain_read_note(backend);
+        } else if (chain_lane >= 0) {
+            // chained cohort call: rows keyed by seq id, so cohort calls in
+            // flight together write disjoint regions. No (seq,pos) metadata -
+            // the caller reads rows by seq id and tracks positions itself.
+            uint8_t * stage = chain_stage(chain_lane, nbytes);
+            ggml_backend_tensor_get_async(backend, t, stage, 0, nbytes);
+            const size_t row_bytes = row_floats*sizeof(float);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const size_t row = (size_t) ubatch.seq_id[i][0];
+                GGML_ASSERT((row + 1) * row_floats <= embd_layer_inp[il].size);
+                chain_stage_copies[chain_lane].push_back({ embd_layer_inp[il].data + row*row_floats, stage + i*row_bytes, row_bytes });
             }
             chain_read_note(backend);
         } else {
@@ -3871,7 +4125,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, ggml_back
 
     // [fork, SPD collect] publish (seq_id, pos) per extracted row - collectors
     // must map rows by this, never by batch index (ubatch order differs)
-    if (extracted && !chain_rows) {
+    if (extracted && chain_lane < 0) {
         GGML_ASSERT(embd_layer_inp_seq.size() == token_offset);
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             embd_layer_inp_seq.push_back(ubatch.seq_id[i][0]);
@@ -5399,6 +5653,8 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.spd_stage                   =*/ 0,
         /*.spd_stage_count             =*/ 0,
+        /*.spd_layer_start             =*/ 0,
+        /*.spd_layer_end               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -5523,8 +5779,8 @@ llama_context * llama_init_from_model(
     if ((params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_STAGE ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_HEAD  ||
          params.ctx_type == LLAMA_CONTEXT_TYPE_SPD_EMBED) &&
-        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_DEEPSEEK4) {
-        LLAMA_LOG_WARN("%s: SPD target contexts currently require a Qwen3.5 or DeepSeek-V4 model\n", __func__);
+        model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_DEEPSEEK4 && model->arch != LLM_ARCH_GLM5_NEXT) {
+        LLAMA_LOG_WARN("%s: SPD target contexts require a Qwen3.5, DeepSeek-V4 or GLM5-Next model\n", __func__);
         return nullptr;
     }
 
@@ -6476,6 +6732,10 @@ const float * llama_chain_logits_row(llama_context * ctx, int32_t row) {
     return ctx->chain_logits_row(row);
 }
 
+int32_t llama_chain_argmax_row(llama_context * ctx, int32_t row) {
+    return ctx->chain_argmax_row(row);
+}
+
 const float * llama_chain_tap_row(llama_context * ctx, uint32_t lid, int32_t row) {
     return ctx->chain_tap_row(lid, row);
 }
@@ -6500,6 +6760,15 @@ ggml_tensor * llama_spd_peer_out_tensor(llama_context * ctx) {
 
 void llama_set_spd_peer_io(llama_context * ctx, bool skip_inp, bool skip_out, bool skip_layer_inp) {
     ctx->set_spd_peer_io(skip_inp, skip_out, skip_layer_inp);
+}
+
+uint32_t llama_spd_aggr_n_slots(const llama_context * ctx) {
+    return ctx->spd_aggr_n_slots();
+}
+
+bool llama_spd_aggr_set_plan(llama_context * ctx, int32_t n, const llama_pos * pos,
+        const int32_t * held, const int32_t * n_new, const float * feat) {
+    return ctx->set_spd_aggr_plan(n, pos, held, n_new, feat);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

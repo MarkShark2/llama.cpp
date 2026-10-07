@@ -356,6 +356,18 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// [fork] LLAMA_RS_SPARSE: destination cell of each ubatch seq
+static void set_input_rs_dst(ggml_tensor * s_dst, const llama_memory_recurrent_context * mctx) {
+    if (s_dst == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_dst->buffer));
+    int32_t * data = (int32_t *) s_dst->data;
+    for (int64_t i = 0; i < s_dst->ne[0]; ++i) {
+        data[i] = mctx->s_dst(i);
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -370,6 +382,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    set_input_rs_dst(s_dst, mctx);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1161,6 +1175,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    set_input_rs_dst(inp_rs->s_dst, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1190,13 +1206,18 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 // Instead of creating a hybrid input, the graph can simply create 2 separate inputs.
 // Refactoring is required in the future.
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    // A stage may contain only recurrent layers or only attention layers.
+    if (inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1204,6 +1225,10 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+    }
+
+    if (inp_rs->s_dst && inp_rs->s_dst->buffer) {
+        set_input_rs_dst(inp_rs->s_dst, mctx->get_recr());
     }
 }
 
@@ -1279,6 +1304,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    set_input_rs_dst(inp_rs->s_dst, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1373,6 +1400,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_argmax      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -3608,11 +3636,17 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
 
-    const int64_t n_rs   = mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
+    // [fork] sparse cells touch exactly the ubatch's states, also in a reserve
+    const int64_t n_rs   = mctx_cur->is_sparse() ? n_seqs : (int64_t) mctx_cur->get_n_rs();
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+
+    if (mctx_cur->is_sparse()) {
+        inp->s_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+        ggml_set_input(inp->s_dst);
+    }
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
@@ -3640,7 +3674,7 @@ ggml_tensor * llm_graph_context::build_rs(
     const auto * kv_state = inp->mctx;
 
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
-                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                    (uint32_t) inp->s_copy->ne[0], kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 }
 

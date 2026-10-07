@@ -138,7 +138,10 @@ public:
         seq->n_tokens = n_tokens;
         seq->n_embd   = n_embd_;
 
-        n_reserve = std::max(n_reserve, n_tokens);
+        // [fork] 96 live sequences reserving prompt + n_predict rows up front
+        // commit 26-37 GB of mostly unwritten pages; reserve the prompt and a
+        // little headroom and let the vectors grow
+        n_reserve = std::min(std::max(n_reserve, n_tokens), n_tokens + 256);
 
         if (label_ranges.empty()) {
             seq->labels.assign(n_tokens, 1);

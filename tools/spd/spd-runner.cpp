@@ -2,7 +2,9 @@
 #include "spd-pipeline.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -51,7 +53,12 @@ void usage(const char * argv0) {
             "       [--cache-type-k q8_0] [--cache-type-v q8_0]\n"
             "       [--flash-attn on|off|auto] [--no-mmap]\n"
             "       [--prompt-file path] [--duration seconds] [--phase-file path]\n"
-            "       [--arm both|baseline|spd]\n",
+            "       [--arm both|baseline|spd]\n"
+            "       [--check-prefix-reuse --checkpoint-file path]\n"
+            "Prefix checks compare repeated, extended and changed prompts with cold greedy output,\n"
+            "wrap the bounded prefill ring, repeat in-place rewinds, and check bundle/cancellation recovery.\n"
+            "Prefix checks require -n greater than stage_count, batch size at least 2, and enough context\n"
+            "for stage_count + 2 batches plus the prompt. --checkpoint-file is overwritten.\n",
             argv0);
 }
 
@@ -196,13 +203,13 @@ void print_devices(const char * label, const std::vector<ggml_backend_dev_t> & d
     std::fprintf(stderr, "\n");
 }
 
-bool tokenize(const llama_vocab * vocab, const std::string & text, std::vector<llama_token> & tokens) {
-    const int32_t size = -llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), nullptr, 0, true, true);
+bool tokenize(const llama_vocab * vocab, const std::string & text, std::vector<llama_token> & tokens, bool special = true) {
+    const int32_t size = -llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), nullptr, 0, special, true);
     if (size <= 0) {
         return false;
     }
     tokens.resize(size);
-    return llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), size, true, true) == size;
+    return llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), size, special, true) == size;
 }
 
 bool run_baseline(
@@ -212,7 +219,9 @@ bool run_baseline(
         uint32_t n_ctx,
         uint32_t n_batch,
         const llama_context_params & context_template,
-        baseline_result & result) {
+        baseline_result & result,
+        bool ignore_eos = false,
+        const std::string & grammar = {}) {
     llama_context_params cp = context_template;
     cp.n_ctx = n_ctx;
     cp.n_batch = n_batch;
@@ -235,7 +244,18 @@ bool run_baseline(
     }
     result.prefill_seconds = seconds_since(prefill_start);
 
-    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> grammar_sampler(nullptr, llama_sampler_free);
+    std::vector<llama_token_data> grammar_candidates;
+    if (!grammar.empty()) {
+        grammar_sampler.reset(llama_sampler_init_grammar(vocab, grammar.c_str(), "root"));
+        if (!grammar_sampler) {
+            llama_free(ctx);
+            return false;
+        }
+        grammar_candidates.resize(n_vocab);
+    }
     const float * logits = llama_get_logits_ith(ctx, -1);
     if (logits == nullptr) {
         llama_free(ctx);
@@ -244,9 +264,37 @@ bool run_baseline(
 
     const auto decode_start = clock_type::now();
     for (int32_t i = 0; i < n_predict; ++i) {
-        const llama_token token = argmax(logits, n_vocab);
+        llama_token token = argmax(logits, n_vocab);
+        if (grammar_sampler) {
+            for (llama_token candidate = 0; candidate < n_vocab; ++candidate) {
+                grammar_candidates[candidate] = { candidate,
+                    ignore_eos && llama_vocab_is_eog(vocab, candidate) ? -INFINITY : logits[candidate], 0.0f };
+            }
+            llama_token_data_array candidates = { grammar_candidates.data(), grammar_candidates.size(), -1, false };
+            llama_sampler_apply(grammar_sampler.get(), &candidates);
+            const auto * best = std::max_element(candidates.data, candidates.data + candidates.size,
+                    [](const llama_token_data & a, const llama_token_data & b) { return a.logit < b.logit; });
+            if (candidates.size == 0 || !std::isfinite(best->logit)) {
+                llama_free(ctx);
+                return false;
+            }
+            token = best->id;
+            llama_sampler_accept(grammar_sampler.get(), token);
+        }
+        if (ignore_eos && llama_vocab_is_eog(vocab, token)) {
+            token = LLAMA_TOKEN_NULL;
+            for (llama_token candidate = 0; candidate < n_vocab; ++candidate) {
+                if (!llama_vocab_is_eog(vocab, candidate) && (token == LLAMA_TOKEN_NULL || logits[candidate] > logits[token])) {
+                    token = candidate;
+                }
+            }
+            if (token == LLAMA_TOKEN_NULL) {
+                llama_free(ctx);
+                return false;
+            }
+        }
         result.tokens.push_back(token);
-        if (i + 1 == n_predict) {
+        if (i + 1 == n_predict || (grammar_sampler && !ignore_eos && llama_vocab_is_eog(vocab, token))) {
             break;
         }
         llama_batch batch = llama_batch_get_one(&result.tokens.back(), 1);
@@ -319,6 +367,299 @@ void print_mismatch(
     std::fprintf(stderr, "\n");
 }
 
+void check_prefix_reuse(llama_model * target, llama_model * sidecar, const common_spd_params & params,
+        std::unique_ptr<common_spd_pipeline> & pipeline, const std::vector<llama_token> & prompt,
+        int32_t n_predict, const std::string & checkpoint_file) {
+    const uint32_t stage_count = pipeline->stage_count();
+    if (n_predict <= (int32_t) stage_count) {
+        throw std::invalid_argument("prefix checks require -n greater than stage_count to exercise committed generated tokens");
+    }
+    if (params.n_batch < 2) {
+        throw std::invalid_argument("prefix checks require batch size at least 2 for an interior-chunk checkpoint");
+    }
+    common_spd_gen_params gparams;
+    gparams.n_predict = n_predict;
+    gparams.ignore_eos = true;
+    gparams.prefix_reuse = true;
+    gparams.n_ctx_checkpoints = 4;
+    gparams.checkpoint_min_step = 256;
+    const llama_vocab * vocab = llama_model_get_vocab(target);
+    std::vector<llama_token> suffix;
+    if (!tokenize(vocab, " Explain the reasoning and compare it with a different example.", suffix, false) || suffix.empty()) {
+        throw std::runtime_error("failed to tokenize prefix-check suffix");
+    }
+    std::vector<std::vector<llama_token>> prompts(3);
+    prompts[0] = prompt;
+    while (prompts[0].size() < 2 * stage_count) {
+        prompts[0].insert(prompts[0].end(), suffix.begin(), suffix.end());
+    }
+    prompts[1] = prompts[0];
+    prompts[1].insert(prompts[1].end(), suffix.begin(), suffix.begin() + std::min<size_t>(2, suffix.size()));
+    prompts[2] = prompts[0];
+    const auto changed = std::find_if(suffix.begin(), suffix.end(),
+            [&](llama_token token) { return token != prompts[2].back(); });
+    if (changed == suffix.end()) {
+        throw std::runtime_error("prefix-check suffix must contain a distinct replacement token");
+    }
+    prompts[2].back() = *changed;
+    const uint64_t ring_tokens = ((uint64_t) stage_count + 1) * params.n_batch;
+    const uint64_t long_size = prompts[0].size() + ((uint64_t) stage_count + 2) * params.n_batch + 1;
+    if (long_size + n_predict + stage_count >= params.n_ctx) {
+        throw std::invalid_argument("prefix checks need a larger context or smaller batch for ring wrap");
+    }
+    prompts.push_back(prompts[1]);
+    while (prompts.back().size() < long_size) {
+        prompts.back().insert(prompts.back().end(), suffix.begin(), suffix.end());
+    }
+    prompts.back().resize((size_t) long_size);
+    const std::vector<llama_token> cancel_prompt = prompts.back();
+
+    pipeline.reset();
+    std::vector<baseline_result> expected(prompts.size());
+    for (size_t i = 0; i < prompts.size(); ++i) {
+        if (!run_baseline(target, prompts[i], n_predict, params.n_ctx, params.n_batch, params.target_context, expected[i], true)) {
+            throw std::runtime_error("prefix-check cold baseline failed");
+        }
+    }
+    auto recreate = [&] {
+        pipeline.reset();
+        pipeline = std::make_unique<common_spd_pipeline>(target, sidecar, params);
+        if (!pipeline->valid()) {
+            throw std::runtime_error("prefix-check initialization failed: " + pipeline->error());
+        }
+    };
+    recreate();
+
+    const size_t min_reused = prompts[0].size() - stage_count + 1;
+    common_spd_result current;
+    auto check = [&](const std::string & label, size_t prompt_index, bool reused, bool allow_eviction = false) {
+        if (!pipeline->generate(prompts[prompt_index], gparams, current)) {
+            throw std::runtime_error(label + " failed: " + pipeline->error());
+        }
+        if (current.tokens != expected[prompt_index].tokens) {
+            print_mismatch(expected[prompt_index].tokens, current.tokens);
+            throw std::runtime_error(label + " differs from cold greedy output");
+        }
+        if (current.n_prompt_reused < 0 || current.n_prompt_processed < 0 ||
+            (size_t) current.n_prompt_reused + current.n_prompt_processed != prompts[prompt_index].size() ||
+            (reused ? (size_t) current.n_prompt_reused < min_reused && !(allow_eviction && current.n_prompt_reused == 0)
+                    : current.n_prompt_reused != 0)) {
+            throw std::runtime_error(label + " has unexpected prompt reuse counters");
+        }
+        std::printf("prefix check %s: PASS (reused=%d processed=%d cached=%d)\n", label.c_str(),
+                current.n_prompt_reused, current.n_prompt_processed, current.n_cached_tokens);
+    };
+    check("cold request", 0, false);
+    check("same prompt", 0, true);
+    check("extended prompt", 1, true);
+    check("changed suffix", 2, true);
+    check("changed suffix repeat", 2, true);
+    check("return to original prompt", 0, true);
+    check("changed suffix after rewind", 2, true);
+    check("retained ring-wrap prefill", 3, true);
+    const size_t checkpoint_limit = prompts[3].size() - stage_count + 1;
+    if ((uint64_t) current.n_prompt_processed <= ring_tokens ||
+        (size_t) current.n_prompt_reused != min_reused ||
+        (checkpoint_limit - current.n_prompt_reused) % params.n_batch != 1) {
+        throw std::runtime_error("retained request did not wrap the ring with an interior-chunk checkpoint");
+    }
+    check("ring-wrap partial-chunk checkpoint rewind", 3, true);
+    if ((size_t) current.n_prompt_reused != checkpoint_limit || current.n_prompt_processed != (int32_t) stage_count - 1) {
+        throw std::runtime_error("ring-wrap rewind missed the exact checkpoint limit");
+    }
+    std::printf("prefix check ring-wrap coverage: PASS (ring_slots=%u checkpoint_limit=%zu replayed=%d)\n",
+            stage_count + 1, checkpoint_limit, current.n_prompt_processed);
+    check("short prompt recovery after ring wrap", 2, true, true);
+
+    std::vector<llama_token> resident = prompts[2];
+    resident.insert(resident.end(), current.tokens.begin(), current.tokens.end());
+    if (current.n_cached_tokens <= (int32_t) prompts[2].size() || (size_t) current.n_cached_tokens > resident.size()) {
+        throw std::runtime_error("prefix-check state must retain committed generated tokens after the prompt");
+    }
+    resident.resize(current.n_cached_tokens);
+    const size_t state_size = pipeline->state_io().get_size(0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (state_size == 0) {
+        throw std::runtime_error("prefix-check bundle is empty");
+    }
+    std::vector<uint8_t> state(state_size);
+    if (pipeline->state_io().get_data(state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != state.size()) {
+        throw std::runtime_error("prefix-check bundle capture failed");
+    }
+    const size_t disk_size = pipeline->state_io().save_file(checkpoint_file, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (disk_size == 0) {
+        throw std::runtime_error("prefix-check disk bundle save failed");
+    }
+
+    const size_t continuation_index = prompts.size();
+    prompts.push_back(resident);
+    while (prompts.back().size() < resident.size() + stage_count - 1) {
+        prompts.back().insert(prompts.back().end(), suffix.begin(), suffix.end());
+    }
+    const std::string grammar = "root ::= \"A\"";
+    const int32_t grammar_predict = std::max(8, n_predict);
+    if ((uint64_t) prompts.back().size() + n_predict + stage_count >= params.n_ctx ||
+        (uint64_t) prompts[2].size() + grammar_predict + stage_count >= params.n_ctx) {
+        throw std::invalid_argument("prefix checks need a larger context for saved-prefix continuation");
+    }
+    pipeline.reset();
+    expected.emplace_back();
+    baseline_result grammar_expected;
+    if (!run_baseline(target, prompts.back(), n_predict, params.n_ctx, params.n_batch, params.target_context, expected.back(), true) ||
+        !run_baseline(target, prompts[2], grammar_predict, params.n_ctx, params.n_batch, params.target_context, grammar_expected, false, grammar)) {
+        throw std::runtime_error("saved-prefix continuation or grammar baseline failed");
+    }
+
+    recreate();
+    if (pipeline->state_io().set_data(state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != state.size()) {
+        throw std::runtime_error("prefix-check bundle restore failed");
+    }
+    pipeline->note_resident_prefix(resident);
+    check("fresh pipeline RAM restore", 2, true);
+    check("restored same prompt repeat", 2, true);
+    {
+        std::vector<llama_token> reexport_resident = prompts[2];
+        reexport_resident.insert(reexport_resident.end(), current.tokens.begin(), current.tokens.end());
+        if (current.n_cached_tokens <= (int32_t) prompts[2].size() ||
+            (size_t) current.n_cached_tokens > reexport_resident.size()) {
+            throw std::runtime_error("repeated rewind lost the committed prefix before re-export");
+        }
+        reexport_resident.resize(current.n_cached_tokens);
+        const size_t reexport_size = pipeline->state_io().get_size(0, LLAMA_STATE_SEQ_FLAGS_NONE);
+        std::vector<uint8_t> reexport(reexport_size);
+        if (reexport.empty() || pipeline->state_io().get_data(reexport.data(), reexport.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_NONE) != reexport.size()) {
+            throw std::runtime_error("repeated rewind bundle re-export failed");
+        }
+        recreate();
+        if (pipeline->state_io().set_data(reexport.data(), reexport.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != reexport.size()) {
+            throw std::runtime_error("re-exported bundle restore failed");
+        }
+        pipeline->note_resident_prefix(reexport_resident);
+        check("re-export after repeated rewind", 2, true);
+    }
+    if (pipeline->state_io().set_data(state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != state.size()) {
+        throw std::runtime_error("used pipeline bundle restore failed");
+    }
+    pipeline->note_resident_prefix(resident);
+    check("used pipeline RAM restore", 2, true);
+    recreate();
+    if (pipeline->state_io().set_data(state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != state.size()) {
+        throw std::runtime_error("prefix-check continuation bundle restore failed");
+    }
+    pipeline->note_resident_prefix(resident);
+    check("RAM committed-prefix continuation", continuation_index, true);
+    if ((size_t) current.n_prompt_reused != resident.size()) {
+        throw std::runtime_error("RAM continuation did not reuse the whole committed prefix");
+    }
+    recreate();
+    if (pipeline->state_io().load_file(checkpoint_file, 0, LLAMA_STATE_SEQ_FLAGS_NONE) != disk_size) {
+        throw std::runtime_error("prefix-check disk bundle restore failed");
+    }
+    pipeline->note_resident_prefix(resident);
+    check("disk committed-prefix continuation", continuation_index, true);
+    if ((size_t) current.n_prompt_reused != resident.size()) {
+        throw std::runtime_error("disk continuation did not reuse the whole committed prefix");
+    }
+
+    recreate();
+    if (pipeline->state_io().set_data(state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != state.size()) {
+        throw std::runtime_error("prefix-check grammar bundle restore failed");
+    }
+    pipeline->note_resident_prefix(resident);
+    common_spd_gen_params grammar_params = gparams;
+    grammar_params.grammar = grammar;
+    grammar_params.ignore_eos = false;
+    grammar_params.n_predict = grammar_predict;
+    common_spd_result grammar_actual;
+    if (!pipeline->generate(prompts[2], grammar_params, grammar_actual) ||
+        grammar_actual.tokens != grammar_expected.tokens || (size_t) grammar_actual.n_prompt_reused < min_reused) {
+        throw std::runtime_error("restored grammar request differs from cold constrained greedy output or lost prefix reuse");
+    }
+    std::printf("prefix check restored grammar: PASS (reused=%d)\n", grammar_actual.n_prompt_reused);
+
+    // Import into a used pipeline so failure must invalidate its previous prefix record.
+    const std::array<const char *, 4> damaged_labels = {
+        "bad-magic recovery", "truncated-bundle recovery", "middle-byte recovery", "checksum-footer recovery",
+    };
+    for (size_t variant = 0; variant < damaged_labels.size(); ++variant) {
+        std::vector<uint8_t> corrupt = state;
+        if (variant == 0) {
+            corrupt[0] ^= 0xff;
+        } else if (variant == 1) {
+            corrupt.pop_back();
+        } else if (variant == 2) {
+            corrupt[corrupt.size() / 2] ^= 1;
+        } else {
+            corrupt.back() ^= 1;
+        }
+        if (pipeline->state_io().set_data(corrupt.data(), corrupt.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != 0) {
+            throw std::runtime_error("corrupt prefix-check bundle was accepted");
+        }
+        check(damaged_labels[variant], 2, false);
+    }
+
+    {
+        std::fstream corrupt(checkpoint_file, std::ios::binary | std::ios::in | std::ios::out);
+        char magic = 0;
+        corrupt.read(&magic, 1);
+        magic ^= 0x7f;
+        corrupt.seekp(0);
+        corrupt.write(&magic, 1);
+        corrupt.flush();
+        if (!corrupt) {
+            throw std::runtime_error("failed to write bad-magic disk bundle");
+        }
+    }
+    if (pipeline->state_io().load_file(checkpoint_file, 0, LLAMA_STATE_SEQ_FLAGS_NONE) != 0) {
+        throw std::runtime_error("bad-magic disk bundle was accepted");
+    }
+    check("bad-magic disk recovery", 2, false);
+    if (pipeline->state_io().save_file(checkpoint_file, 0, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+        throw std::runtime_error("failed to replace the damaged test file with a valid bundle");
+    }
+
+    common_spd_gen_params cancelled_params = gparams;
+    cancelled_params.prefix_reuse = false;
+    size_t polls = 0;
+    const size_t cancel_poll = (size_t) stage_count + 3;
+    cancelled_params.should_cancel = [&] { return ++polls == cancel_poll; };
+    common_spd_result cancelled;
+    if (pipeline->generate(cancel_prompt, cancelled_params, cancelled) || !cancelled.cancelled ||
+        !pipeline->error().empty() || polls != cancel_poll || cancelled.n_cached_tokens != 0) {
+        throw std::runtime_error("ring-wrap cancellation did not discard the unfinished request");
+    }
+    std::printf("prefix check ring-wrap cancellation: PASS (ring_slots=%u stage0_chunks=%zu)\n",
+            stage_count + 1, polls - 1);
+    check("ring-wrap cancellation recovery", 2, false);
+
+    common_spd_result stopped;
+    size_t callbacks = 0;
+    if (!pipeline->generate(prompts[2], gparams, stopped, [&](llama_token token, size_t index) {
+                if (index != 0 || token != expected[2].tokens.front()) {
+                    throw std::runtime_error("wrong first token in stopped prefix-check request");
+                }
+                ++callbacks;
+                return false;
+            }) || stopped.cancelled || callbacks != 1 || stopped.tokens.size() != 1) {
+        throw std::runtime_error("token callback stop failed");
+    }
+    check("early-stop recovery", 2, true);
+
+    callbacks = 0;
+    const size_t stop_after = (size_t) stage_count + 1;
+    if (!pipeline->generate(prompts[2], gparams, stopped, [&](llama_token token, size_t index) {
+                if (index != callbacks || token != expected[2].tokens.at(index)) {
+                    throw std::runtime_error("wrong token in filled-pipeline stop check");
+                }
+                return ++callbacks < stop_after;
+            }) || stopped.cancelled || callbacks != stop_after || stopped.tokens.size() != stop_after ||
+            !std::equal(stopped.tokens.begin(), stopped.tokens.end(), expected[2].tokens.begin())) {
+        throw std::runtime_error("filled-pipeline callback stop failed");
+    }
+    check("filled-pipeline stop recovery", 2, true);
+    std::printf("PASS: prefix reuse, full-bundle restore and interrupted-request recovery match cold greedy output\n");
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -334,6 +675,7 @@ int main(int argc, char ** argv) {
     bool parallel_stages = true;
     bool rpc_cache = false;
     bool use_mmap = true;
+    bool check_reuse = false;
     std::string rpc_servers;
     std::string target_device_names;
     std::string draft_device_names;
@@ -344,26 +686,31 @@ int main(int argc, char ** argv) {
     std::string prompt_file;
     std::string phase_file;
     std::string arm = "both";
+    std::string checkpoint_file;
 
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+        if ((std::strcmp(argv[i], "-m") == 0 || std::strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
             target_path = argv[++i];
         } else if ((std::strcmp(argv[i], "-md") == 0 || std::strcmp(argv[i], "--model-draft") == 0) && i + 1 < argc) {
             sidecar_path = argv[++i];
-        } else if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "-p") == 0 || std::strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             prompt = argv[++i];
-        } else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "-n") == 0 || std::strcmp(argv[i], "--n-predict") == 0) && i + 1 < argc) {
             n_predict = std::stoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "--ctx-size") == 0) && i + 1 < argc) {
             n_ctx = std::stoul(argv[++i]);
-        } else if (std::strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "-b") == 0 || std::strcmp(argv[i], "--batch-size") == 0) && i + 1 < argc) {
             n_batch = std::stoul(argv[++i]);
-        } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "-ngl") == 0 || std::strcmp(argv[i], "--n-gpu-layers") == 0) && i + 1 < argc) {
             n_gpu_layers = std::stoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "-ngld") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "-ngld") == 0 || std::strcmp(argv[i], "--n-gpu-layers-draft") == 0) && i + 1 < argc) {
             n_gpu_layers_draft = std::stoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--serial-stages") == 0) {
             parallel_stages = false;
+        } else if (std::strcmp(argv[i], "--check-prefix-reuse") == 0) {
+            check_reuse = true;
+        } else if (std::strcmp(argv[i], "--checkpoint-file") == 0 && i + 1 < argc) {
+            checkpoint_file = argv[++i];
         } else if (std::strcmp(argv[i], "--rpc") == 0 && i + 1 < argc) {
             rpc_servers = argv[++i];
         } else if (std::strcmp(argv[i], "--rpc-cache") == 0) {
@@ -399,7 +746,9 @@ int main(int argc, char ** argv) {
     const bool run_baseline_arm = arm == "both" || arm == "baseline";
     const bool run_spd_arm = arm == "both" || arm == "spd";
     if (target_path.empty() || (run_spd_arm && sidecar_path.empty()) ||
-        (!run_baseline_arm && !run_spd_arm) || n_predict <= 0 || n_batch == 0 || duration_seconds < 0) {
+        (!run_baseline_arm && !run_spd_arm) || n_predict <= 0 || n_batch == 0 || duration_seconds < 0 ||
+        (check_reuse && (!run_spd_arm || checkpoint_file.empty() || duration_seconds != 0)) ||
+        (!checkpoint_file.empty() && !check_reuse)) {
         usage(argv[0]);
         return 1;
     }
@@ -550,6 +899,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::fprintf(stderr, "[spd] initialized %u-stage SPD controller\n", pipeline->stage_count());
+
+    if (check_reuse) {
+        int status = 0;
+        try {
+            check_prefix_reuse(target, sidecar, sp, pipeline, prompt_tokens, n_predict, checkpoint_file);
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "FAIL: %s\n", error.what());
+            status = 2;
+        }
+        pipeline.reset();
+        llama_model_free(sidecar);
+        llama_model_free(target);
+        return status;
+    }
 
     common_spd_result actual;
     double spd_prefill_seconds = 0.0;

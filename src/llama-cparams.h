@@ -7,6 +7,37 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// [fork, SPD shared aggregation bank] the rows of the next sidecar decode, by
+// position. `held` anchors are already summed into the position's ring slot
+// (pos % n_slots); -1 = untracked, which starts from zero in the scratch slot.
+// `n_new` anchors follow it, packed at feat[off] (n_embd floats each).
+struct llama_spd_aggr_plan {
+    std::vector<llama_pos> pos;
+    std::vector<int32_t>   held;
+    std::vector<int32_t>   n_new;
+    std::vector<size_t>    off;
+    std::vector<float>     feat;
+    uint32_t n_slots = 0;
+
+    // row index of position p, -1 if absent; rows are almost always
+    // consecutive positions, so try the direct index first
+    int32_t find(llama_pos p) const {
+        if (pos.empty()) {
+            return -1;
+        }
+        const int64_t guess = (int64_t) p - pos.front();
+        if (guess >= 0 && guess < (int64_t) pos.size() && pos[guess] == p) {
+            return (int32_t) guess;
+        }
+        for (size_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] == p) {
+                return (int32_t) i;
+            }
+        }
+        return -1;
+    }
+};
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -83,6 +114,12 @@ struct llama_cparams {
     // the context; build_inp_embd references it like a weight so the scheduler
     // neither stages it on the CPU nor re-uploads it per eval
     struct ggml_tensor * spd_boundary_inp = nullptr;
+    // [fork, SPD shared aggregation bank] per-position running sums of the
+    // anchor blocks, device-resident, [n_embd, n_slots + 1]; the last column
+    // is scratch for rows the host does not track. The plan names, per
+    // position of the next decode, how many anchors that slot already holds.
+    struct ggml_tensor * spd_aggr_state = nullptr;
+    const struct llama_spd_aggr_plan * spd_aggr_plan = nullptr;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer() + 1] extract input embeddings for layer; slot n_layer = output of the final layer
 

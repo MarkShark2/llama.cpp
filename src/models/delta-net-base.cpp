@@ -460,6 +460,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
+    // [fork] the writes below are head-relative; LLAMA_RS_SPARSE is wired for glm5-next only
+    GGML_ASSERT(inp->s_dst == nullptr && "LLAMA_RS_SPARSE is not supported by this model's conv state");
+
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
@@ -557,10 +560,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        if (inp->s_dst) {
+            // [fork] sparse cells: scatter each seq's state back to its own cell
+            ggml_tensor * rows = ggml_is_contiguous(new_state)
+                    ? ggml_reshape_2d(ctx0, new_state, hparams.n_embd_s(), n_seqs)
+                    : ggml_cont_2d(ctx0, new_state, hparams.n_embd_s(), n_seqs);
+            ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), mem_size, ssm_states_all->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, rows, inp->s_dst));
+        } else {
+            ggml_build_forward_expand(gf,
+                    ggml_cpy(ctx0, new_state,
+                        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        }
 
         return output;
     }

@@ -111,7 +111,13 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // [fork] n_seq_max > 0 also caps the sequence sets per ubatch, independently of n_ubatch
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_seq_max = 0);
+
+    // [fork] LLAMA_UBATCH_SEQS=G: most sequences a hybrid-index ubatch may carry
+    // (0 = no cap). Its k-pool tables scale with the sequences in the ubatch, so
+    // one 64-slot decode round would build 64 slots' pools for every token.
+    static uint32_t ubatch_seq_cap();
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

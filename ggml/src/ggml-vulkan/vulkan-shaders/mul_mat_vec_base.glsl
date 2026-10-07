@@ -31,6 +31,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint expert_i1;
     uint nbi1;
+    uint k_tri;
 #else
     uint base_work_group_y;
     uint ne02;
@@ -52,6 +53,11 @@ uint expert_id;
 #define MMV_MAX_COLS 8
 uint b_off[MMV_MAX_COLS];
 uint d_off[MMV_MAX_COLS];
+
+// [fork] K extent this workgroup walks, set by get_offsets: p.ncols, or for a
+// MUL_MAT_ID with the k_tri hint (expert e sees non-zero B only in its first
+// (e+1)*k_tri columns) that prefix. Row strides stay p.ncols.
+uint ncols_k;
 
 #ifdef MUL_MAT_ID_GROUPED
 // [fork] rows grouped by expert: the count_experts pre-pass (hoisted layout)
@@ -95,6 +101,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     }
     b_offset = b_off[0];
     d_offset = d_off[0];
+    ncols_k = p.k_tri != 0 ? min(p.ncols, (expert_id + 1) * p.k_tri) : p.ncols;
     return;
 #endif
 #ifdef MUL_MAT_ID
@@ -140,6 +147,11 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
         b_off[j] = j*p.batch_stride_b + b_offset;
         d_off[j] = j*p.batch_stride_d + d_offset;
     }
+#ifdef MUL_MAT_ID
+    ncols_k = p.k_tri != 0 ? min(p.ncols, (expert_id + 1) * p.k_tri) : p.ncols;
+#else
+    ncols_k = p.ncols;
+#endif
 }
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM

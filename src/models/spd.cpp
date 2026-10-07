@@ -1,8 +1,14 @@
 #include "models.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+
+extern "C" {
+void ggml_mul_mat_id_set_k_tri(struct ggml_tensor * a, int32_t k_block);
+}
 
 namespace {
 
@@ -50,6 +56,100 @@ private:
     std::vector<float> fallback_embd;
 };
 
+// Shared-block bank: pattern e aggregates as (sum_{k<=e} blk_k x_k) * scale_e +
+// bias_e, so a position's sum only ever grows by the anchors that arrived
+// since the last step. The sums live in a device-resident ring
+// (cparams.spd_aggr_state) and the host sends only the new anchor vectors,
+// through the plan (llama_spd_aggr_set_plan) rather than batch.embd. The
+// batch carries the pattern selectors as tokens.
+class llm_graph_input_spd_shared : public llm_graph_input_i {
+public:
+    llm_graph_input_spd_shared(int64_t n_embd, int64_t n_aggr, const llama_spd_aggr_plan * plan, int64_t c)
+        : n_embd(n_embd), n_aggr(n_aggr), plan(plan), c(c) {}
+
+    // widest new-anchor run in the ubatch; every row is padded to it
+    static int64_t width(const llama_ubatch & ubatch, const llama_spd_aggr_plan * plan, int64_t n_aggr) {
+        if (ubatch.token == nullptr || ubatch.pos == nullptr || plan == nullptr) {
+            return n_aggr;
+        }
+        int32_t widest = 1;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const int32_t row = plan->find(ubatch.pos[i]);
+            if (row >= 0) {
+                widest = std::max(widest, plan->n_new[row]);
+            }
+        }
+        return widest;
+    }
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const uint32_t n_rows  = ubatch->n_tokens;
+        const int32_t  scratch = (int32_t) plan->n_slots;
+
+        pattern.assign(n_rows, (int32_t) n_aggr - 1);
+        feat_data.assign((size_t) n_rows*c*n_embd, 0.0f);
+        ids_data.assign((size_t) n_rows*c, 0);
+        slot_data.assign(n_rows, scratch);
+        keep_data.assign(n_rows, 0.0f);
+
+        for (uint32_t i = 0; ubatch->token != nullptr && i < n_rows; ++i) {
+            const int32_t row = plan->find(ubatch->pos[i]);
+            if (row < 0) {
+                // not described by the plan: contributes nothing and leaves the
+                // ring alone (warmup, or a decode the host did not plan)
+                continue;
+            }
+            const int32_t held  = plan->held[row];
+            const int32_t first = std::max(held, 0);
+            const int32_t n_new = plan->n_new[row];
+            GGML_ASSERT(n_new <= c);
+            GGML_ASSERT(ubatch->token[i] == first + n_new - 1);
+            GGML_ASSERT(ubatch->token[i] >= 0 && ubatch->token[i] < n_aggr);
+
+            pattern[i] = ubatch->token[i];
+            if (held >= 0) {
+                slot_data[i] = (int32_t) (ubatch->pos[i] % (llama_pos) plan->n_slots);
+                keep_data[i] = held > 0 ? 1.0f : 0.0f;
+            }
+            for (int32_t t = 0; t < n_new; ++t) {
+                ids_data[(size_t) i*c + t] = first + t;
+            }
+            std::memcpy(feat_data.data() + (size_t) i*c*n_embd, plan->feat.data() + plan->off[row],
+                    (size_t) n_new*n_embd*sizeof(float));
+        }
+
+        ggml_backend_tensor_set(tokens, pattern.data(),   0, ggml_nbytes(tokens));
+        ggml_backend_tensor_set(feat,   feat_data.data(), 0, ggml_nbytes(feat));
+        ggml_backend_tensor_set(ids,    ids_data.data(),  0, ggml_nbytes(ids));
+        ggml_backend_tensor_set(slots,  slot_data.data(), 0, ggml_nbytes(slots));
+        ggml_backend_tensor_set(keep,   keep_data.data(), 0, ggml_nbytes(keep));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return tokens != nullptr &&
+               tokens->ne[0] == params.ubatch.n_tokens &&
+               params.cparams.spd_aggr_plan == plan &&
+               width(params.ubatch, plan, n_aggr) == c;
+    }
+
+    ggml_tensor * tokens = nullptr; // I32 [n_rows]            pattern selector
+    ggml_tensor * feat   = nullptr; // F32 [n_embd, c, n_rows] new anchors, zero-padded
+    ggml_tensor * ids    = nullptr; // I32 [c, n_rows]         their anchor indices
+    ggml_tensor * slots  = nullptr; // I32 [n_rows]            ring slot, n_slots = scratch
+    ggml_tensor * keep   = nullptr; // F32 [1, n_rows]         0 = start the sum over
+
+private:
+    const int64_t n_embd;
+    const int64_t n_aggr;
+    const llama_spd_aggr_plan * plan;
+    const int64_t c;
+    std::vector<int32_t> pattern;
+    std::vector<float>   feat_data;
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> slot_data;
+    std::vector<float>   keep_data;
+};
+
 }
 
 void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
@@ -61,6 +161,23 @@ void llama_model_spd::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SPD_CHECKPOINT_VERSION, checkpoint_version);
     ml.get_key(LLM_KV_SPD_STAGE_COUNT, stage_count);
     ml.get_key(LLM_KV_SPD_USE_DEEPEST, use_deepest);
+
+    const int64_t target_arch_key = gguf_find_key(ml.metadata, "spd.target_architecture");
+    if (target_arch_key >= 0 && gguf_get_kv_type(ml.metadata, target_arch_key) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("SPD target_architecture must be a string");
+    }
+    const int64_t stage_layers_key = gguf_find_key(ml.metadata, "spd.stage_layers");
+    if (stage_layers_key >= 0) {
+        if (gguf_get_kv_type(ml.metadata, stage_layers_key) != GGUF_TYPE_ARRAY ||
+                gguf_get_arr_type(ml.metadata, stage_layers_key) != GGUF_TYPE_UINT32) {
+            throw std::runtime_error("SPD stage_layers must be a uint32 array");
+        }
+        ml.get_arr("spd.stage_layers", stage_layers);
+        if (stage_layers.size() != stage_count ||
+                std::find(stage_layers.begin(), stage_layers.end(), 0) != stage_layers.end()) {
+            throw std::runtime_error("SPD stage_layers must contain one positive layer count per stage");
+        }
+    }
 
     // The sidecar is trained on fixed-length windows cut out of the corpus
     // (train_offline.py --chunk), so it has never attended across more than
@@ -125,7 +242,14 @@ void llama_model_spd::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_aggr = target_layer_ids.size();
-    spd_aggr = create_tensor(tn(LLM_TENSOR_SPD_AGGR, "weight"), { n_embd*n_aggr, n_embd, n_aggr }, 0);
+    if (ml->get_tensor_meta(tn(LLM_TENSOR_SPD_AGGR_BLK, "weight").str().c_str()) != nullptr) {
+        spd_aggr_blk   = create_tensor(tn(LLM_TENSOR_SPD_AGGR_BLK,   "weight"), { n_embd, n_embd, n_aggr }, 0);
+        // no ".weight" suffix: llama-quantize keeps these f32 the way it keeps d2t
+        spd_aggr_scale = create_tensor(tn(LLM_TENSOR_SPD_AGGR_SCALE), { n_embd, n_aggr }, 0);
+        spd_aggr_bias  = create_tensor(tn(LLM_TENSOR_SPD_AGGR_BIAS),  { n_embd, n_aggr }, 0);
+    } else {
+        spd_aggr = create_tensor(tn(LLM_TENSOR_SPD_AGGR, "weight"), { n_embd*n_aggr, n_embd, n_aggr }, 0);
+    }
 
     const ggml_tensor * d2t_meta = ml->get_tensor_meta(tn(LLM_TENSOR_D2T).str().c_str());
     if (d2t_meta == nullptr || d2t_meta->type != GGML_TYPE_I64) {
@@ -162,20 +286,59 @@ llama_model_spd::graph::graph(const llama_model & model, const llm_graph_params 
     const int64_t n_aggr = model.target_layer_ids.size();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-    auto inp = std::make_unique<llm_graph_input_spd>(hparams.n_embd_inp(), n_aggr);
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
-    ggml_set_input(inp->tokens);
-    ggml_set_input(inp->embd);
-    res->t_inp_tokens = inp->tokens;
+    ggml_tensor * inpL = nullptr;
+    if (model.spd_aggr_blk != nullptr) {
+        ggml_tensor * state = cparams.spd_aggr_state;
+        const llama_spd_aggr_plan * plan = cparams.spd_aggr_plan;
+        GGML_ASSERT(state != nullptr && plan != nullptr);
 
-    ggml_tensor * aggr_ids = ggml_reshape_2d(ctx0, inp->tokens, 1, n_tokens);
-    ggml_tensor * aggr_inp = ggml_reshape_3d(ctx0, inp->embd, hparams.n_embd_inp(), 1, n_tokens);
-    ggml_tensor * inpL = ggml_mul_mat_id(ctx0, model.spd_aggr, aggr_inp, aggr_ids);
-    inpL = ggml_reshape_2d(ctx0, inpL, n_embd, n_tokens);
+        const int64_t c = llm_graph_input_spd_shared::width(ubatch, plan, n_aggr);
+        auto inp = std::make_unique<llm_graph_input_spd_shared>(n_embd, n_aggr, plan, c);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        inp->feat   = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, c, n_tokens);
+        inp->ids    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, c, n_tokens);
+        inp->slots  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        inp->keep   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->tokens);
+        ggml_set_input(inp->feat);
+        ggml_set_input(inp->ids);
+        ggml_set_input(inp->slots);
+        ggml_set_input(inp->keep);
+        res->t_inp_tokens = inp->tokens;
+
+        // one block per new anchor, summed over the run
+        ggml_tensor * contrib = ggml_mul_mat_id(ctx0, model.spd_aggr_blk, inp->feat, inp->ids);
+        ggml_tensor * sum = ggml_view_2d(ctx0, contrib, n_embd, n_tokens, contrib->nb[2], 0);
+        for (int64_t t = 1; t < c; ++t) {
+            sum = ggml_add(ctx0, sum, ggml_view_2d(ctx0, contrib, n_embd, n_tokens, contrib->nb[2], t*contrib->nb[1]));
+        }
+
+        // what the slot already held, unless this row starts over
+        ggml_tensor * prev = ggml_mul(ctx0, ggml_get_rows(ctx0, state, inp->slots), inp->keep);
+        ggml_tensor * acc  = ggml_add(ctx0, prev, sum);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, state, acc, inp->slots));
+
+        inpL = ggml_mul(ctx0, acc, ggml_get_rows(ctx0, model.spd_aggr_scale, inp->tokens));
+        inpL = ggml_add(ctx0, inpL, ggml_get_rows(ctx0, model.spd_aggr_bias, inp->tokens));
+        res->add_input(std::move(inp));
+    } else {
+        auto inp = std::make_unique<llm_graph_input_spd>(hparams.n_embd_inp(), n_aggr);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+        ggml_set_input(inp->tokens);
+        ggml_set_input(inp->embd);
+        res->t_inp_tokens = inp->tokens;
+
+        ggml_tensor * aggr_ids = ggml_reshape_2d(ctx0, inp->tokens, 1, n_tokens);
+        ggml_tensor * aggr_inp = ggml_reshape_3d(ctx0, inp->embd, hparams.n_embd_inp(), 1, n_tokens);
+        inpL = ggml_mul_mat_id(ctx0, model.spd_aggr, aggr_inp, aggr_ids);
+        // pattern e has non-zero weights only in its first e+1 anchor blocks
+        ggml_mul_mat_id_set_k_tri(inpL, hparams.n_embd_inp()/n_aggr);
+        inpL = ggml_reshape_2d(ctx0, inpL, n_embd, n_tokens);
+        res->add_input(std::move(inp));
+    }
     cb(inpL, "spd_aggr", -1);
     res->t_inp_embd = inpL;
-    res->add_input(std::move(inp));
     ggml_build_forward_expand(gf, inpL);
 
     int sections[4];
