@@ -1361,6 +1361,10 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 
         auto & sampler = samplers[seq_id];
 
+        auto binding = graph_bindings.find(seq_id);
+        if (binding != graph_bindings.end()) {
+            binding->second();
+        }
         if (sampler->iface->backend_set_input) {
             sampler->iface->backend_set_input(sampler);
         }
@@ -3906,6 +3910,7 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto * sampling_input = inp_sampling.get();
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
@@ -3988,6 +3993,14 @@ void llm_graph_context::build_sampling() const {
                 }
                 outs[1] = data.candidates;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            }
+        }
+    }
+
+    if (arch == LLM_ARCH_SPD && !cparams.spd_target_k_state.empty()) {
+        for (const auto & [seq_id, sampler] : samplers) {
+            if (llama_sampler_backend_graph_reuse_supported(sampler)) {
+                sampling_input->graph_bindings.emplace(seq_id, llama_sampler_backend_graph_binding(sampler));
             }
         }
     }

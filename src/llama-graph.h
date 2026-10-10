@@ -785,6 +785,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::function<void()>> graph_bindings;
 };
 
 //
@@ -908,6 +909,19 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (arch == LLM_ARCH_SPD && (
+                cparams.flash_attn                != other.cparams.flash_attn ||
+                cparams.spd_aggr_plan             != other.cparams.spd_aggr_plan ||
+                cparams.spd_aggr_state            != other.cparams.spd_aggr_state ||
+                cparams.spd_aggr_view_state       != other.cparams.spd_aggr_view_state ||
+                cparams.spd_aggr_correction_state != other.cparams.spd_aggr_correction_state ||
+                cparams.spd_target_k_state        != other.cparams.spd_target_k_state ||
+                cparams.spd_target_v_state        != other.cparams.spd_target_v_state ||
+                cparams.spd_raw_k_state           != other.cparams.spd_raw_k_state ||
+                cparams.spd_raw_v_state           != other.cparams.spd_raw_v_state)) {
             return false;
         }
 

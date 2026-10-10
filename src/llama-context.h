@@ -496,6 +496,18 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    struct spd_graph_variant {
+        llm_graph_result_ptr res;
+        ggml_backend_sched_ptr sched;
+        size_t buffer_size;
+    };
+    // Parked variants are synchronized and own both graph metadata and allocation.
+    std::deque<spd_graph_variant> spd_graph_cache;
+    bool spd_graph_cache_current = false;
+    void spd_graph_cache_clear();
+    void spd_graph_cache_park();
+    bool spd_graph_cache_select(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx);
+
     // classic stage 2 runs every slot's verification group of one batch on its
     // own lanes, so this bounds n_parallel x (1 + n_draft_max)
     static constexpr uint32_t PIPEDEC_STAGE2_MAX_LANES = 32;

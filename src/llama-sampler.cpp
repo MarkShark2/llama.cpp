@@ -4296,6 +4296,74 @@ struct llama_sampler * llama_sampler_init_infill(const struct llama_vocab * voca
     );
 }
 
+bool llama_sampler_backend_graph_reuse_supported(const llama_sampler * sampler) {
+    if (sampler->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            if (!llama_sampler_backend_graph_reuse_supported(entry.ptr)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return sampler->iface == &llama_sampler_empty_i ||
+           sampler->iface == &llama_sampler_greedy_i ||
+           sampler->iface == &llama_sampler_dist_i ||
+           sampler->iface == &llama_sampler_top_k_i ||
+           sampler->iface == &llama_sampler_top_p_i ||
+           sampler->iface == &llama_sampler_min_p_i ||
+           sampler->iface == &llama_sampler_temp_i ||
+           sampler->iface == &llama_sampler_temp_ext_i ||
+           sampler->iface == &llama_sampler_penalties_i ||
+           sampler->iface == &llama_sampler_logit_bias_i;
+}
+
+std::function<void()> llama_sampler_backend_graph_binding(llama_sampler * sampler) {
+    if (sampler->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) sampler->ctx;
+        std::vector<std::function<void()>> bindings;
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            bindings.push_back(llama_sampler_backend_graph_binding(entry.ptr));
+        }
+        return [bindings = std::move(bindings)] {
+            for (const auto & bind : bindings) {
+                bind();
+            }
+        };
+    }
+    if (sampler->iface == &llama_sampler_dist_i) {
+        auto * ctx = (llama_sampler_dist *) sampler->ctx;
+        return [ctx, uniforms = ctx->inp_uniforms] {
+            ctx->inp_uniforms = uniforms;
+        };
+    }
+    if (sampler->iface == &llama_sampler_penalties_i) {
+        auto * ctx = (llama_sampler_penalties *) sampler->ctx;
+        return [ctx, ids = ctx->inp_token_ids, counts = ctx->inp_counts,
+                n_max = ctx->n_max, has_candidates = ctx->has_candidates] {
+            ctx->inp_token_ids = ids;
+            ctx->inp_counts = counts;
+            ctx->n_max = n_max;
+            ctx->has_candidates = has_candidates;
+        };
+    }
+    if (sampler->iface == &llama_sampler_logit_bias_i) {
+        auto * ctx = (llama_sampler_logit_bias *) sampler->ctx;
+        return [ctx, bias = ctx->inp_logit_bias, ids = ctx->inp_logit_idxs] {
+            ctx->inp_logit_bias = bias;
+            ctx->inp_logit_idxs = ids;
+        };
+    }
+    GGML_ASSERT(llama_sampler_backend_graph_reuse_supported(sampler));
+    return [] {};
+}
+
 void llama_sampler_copy(const struct llama_sampler * src, struct llama_sampler * dst) {
     if (!src || !dst || src == dst) {
         return;
