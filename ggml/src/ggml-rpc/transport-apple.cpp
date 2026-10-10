@@ -388,10 +388,20 @@ int apple_rdma::impl::progress() {
 // Reserve a free send buffer to coalesce into, waiting on progress if none free.
 bool apple_rdma::impl::acquire_pending() {
     if (pend_buf >= 0) return true;
+    unsigned idle = 0;
     for (;;) {
         if (broken) return false;
         for (int k = 0; k < RDMA_NBUF; k++) if (!send_busy[k]) { pend_buf = k; pend_len = 0; return true; }
         if (progress() < 0) return false;
+        // Session failure shuts down TCP to interrupt blocked RDMA senders too.
+        if ((++idle & 0xFFFFF) == 0) {
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            if (poll(&pfd, 1, 0) > 0 &&
+                (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+                broken = true;
+                return false;
+            }
+        }
     }
 }
 

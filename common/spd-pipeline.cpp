@@ -3204,7 +3204,19 @@ struct common_spd_pipeline::impl {
                 }
             }
             scope_timer copy_timer(timing.stage_copy[stage]);
-            ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
+            using ordered_copy_fn = int (*)(const ggml_tensor *, ggml_tensor *);
+            auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(pb_in->inp_dec->buffer));
+            auto reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto ordered_copy = reg != nullptr ? (ordered_copy_fn) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_rpc_tensor_copy_ordered") : nullptr;
+            const int copied = ordered_copy != nullptr ? ordered_copy(pb_in->staging_dec[slot], pb_in->inp_dec) : 0;
+            if (copied < 0) {
+                error = "SPD ordered boundary copy failed for decode stage " + std::to_string(stage);
+                return false;
+            }
+            if (copied == 0) {
+                ggml_backend_tensor_copy(pb_in->staging_dec[slot], pb_in->inp_dec);
+            }
         }
 
         const uint32_t n_rollback = stage_rollback_tokens(stage);
@@ -3890,14 +3902,14 @@ struct common_spd_pipeline::impl {
             fprintf(stderr,
                     "SPD timing: steps=%" PRIu64 " decode=%.2fs (%.1f ms/step) rollback_mode=%s | "
                     "prepare %.2fs | stages(wall) %.2fs | sidecar-extra %.2fs | head %.2fs/%" PRIu64 " | "
-                    "embed %.2fs/%" PRIu64 " | rollback %.2fs/%" PRIu64 " | other %.2fs\n",
+                    "embed %.2fs/%" PRIu64 " | rollback %.2fs/%" PRIu64 " calls | rejected=%" PRIu64 " | other %.2fs\n",
                     result.decode_steps, result.decode_seconds,
                     1e3*result.decode_seconds/(double) result.decode_steps,
                     light_rollback ? "seq_rm" : "seq_cp",
                     timing.prepare, timing.stage_wall, timing.sidecar_extra,
                     timing.head, timing.head_calls,
                     timing.embed, timing.embed_calls,
-                    timing.rollback, result.n_rejected,
+                    timing.rollback, timing.rollback_calls, result.n_rejected,
                     other);
             if (sidecar_host_fallback_count > 0) {
                 fprintf(stderr, "SPD timing: sidecar host-argmax fallbacks %" PRIu64 "\n",

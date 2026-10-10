@@ -136,6 +136,8 @@ enum rpc_cmd {
     // payload the server stashed recently is sent as header + hash only, see
     // rpc_dedupe_lru.
     RPC_CMD_SET_TENSOR_DEDUPE,
+    // Main-stream whole-tensor copy; completion is observed by the next read.
+    RPC_CMD_COPY_TENSOR_ORDERED,
     RPC_CMD_COUNT,
 };
 
@@ -153,6 +155,10 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 #define GGML_RPC_DEDUPE_MIN_PATCH 5
 // ...and a dedupe miss sent as byte ranges against a stashed payload
 #define GGML_RPC_DELTA_MIN_PATCH 6
+
+// Optional extension of fork 6.0.6: HELLO response byte 3 was zero padding.
+// Old clients ignore it; old servers leave it zero. Transport caps are unchanged.
+static constexpr uint8_t RPC_FEATURE_ORDERED_COPY = 1 << 0;
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -174,7 +180,7 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t features;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -469,6 +475,7 @@ static rpc_phase_kind rpc_phase_command(rpc_cmd cmd) {
         case RPC_CMD_PEER_OPEN:
         case RPC_CMD_PUSH_TENSOR: return RPC_PHASE_PEER;
         case RPC_CMD_COPY_TENSOR:
+        case RPC_CMD_COPY_TENSOR_ORDERED:
         case RPC_CMD_MEMSET_TENSOR:
         case RPC_CMD_BUFFER_CLEAR: return RPC_PHASE_MAINTENANCE;
         default: return RPC_PHASE_OTHER;
@@ -710,7 +717,7 @@ size_t ggml_backend_rpc_cache_threshold(void) {
 // [fork] reports the server's patch level and fails soft instead of aborting:
 // the connection may have been accepted and dropped (server busy with another
 // client) and the caller retries.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * out_patch = nullptr) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * out_patch = nullptr, uint8_t * out_features = nullptr) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -730,6 +737,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * ou
 
     if (out_patch != nullptr) {
         *out_patch = response.patch;
+    }
+    if (out_features != nullptr) {
+        *out_features = response.major == 6 && response.minor == 0 && response.patch >= 6
+                ? response.features : 0;
     }
     sock->update_caps(response.conn_caps);
     return true;
@@ -992,6 +1003,7 @@ public:
     const std::string endpoint;
     // server RPC_PROTO_PATCH_VERSION learnt at HELLO; gates the fork commands
     uint8_t   patch = 0;
+    uint8_t   features = 0;
     rpc_lanes lanes;
     rpc_phase_profile peer_profile;
 
@@ -1349,10 +1361,10 @@ bool rpc_dispatcher::start() {
     // endpoint - retry with backoff before giving up
     constexpr int max_attempts = 5;
     socket_ptr s;
-    uint8_t server_patch = 0;
+    uint8_t server_patch = 0, server_features = 0;
     for (int attempt = 1; attempt <= max_attempts; ++attempt) {
         s = socket_t::connect(host.c_str(), port);
-        if (s != nullptr && negotiate_hello(s, &server_patch)) {
+        if (s != nullptr && negotiate_hello(s, &server_patch, &server_features)) {
             break;
         }
         s = nullptr;
@@ -1374,6 +1386,7 @@ bool rpc_dispatcher::start() {
         std::lock_guard<std::mutex> l(sock_m);
         sock  = s;
         patch = server_patch;
+        features = server_features;
     }
     {
         // the server's main-lane ordering counter is per connection and
@@ -2066,6 +2079,45 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         return response.result;
     }
     return false;
+}
+
+// Returns 0 without sending when unsupported, 1 after transmission, -1 on failure.
+// The caller must fence delivery first and observe a later graph/read completion.
+extern "C" {
+GGML_BACKEND_API int ggml_backend_rpc_tensor_copy_ordered(const ggml_tensor * src, ggml_tensor * dst);
+
+GGML_BACKEND_API int ggml_backend_rpc_tensor_copy_ordered(const ggml_tensor * src, ggml_tensor * dst) {
+    auto disp = rpc_tensor_dispatcher(src);
+    if (disp == nullptr || rpc_tensor_dispatcher(dst) != disp ||
+            !(disp->features & RPC_FEATURE_ORDERED_COPY) || !ggml_are_same_layout(src, dst)) {
+        return 0;
+    }
+    auto request = std::make_shared<rpc_msg_copy_tensor_req>();
+    request->src = serialize_tensor(src);
+    request->dst = serialize_tensor(dst);
+    if (!disp->send(RPC_CMD_COPY_TENSOR_ORDERED, request, sizeof(*request))) {
+        // Retain the closed socket: reconnecting would invalidate remote handles.
+        auto sock = disp->get_sock();
+        if (sock != nullptr) {
+            sock->shutdown_rw();
+        }
+        std::shared_ptr<rpc_dispatcher> set_lane, get_lane;
+        {
+            std::lock_guard<std::mutex> l(disp->lanes.m);
+            set_lane = disp->lanes.set_lane;
+            get_lane = disp->lanes.get_lane;
+        }
+        for (const auto & lane : {set_lane, get_lane}) {
+            auto lane_sock = lane != nullptr ? lane->get_sock() : nullptr;
+            if (lane_sock != nullptr) {
+                lane_sock->shutdown_rw();
+            }
+        }
+        g_rpc_session_lost.store(true);
+        return -1;
+    }
+    return 1;
+}
 }
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -3960,7 +4012,7 @@ static void rpc_peer_sender(rpc_peer_link * link, std::string endpoint) {
 
 // close every peer link; called when the session that created them ends so a
 // later client does not inherit sockets into a stale peer session
-static void rpc_peer_links_close() {
+static void rpc_peer_links_close(bool abort_pending) {
     std::unordered_map<std::string, std::shared_ptr<rpc_peer_link>> links;
     {
         std::lock_guard<std::mutex> l(g_peer_mutex);
@@ -3970,6 +4022,16 @@ static void rpc_peer_links_close() {
         {
             std::lock_guard<std::mutex> l(kv.second->q_m);
             kv.second->closing = true;
+            if (abort_pending) {
+                kv.second->q.clear();
+                kv.second->q_bytes = 0;
+            }
+        }
+        if (abort_pending) {
+            std::lock_guard<std::mutex> l(kv.second->m);
+            if (kv.second->sock != nullptr) {
+                kv.second->sock->shutdown_rw();
+            }
         }
         kv.second->q_cv.notify_all();
         if (kv.second->sender.joinable()) {
@@ -4014,7 +4076,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool imatrix_sqsum(const rpc_msg_imatrix_sqsum_req & request, std::vector<uint8_t> & response);
     bool get_tensor_bf16(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
-    bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response, bool ordered = false);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool graph_forget(const rpc_msg_graph_forget_req & request);
@@ -4199,6 +4261,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.features = RPC_FEATURE_ORDERED_COPY;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -5440,7 +5503,7 @@ bool rpc_server::imatrix_sqsum(const rpc_msg_imatrix_sqsum_req & request, std::v
     return true;
 }
 
-bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
+bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response, bool ordered) {
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -5477,7 +5540,17 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
-    response.result = ggml_backend_buffer_copy_tensor(src, dst);
+    if (ordered) {
+        if (!ggml_are_same_layout(src, dst)) {
+            GGML_LOG_ERROR("[%s] ordered copy layout mismatch\n", __func__);
+            return false;
+        }
+        // Includes synchronous host staging when the backend cannot copy directly.
+        ggml_backend_tensor_copy(src, dst);
+        response.result = true;
+    } else {
+        response.result = ggml_backend_buffer_copy_tensor(src, dst);
+    }
     return true;
 }
 
@@ -5818,6 +5891,7 @@ struct rpc_lane_set_msg {
 struct rpc_active_session {
     uint64_t     id     = 0;
     rpc_server * server = nullptr;
+    bool detached = false; // last main command successfully parked this session
 
     // execution-order counters: commands fully processed per lane
     std::mutex              sync_m;
@@ -6160,6 +6234,11 @@ static bool rpc_session_attach_lane(uint64_t session_id, uint8_t lane, socket_pt
 }
 
 static void rpc_session_shutdown_lanes(rpc_active_session & s) {
+    bool abort_pending;
+    {
+        std::lock_guard<std::mutex> l(s.sync_m);
+        abort_pending = s.failed || !s.detached;
+    }
     {
         std::lock_guard<std::mutex> l(s.lane_m);
         s.closing = true;
@@ -6190,8 +6269,8 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
     if (s.get_th.joinable()) {
         s.get_th.join();
     }
-    // drop our outgoing links too: they belong to the session that opened them
-    rpc_peer_links_close();
+    // Only an explicit, quiesced detach can drain peers after the main stream ends.
+    rpc_peer_links_close(abort_pending);
 }
 
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
@@ -6208,6 +6287,7 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        session.detached = false;
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
@@ -6453,6 +6533,18 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 }
                 break;
             }
+            case RPC_CMD_COPY_TENSOR_ORDERED: {
+                rpc_msg_copy_tensor_req request;
+                rpc_msg_copy_tensor_rsp response = {};
+                if (!recv_msg(sock, &request, sizeof(request)) ||
+                        !server.copy_tensor(request, response, true) || !response.result) {
+                    GGML_LOG_ERROR("[rpc] ordered copy failed; terminating session\n");
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GRAPH_COMPUTE: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -6519,6 +6611,7 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
+                session.detached = true;
                 break;
             }
             case RPC_CMD_SESSION_RESUME: {
@@ -6603,6 +6696,7 @@ static bool rpc_handshake_hello(const socket_ptr & sock) {
     rsp.major = RPC_PROTO_MAJOR_VERSION;
     rsp.minor = RPC_PROTO_MINOR_VERSION;
     rsp.patch = RPC_PROTO_PATCH_VERSION;
+    rsp.features = RPC_FEATURE_ORDERED_COPY;
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
@@ -6761,6 +6855,8 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
                 g_session_active = &session;
             }
             rpc_serve_client(server, session, client_socket);
+            // A failed no-response command must wake the next read before joins.
+            client_socket->shutdown_rw();
             {
                 std::lock_guard<std::mutex> l(g_session_mutex);
                 g_session_active = nullptr;
@@ -6958,6 +7054,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_buffer_endpoint") == 0) {
         return (void *)ggml_backend_rpc_buffer_endpoint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_tensor_copy_ordered") == 0) {
+        return (void *)ggml_backend_rpc_tensor_copy_ordered;
     }
     if (std::strcmp(name, "ggml_backend_rpc_device_endpoint") == 0) {
         return (void *)ggml_backend_rpc_device_get_endpoint;
