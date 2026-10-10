@@ -5376,8 +5376,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // n=1 366 -> 287 us, n=8 1252 -> 557 us at 8 rows; 16 spills. The grouped
     // MUL_MAT_ID (SPD aggregation bank, 13 patterns) 13.5 -> 10.0 ms.
     const uint32_t rm_q8_0 = (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_GCN) ? 8 : 1*rm_stdq;
-    // Skip padded columns in sparse Q8 groups on GCN.
-    const uint32_t q8_0_skip_inactive_cols = device->architecture == AMD_GCN && !device->integer_dot_product;
+    // Opt-in: the GCN driver can lose more to uniform control flow than it saves
+    // by skipping padded columns. Keep the established dispatch as the default.
+    const char * q8_skip_padded = std::getenv("GGML_VK_GCN_Q8_SKIP_PADDED");
+    const uint32_t q8_0_skip_inactive_cols = device->architecture == AMD_GCN && !device->integer_dot_product &&
+            q8_skip_padded && std::atoi(q8_skip_padded) != 0;
 
     // [fork] rows per workgroup for the codebook IQ types on the mul_mat_vec_ID
     // path. Every workgroup fills its whole grid table into LDS before doing any
