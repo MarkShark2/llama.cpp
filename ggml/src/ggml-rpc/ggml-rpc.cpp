@@ -437,7 +437,163 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
     return hash;
 }
 
+// Bounded attribution only. Socket receive time includes remote queueing and
+// compute; it is not wire time and is not additive with the enclosing service.
+using rpc_phase_clock = std::chrono::steady_clock;
+
+static uint32_t rpc_phase_limit() {
+    static const uint32_t limit = [] {
+        const char * value = std::getenv("GGML_RPC_PHASE_PROFILE");
+        return value ? (uint32_t) std::clamp(std::strtol(value, nullptr, 10), 0L, 100000L) : 0;
+    }();
+    return limit;
+}
+
+static uint32_t rpc_phase_skip() {
+    static const uint32_t skip = [] {
+        const char * value = std::getenv("GGML_RPC_PHASE_SKIP");
+        return value ? (uint32_t) std::clamp(std::strtol(value, nullptr, 10), 0L, 1000000000L) : 0;
+    }();
+    return skip;
+}
+
+enum rpc_phase_kind { RPC_PHASE_OTHER, RPC_PHASE_MAINTENANCE, RPC_PHASE_PEER, RPC_PHASE_GET, RPC_PHASE_GRAPH, RPC_PHASE_COUNT };
+
+static rpc_phase_kind rpc_phase_command(rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_GRAPH_COMPUTE:
+        case RPC_CMD_GRAPH_RECOMPUTE: return RPC_PHASE_GRAPH;
+        case RPC_CMD_GET_TENSOR:
+        case RPC_CMD_GET_TENSOR_BF16: return RPC_PHASE_GET;
+        case RPC_CMD_LANE_FENCE:
+        case RPC_CMD_PEER_OPEN:
+        case RPC_CMD_PUSH_TENSOR: return RPC_PHASE_PEER;
+        case RPC_CMD_COPY_TENSOR:
+        case RPC_CMD_MEMSET_TENSOR:
+        case RPC_CMD_BUFFER_CLEAR: return RPC_PHASE_MAINTENANCE;
+        default: return RPC_PHASE_OTHER;
+    }
+}
+
+struct rpc_phase_sample {
+    rpc_phase_kind kind = RPC_PHASE_OTHER;
+    double lock_ms = 0, queue_ms = 0, service_ms = 0, send_ms = 0, recv_ms = 0, dependency_ms = 0, read_ms = 0;
+};
+
+static thread_local rpc_phase_sample rpc_phase_data;
+static thread_local rpc_phase_sample * rpc_phase_current = nullptr;
+
+struct rpc_phase_profile {
+    struct total {
+        uint32_t count = 0;
+        rpc_phase_sample sum;
+    };
+    std::array<total, RPC_PHASE_COUNT> totals = {};
+    uint32_t seen = 0;
+    std::atomic<uint32_t> count{0};
+    bool armed = false;
+
+    bool enabled() const { return rpc_phase_limit() > 0 && count.load(std::memory_order_relaxed) < rpc_phase_limit(); }
+
+    void add(const char * role, const std::string & endpoint, const rpc_phase_sample & sample) {
+        armed |= sample.kind == RPC_PHASE_GRAPH;
+        if (!armed || seen++ < rpc_phase_skip()) {
+            return;
+        }
+        auto & t = totals[sample.kind];
+        ++t.count;
+        t.sum.lock_ms += sample.lock_ms;
+        t.sum.queue_ms += sample.queue_ms;
+        t.sum.service_ms += sample.service_ms;
+        t.sum.send_ms += sample.send_ms;
+        t.sum.recv_ms += sample.recv_ms;
+        t.sum.dependency_ms += sample.dependency_ms;
+        t.sum.read_ms += sample.read_ms;
+        if (count.fetch_add(1, std::memory_order_relaxed) + 1 != rpc_phase_limit()) {
+            return;
+        }
+        static const char * names[] = { "other", "maintenance", "peer", "get", "graph" };
+        for (size_t i = 0; i < totals.size(); ++i) {
+            const auto & row = totals[i];
+            if (row.count == 0) {
+                continue;
+            }
+            const double n = row.count;
+            GGML_LOG_INFO("[rpc phase] %s %s %s n=%u mean_ms: lock=%.3f queue=%.3f service=%.3f send=%.3f recv=%.3f dependency=%.3f read=%.3f\n",
+                    role, endpoint.c_str(), names[i], row.count, row.sum.lock_ms/n, row.sum.queue_ms/n,
+                    row.sum.service_ms/n, row.sum.send_ms/n, row.sum.recv_ms/n, row.sum.dependency_ms/n, row.sum.read_ms/n);
+        }
+    }
+};
+
+struct rpc_phase_scope {
+    rpc_phase_profile & profile;
+    const char * role;
+    const std::string & endpoint;
+    rpc_phase_sample & sample = rpc_phase_data;
+    rpc_phase_clock::time_point start;
+    bool active;
+
+    rpc_phase_scope(rpc_phase_profile & profile, const char * role, const std::string & endpoint,
+            rpc_cmd cmd = RPC_CMD_NONE, double lock_ms = 0, double queue_ms = 0)
+        : profile(profile), role(role), endpoint(endpoint), active(profile.enabled() && rpc_phase_current == nullptr) {
+        if (active) {
+            sample = {};
+            sample.kind = rpc_phase_command(cmd);
+            sample.lock_ms = lock_ms;
+            sample.queue_ms = queue_ms;
+            start = rpc_phase_clock::now();
+            rpc_phase_current = &sample;
+        }
+    }
+
+    ~rpc_phase_scope() {
+        if (active) {
+            sample.service_ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - start).count();
+            rpc_phase_current = nullptr;
+            profile.add(role, endpoint, sample);
+        }
+    }
+};
+
+struct rpc_phase_io {
+    rpc_phase_sample * sample = rpc_phase_current;
+    bool send;
+    rpc_phase_clock::time_point start;
+
+    explicit rpc_phase_io(bool send, rpc_cmd cmd = RPC_CMD_NONE) : send(send) {
+        if (sample) {
+            sample->kind = std::max(sample->kind, rpc_phase_command(cmd));
+            start = rpc_phase_clock::now();
+        }
+    }
+    ~rpc_phase_io() {
+        if (sample) {
+            const double ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - start).count();
+            (send ? sample->send_ms : sample->recv_ms) += ms;
+        }
+    }
+};
+
+struct rpc_phase_wait {
+    double * total;
+    rpc_phase_clock::time_point start;
+
+    explicit rpc_phase_wait(bool read) : total(rpc_phase_current
+            ? (read ? &rpc_phase_current->read_ms : &rpc_phase_current->dependency_ms) : nullptr) {
+        if (total) {
+            start = rpc_phase_clock::now();
+        }
+    }
+    ~rpc_phase_wait() {
+        if (total) {
+            *total += std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - start).count();
+        }
+    }
+};
+
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
+    rpc_phase_io phase(true);
     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
         return false;
     }
@@ -448,6 +604,7 @@ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
+    rpc_phase_io phase(false);
     uint64_t size;
     if (!sock->recv_data(&size, sizeof(size))) {
         return false;
@@ -459,6 +616,7 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
 }
 
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+    rpc_phase_io phase(false);
     uint64_t size;
     if (!sock->recv_data(&size, sizeof(size))) {
         return false;
@@ -489,6 +647,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    rpc_phase_io phase(true, cmd);
     if (sock == nullptr) {
         return false;
     }
@@ -511,6 +670,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    rpc_phase_io phase(false);
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -773,6 +933,9 @@ struct rpc_lanes {
 class rpc_dispatcher {
 public:
     explicit rpc_dispatcher(std::string endpoint) : endpoint(std::move(endpoint)) {
+        profile.armed = this->endpoint.size() >= 4 &&
+                (this->endpoint.compare(this->endpoint.size() - 4, 4, "/set") == 0 ||
+                 this->endpoint.compare(this->endpoint.size() - 4, 4, "/get") == 0);
     }
 
     bool send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
@@ -830,6 +993,7 @@ public:
     // server RPC_PROTO_PATCH_VERSION learnt at HELLO; gates the fork commands
     uint8_t   patch = 0;
     rpc_lanes lanes;
+    rpc_phase_profile peer_profile;
 
 private:
     struct rpc_msg {
@@ -841,6 +1005,8 @@ private:
         task_fn                       task;       // [fork] closure form
         bool                          ok = true;  // [fork] result of the send / task
         std::promise<void>            completion;
+        rpc_phase_clock::time_point    queued;
+        double                        lock_ms = 0;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -858,6 +1024,7 @@ private:
     void submit_counted(rpc_msg_ptr msg);
     void ensure_worker();
 
+    rpc_phase_profile profile;
     rpc_msg_queue    queue;
     std::mutex       sock_m;    // guards `sock` handoffs (start/adopt/disconnect)
     socket_ptr       sock;
@@ -887,6 +1054,9 @@ static std::atomic<bool> g_rpc_detached{false};
 static std::atomic<bool> g_rpc_session_lost{false};
 
 void rpc_dispatcher::exec(rpc_msg & msg) {
+    const double queue_ms = profile.enabled() && rpc_async_enabled()
+            ? std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - msg.queued).count() : 0;
+    rpc_phase_scope phase(profile, "client", endpoint, msg.cmd, msg.lock_ms, queue_ms);
     socket_ptr s;
     {
         std::lock_guard<std::mutex> l(sock_m);
@@ -920,7 +1090,12 @@ rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
     if (!rpc_async_enabled()) {
         // direct mode: the calling thread owns the wire for the whole message
         {
+            const bool measure = profile.enabled();
+            const auto begin = measure ? rpc_phase_clock::now() : rpc_phase_clock::time_point{};
             std::lock_guard<std::recursive_mutex> l(io_m);
+            if (profile.enabled()) {
+                msg->lock_ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - begin).count();
+            }
             exec(*msg);
         }
         msg->completion.set_value();
@@ -932,6 +1107,9 @@ rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
         return msg;
     }
     ensure_worker();
+    if (profile.enabled()) {
+        msg->queued = rpc_phase_clock::now();
+    }
     GGML_ASSERT(queue.push(msg));
     return msg;
 }
@@ -1333,6 +1511,7 @@ static bool rpc_fdx_enabled() {
 // wait_a is always the main-lane count; wait_b is the opposite lane's count.
 static bool send_lane_cmd(const socket_ptr & sock, enum rpc_cmd cmd,
                           uint64_t wait_a, uint64_t wait_b, const void * data, size_t size) {
+    rpc_phase_io phase(true, cmd);
     if (sock == nullptr) {
         return false;
     }
@@ -1797,10 +1976,8 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
-    // [fork] this is the blocking point of a synchronous stage decode: on a
-    // 9-stage split every board answers its boundary read within about a
-    // millisecond of the others, so the head's single NIC sees the reads as a
-    // burst - halving them is what the bf16 wire is for
+    // Synchronous stage decode extracts outputs here before llama_decode returns.
+    // The receive wait includes prior remote work, not just payload transfer.
     if (rpc_wire_bf16_ok(tensor, offset, size)) {
         std::vector<uint8_t> wire(size / 2);
         bool status = ctx->dispatcher->send(RPC_CMD_GET_TENSOR_BF16, request, sizeof(*request), wire.data(), wire.size());
@@ -3234,6 +3411,8 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
     if (sdisp == ddisp) {
         return false;
     }
+    sdisp->peer_profile.armed = true;
+    rpc_phase_scope phase(sdisp->peer_profile, "client-push", sdisp->endpoint, RPC_CMD_PUSH_TENSOR);
     const std::string & src_ep = sdisp->endpoint;
     const std::string & dst_ep = ddisp->endpoint;
     const size_t size = ggml_nbytes(src);
@@ -4832,7 +5011,10 @@ bool rpc_server::get_tensor_bf16(const rpc_msg_get_tensor_req & request, std::ve
     }
 
     std::vector<float> tmp(request.size / sizeof(float));
-    ggml_backend_tensor_get(tensor, tmp.data(), request.offset, request.size);
+    {
+        rpc_phase_wait phase(true);
+        ggml_backend_tensor_get(tensor, tmp.data(), request.offset, request.size);
+    }
     response.resize(request.size / 2);
     ggml_fp32_to_bf16_row(tmp.data(), (ggml_bf16_t *) response.data(), (int64_t) tmp.size());
     return true;
@@ -4965,11 +5147,17 @@ bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_pu
     memcpy(body + sizeof(request.dst),    &request.dst_offset, sizeof(request.dst_offset));
     if (bf16) {
         std::vector<float> tmp(request.size / sizeof(float));
-        ggml_backend_tensor_get(src, tmp.data(), request.src_offset, request.size);
+        {
+            rpc_phase_wait phase(true);
+            ggml_backend_tensor_get(src, tmp.data(), request.src_offset, request.size);
+        }
         ggml_fp32_to_bf16_row(tmp.data(), (ggml_bf16_t *) (body + RPC_SET_TENSOR_HDR),
                               (int64_t) tmp.size());
     } else {
-        ggml_backend_tensor_get(src, body + RPC_SET_TENSOR_HDR, request.src_offset, request.size);
+        {
+            rpc_phase_wait phase(true);
+            ggml_backend_tensor_get(src, body + RPC_SET_TENSOR_HDR, request.src_offset, request.size);
+        }
     }
     // hand off and acknowledge; never wait for the wire (see rpc_peer_link)
     {
@@ -5134,7 +5322,10 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
 
     response.resize(request.size, 0);
-    ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    {
+        rpc_phase_wait phase(true);
+        ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    }
     return true;
 }
 
@@ -5527,8 +5718,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     // [fork] This -- not graph_compute -- is the decode hot path: once a graph
     // shape repeats, the client sends only a uid. Same GGML_RPC_GRAPH_TRACE
-    // gate; `compute` here is the device's honest cost for the stage, so
-    // client stage time minus this is the RPC overhead.
+    // gate; backend compute is attribution, not a paired client-stage sample.
     static const bool graph_trace = [] {
         const char * value = getenv("GGML_RPC_GRAPH_TRACE");
         return value && atoi(value) != 0;
@@ -5621,6 +5811,7 @@ struct rpc_lane_set_msg {
     uint8_t  cmd = 0;
     uint64_t wait_main = 0;
     uint64_t wait_get  = 0;
+    rpc_phase_clock::time_point queued;
     std::vector<uint8_t> payload;
 };
 
@@ -5661,6 +5852,7 @@ struct rpc_active_session {
 
     // wait until the counters reach the targets; false once the session failed
     bool wait_counts(uint64_t need_main, uint64_t need_set, uint64_t need_get) {
+        rpc_phase_wait phase(false);
         std::unique_lock<std::mutex> l(sync_m);
         sync_cv.wait(l, [&]{
             return failed || (main_done >= need_main && set_done >= need_set && get_done >= need_get);
@@ -5726,6 +5918,9 @@ static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is
             break;
         }
         const size_t bytes = m.payload.size();
+        if (rpc_phase_limit() > 0) {
+            m.queued = rpc_phase_clock::now();
+        }
         {
             std::unique_lock<std::mutex> l(s->q_m);
             s->q_cv.wait(l, [&]{ return s->q_closed || s->q_bytes < rpc_lane_queue_cap(); });
@@ -5751,6 +5946,9 @@ static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is
 }
 
 static void rpc_lane_set_exec(rpc_active_session * s) {
+    rpc_phase_profile profile;
+    profile.armed = true;
+    const std::string profile_endpoint = std::to_string(s->id);
     for (;;) {
         rpc_lane_set_msg m;
         {
@@ -5764,6 +5962,9 @@ static void rpc_lane_set_exec(rpc_active_session * s) {
             s->q_bytes -= m.payload.size();
         }
         s->q_cv.notify_all();
+        const double queue_ms = profile.enabled()
+                ? std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - m.queued).count() : 0;
+        rpc_phase_scope phase(profile, "server-set", profile_endpoint, (rpc_cmd) m.cmd, 0, queue_ms);
         if (!s->wait_counts(m.wait_main, 0, m.wait_get)) {
             return;
         }
@@ -5780,6 +5981,9 @@ static void rpc_lane_set_exec(rpc_active_session * s) {
 }
 
 static void rpc_lane_get_serve(rpc_active_session * s) {
+    rpc_phase_profile profile;
+    profile.armed = true;
+    const std::string profile_endpoint = std::to_string(s->id);
     socket_ptr sock = s->get_sock;
     for (;;) {
         uint8_t cmd;
@@ -5789,6 +5993,7 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
         // PUSH_TENSOR rides the GET lane because it is a local read like the
         // others -- the only difference is where the bytes go afterwards, so it
         // wants exactly the same ordering against this node's compute
+        rpc_phase_scope phase(profile, "server-get", profile_endpoint, (rpc_cmd) cmd);
         const bool is_push = cmd == RPC_CMD_PUSH_TENSOR;
         if (cmd != RPC_CMD_GET_TENSOR && cmd != RPC_CMD_GET_TENSOR_BF16 && !is_push) {
             GGML_LOG_ERROR("[rpc fdx] unexpected command %d on GET lane\n", cmd);
@@ -5865,6 +6070,9 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
 // these carry are distinct, so applying them out of order relative to each
 // other is not observable.
 static void rpc_lane_peer_serve(rpc_active_session * s, socket_ptr sock) {
+    rpc_phase_profile profile;
+    profile.armed = true;
+    const std::string profile_endpoint = std::to_string(s->id);
     for (;;) {
         uint8_t cmd;
         if (!sock->recv_data(&cmd, 1)) {
@@ -5874,6 +6082,7 @@ static void rpc_lane_peer_serve(rpc_active_session * s, socket_ptr sock) {
             GGML_LOG_ERROR("[rpc peer] unexpected command %d on a peer lane\n", cmd);
             break;
         }
+        rpc_phase_scope phase(profile, "server-peer", profile_endpoint, RPC_CMD_PUSH_TENSOR);
         uint64_t size;
         if (!sock->recv_data(&size, sizeof(size))) {
             break;
@@ -5986,6 +6195,8 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
 }
 
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
+    rpc_phase_profile profile;
+    const std::string profile_endpoint = std::to_string(session.id);
     uint8_t cmd;
     // the HELLO handshake was already completed by the connection dispatcher.
     // [fork] the first command decides the fate of a parked session: anything
@@ -6002,6 +6213,7 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        rpc_phase_scope phase(profile, "server-main", profile_endpoint, (rpc_cmd) cmd);
         if (first_cmd) {
             switch (cmd) {
                 // read-only probes: a version check or a device enumeration
