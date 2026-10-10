@@ -219,6 +219,14 @@ struct ggml_backend_vk_context;
 // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
 #define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
 
+static bool ggml_vk_recording_reuse_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_VK_RECORDING_REUSE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 typedef std::shared_ptr<struct vk_pipeline_struct> vk_pipeline;
 
 struct vk_pipeline_struct {
@@ -292,6 +300,7 @@ struct vk_command_buffer {
     vk::CommandBuffer buf;
     uint64_t use_counter = 0;
     bool in_use = false;
+    vk::Pipeline bound_pipeline {};
 };
 
 // Stores command pool/buffers. There's an instance of this
@@ -805,6 +814,7 @@ static bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
 struct vk_device_struct {
     std::recursive_mutex mutex;
     mutable std::shared_mutex pinned_memory_mutex;
+    std::atomic<uint64_t> buffer_allocation_generation {1};
 
     // Guards compile_pending, all_pipelines, and the dynamic pipeline maps
     // (flash_attn, fa_mask_opt, solve_tri, conv2d, etc). The actual compile
@@ -2562,6 +2572,14 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_descriptor_set_contents {
+    std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> buffers;
+    uint64_t allocation_generation = 0;
+    uint32_t count = 0;
+};
+
+static constexpr size_t VK_DESCRIPTOR_CACHE_SIZE = 4096;
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2605,6 +2623,7 @@ struct ggml_backend_vk_context {
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;
+    std::vector<vk_descriptor_set_contents> descriptor_set_contents;
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
@@ -3375,6 +3394,9 @@ static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx
         vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(ctx->descriptor_pools[pool_idx], alloc_count, layouts.data());
         std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
         ctx->descriptor_sets.insert(ctx->descriptor_sets.end(), sets.begin(), sets.end());
+        if (ggml_vk_recording_reuse_enabled()) {
+            ctx->descriptor_set_contents.resize(std::min(ctx->descriptor_sets.size(), VK_DESCRIPTOR_CACHE_SIZE));
+        }
 
         pool_idx++;
     }
@@ -3400,6 +3422,22 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         return;
     }
     VK_LOG_DEBUG("ggml_vk_submit(" << ctx << ", " << fence << ")");
+
+    if (ggml_vk_recording_reuse_enabled() && ctx->seqs.size() == 1 && ctx->seqs.front().size() == 1) {
+        const auto & submission = ctx->seqs.front().front();
+        if (submission.wait_semaphores.size() <= 1 && submission.signal_semaphores.size() <= 1) {
+            const uint32_t wait_count = submission.wait_semaphores.size();
+            const uint32_t signal_count = submission.signal_semaphores.size();
+            const vk_semaphore wait = wait_count ? submission.wait_semaphores.front() : vk_semaphore{};
+            const vk_semaphore signal = signal_count ? submission.signal_semaphores.front() : vk_semaphore{};
+            const vk::TimelineSemaphoreSubmitInfo timeline_info { wait_count, &wait.value, signal_count, &signal.value };
+            vk::SubmitInfo submit_info { wait_count, &wait.s, &ctx->p->q->stage_flags, 1, &submission.buffer->buf, signal_count, &signal.s };
+            submit_info.setPNext(&timeline_info);
+            ctx->p->q->handle->submit(submit_info, fence);
+            ctx->seqs.clear();
+            return;
+        }
+    }
 
     std::vector<std::vector<uint64_t>> tl_wait_vals;
     std::vector<std::vector<uint64_t>> tl_signal_vals;
@@ -3794,6 +3832,10 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     device->memory_logger->log_allocation(buf, size);
 
+    // Vulkan can reuse a destroyed buffer handle. Invalidate cached descriptor contents on allocation.
+    if (ggml_vk_recording_reuse_enabled()) {
+        device->buffer_allocation_generation.fetch_add(1, std::memory_order_relaxed);
+    }
     return buf;
 }
 
@@ -8505,6 +8547,7 @@ static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk
 static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool& p, bool one_time = true) {
     vk_submission s;
     s.buffer = ggml_vk_get_or_create_cmd_buffer(device, p);
+    s.buffer->bound_pipeline = nullptr;
     if (one_time) {
         s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
     } else {
@@ -8557,12 +8600,27 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
-    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
-    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+    const uint32_t descriptor_idx = ctx->descriptor_set_idx++;
+    const vk::DescriptorSet descriptor_set = ctx->descriptor_sets[descriptor_idx];
+    vk_descriptor_set_contents * contents = descriptor_idx < ctx->descriptor_set_contents.size() ? &ctx->descriptor_set_contents[descriptor_idx] : nullptr;
+    const uint64_t allocation_generation = contents ? ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed) : 0;
+    if (!contents || contents->allocation_generation != allocation_generation ||
+        contents->count != descriptor_buffer_infos.size() ||
+        !std::equal(descriptor_buffer_infos.begin(), descriptor_buffer_infos.end(), contents->buffers.begin())) {
+        vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+        ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+        if (contents) {
+            std::copy(descriptor_buffer_infos.begin(), descriptor_buffer_infos.end(), contents->buffers.begin());
+            contents->count = descriptor_buffer_infos.size();
+            contents->allocation_generation = allocation_generation;
+        }
+    }
 
     subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
-    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    if (!ggml_vk_recording_reuse_enabled() || subctx->s->buffer->bound_pipeline != pipeline->pipeline) {
+        subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+        subctx->s->buffer->bound_pipeline = pipeline->pipeline;
+    }
     subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                 pipeline->layout,
                                 0,
@@ -17091,6 +17149,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->tensor_ctxs.clear();
     ctx->gc.contexts.clear();
     ctx->pipeline_descriptor_set_requirements = 0;
+    // Completed slots can be reused; resetting command pools does not change descriptor contents.
     ctx->descriptor_set_idx = 0;
 }
 
@@ -17131,6 +17190,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->descriptor_pools.clear();
     ctx->descriptor_sets.clear();
+    ctx->descriptor_set_contents.clear();
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
