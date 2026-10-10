@@ -161,6 +161,7 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 // Old clients ignore it; old servers leave it zero. Transport caps are unchanged.
 static constexpr uint8_t RPC_FEATURE_ORDERED_COPY = 1 << 0;
 static constexpr uint8_t RPC_FEATURE_GET_AND_PUSH = 1 << 1;
+static constexpr uint8_t RPC_FEATURE_MAIN_DEDUPE = 1 << 2;
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -1075,6 +1076,15 @@ struct rpc_dedupe_lru {
         return &*it->second;
     }
 
+    void erase(uint64_t hash) {
+        auto it = map.find(hash);
+        if (it != map.end()) {
+            bytes -= it->second->size;
+            order.erase(it->second);
+            map.erase(it);
+        }
+    }
+
     void insert(uint64_t hash, size_t size, std::vector<uint8_t> data, std::shared_ptr<std::vector<uint8_t>> msg = nullptr) {
         order.push_back({hash, size, std::move(data), std::move(msg)});
         map[hash] = std::prev(order.end());
@@ -1086,6 +1096,23 @@ struct rpc_dedupe_lru {
         }
     }
 };
+
+// Main-stream stashes are separate from SET lanes and never survive a connection.
+static const size_t RPC_MAIN_DEDUPE_MIN_BYTES = 1u << 10;
+static const size_t RPC_MAIN_DEDUPE_MAX_BYTES = 64u << 10;
+static_assert(RPC_MAIN_DEDUPE_MAX_BYTES < HASH_THRESHOLD, "main dedupe must not bypass disk-cache uploads");
+
+struct rpc_main_dedupe_lru : rpc_dedupe_lru {
+    rpc_main_dedupe_lru() { max_bytes = 4u << 20; }
+};
+
+static bool rpc_main_dedupe_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_RPC_SYNC_DEDUPE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return enabled;
+}
 
 static bool rpc_dedupe_enabled() {
     static const bool enabled = [] {
@@ -1222,6 +1249,9 @@ public:
     uint8_t   patch = 0;
     uint8_t   features = 0;
     rpc_lanes lanes;
+    // Access only at the main stream's wire position (direct-mode io_m).
+    std::weak_ptr<socket_t> main_dedupe_sock;
+    rpc_main_dedupe_lru main_dedupe;
     rpc_phase_profile peer_profile;
 
 private:
@@ -2128,11 +2158,19 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     RPC_STATUS_ASSERT(status);
 }
 
+static bool rpc_buffer_set_tensor_dedupe(const std::shared_ptr<rpc_dispatcher> & disp,
+        const ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
 // [fork] the upload proper, shared by the plain path and the cache-aware loader
 static bool rpc_buffer_set_tensor_raw(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!rpc_async_enabled() && rpc_main_dedupe_enabled() &&
+            (ctx->dispatcher->features & RPC_FEATURE_MAIN_DEDUPE) &&
+            size >= RPC_MAIN_DEDUPE_MIN_BYTES && size <= RPC_MAIN_DEDUPE_MAX_BYTES) {
+        return rpc_buffer_set_tensor_dedupe(ctx->dispatcher, tensor, data, offset, size);
+    }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
@@ -2998,7 +3036,7 @@ static bool rpc_delta_ranges(const uint8_t * base, const uint8_t * cur, size_t s
 // hashes the payload against the mirror and returns how many bytes of msg to
 // send, or 0 with the delta form in delta_msg
 static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, const std::shared_ptr<std::vector<uint8_t>> & msg_ptr,
-                                bool delta_ok, std::vector<uint8_t> & delta_msg) {
+                                bool delta_ok, std::vector<uint8_t> & delta_msg, bool exact = false) {
     std::vector<uint8_t> & msg = *msg_ptr;
     const uint8_t * payload = msg.data() + RPC_SET_TENSOR_DEDUPE_HDR;
     const size_t    size    = msg.size() - RPC_SET_TENSOR_DEDUPE_HDR;
@@ -3006,7 +3044,9 @@ static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, const std::shared_ptr<std:
     memcpy(msg.data() + RPC_SET_TENSOR_HDR, &hash, sizeof(hash));
 
     size_t n_send = 0;
-    if (rpc_dedupe_lru::entry * e = lru.find(hash)) {
+    rpc_dedupe_lru::entry * e = lru.find(hash);
+    if (e && (!exact || (e->size == size && e->msg &&
+            memcmp(e->msg->data() + RPC_SET_TENSOR_DEDUPE_HDR, payload, size) == 0))) {
         e->msg = msg_ptr;
         msg[RPC_SET_TENSOR_DEDUPE_HDR - 1] = 1;
         n_send = RPC_SET_TENSOR_DEDUPE_HDR;
@@ -3046,9 +3086,16 @@ static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, const std::shared_ptr<std:
             msg[RPC_SET_TENSOR_DEDUPE_HDR - 1] = 0;
             n_send = msg.size();
         }
+        if (exact) {
+            lru.erase(hash); // a collision replaces the same key on both peers
+        }
         lru.insert(hash, size, {}, msg_ptr);
     }
 
+    // Exact hits need retained bytes even when they are no longer delta candidates.
+    if (exact) {
+        return n_send;
+    }
     // only the most recent entries stay delta bases
     size_t n_kept = 0;
     for (auto it = lru.order.rbegin(); it != lru.order.rend(); ++it) {
@@ -3057,6 +3104,29 @@ static size_t rpc_dedupe_finish(rpc_dedupe_lru & lru, const std::shared_ptr<std:
         }
     }
     return n_send;
+}
+
+static bool rpc_buffer_set_tensor_dedupe(const std::shared_ptr<rpc_dispatcher> & disp,
+        const ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    auto msg = rpc_prepare_set_tensor_dedupe(tensor, data, offset, size);
+    return disp->call([disp, msg](const socket_ptr & sock) {
+        if (!sock) {
+            return false;
+        }
+        if (disp->main_dedupe_sock.lock() != sock) {
+            disp->main_dedupe = rpc_main_dedupe_lru();
+            disp->main_dedupe_sock = sock;
+        }
+        std::vector<uint8_t> delta_msg;
+        const size_t n = rpc_dedupe_finish(disp->main_dedupe, msg, rpc_delta_enabled(), delta_msg, true);
+        const bool ok = n ? send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_DEDUPE, msg->data(), n)
+                         : send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_DEDUPE, delta_msg.data(), delta_msg.size());
+        if (!ok) {
+            // A partial frame cannot be retried as a raw SET on the same stream.
+            disp->disconnect();
+        }
+        return ok;
+    });
 }
 
 static std::shared_ptr<std::vector<uint8_t>> rpc_prepare_set_tensor_bf16(
@@ -4391,7 +4461,7 @@ public:
     // SET_TENSOR_HASH bookkeeping, which belongs to the main thread only
     bool set_tensor(const std::vector<uint8_t> & input, bool allow_cache = true);
     // [fork] SET lane dedupe: applies a payload, or on a hit the stashed copy
-    bool set_tensor_dedupe(const std::vector<uint8_t> & input);
+    bool set_tensor_dedupe(const std::vector<uint8_t> & input, rpc_main_dedupe_lru * main = nullptr);
     // [fork] streaming form of set_tensor for the main command socket: the
     // length prefix is already consumed, the body is still on the wire. Bounds
     // host RAM to one chunk instead of the whole upload.
@@ -4588,7 +4658,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH;
+    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -4902,7 +4972,7 @@ bool rpc_server::set_tensor_raw(const rpc_tensor & in_tensor, uint64_t offset, c
     return true;
 }
 
-bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input) {
+bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input, rpc_main_dedupe_lru * main) {
     // | rpc_tensor | offset (8) | hash (8) | size (8) | hit (1) | payload (size, only on a miss) |
     const size_t hdr = sizeof(rpc_tensor) + 3*sizeof(uint64_t) + 1;
     if (input.size() < hdr) {
@@ -4915,7 +4985,15 @@ bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input) {
     memcpy(&size,   input.data() + sizeof(rpc_tensor) + 2*sizeof(uint64_t), sizeof(size));
     const uint8_t hit = input[hdr - 1];
 
+    if (main && (size < RPC_MAIN_DEDUPE_MIN_BYTES || size > RPC_MAIN_DEDUPE_MAX_BYTES || hit > 2 ||
+            (hit == 1 && input.size() != hdr))) {
+        return false;
+    }
+    if (main) {
+        cache_pending = false; // bounded inputs are below the disk-cache threshold
+    }
     std::lock_guard<std::mutex> l(dedupe_mtx);
+    rpc_dedupe_lru & dedupe = main ? *main : this->dedupe;
     const void * data = nullptr;
     if (hit == 2) {
         // | base hash (8) | n_ranges (4) | ranges | range bytes |: the stashed base patched into the new payload
@@ -4954,6 +5032,9 @@ bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input) {
         dedupe_deltas++;
         dedupe_delta_bytes += size - (input.size() - hdr);
         const bool ok = set_tensor_raw(*in_tensor, offset, patched.data(), size);
+        if (main) {
+            dedupe.erase(hash);
+        }
         dedupe.insert(hash, size, std::move(patched));
         return ok;
     }
@@ -4971,6 +5052,12 @@ bool rpc_server::set_tensor_dedupe(const std::vector<uint8_t> & input) {
             return false;
         }
         data = input.data() + hdr;
+        if (main) {
+            if (rpc_dedupe_hash((const uint8_t *) data, size) != hash) {
+                return false;
+            }
+            dedupe.erase(hash);
+        }
         dedupe.insert(hash, size, std::vector<uint8_t>(input.begin() + hdr, input.end()));
         dedupe_misses++;
     }
@@ -6659,6 +6746,7 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
 }
 
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
+    rpc_main_dedupe_lru main_dedupe;
     rpc_phase_profile profile;
     const std::string profile_endpoint = std::to_string(session.id);
     uint8_t cmd;
@@ -6825,6 +6913,22 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                     return;
                 }
                 if (!server.set_tensor_stream(sock, msg_size)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_DEDUPE: {
+                uint64_t size;
+                if (!sock->recv_data(&size, sizeof(size)) || size < RPC_SET_TENSOR_DEDUPE_HDR ||
+                        size > RPC_SET_TENSOR_DEDUPE_HDR + RPC_MAIN_DEDUPE_MAX_BYTES) {
+                    return;
+                }
+                std::vector<uint8_t> input(size);
+                if (!sock->recv_data(input.data(), input.size())) {
+                    return;
+                }
+                rpc_command_payload(RPC_CMD_SET_TENSOR_DEDUPE, input.data(), input.size());
+                if (!server.set_tensor_dedupe(input, &main_dedupe)) {
                     return;
                 }
                 break;
@@ -7094,7 +7198,7 @@ static bool rpc_handshake_hello(const socket_ptr & sock) {
     rsp.major = RPC_PROTO_MAJOR_VERSION;
     rsp.minor = RPC_PROTO_MINOR_VERSION;
     rsp.patch = RPC_PROTO_PATCH_VERSION;
-    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH;
+    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE;
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
