@@ -377,6 +377,7 @@ struct common_spd_pipeline::impl {
     std::array<llama_pos, SPD_MAX_STAGE_COUNT> stage_tail_pos = {};
     std::array<std::vector<size_t>, SPD_MAX_STAGE_COUNT> stage_resources;
     std::vector<size_t> sidecar_resources;
+    std::vector<std::vector<uint32_t>> rollback_groups;
     std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
     std::array<batch_storage, SPD_MAX_STAGE_COUNT> stage_decode_batches;
     std::array<std::vector<float>, SPD_MAX_STAGE_COUNT> stage_decode_outputs;
@@ -649,10 +650,8 @@ struct common_spd_pipeline::impl {
         std::array<double, SPD_MAX_STAGE_COUNT> stage_lock = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_decode = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_read = {};
-        // [fork] the per-stage decode work that sits OUTSIDE llama_decode, split
-        // by protocol round trip. The guard, the fence and the staging->input
-        // copy are each a blocking command on the endpoint's single command
-        // loop. Alias snapshots also update the host cache metadata.
+        // Per-stage work outside llama_decode. Guards/fences only submit ordering;
+        // the later copy/read pays any remote wait. Snapshots also update host metadata.
         std::array<double, SPD_MAX_STAGE_COUNT> stage_guard = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_fence = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_copy  = {};
@@ -1282,6 +1281,38 @@ struct common_spd_pipeline::impl {
                 }
             }
             std::sort(stage_resources[stage].begin(), stage_resources[stage].end());
+        }
+        // Connected resource groups retain stage order even when a stage spans endpoints.
+        std::array<uint32_t, SPD_MAX_STAGE_COUNT> group = {};
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            group[stage] = stage;
+            for (uint32_t prior = 0; prior < stage; ++prior) {
+                bool shared = false;
+                for (size_t resource : stage_resources[stage]) {
+                    shared |= std::find(stage_resources[prior].begin(), stage_resources[prior].end(), resource)
+                            != stage_resources[prior].end();
+                }
+                if (shared) {
+                    const uint32_t from = group[stage];
+                    const uint32_t to = group[prior];
+                    for (uint32_t i = 0; i <= stage; ++i) {
+                        if (group[i] == from) {
+                            group[i] = to;
+                        }
+                    }
+                }
+            }
+        }
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            if (std::find(group.begin(), group.begin() + stage, group[stage]) != group.begin() + stage) {
+                continue;
+            }
+            rollback_groups.emplace_back();
+            for (uint32_t i = stage; i < stage_count; ++i) {
+                if (group[i] == group[stage]) {
+                    rollback_groups.back().push_back(i);
+                }
+            }
         }
         for (int32_t layer = 0; layer < llama_model_n_layer(model_spd); ++layer) {
             const std::string key = execution_resource_key(
@@ -2380,11 +2411,16 @@ struct common_spd_pipeline::impl {
         return full_checkpoints ? stage_count - 1 - stage : rollback_tokens;
     }
 
-    bool clear_rollback_aliases(uint32_t stage) {
+    bool clear_rollback_aliases(uint32_t stage, std::string * error = nullptr) {
         for (uint32_t i = 0; i < stage_rollback_tokens(stage); ++i) {
             if (checkpoint_pos[stage][i] >= 0 &&
                     !llama_memory_seq_rm(llama_get_memory(stages[stage]), (llama_seq_id) i + 1, -1, -1)) {
-                fail("failed to retire target SPD rollback alias " + std::to_string(stage));
+                const std::string message = "failed to retire target SPD rollback alias " + std::to_string(stage);
+                if (error) {
+                    *error = message;
+                } else {
+                    fail(message);
+                }
                 return false;
             }
             checkpoint_pos[stage][i] = -1;
@@ -2392,69 +2428,130 @@ struct common_spd_pipeline::impl {
         return true;
     }
 
-    bool rollback(llama_pos target_pos) {
-        if (timing_enabled) {
-            ++timing.rollback_calls;
-        }
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            auto retire_aliases = [&]() {
-                const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
-                const bool ok = clear_rollback_aliases(stage);
-                if (timing_enabled) {
-                    timing.stage_rollback_retire[stage] += seconds_since(start);
-                }
-                return ok;
-            };
-            const llama_pos restore_pos = target_pos - 1;
-            if (stage_tail_pos[stage] == restore_pos) {
-                if (full_checkpoints && !retire_aliases()) {
-                    return false;
-                }
-                continue;
-            }
-
-            if (light_rollback) {
-                const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
-                // Position-addressed attention cache: dropping every cell at or
-                // past the rejected position restores the checkpoint exactly.
-                if (!llama_memory_seq_rm(llama_get_memory(stages[stage]), 0, target_pos, -1)) {
-                    fail("failed to rewind target SPD stage " + std::to_string(stage) +
-                            " to position " + std::to_string(restore_pos));
-                    return false;
-                }
-                stage_tail_pos[stage] = restore_pos;
-                if (timing_enabled) {
-                    timing.stage_rollback_restore[stage] += seconds_since(start);
-                }
-                continue;
-            }
-
-            llama_seq_id restore_seq = -1;
-            for (uint32_t i = 0; i < stage_rollback_tokens(stage); ++i) {
-                if (checkpoint_pos[stage][i] == restore_pos) {
-                    restore_seq = (llama_seq_id) i + 1;
-                    break;
-                }
-            }
-            if (restore_seq < 0) {
-                fail("target SPD stage " + std::to_string(stage) +
-                        " has no checkpoint for position " + std::to_string(restore_pos));
-                return false;
-            }
-
-            llama_memory_t memory = llama_get_memory(stages[stage]);
+    bool rollback_stage(uint32_t stage, llama_pos target_pos, std::string & error) {
+        auto retire_aliases = [&]() {
             const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
-            if (!llama_memory_seq_rm(memory, 0, -1, -1)) {
-                fail("failed to clear target SPD stage " + std::to_string(stage) + " before restore");
+            const bool ok = clear_rollback_aliases(stage, &error);
+            if (timing_enabled) {
+                timing.stage_rollback_retire[stage] += seconds_since(start);
+            }
+            return ok;
+        };
+        const llama_pos restore_pos = target_pos - 1;
+        if (stage_tail_pos[stage] == restore_pos) {
+            if (full_checkpoints && !retire_aliases()) {
                 return false;
             }
-            llama_memory_seq_cp(memory, restore_seq, 0, -1, -1);
+            return true;
+        }
+
+        if (light_rollback) {
+            const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
+            // Position-addressed attention cache: dropping every cell at or
+            // past the rejected position restores the checkpoint exactly.
+            if (!llama_memory_seq_rm(llama_get_memory(stages[stage]), 0, target_pos, -1)) {
+                error = "failed to rewind target SPD stage " + std::to_string(stage) +
+                        " to position " + std::to_string(restore_pos);
+                return false;
+            }
             stage_tail_pos[stage] = restore_pos;
             if (timing_enabled) {
                 timing.stage_rollback_restore[stage] += seconds_since(start);
             }
-            if (full_checkpoints && !retire_aliases()) {
+            return true;
+        }
+
+        llama_seq_id restore_seq = -1;
+        for (uint32_t i = 0; i < stage_rollback_tokens(stage); ++i) {
+            if (checkpoint_pos[stage][i] == restore_pos) {
+                restore_seq = (llama_seq_id) i + 1;
+                break;
+            }
+        }
+        if (restore_seq < 0) {
+            error = "target SPD stage " + std::to_string(stage) +
+                    " has no checkpoint for position " + std::to_string(restore_pos);
+            return false;
+        }
+
+        llama_memory_t memory = llama_get_memory(stages[stage]);
+        const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
+        if (!llama_memory_seq_rm(memory, 0, -1, -1)) {
+            error = "failed to clear target SPD stage " + std::to_string(stage) + " before restore";
+            return false;
+        }
+        llama_memory_seq_cp(memory, restore_seq, 0, -1, -1);
+        stage_tail_pos[stage] = restore_pos;
+        if (timing_enabled) {
+            timing.stage_rollback_restore[stage] += seconds_since(start);
+        }
+        if (full_checkpoints && !retire_aliases()) {
+            return false;
+        }
+        return true;
+    }
+
+    struct rollback_job {
+        impl * self;
+        const std::vector<uint32_t> * stages;
+        llama_pos target_pos;
+        std::string error;
+        bool ok = true;
+    };
+
+    static void execute_rollback_job(void * data) {
+        auto & job = *static_cast<rollback_job *>(data);
+        for (uint32_t stage : *job.stages) {
+            if (!job.self->rollback_stage(stage, job.target_pos, job.error)) {
+                job.ok = false;
+                return;
+            }
+        }
+    }
+
+    bool rollback(llama_pos target_pos) {
+        if (timing_enabled) {
+            ++timing.rollback_calls;
+        }
+        // Decode and sidecar workers have joined. Disjoint endpoint groups may
+        // retire their own aliases concurrently; each group keeps stage order.
+        if (static_decode_fast_path && params.parallel_stages && rollback_groups.size() > 1) {
+            std::array<rollback_job, SPD_MAX_STAGE_COUNT> jobs = {};
+            for (size_t i = 0; i < rollback_groups.size(); ++i) {
+                jobs[i] = { this, &rollback_groups[i], target_pos, {}, true };
+                stage_workers[rollback_groups[i].front()]->submit(execute_rollback_job, &jobs[i]);
+            }
+            std::exception_ptr failure;
+            for (const auto & group : rollback_groups) {
+                auto current = stage_workers[group.front()]->wait();
+                if (!failure) {
+                    failure = current;
+                }
+            }
+            // Join every job before reporting failure or resetting any context.
+            if (failure) {
+                try {
+                    std::rethrow_exception(failure);
+                } catch (const std::exception & error) {
+                    fail(std::string("SPD rollback worker failed: ") + error.what());
+                } catch (...) {
+                    fail("SPD rollback worker failed");
+                }
                 return false;
+            }
+            for (size_t i = 0; i < rollback_groups.size(); ++i) {
+                if (!jobs[i].ok) {
+                    fail(jobs[i].error);
+                    return false;
+                }
+            }
+        } else {
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                std::string error;
+                if (!rollback_stage(stage, target_pos, error)) {
+                    fail(error);
+                    return false;
+                }
             }
         }
         const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
