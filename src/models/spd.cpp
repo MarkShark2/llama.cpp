@@ -474,7 +474,7 @@ llama_model_spd::graph::graph(const llama_model & model, const llm_graph_params 
             ggml_tensor * flat = ggml_reshape_2d(ctx0, features, n_embd, c*n_tokens);
             ggml_tensor * normalized = norm_f32(flat, ggml_get_rows(ctx0, model.spd_bank_norm, flat_ids));
             ggml_tensor * gate = ggml_get_rows(ctx0, model.spd_bank_gate, flat_ids);
-            features = round_bank(ggml_add(ctx0, flat, ggml_mul(ctx0, gate, ggml_sub(ctx0, normalized, flat))));
+            features = round_bank(ggml_add(ctx0, flat, ggml_mul(ctx0, ggml_sub(ctx0, normalized, flat), gate)));
             features = ggml_reshape_3d(ctx0, features, n_embd, c, n_tokens);
         }
         ggml_tensor * contrib = round_bank(ggml_mul_mat_id(ctx0, model.spd_aggr_blk, features, inp->ids));
