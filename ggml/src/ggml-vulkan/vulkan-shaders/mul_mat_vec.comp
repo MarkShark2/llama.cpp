@@ -70,6 +70,9 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         }
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (!MMV_COL_COMPUTE(j)) {
+                continue;
+            }
 #if QUANT_R == 2
             // Note that we end up fetching bogus elements here, but its fine as they'll be
             // within an accessible block.
