@@ -23,6 +23,9 @@ import gguf  # noqa: E402
 LOGGER = logging.getLogger("convert_spd_to_gguf")
 SPD_ARCH = gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.SPD]
 SUPPORTED_CHECKPOINT_VERSION = 11
+FINAL_RAW_ARCH = "glm_final_raw_anchor_reader_v1"
+BANK_FFN_ARCH = "glm_bank_ffn_norm_v1"
+READER_ARCHS = (FINAL_RAW_ARCH, BANK_FFN_ARCH)
 
 
 def field_value(reader: gguf.GGUFReader, key: str) -> Any:
@@ -41,6 +44,11 @@ def copy_tokenizer_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter) ->
 
 
 AGGR_PREFIXES = ("aggr_projs.", "aggr_blocks.", "aggr_scale", "aggr_bias")
+PACKED_READER_PREFIXES = ("raw_anchor_norm.", "bank_anchor_norm.", "bank_correction_a.", "bank_correction_u.")
+
+
+def packed_reader_tensor(name: str) -> bool:
+    return name.startswith(PACKED_READER_PREFIXES) or ".mlp.addition_" in name
 
 
 def checkpoint_tensor_name(name: str) -> str:
@@ -48,6 +56,11 @@ def checkpoint_tensor_name(name: str) -> str:
         raise ValueError("aggregation tensors are packed into aggr.weight / aggr_blk.weight")
     if name == "lm_head.weight":
         return "output.weight"
+    if name in ("target_mem_norm.weight", "target_k.weight", "target_v.weight", "target_k_norm.weight",
+                "raw_anchor_k.weight", "raw_anchor_v.weight", "raw_anchor_k_norm.weight"):
+        return name
+    if name in ("raw_anchor_stage_k.weight", "raw_anchor_stage_v.weight"):
+        return name.removesuffix(".weight")
 
     match = re.fullmatch(r"spec_layers\.(\d+)\.(.+)", name)
     if match is None:
@@ -67,6 +80,15 @@ def checkpoint_tensor_name(name: str) -> str:
         "mlp.gate_proj.weight":                "ffn_gate.weight",
         "mlp.up_proj.weight":                  "ffn_up.weight",
         "mlp.down_proj.weight":                "ffn_down.weight",
+        "reader_norm.weight":                 "reader_norm.weight",
+        "reader_q.weight":                    "reader_q.weight",
+        "reader_q_norm.weight":               "reader_q_norm.weight",
+        "reader_o.weight":                    "reader_o.weight",
+        "reader_stage_gate":                  "reader_stage_gate",
+        "raw_reader_norm.weight":             "raw_reader_norm.weight",
+        "raw_reader_q.weight":                "raw_reader_q.weight",
+        "raw_reader_q_norm.weight":           "raw_reader_q_norm.weight",
+        "raw_reader_o.weight":                "raw_reader_o.weight",
     }
     if suffix not in suffix_map:
         raise ValueError(f"unrecognized checkpoint tensor: {name}")
@@ -79,7 +101,7 @@ def to_bf16_bytes(tensor: torch.Tensor) -> np.ndarray[Any, Any]:
 
 
 def add_checkpoint_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tensor) -> None:
-    if tensor.ndim == 1:
+    if tensor.ndim == 1 or not name.endswith(".weight"):
         writer.add_tensor(name, tensor.detach().to(device="cpu", dtype=torch.float32).numpy())
         return
     writer.add_tensor(
@@ -135,6 +157,80 @@ def resolve_train_span(config: dict[str, Any], override: int | None) -> int:
     return span
 
 
+def reader_checkpoint_shapes(config: dict[str, Any], hidden: int, anchors: int,
+                             layers: int) -> dict[str, tuple[int, ...]]:
+    eps = float(config["spec_attn"]["rms_norm_eps"])
+    contracts = {
+        "reader": {
+            "width": 512, "heads": 8, "head_dim": 64, "shared_kv": True,
+            "insertion": "after_self_attention_before_mlp", "rope_theta": 10000.0,
+            "rms_norm_eps": eps, "dropout": 0.0, "sum_policy": "ascending_anchor_model_dtype_v1",
+        },
+        "layer_views": {
+            "gates": "channelwise_tanh_zero_start", "accumulation": "float32_ascending_anchor_v1",
+            "shared_kv_weights": True, "shared_kv_values": False,
+        },
+        "raw_reader": {
+            "input": "raw_target_anchor", "normalization": "per_anchor_learned_rms_fp32",
+            "width": 128, "heads": 4, "head_dim": 32, "stage_identity": "learned_key_and_value",
+            "shared_kv": True, "insertion": "parallel_to_inherited_reader_before_mlp",
+            "zero_start": "output_projection", "availability": "all_anchors_in_legal_aggregate_prefix",
+            "history": "unchanged_legal_window", "query_rows": 128, "reader_layers": "final_only",
+        },
+    }
+    for name, expected in contracts.items():
+        if config.get(name) != expected:
+            raise ValueError(f"unsupported GLM {name} contract")
+
+    shapes = {
+        "target_mem_norm.weight": (hidden,), "target_k.weight": (512, hidden),
+        "target_v.weight": (512, hidden), "target_k_norm.weight": (64,),
+        "raw_anchor_k.weight": (128, hidden), "raw_anchor_v.weight": (128, hidden),
+        "raw_anchor_stage_k.weight": (anchors, 128), "raw_anchor_stage_v.weight": (anchors, 128),
+        "raw_anchor_k_norm.weight": (32,),
+    }
+    for index in range(anchors):
+        shapes[f"raw_anchor_norm.{index}.weight"] = (hidden,)
+    for index in range(layers):
+        shapes.update({f"spec_layers.{index}.{name}": shape for name, shape in {
+            "reader_norm.weight": (hidden,), "reader_q.weight": (512, hidden),
+            "reader_q_norm.weight": (64,), "reader_o.weight": (hidden, 512),
+            "reader_stage_gate": (anchors, hidden),
+        }.items()})
+    shapes.update({f"spec_layers.{layers - 1}.{name}": shape for name, shape in {
+        "raw_reader_norm.weight": (hidden,), "raw_reader_q.weight": (128, hidden),
+        "raw_reader_q_norm.weight": (32,), "raw_reader_o.weight": (hidden, 128),
+    }.items()})
+
+    if config["architecture"] == BANK_FFN_ARCH:
+        bank = config.get("bank_ffn_norm")
+        expected_bank = {
+            "normalization": "per_anchor_learned_rms_fp32_scalar_identity_gate_v1",
+            "rank": 64, "correction": "depth_specific_u_after_inherited_bank_v1",
+            "correction_sum": "ascending_anchor_model_dtype_v1", "ffn_layer": "final_only",
+            "ffn_extension": "half_inherited_intermediate_size",
+            "ffn_production_inherited": 8192, "ffn_production_extended": 12288,
+            "ffn_execution": "separate_added_term_preserve_inherited_matmuls_v1",
+            "bypass": "additions_off_all_three",
+        }
+        if not isinstance(bank, dict) or any(bank.get(key) != value for key, value in expected_bank.items()):
+            raise ValueError("unsupported GLM bank_ffn_norm contract")
+        width = int(config["spec_attn"]["intermediate_size"])
+        if width < 2 or width % 2:
+            raise ValueError("bank FFN extension requires an even inherited intermediate size")
+        for index in range(anchors):
+            shapes[f"bank_anchor_norm.{index}.weight"] = (hidden,)
+            shapes[f"bank_anchor_norm.{index}.gate"] = ()
+            shapes[f"bank_correction_a.{index}.weight"] = (64, hidden)
+            shapes[f"bank_correction_u.{index}.weight"] = (hidden, 64)
+        shapes.update({f"spec_layers.{layers - 1}.mlp.addition_{name}_proj.weight": shape
+                       for name, shape in {"gate": (width // 2, hidden), "up": (width // 2, hidden),
+                                           "down": (hidden, width // 2)}.items()})
+    elif "bank_ffn_norm" in config:
+        raise ValueError("bank_ffn_norm requires its own checkpoint architecture")
+    return shapes
+
+
 def validate_checkpoint(
     config: dict[str, Any],
     state_dict: dict[str, torch.Tensor],
@@ -145,10 +241,13 @@ def validate_checkpoint(
         raise ValueError(
             f"SPD checkpoint requires a target GGUF with one of {SUPPORTED_TARGET_ARCHS}, got {target_arch!r}")
 
-    version = int(config["version"])
-    if version != SUPPORTED_CHECKPOINT_VERSION:
+    architecture = config.get("architecture", "v11")
+    has_readers = architecture in READER_ARCHS
+    version = config["version"] if has_readers else int(config["version"])
+    if (has_readers and (version != architecture or target_arch != "glm5-next")) or (
+            not has_readers and (architecture != "v11" or version != SUPPORTED_CHECKPOINT_VERSION)):
         raise ValueError(
-            f"unsupported SPD checkpoint version {version}; expected {SUPPORTED_CHECKPOINT_VERSION}"
+            f"unsupported SPD checkpoint architecture/version: {architecture!r}/{version!r}"
         )
 
     hidden_size = int(config["hidden_size"])
@@ -228,6 +327,11 @@ def validate_checkpoint(
             raise ValueError("glm5-next checkpoints must declare the sidecar's spec_attn geometry")
 
     aggr_shared = bool(config.get("aggr_shared", False))
+    if has_readers:
+        if not aggr_shared or num_spec_layers != 2:
+            raise ValueError("GLM reader checkpoints require the shared bank and two speculative layers")
+        if config.get("mask_semantics") != "pre_step_snapshot_v1":
+            raise ValueError("GLM readers require pre_step_snapshot_v1 mask semantics")
     expected_shapes: dict[str, tuple[int, ...]]
     if aggr_shared:
         expected_shapes = {f"aggr_blocks.{index}.weight": (hidden_size, hidden_size)
@@ -273,6 +377,15 @@ def validate_checkpoint(
         for index in range(num_spec_layers):
             expected_shapes.update({f"spec_layers.{index}.{name}": shape for name, shape in layer_shapes.items()})
 
+    if has_readers:
+        expected_shapes.update(reader_checkpoint_shapes(config, hidden_size, num_aggr_types, num_spec_layers))
+        unexpected = set(state_dict) - set(expected_shapes) - {"lm_head.weight"}
+        if unexpected:
+            raise ValueError(f"unexpected GLM reader checkpoint tensors: {sorted(unexpected)}")
+    elif any(packed_reader_tensor(name) or name.startswith(("target_", "raw_anchor_"))
+             or ".reader_" in name or ".raw_reader_" in name for name in state_dict):
+        raise ValueError("reader tensors require an explicit supported GLM reader architecture")
+
     expected_shapes["lm_head.weight"] = (draft_vocab_size, hidden_size)
     for key, expected in expected_shapes.items():
         tensor = state_dict.get(key)
@@ -295,7 +408,7 @@ def validate_checkpoint(
     mapped_names = [
         checkpoint_tensor_name(name)
         for name in state_dict
-        if not name.startswith(AGGR_PREFIXES)
+        if not name.startswith(AGGR_PREFIXES) and not packed_reader_tensor(name)
     ]
     if len(mapped_names) != len(set(mapped_names)):
         raise ValueError("multiple checkpoint tensors map to the same GGUF tensor name")
@@ -314,6 +427,7 @@ def validate_checkpoint(
         "trunk_blocks": trunk_blocks,
         "stage_layers": stage_layers,
         "version": version,
+        "architecture": architecture,
     }
 
 
@@ -321,13 +435,16 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
             assets_path: Path | None = None, train_span: int | None = None) -> None:
     LOGGER.info("Loading SPD checkpoint: %s", checkpoint_path)
     checkpoint, checkpoint_sha256 = load_hashed_source(checkpoint_path, weights_only=True)
-    if (not isinstance(checkpoint, dict) or not {"config", "state_dict"}.issubset(checkpoint)
-            or set(checkpoint) - {"config", "state_dict", "training_step"}):
-        raise ValueError("SPD checkpoint must contain config and state_dict, with optional training_step")
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("config"), dict):
+        raise ValueError("SPD checkpoint must contain a config dictionary")
     config = checkpoint["config"]
-    state_dict = checkpoint["state_dict"]
-    if not isinstance(config, dict) or not isinstance(state_dict, dict):
-        raise ValueError("invalid SPD checkpoint config or state_dict")
+    has_readers = config.get("architecture") in READER_ARCHS
+    tensor_key = "target_memory_state_dict" if has_readers else "state_dict"
+    if tensor_key not in checkpoint or set(checkpoint) - {"config", tensor_key, "training_step"}:
+        raise ValueError(f"SPD checkpoint must contain config and {tensor_key}, with optional training_step")
+    state_dict = checkpoint[tensor_key]
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"invalid SPD checkpoint {tensor_key}")
 
     LOGGER.info("Reading target GGUF metadata: %s", target_path)
     target = gguf.GGUFReader(target_path)
@@ -392,7 +509,13 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
         # spd-train checkpoints carry the speculation module's own attention
         # geometry (independent of the target's); standard NEOX rope, no
         # dimension sections
-        writer.add_feed_forward_length(int(spec_attn["intermediate_size"]))
+        intermediate_size = int(spec_attn["intermediate_size"])
+        if meta["architecture"] == BANK_FFN_ARCH:
+            widths = [intermediate_size] * int(meta["num_spec_layers"])
+            widths[-1] += intermediate_size // 2
+            writer.add_feed_forward_length(widths)
+        else:
+            writer.add_feed_forward_length(intermediate_size)
         writer.add_head_count(int(spec_attn["num_heads"]))
         writer.add_head_count_kv(int(spec_attn["num_kv_heads"]))
         writer.add_key_length(int(spec_attn["head_dim"]))
@@ -421,7 +544,19 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
         writer.add_string(f"{SPD_ARCH}.assets_sha256", assets_sha256)
     if "training_step" in checkpoint:
         writer.add_uint32(f"{SPD_ARCH}.training_step", checkpoint_uint(checkpoint["training_step"], "training_step"))
-    writer.add_spd_checkpoint_version(int(meta["version"]))
+    writer.add_spd_checkpoint_version(SUPPORTED_CHECKPOINT_VERSION)
+    if has_readers:
+        writer.add_string(f"{SPD_ARCH}.head_architecture", str(meta["architecture"]))
+        writer.add_string(f"{SPD_ARCH}.mask_semantics", config["mask_semantics"])
+        reader = config["reader"]
+        writer.add_uint32(f"{SPD_ARCH}.reader.head_count", int(reader["heads"]))
+        writer.add_uint32(f"{SPD_ARCH}.reader.head_dim", int(reader["head_dim"]))
+        writer.add_float32(f"{SPD_ARCH}.reader.rope_freq_base", float(reader["rope_theta"]))
+        writer.add_float32(f"{SPD_ARCH}.reader.rms_norm_eps", float(reader["rms_norm_eps"]))
+        writer.add_uint32(f"{SPD_ARCH}.raw_reader.head_count", int(config["raw_reader"]["heads"]))
+        writer.add_uint32(f"{SPD_ARCH}.raw_reader.head_dim", int(config["raw_reader"]["head_dim"]))
+        if meta["architecture"] == BANK_FFN_ARCH:
+            writer.add_uint32(f"{SPD_ARCH}.bank_correction_rank", int(config["bank_ffn_norm"]["rank"]))
     writer.add_spd_stage_count(int(meta["num_stages"]))
     writer.add_key_value(f"{SPD_ARCH}.stage_layers", meta["stage_layers"], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT32)
     writer.add_spd_use_deepest(bool(meta["use_deepest"]))
@@ -470,9 +605,32 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
         )
         del aggr
 
+    if has_readers:
+        for source, destination in (("raw_anchor_norm", "raw_anchor_norm"),
+                                    ("bank_anchor_norm", "bank_anchor_norm"),
+                                    ("bank_correction_a", "bank_correction_a.weight"),
+                                    ("bank_correction_u", "bank_correction_u.weight")):
+            if source != "raw_anchor_norm" and meta["architecture"] != BANK_FFN_ARCH:
+                continue
+            packed = torch.stack([state_dict[f"{source}.{index}.weight"] for index in range(num_aggr_types)])
+            LOGGER.info("%-64s -> %s", f"{source}.*.weight", destination)
+            add_checkpoint_tensor(writer, destination, packed)
+        if meta["architecture"] == BANK_FFN_ARCH:
+            gates = torch.stack([state_dict[f"bank_anchor_norm.{index}.gate"] for index in range(num_aggr_types)])
+            add_checkpoint_tensor(writer, "bank_anchor_gate", gates.reshape(num_aggr_types, 1))
+            LOGGER.info("folding the final FFN extension into gate/up rows and down columns")
+
+    final_mlp = f"spec_layers.{int(meta['num_spec_layers']) - 1}.mlp."
     for source_name, tensor in state_dict.items():
-        if source_name.startswith(AGGR_PREFIXES):
+        if source_name.startswith(AGGR_PREFIXES) or packed_reader_tensor(source_name):
             continue
+        if has_readers and source_name.endswith(".reader_stage_gate"):
+            # The graph consumes these constant tanh values in its F32 view sum.
+            tensor = tensor.to(torch.float32).tanh()
+        if meta["architecture"] == BANK_FFN_ARCH and source_name.startswith(final_mlp):
+            suffix = source_name.removeprefix(final_mlp)
+            addition = state_dict[final_mlp + "addition_" + suffix]
+            tensor = torch.cat((tensor, addition), dim=1 if suffix == "down_proj.weight" else 0)
         output_name = checkpoint_tensor_name(source_name)
         LOGGER.info("%-64s -> %s", source_name, output_name)
         add_checkpoint_tensor(writer, output_name, tensor)
@@ -488,7 +646,7 @@ def convert(checkpoint_path: Path, target_path: Path, output_path: Path,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert an SPD v11 PyTorch sidecar checkpoint to BF16 GGUF")
+    parser = argparse.ArgumentParser(description="Convert an SPD v11 or GLM reader sidecar checkpoint to BF16 GGUF")
     parser.add_argument("checkpoint", type=Path, help="SPD speculation-head .pt checkpoint")
     parser.add_argument("target_gguf", type=Path, help="matching target GGUF")
     parser.add_argument("--outfile", type=Path, help="output GGUF path")

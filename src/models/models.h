@@ -1430,6 +1430,13 @@ struct llama_model_spd : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     };
 
+    std::string head_architecture;
+    uint32_t reader_head_count = 0;
+    uint32_t reader_head_dim = 0;
+    float reader_rope_freq_base = 10000.0f;
+    uint32_t raw_head_count = 0;
+    uint32_t raw_head_dim = 0;
+    uint32_t bank_correction_rank = 0;
     uint32_t checkpoint_version = 0;
     uint32_t stage_count = 0;
     std::vector<uint32_t> stage_layers;

@@ -60,6 +60,30 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
+static int64_t spd_raw_fa_head_dim(ggml_backend_dev_t dev, int64_t head_dim, int64_t n_heads) {
+    ggml_init_params params = { 10*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx || !dev) {
+        throw std::runtime_error("failed to prepare SPD raw attention capability probe");
+    }
+    auto supported = [&](int64_t dim) {
+        auto * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, dim, 1, n_heads, 1);
+        auto * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, dim, 256, n_heads, 1);
+        auto * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, dim, 256, n_heads, 1);
+        auto * mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, 256, 1, 1, 1);
+        auto * op = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.0f/std::sqrt(float(head_dim)), 0.0f, 0.0f);
+        return ggml_backend_dev_supports_op(dev, op);
+    };
+    if (supported(head_dim)) {
+        return head_dim;
+    }
+    if (head_dim == 32 && supported(64)) {
+        LLAMA_LOG_INFO("%s: padding SPD raw attention heads from 32 to 64 on %s\n", __func__, ggml_backend_dev_name(dev));
+        return 64;
+    }
+    throw std::runtime_error("SPD raw flash attention is unsupported on " + std::string(ggml_backend_dev_name(dev)));
+}
+
 //
 // llama_kv_cache
 //
@@ -116,9 +140,9 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // 3 tensors per layer (K, V, optional K_idx) + one view per stream,
-                // + 8: room for the per-buft device-resident rotation tensors
-                /*.mem_size   =*/ size_t(3u*(1 + n_stream)*n_layer + 8)*ggml_tensor_overhead(),
+                // K/V, optional indexer, five SPD auxiliaries, and views per stream.
+                // Eight extra tensors hold the device-resident rotations.
+                /*.mem_size   =*/ size_t((model.spd_target_k ? 8u : 3u)*(1 + n_stream)*n_layer + 8)*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -251,6 +275,35 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+        if (model.spd_target_k != nullptr) {
+            auto & layer = layers.back();
+            const int64_t n_anchor = model.target_layer_ids.size();
+            const bool raw = model.layers[il].spd_raw_reader_q != nullptr;
+            const int64_t target_width = model.spd_target_k->ne[1];
+            int64_t raw_width = raw ? model.spd_raw_k->ne[1]*n_anchor : 0;
+            if (raw && !v_trans) {
+                const int64_t head_dim = model.spd_raw_k_norm->ne[0];
+                const int64_t n_heads = model.spd_raw_k->ne[1]/head_dim;
+                auto * dev = offload ? model.dev_layer(il) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                raw_width = spd_raw_fa_head_dim(dev, head_dim, n_heads)*n_heads*n_anchor;
+            }
+            const int64_t widths[] = { target_width, target_width, raw_width, raw_width, raw ? n_anchor : 0 };
+            for (size_t a = 0; a < layer.spd_aux.size(); ++a) {
+                if (widths[a] == 0) {
+                    continue;
+                }
+                const bool is_k = a == (size_t) llama_spd_cache_kind::TARGET_K || a == (size_t) llama_spd_cache_kind::RAW_K;
+                const bool is_v = a == (size_t) llama_spd_cache_kind::TARGET_V || a == (size_t) llama_spd_cache_kind::RAW_V;
+                // FA consumes F16 K/V; cast only arriving rows instead of the full span.
+                const bool use_f16 = !v_trans && ((is_k && type_k == GGML_TYPE_F16) || (is_v && type_v == GGML_TYPE_F16));
+                auto * t = ggml_new_tensor_3d(ctx, use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, widths[a], kv_size, n_stream);
+                ggml_format_name(t, "cache_%sspd_%zu_l%d", name_tag, a, il);
+                layer.spd_aux[a] = t;
+                for (uint32_t stream = 0; stream < n_stream; ++stream) {
+                    layer.spd_aux_stream[a].push_back(ggml_view_2d(ctx, t, widths[a], kv_size, t->nb[1], stream*t->nb[2]));
+                }
+            }
+        }
     }
 
     if (reuse) {
@@ -887,6 +940,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
+                for (size_t a = 0; a < layer.spd_aux.size(); ++a) {
+                    if (layer.spd_aux[a]) {
+                        ggml_backend_tensor_copy(layer.spd_aux_stream[a][ssrc], layer.spd_aux_stream[a][sdst]);
+                    }
+                }
             }
         }
     }
@@ -1482,6 +1540,18 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_spd_aux(ggml_context * ctx, int32_t il, llama_spd_cache_kind kind, uint32_t n_kv, const slot_info & sinfo) const {
+    auto * t = layers[map_layer_ids.at(il)].spd_aux.at((size_t) kind);
+    GGML_ASSERT(t != nullptr);
+    return ggml_view_3d(ctx, t, t->ne[0], n_kv, sinfo.s1 - sinfo.s0 + 1, t->nb[1], t->nb[2], sinfo.s0*t->nb[2]);
+}
+
+ggml_tensor * llama_kv_cache::cpy_spd_aux(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, llama_spd_cache_kind kind) const {
+    auto * t = layers[map_layer_ids.at(il)].spd_aux.at((size_t) kind);
+    GGML_ASSERT(t != nullptr && cur->ne[0] == t->ne[0]);
+    return ggml_set_rows(ctx, ggml_reshape_2d(ctx, t, t->ne[0], t->ne[1]*t->ne[2]), cur, idxs);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2252,6 +2322,23 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
 
         ggml_build_forward_expand(gf, cur);
+
+        for (auto kind : { llama_spd_cache_kind::TARGET_K, llama_spd_cache_kind::RAW_K }) {
+            auto * aux = layer.spd_aux[(size_t) kind];
+            if (!aux) {
+                continue;
+            }
+            const bool raw = kind == llama_spd_cache_kind::RAW_K;
+            const int64_t head_dim = (raw ? model.spd_raw_k_norm : model.spd_target_k_norm)->ne[0];
+            const int64_t n_heads = raw ? model.spd_raw_k->ne[1]/head_dim*model.target_layer_ids.size() : aux->ne[0]/head_dim;
+            const int64_t storage_dim = aux->ne[0]/n_heads;
+            auto * keys = ggml_view_3d(ctx, aux, head_dim, n_heads, get_size()*n_stream,
+                    storage_dim*ggml_element_size(aux), aux->nb[1], 0);
+            // Reader metadata fixes independent NEOX RoPE at theta 10000.
+            auto * shifted = ggml_rope_ext_inplace(ctx, keys, inp->k_shift, nullptr,
+                    head_dim, LLAMA_ROPE_TYPE_NEOX, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            ggml_build_forward_expand(gf, shifted);
+        }
     }
 
     res->add_input(std::move(inp));
@@ -2561,6 +2648,47 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     const size_t src_offset = (range.first + j * kv_size) * v_size_el;
                     const size_t buf_size = range_size * v_size_el;
                     io.write_tensor(v, src_offset, buf_size);
+                }
+            }
+        }
+    }
+    for (const auto & layer : layers) {
+        for (size_t a = 0; a < layer.spd_aux.size(); ++a) {
+            if (!layer.spd_aux[a]) {
+                continue;
+            }
+            auto * t = layer.spd_aux_stream[a][cr.strm];
+            const bool raw = a == (size_t) llama_spd_cache_kind::RAW_K || a == (size_t) llama_spd_cache_kind::RAW_V;
+            const uint64_t width = raw && !io.is_device() ? model.spd_raw_k->ne[1]*model.target_layer_ids.size() : t->ne[0];
+            const int32_t type = t->type;
+            const uint64_t row_bytes = ggml_row_size(t->type, width);
+            io.write(&width, sizeof(width));
+            io.write(&type, sizeof(type));
+            io.write(&row_bytes, sizeof(row_bytes));
+            if (io.is_sizing() || width == (uint64_t) t->ne[0]) {
+                for (const auto & range : cr.data) {
+                    io.write_tensor(t, range.first*t->nb[1], (range.second - range.first)*row_bytes);
+                }
+                continue;
+            }
+            // Keep raw state portable between native and padded FA devices.
+            const size_t heads = width/model.spd_raw_k_norm->ne[0];
+            const size_t head_bytes = row_bytes/heads;
+            const size_t storage_head_bytes = t->nb[1]/heads;
+            std::vector<uint8_t> storage(64*t->nb[1]);
+            std::vector<uint8_t> packed(64*row_bytes);
+            for (const auto & range : cr.data) {
+                for (uint32_t first = range.first; first < range.second;) {
+                    const uint32_t count = std::min(64u, range.second - first);
+                    ggml_backend_tensor_get(t, storage.data(), first*t->nb[1], count*t->nb[1]);
+                    for (uint32_t row = 0; row < count; ++row) {
+                        for (size_t head = 0; head < heads; ++head) {
+                            std::memcpy(packed.data() + row*row_bytes + head*head_bytes,
+                                    storage.data() + row*t->nb[1] + head*storage_head_bytes, head_bytes);
+                        }
+                    }
+                    io.write(packed.data(), count*row_bytes);
+                    first += count;
                 }
             }
         }
@@ -2893,6 +3021,52 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
+    for (const auto & layer : layers) {
+        for (size_t a = 0; a < layer.spd_aux.size(); ++a) {
+            if (!layer.spd_aux[a]) {
+                continue;
+            }
+            auto * t = layer.spd_aux_stream[a][strm];
+            uint64_t width;
+            int32_t type;
+            uint64_t row_bytes;
+            io.read(&width, sizeof(width));
+            io.read(&type, sizeof(type));
+            io.read(&row_bytes, sizeof(row_bytes));
+            const bool raw = a == (size_t) llama_spd_cache_kind::RAW_K || a == (size_t) llama_spd_cache_kind::RAW_V;
+            const uint64_t expected_width = raw && !io.is_device() ? model.spd_raw_k->ne[1]*model.target_layer_ids.size() : t->ne[0];
+            if (width != expected_width || type != t->type || row_bytes != ggml_row_size(t->type, expected_width)) {
+                LLAMA_LOG_ERROR("%s: mismatched SPD auxiliary tensor layout\n", __func__);
+                return false;
+            }
+            if (width == (uint64_t) t->ne[0]) {
+                for (const auto & r : runs) {
+                    io.read_tensor(t, (size_t) r.from*t->nb[1], (size_t) (r.to - r.from)*t->nb[1]);
+                }
+                continue;
+            }
+            const size_t heads = width/model.spd_raw_k_norm->ne[0];
+            const size_t head_bytes = row_bytes/heads;
+            const size_t storage_head_bytes = t->nb[1]/heads;
+            std::vector<uint8_t> storage(64*t->nb[1], 0);
+            std::vector<uint8_t> packed(64*row_bytes);
+            for (const auto & r : runs) {
+                for (uint32_t first = r.from; first < r.to;) {
+                    const uint32_t count = std::min(64u, r.to - first);
+                    io.read(packed.data(), count*row_bytes);
+                    for (uint32_t row = 0; row < count; ++row) {
+                        for (size_t head = 0; head < heads; ++head) {
+                            std::memcpy(storage.data() + row*t->nb[1] + head*storage_head_bytes,
+                                    packed.data() + row*row_bytes + head*head_bytes, head_bytes);
+                        }
+                    }
+                    ggml_backend_tensor_set(t, storage.data(), first*t->nb[1], count*t->nb[1]);
+                    first += count;
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -3070,4 +3244,12 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+ggml_tensor * llama_kv_cache_context::get_spd_aux(ggml_context * ctx, int32_t il, llama_spd_cache_kind kind) const {
+    return kv->get_spd_aux(ctx, il, kind, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_spd_aux(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, llama_spd_cache_kind kind) const {
+    return kv->cpy_spd_aux(ctx, cur, idxs, il, kind);
 }

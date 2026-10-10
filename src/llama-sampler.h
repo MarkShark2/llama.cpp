@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <functional>
 #include <vector>
 
 struct llama_vocab;
@@ -37,6 +38,10 @@ struct llama_sampler_chain {
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+
+// Retain graph inputs without snapshotting RNG or accepted-token state.
+bool llama_sampler_backend_graph_reuse_supported(const llama_sampler * sampler);
+std::function<void()> llama_sampler_backend_graph_binding(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
