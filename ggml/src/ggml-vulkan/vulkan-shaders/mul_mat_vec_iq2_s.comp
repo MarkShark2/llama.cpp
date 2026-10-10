@@ -5,16 +5,29 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (constant_id = 3) const uint REUSE_TARGET_INPUT = 0;
+layout (constant_id = 3) const uint TARGET_IQ_MODE = 0;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+vec4 apply_iq_sign(const vec4 grid, const uint sign, const bool bitwise_sign) {
+    if (bitwise_sign) {
+        // The unsigned grid magnitudes are exact positive floats.
+        const uvec4 sign_bits = (uvec4(sign) << uvec4(31, 30, 29, 28)) & uvec4(0x80000000u);
+        return uintBitsToFloat(floatBitsToUint(grid) ^ sign_bits);
+    }
+    return vec4((sign & 1) != 0 ? -grid.x : grid.x,
+                (sign & 2) != 0 ? -grid.y : grid.y,
+                (sign & 4) != 0 ? -grid.z : grid.z,
+                (sign & 8) != 0 ? -grid.w : grid.w);
+}
 
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 16 * itid;
     const uint nibble_shift = 4 * (itid & 1);
     const uint ib32 = itid / 2; // 0..7
 
-    const bool reuse_input = REUSE_TARGET_INPUT != 0 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
+    const bool bitwise_sign = TARGET_IQ_MODE == 2 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
+    const bool reuse_input = TARGET_IQ_MODE == 1 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
     vec4 input_slice[4];
     if (reuse_input) {
         [[unroll]] for (uint l = 0; l < 4; ++l) {
@@ -35,22 +48,22 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
             const uint8_t sign = sign16[l];
             const uint qs = qs16[l] | ((qh << (8 - nibble_shift - 2 * l)) & 0x300);
             const uvec2 grid = iq2s_grid[qs];
-            const vec4 grid0 = vec4(unpack8(grid.x));
-            const vec4 grid1 = vec4(unpack8(grid.y));
+            const vec4 grid0 = apply_iq_sign(vec4(unpack8(grid.x)), uint(sign), bitwise_sign);
+            const vec4 grid1 = apply_iq_sign(vec4(unpack8(grid.y)), uint(sign) >> 4, bitwise_sign);
 
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 vec4 b0 = reuse_input ? input_slice[2*l + 0] : vec4(data_b_v4[(b_off[j] + y_idx) / 4 + 2*l + 0]);
                 vec4 b4 = reuse_input ? input_slice[2*l + 1] : vec4(data_b_v4[(b_off[j] + y_idx) / 4 + 2*l + 1]);
 
                 FLOAT_TYPE sum =
-                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
-                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
-                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE((sign &   4) != 0 ? -grid0.z : grid0.z),
-                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE((sign &   8) != 0 ? -grid0.w : grid0.w),
-                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE((sign &  16) != 0 ? -grid1.x : grid1.x),
-                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE((sign &  32) != 0 ? -grid1.y : grid1.y),
-                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
-                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign & 128) != 0 ? -grid1.w : grid1.w),
+                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(grid0.x),
+                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(grid0.y),
+                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(grid0.z),
+                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(grid0.w),
+                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE(grid1.x),
+                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE(grid1.y),
+                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE(grid1.z),
+                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE(grid1.w),
                       FLOAT_TYPE(0.0)))))))));
                 temp[j][n] = fma(db, sum, temp[j][n]);
             }
