@@ -16,6 +16,10 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+#if defined(DATA_A_Q8_0) && !defined(MUL_MAT_ID)
+layout (constant_id = 3) const uint REUSE_Q8_PAIR = 0;
+#endif
+
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
     OOB_y = lastiter && (iybs + iqs + y_offset >= ncols_k);
@@ -51,6 +55,30 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
     const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
     const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
     const uint iybs = col - col%QUANT_K; // y block start index
+
+#if defined(DATA_A_Q8_0) && !defined(MUL_MAT_ID)
+    if (REUSE_Q8_PAIR != 0 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0 &&
+        NUM_ROWS == 8 && num_rows == NUM_ROWS) {
+        // Keep only two rows of weights live; stream each B vector once per pair.
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n += 2) {
+            const uint ib0 = ((first_row + n) * p.ncols + col) / QUANT_K;
+            const uint ib1 = ib0 + p.ncols / QUANT_K;
+            const float d0 = get_dm(ib0, a_offset).x;
+            const float d1 = get_dm(ib1, a_offset).x;
+            const vec4 v0 = dequantize4(ib0, iqs, a_offset) * d0;
+            const vec4 v1 = dequantize4(ib0, iqs + 4, a_offset) * d0;
+            const vec4 w0 = dequantize4(ib1, iqs, a_offset) * d1;
+            const vec4 w1 = dequantize4(ib1, iqs + 4, a_offset) * d1;
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const vec4 bv0 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4]);
+                const vec4 bv1 = vec4(data_b_v4[(b_off[j] + iybs + iqs) / 4 + 1]);
+                temp[j][n] += dot(bv0, v0) + dot(bv1, v1);
+                temp[j][n + 1] += dot(bv0, w0) + dot(bv1, w1);
+            }
+        }
+        return;
+    }
+#endif
 
     uint ibi = first_row*p.ncols;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
