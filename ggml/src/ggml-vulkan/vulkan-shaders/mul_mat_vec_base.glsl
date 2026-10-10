@@ -70,6 +70,11 @@ uint mmv_chunk = 0;
 uint mmv_ncols = 0;
 uint mmv_pair[MMV_MAX_COLS];
 #define MMV_COL_ACTIVE(j) ((j) < mmv_ncols)
+#if defined(DATA_A_Q8_0) && !defined(MMQ)
+// Keep loop bounds static; this predicate is uniform across the workgroup.
+layout (constant_id = 3) const uint SKIP_INACTIVE_COLS = 0;
+#define MMV_COL_COMPUTE(j) (SKIP_INACTIVE_COLS == 0 || MMV_COL_ACTIVE(j))
+#endif
 #define MMV_FUSE_IDX(j) mmv_pair[j]
 #define MMV_COMPUTE(first_row, num_rows) { \
     const uint mmv_count = data_map[gl_WorkGroupID.y]; \
@@ -81,6 +86,10 @@ uint mmv_pair[MMV_MAX_COLS];
 #define MMV_COL_ACTIVE(j) true
 #define MMV_FUSE_IDX(j) gl_GlobalInvocationID.y
 #define MMV_COMPUTE(first_row, num_rows) compute_outputs(first_row, num_rows)
+#endif
+
+#ifndef MMV_COL_COMPUTE
+#define MMV_COL_COMPUTE(j) true
 #endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
@@ -157,6 +166,9 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        if (!MMV_COL_COMPUTE(j)) {
+            continue;
+        }
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
@@ -164,6 +176,9 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
 
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (!MMV_COL_COMPUTE(j)) {
+                continue;
+            }
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
@@ -199,6 +214,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 #if USE_SUBGROUP_ADD
     // sum up partial sums within a subgroup
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        if (!MMV_COL_COMPUTE(j)) {
+            continue;
+        }
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
@@ -207,6 +225,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     // Go through shared memory to sum partials across subgroups
     if (gl_SubgroupInvocationID == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (!MMV_COL_COMPUTE(j)) {
+                continue;
+            }
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
                 tmpsh[j][n][gl_SubgroupID] = temp[j][n];
             }
@@ -215,6 +236,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     barrier();
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (!MMV_COL_COMPUTE(j)) {
+                continue;
+            }
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
                 temp[j][n] = FLOAT_TYPE(0);
                 [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
@@ -247,6 +271,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 #else
     // sum up partial sums and write back result
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        if (!MMV_COL_COMPUTE(j)) {
+            continue;
+        }
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             tmpsh[j][n][tid] = temp[j][n];
         }
@@ -255,6 +282,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
         if (tid < s) {
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                if (!MMV_COL_COMPUTE(j)) {
+                    continue;
+                }
                 [[unroll]] for (uint n = 0; n < num_rows; ++n) {
                     tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
                 }
@@ -264,6 +294,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     }
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (!MMV_COL_COMPUTE(j)) {
+                continue;
+            }
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
