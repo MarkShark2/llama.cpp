@@ -8,19 +8,21 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sccache[2][BLOCK_SIZE/16][16];
 
-layout (constant_id = 3) const uint REUSE_TARGET_INPUT = 0;
+// 0: original, 1: cached input and direct scales, 2: direct scales only.
+layout (constant_id = 3) const uint TARGET_MODE = 0;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 uint csel = 0;
 
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint ix, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows, const bool all_threads) {
     const uint y_idx = i * QUANT_K + y_offset;
-    const bool reuse_input = REUSE_TARGET_INPUT != 0 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
+    const bool direct_scales = TARGET_MODE != 0 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
+    const bool reuse_input = TARGET_MODE == 1 && direct_scales;
+    if (direct_scales && i >= num_blocks_per_row) {
+        return;
+    }
     vec4 input_slice[4];
     if (reuse_input) {
-        if (i >= num_blocks_per_row) {
-            return;
-        }
         [[unroll]] for (uint l = 0; l < 4; ++l) {
             input_slice[l] = vec4(data_b_v4[(b_off[0] + y_idx) / 4 + 8*l]);
         }
@@ -28,9 +30,11 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
-        csel ^= 1;
+        if (!direct_scales) {
+            csel ^= 1;
+        }
 
-        if (!reuse_input && !all_threads) { // when we don't have enough blocks to use all threads
+        if (!direct_scales && !all_threads) { // when we don't have enough blocks to use all threads
             if (i < num_blocks_per_row)
                 sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);
             barrier();
@@ -63,14 +67,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
         const vec4 q2 = vec4(unpack8(q2_u32)) - 32;
         const vec4 q3 = vec4(unpack8(q3_u32)) - 32;
 
-        if (!reuse_input && all_threads) {
+        if (!direct_scales && all_threads) {
             sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);
             barrier();
         }
 
         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
         vec4 scales;
-        if (reuse_input) {
+        if (direct_scales) {
             scales = vec4(data_a[ib0 + i].scales[s_offset], data_a[ib0 + i].scales[s_offset + 2],
                           data_a[ib0 + i].scales[s_offset + 4], data_a[ib0 + i].scales[s_offset + 6]);
         } else {
