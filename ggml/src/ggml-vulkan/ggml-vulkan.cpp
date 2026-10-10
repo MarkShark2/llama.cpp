@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cmath>
 #include <iomanip>
@@ -2265,6 +2266,84 @@ static bool vk_enable_sync_logger = false;
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
 
+// [fork] Bounded, default-off host-wall attribution. Submit/wait are nested
+// spans, not extra time to add to graph setup/loop/tail. No GPU queries or
+// changes to submission, synchronization, or tensor ownership are introduced.
+static uint64_t ggml_vk_host_trace_limit() {
+    static const uint64_t limit = []() -> uint64_t {
+        const char * value = getenv("GGML_VK_HOST_TRACE");
+        if (!value || value[0] == '-') {
+            return 0;
+        }
+        char * end = nullptr;
+        const auto parsed = strtoull(value, &end, 10);
+        return end != value && *end == '\0' ? std::min<uint64_t>(parsed, 1000000) : 0;
+    }();
+    return limit;
+}
+
+static thread_local int64_t vk_host_submit_us = 0;
+static thread_local int64_t vk_host_wait_us = 0;
+static thread_local uint64_t vk_host_parent_id = 0;
+
+struct ggml_vk_host_timer {
+    int64_t * total;
+    int64_t start;
+    explicit ggml_vk_host_timer(int64_t & destination) :
+        total(ggml_vk_host_trace_limit() ? &destination : nullptr),
+        start(total ? ggml_time_us() : 0) {}
+    ~ggml_vk_host_timer() {
+        if (total) {
+            *total += ggml_time_us() - start;
+        }
+    }
+};
+
+struct ggml_vk_host_trace {
+    uint64_t id = 0;
+    uint64_t parent = 0;
+    const char * kind;
+    const char * device;
+    const void * context;
+    int nodes;
+    int64_t start = 0, loop = 0, tail = 0, submit = 0, wait = 0;
+    ggml_vk_host_trace(const char * kind, const char * device, const void * context, int nodes = 0) :
+        kind(kind), device(device), context(context), nodes(nodes) {
+        if (!ggml_vk_host_trace_limit()) {
+            return;
+        }
+        static std::atomic<uint64_t> sequence{0};
+        const auto next = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (next > ggml_vk_host_trace_limit()) {
+            return;
+        }
+        id = next;
+        parent = vk_host_parent_id;
+        vk_host_parent_id = id;
+        start = ggml_time_us();
+        submit = vk_host_submit_us;
+        wait = vk_host_wait_us;
+    }
+    void begin_loop() { if (id) { loop = ggml_time_us(); } }
+    void begin_tail() { if (id) { tail = ggml_time_us(); } }
+    ~ggml_vk_host_trace() {
+        if (!id) {
+            return;
+        }
+        const int64_t end = ggml_time_us();
+        vk_host_parent_id = parent;
+        GGML_LOG_INFO("[vk host] id=%llu parent=%llu kind=%s device=\"%s\" ctx=%p nodes=%d "
+                      "begin_us=%lld end_us=%lld wall_us=%lld setup_us=%lld loop_us=%lld tail_us=%lld "
+                      "nested_submit_us=%lld nested_wait_us=%lld\n",
+                      (unsigned long long) id, (unsigned long long) parent, kind, device, context, nodes,
+                      (long long) start, (long long) end, (long long) (end - start),
+                      (long long) (loop ? loop - start : end - start),
+                      (long long) (loop && tail ? tail - loop : 0),
+                      (long long) (tail ? end - tail : 0),
+                      (long long) (vk_host_submit_us - submit), (long long) (vk_host_wait_us - wait));
+    }
+};
+
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
@@ -2741,6 +2820,7 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 
 // Wait for ctx->fence to be signaled.
 static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    ggml_vk_host_timer host_wait(vk_host_wait_us);
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
@@ -3312,6 +3392,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 }
 
 static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+    ggml_vk_host_timer host_submit(vk_host_submit_us);
     if (ctx->seqs.empty()) {
         if (fence) {
             ctx->p->q->handle->submit({}, fence);
@@ -17539,6 +17620,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+    ggml_vk_host_trace host_trace("sync", ctx->device->name.c_str(), ctx);
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
@@ -17565,7 +17647,10 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(compute_ctx, ctx->fence);
-            VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
+            {
+                ggml_vk_host_timer host_wait(vk_host_wait_us);
+                VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
+            }
             ctx->device->device.resetFences({ ctx->fence });
         } else {
             // Fence the readback itself when no later transfer wait is needed.
@@ -18254,6 +18339,7 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_host_trace host_trace("graph", ctx->device->name.c_str(), ctx, cgraph->n_nodes);
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -18353,6 +18439,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
+            ggml_vk_host_timer host_wait(vk_host_wait_us);
             try {
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {
@@ -18381,6 +18468,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    host_trace.begin_loop();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -18670,6 +18758,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+    host_trace.begin_tail();
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -18678,7 +18767,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_ctx_end(compute_ctx);
 
         ggml_vk_submit(compute_ctx, ctx->device->fence);
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences", ctx->device);
+        {
+            ggml_vk_host_timer host_wait(vk_host_wait_us);
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences", ctx->device);
+        }
         ctx->device->device.resetFences({ ctx->device->fence });
         ctx->compute_ctx.reset();
 
