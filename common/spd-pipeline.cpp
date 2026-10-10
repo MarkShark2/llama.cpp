@@ -3332,6 +3332,8 @@ struct common_spd_pipeline::impl {
             } else {
                 ggml_backend_tensor_get(out, output.data(), 0, output.size()*sizeof(float));
             }
+            // Preserve the completion/accounting performed by llama_get_embeddings on the normal path.
+            llama_synchronize(stages[stage]);
         }
 
         // Producer side: ship this boundary straight to the next stage's
