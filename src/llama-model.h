@@ -257,6 +257,17 @@ struct llama_layer_switch_lora {
 };
 
 struct llama_layer {
+    // SPD target-memory and final raw-anchor readers
+    struct ggml_tensor * spd_reader_norm = nullptr;
+    struct ggml_tensor * spd_reader_q = nullptr;
+    struct ggml_tensor * spd_reader_q_norm = nullptr;
+    struct ggml_tensor * spd_reader_o = nullptr;
+    struct ggml_tensor * spd_reader_stage_gate = nullptr;
+    struct ggml_tensor * spd_raw_reader_norm = nullptr;
+    struct ggml_tensor * spd_raw_reader_q = nullptr;
+    struct ggml_tensor * spd_raw_reader_q_norm = nullptr;
+    struct ggml_tensor * spd_raw_reader_o = nullptr;
+
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
     struct ggml_tensor * attn_norm_b     = nullptr;
@@ -689,6 +700,21 @@ struct llama_model {
     struct ggml_tensor * spd_aggr_blk   = nullptr;
     struct ggml_tensor * spd_aggr_scale = nullptr;
     struct ggml_tensor * spd_aggr_bias  = nullptr;
+
+    struct ggml_tensor * spd_target_mem_norm = nullptr;
+    struct ggml_tensor * spd_target_k = nullptr;
+    struct ggml_tensor * spd_target_v = nullptr;
+    struct ggml_tensor * spd_target_k_norm = nullptr;
+    struct ggml_tensor * spd_raw_norm = nullptr;
+    struct ggml_tensor * spd_raw_k = nullptr;
+    struct ggml_tensor * spd_raw_v = nullptr;
+    struct ggml_tensor * spd_raw_stage_k = nullptr;
+    struct ggml_tensor * spd_raw_stage_v = nullptr;
+    struct ggml_tensor * spd_raw_k_norm = nullptr;
+    struct ggml_tensor * spd_bank_norm = nullptr;
+    struct ggml_tensor * spd_bank_gate = nullptr;
+    struct ggml_tensor * spd_bank_correction_a = nullptr;
+    struct ggml_tensor * spd_bank_correction_u = nullptr;
 
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;

@@ -120,6 +120,12 @@ struct llama_cparams {
     // position of the next decode, how many anchors that slot already holds.
     struct ggml_tensor * spd_aggr_state = nullptr;
     const struct llama_spd_aggr_plan * spd_aggr_plan = nullptr;
+    std::vector<struct ggml_tensor *> spd_aggr_view_state;
+    struct ggml_tensor * spd_aggr_correction_state = nullptr;
+    struct ggml_tensor * spd_raw_k_state = nullptr;
+    struct ggml_tensor * spd_raw_v_state = nullptr;
+    std::vector<struct ggml_tensor *> spd_target_k_state;
+    std::vector<struct ggml_tensor *> spd_target_v_state;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer() + 1] extract input embeddings for layer; slot n_layer = output of the final layer
 

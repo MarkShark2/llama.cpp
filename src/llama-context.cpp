@@ -575,11 +575,42 @@ llama_context::llama_context(
         // scratch column for untracked rows.
         if (model.spd_aggr_blk != nullptr && model.spd_aggr_blk->buffer != nullptr) {
             const uint32_t n_slots = 64;
-            ggml_init_params ip = { ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+            ggml_init_params ip = { (4 + 3*hparams.n_layer())*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
             spd_aggr_ctx = ggml_init(ip);
+            if (spd_aggr_ctx == nullptr) {
+                throw std::runtime_error("failed to create the SPD aggregation context");
+            }
             ggml_tensor * state = ggml_new_tensor_2d(spd_aggr_ctx, GGML_TYPE_F32,
                     model.spd_aggr_blk->ne[1], (int64_t) n_slots + 1);
             ggml_set_name(state, "spd_aggr_state");
+            auto make_state = [&](int64_t width, const char * name) {
+                auto * t = ggml_new_tensor_2d(spd_aggr_ctx, GGML_TYPE_F32, width, (int64_t) n_slots + 1);
+                ggml_set_name(t, name);
+                return t;
+            };
+            if (model.spd_bank_correction_a != nullptr) {
+                cparams.spd_aggr_correction_state = make_state(model.spd_bank_correction_a->ne[1], "spd_aggr_correction_state");
+            }
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                if (model.spd_target_k != nullptr) {
+                    auto * k = make_state(model.spd_target_k->ne[1], "spd_target_k_state");
+                    auto * v = make_state(model.spd_target_v->ne[1], "spd_target_v_state");
+                    ggml_format_name(k, "spd_target_k_state_%u", il);
+                    ggml_format_name(v, "spd_target_v_state_%u", il);
+                    cparams.spd_target_k_state.push_back(k);
+                    cparams.spd_target_v_state.push_back(v);
+                }
+                if (model.layers[il].spd_reader_stage_gate != nullptr) {
+                    auto * t = make_state(model.spd_aggr_blk->ne[1], "spd_aggr_view_state");
+                    ggml_format_name(t, "spd_aggr_view_state_%u", il);
+                    cparams.spd_aggr_view_state.push_back(t);
+                }
+            }
+            if (model.spd_raw_k != nullptr) {
+                const int64_t width = model.spd_raw_k->ne[1]*model.target_layer_ids.size();
+                cparams.spd_raw_k_state = make_state(width, "spd_raw_k_state");
+                cparams.spd_raw_v_state = make_state(width, "spd_raw_v_state");
+            }
             spd_aggr_buf = ggml_backend_alloc_ctx_tensors_from_buft(spd_aggr_ctx,
                     ggml_backend_buffer_get_type(model.spd_aggr_blk->buffer));
             if (spd_aggr_buf == nullptr) {
@@ -591,7 +622,7 @@ llama_context::llama_context(
             cparams.spd_aggr_state = state;
             cparams.spd_aggr_plan  = &spd_aggr_plan_data;
             LLAMA_LOG_INFO("%s: SPD shared aggregation bank: %u-slot state, %.1f MiB on %s\n", __func__,
-                    n_slots, ggml_nbytes(state)/(1024.0*1024.0), ggml_backend_buffer_name(spd_aggr_buf));
+                    n_slots, ggml_backend_buffer_get_size(spd_aggr_buf)/(1024.0*1024.0), ggml_backend_buffer_name(spd_aggr_buf));
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -1835,31 +1866,47 @@ ggml_tensor * llama_context::spd_peer_out_tensor() const {
 
 bool llama_context::set_spd_aggr_plan(int32_t n, const llama_pos * pos, const int32_t * held,
         const int32_t * n_new, const float * feat) {
-    if (cparams.spd_aggr_state == nullptr || n < 0) {
+    auto & plan = spd_aggr_plan_data;
+    plan.pos.clear();
+    if (cparams.spd_aggr_state == nullptr || n < 0 || (n > 0 && (!pos || !held || !n_new))) {
         return false;
+    }
+    if (n == 0) {
+        plan.held.clear();
+        plan.n_new.clear();
+        plan.off.clear();
+        plan.feat.clear();
+        return true;
     }
     const int64_t n_embd = cparams.spd_aggr_state->ne[0];
     const int32_t n_aggr = (int32_t) model.spd_aggr_blk->ne[2];
-    auto & plan = spd_aggr_plan_data;
-    plan.pos.assign(pos, pos + n);
-    plan.held.assign(held, held + n);
-    plan.n_new.assign(n_new, n_new + n);
     plan.off.resize(n);
     size_t total = 0;
     for (int32_t i = 0; i < n; ++i) {
-        // a row may add nothing (its selector did not move), but it must end
-        // up with at least anchor 0 and at most every anchor
-        const int32_t total_anchors = std::max(held[i], 0) + n_new[i];
-        if (held[i] < -1 || n_new[i] < 0 || total_anchors < 1 || total_anchors > n_aggr) {
+        // A held prefix may add no anchors when its selector is unchanged.
+        const int64_t total_anchors = (int64_t) std::max(held[i], 0) + n_new[i];
+        if (pos[i] < 0 || held[i] < -1 || n_new[i] < 0 || total_anchors < 1 || total_anchors > n_aggr) {
             LLAMA_LOG_ERROR("%s: row %d (pos %d): held %d + %d new anchors does not fit %d\n",
                     __func__, i, pos[i], held[i], n_new[i], n_aggr);
-            plan.pos.clear();
             return false;
         }
         plan.off[i] = total;
+        if ((size_t) n_new[i] > (plan.feat.max_size() - total)/(size_t) n_embd) {
+            return false;
+        }
         total += (size_t) n_new[i]*n_embd;
     }
-    plan.feat.assign(feat, feat + total);
+    if (total > 0 && feat == nullptr) {
+        return false;
+    }
+    plan.held.assign(held, held + n);
+    plan.n_new.assign(n_new, n_new + n);
+    if (total > 0) {
+        plan.feat.assign(feat, feat + total);
+    } else {
+        plan.feat.clear();
+    }
+    plan.pos.assign(pos, pos + n);
     return true;
 }
 
@@ -4255,6 +4302,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_SPD && model.spd_target_k != nullptr) {
+        // Reader graphs expand the incoming anchor run before the shared tower.
+        res = std::max<uint32_t>(2048u, 32u*model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
@@ -4499,6 +4549,9 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_override) co
 class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
+
+    bool is_device() const override { return skip_tensors; }
+    bool is_sizing() const override { return true; }
 
     void write(const void * /* src */, size_t size) override {
         size_written += size;
@@ -4761,6 +4814,8 @@ private:
 
 class llama_io_write_device : public llama_io_write_i {
 public:
+    bool is_device() const override { return true; }
+
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
     }
 
@@ -4893,6 +4948,8 @@ private:
 
 class llama_io_read_device : public llama_io_read_i {
 public:
+    bool is_device() const override { return true; }
+
     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
     }
 
@@ -5394,6 +5451,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
         }
+    }
+    if (spd_aggr_buf != nullptr) {
+        ret[ggml_backend_buffer_get_type(spd_aggr_buf)].context += ggml_backend_buffer_get_size(spd_aggr_buf);
     }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {

@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <array>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +22,9 @@ uint32_t llama_kv_bucket_pad(uint32_t cur, uint32_t cells_size, uint32_t n_pad, 
 //
 // llama_kv_cache
 //
+
+// Reader rows share the self-attention cells; RAW_VALID stores additive anchor masks.
+enum class llama_spd_cache_kind { TARGET_K, TARGET_V, RAW_K, RAW_V, RAW_VALID, COUNT };
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -197,6 +201,9 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    ggml_tensor * get_spd_aux(ggml_context * ctx, int32_t il, llama_spd_cache_kind kind, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * cpy_spd_aux(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, llama_spd_cache_kind kind) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -275,6 +282,8 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::array<ggml_tensor *, (size_t) llama_spd_cache_kind::COUNT> spd_aux = {};
+        std::array<std::vector<ggml_tensor *>, (size_t) llama_spd_cache_kind::COUNT> spd_aux_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -423,6 +432,9 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    ggml_tensor * get_spd_aux(ggml_context * ctx, int32_t il, llama_spd_cache_kind kind) const;
+    ggml_tensor * cpy_spd_aux(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, llama_spd_cache_kind kind) const;
 
     // The full K storage tensor of the layer, spanning all streams.
     ggml_tensor * get_k_storage(int32_t il) const;
