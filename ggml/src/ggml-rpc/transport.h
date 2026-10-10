@@ -14,7 +14,13 @@ static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 struct socket_t {
     ~socket_t();
 
+    struct buffer {
+        const void * data;
+        size_t size;
+    };
+
     bool send_data(const void * data, size_t size);
+    bool send_data(const buffer * buffers, size_t count);
     bool recv_data(void * data, size_t size);
     // Must be called at every message boundary: the RDMA transport coalesces
     // writes into fixed-size frames and posts the trailing partial frame only

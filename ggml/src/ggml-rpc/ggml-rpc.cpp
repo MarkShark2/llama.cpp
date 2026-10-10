@@ -803,13 +803,8 @@ struct rpc_phase_wait {
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
     rpc_phase_io phase(true);
-    if (!sock->send_data(&msg_size, sizeof(msg_size))) {
-        return false;
-    }
-    if (!sock->send_data(msg, msg_size)) {
-        return false;
-    }
-    return sock->flush();
+    const socket_t::buffer buffers[] = {{&msg_size, sizeof(msg_size)}, {msg, msg_size}};
+    return sock->send_data(buffers, 2) && sock->flush();
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
@@ -878,16 +873,10 @@ static bool send_rpc_cmd_data(socket_ptr sock, enum rpc_cmd cmd, const void * in
         return false;
     }
     uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!sock->send_data(input, input_size)) {
-        return false;
-    }
-    return sock->flush();
+    const socket_t::buffer buffers[] = {
+        {&cmd_byte, sizeof(cmd_byte)}, {&input_size, sizeof(input_size)}, {input, input_size},
+    };
+    return sock->send_data(buffers, 3) && sock->flush();
 }
 
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
