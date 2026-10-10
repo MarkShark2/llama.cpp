@@ -388,6 +388,12 @@ struct common_spd_pipeline::impl {
         return v == nullptr || atoi(v) != 0;
     }();
     bool host_embedding_tap = false;
+    // An unchanged causal prefix already has its sidecar KV/reader state.
+    // Keep this opt-in until measured against the full-window decode path.
+    const bool stable_sidecar_prefix = [] {
+        const char * v = getenv("LLAMA_SPD_STABLE_PREFIX");
+        return v != nullptr && atoi(v) != 0;
+    }();
     // LLAMA_SPD_PREFIX_REUSE=0 restores the old behaviour: tear the whole impl
     // down between requests and prefill every prompt from zero. The reuse path
     // keeps the contexts (and therefore the KV cache) alive across requests,
@@ -670,6 +676,8 @@ struct common_spd_pipeline::impl {
         uint64_t head_calls = 0;
         uint64_t embed_calls = 0;
         uint64_t sidecar_calls = 0;
+        uint64_t sidecar_input_rows = 0;
+        uint64_t sidecar_retained_rows = 0;
         uint64_t rollback_calls = 0;
         std::array<double, SPD_MAX_STAGE_COUNT> stage_busy = {};
         std::array<double, SPD_MAX_STAGE_COUNT> stage_lock = {};
@@ -2411,6 +2419,29 @@ struct common_spd_pipeline::impl {
             append_row(input, pos, selector, [&](size_t i) { return snap->values[i].data(); }, true);
         }
 
+        timing.sidecar_input_rows += input.positions.size();
+        if (stable_sidecar_prefix && shared_bank()) {
+            // append_row's tracked held count describes the input last decoded
+            // at this position. A zero n_new means that input is unchanged.
+            // Only omit a leading run: every row after the first changed input
+            // must be recomputed because its causal attention can change.
+            // Rollback/reset invalidate the held slots in aggr_forget. Retain
+            // the final row even for an entirely unchanged window so sampling
+            // still has a freshly produced output. These omitted rows contain
+            // no packed features, so the feature buffer needs no adjustment.
+            size_t prefix = 0;
+            while (prefix + 1 < input.positions.size() &&
+                    input.held[prefix] > 0 && input.n_new[prefix] == 0) {
+                ++prefix;
+            }
+            if (prefix > 0) {
+                timing.sidecar_retained_rows += prefix;
+                input.selectors.erase(input.selectors.begin(), input.selectors.begin() + prefix);
+                input.positions.erase(input.positions.begin(), input.positions.begin() + prefix);
+                input.held.erase(input.held.begin(), input.held.begin() + prefix);
+                input.n_new.erase(input.n_new.begin(), input.n_new.begin() + prefix);
+            }
+        }
         input.min_pos = input.positions.front();
         return true;
     }
@@ -3948,6 +3979,8 @@ struct common_spd_pipeline::impl {
             fprintf(stderr, "SPD timing: sidecar_run %.2fs/%" PRIu64 " calls (%.1f ms/call)\n",
                     timing.sidecar_run, timing.sidecar_calls,
                     timing.sidecar_calls > 0 ? 1e3*timing.sidecar_run/(double) timing.sidecar_calls : 0.0);
+            fprintf(stderr, "SPD timing: sidecar rows %" PRIu64 " planned | %" PRIu64 " stable prefix retained\n",
+                    timing.sidecar_input_rows, timing.sidecar_retained_rows);
             if (timing.sidecar_calls > 0) {
                 const double per = 1e3/(double) timing.sidecar_calls;
                 fprintf(stderr, "SPD timing: sidecar split ms/call: crop %.2f | set %.2f | decode %.2f | sample %.2f\n",
