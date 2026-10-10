@@ -13,6 +13,7 @@
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
+#  include <sys/uio.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
@@ -127,6 +128,7 @@ struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
+    bool send_data(const socket_t::buffer * buffers, size_t count);
     bool recv_data(void * data, size_t size);
     bool flush();
     void get_caps(uint8_t * local_caps);
@@ -503,6 +505,87 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     return true;
 }
 
+bool socket_t::impl::send_data(const socket_t::buffer * buffers, size_t count) {
+    if (use_rdma) {
+        // Keep RDMA segment boundaries: its receiver consumes one send at a time.
+        for (size_t i = 0; i < count; ++i) {
+            if (!send_data(buffers[i].data, buffers[i].size)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t index = 0, offset = 0;
+    while (index < count) {
+        while (index < count && offset == buffers[index].size) {
+            ++index;
+            offset = 0;
+        }
+        if (index == count) {
+            break;
+        }
+#ifdef _WIN32
+        WSABUF parts[3];
+#else
+        struct iovec parts[3];
+#endif
+        size_t total = 0;
+        unsigned n_parts = 0;
+        for (size_t i = index; i < count && n_parts < 3 && total < MAX_CHUNK_SIZE; ++i) {
+            const size_t begin = i == index ? offset : 0;
+            const size_t size = std::min(buffers[i].size - begin, MAX_CHUNK_SIZE - total);
+            if (size == 0) {
+                continue;
+            }
+            char * data = (char *) buffers[i].data + begin;
+#ifdef _WIN32
+            parts[n_parts].buf = data;
+            parts[n_parts].len = (ULONG) size;
+#else
+            parts[n_parts].iov_base = data;
+            parts[n_parts].iov_len = size;
+#endif
+            total += size;
+            ++n_parts;
+        }
+#ifdef _WIN32
+        DWORD sent = 0;
+        if (WSASend(fd, parts, n_parts, &sent, 0, nullptr, nullptr) == SOCKET_ERROR) {
+            if (WSAGetLastError() == WSAEINTR) {
+                continue;
+            }
+            GGML_LOG_ERROR("WSASend failed\n");
+            return false;
+        }
+#else
+        struct msghdr msg = {};
+        msg.msg_iov = parts;
+        msg.msg_iovlen = n_parts;
+        const ssize_t sent = sendmsg(fd, &msg, 0);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+#endif
+        if (sent <= 0) {
+            GGML_LOG_ERROR("send buffers failed\n");
+            return false;
+        }
+        size_t remaining = (size_t) sent;
+        while (remaining > 0) {
+            const size_t available = buffers[index].size - offset;
+            if (remaining < available) {
+                offset += remaining;
+                break;
+            }
+            remaining -= available;
+            ++index;
+            offset = 0;
+        }
+    }
+    return true;
+}
+
 bool socket_t::impl::recv_data(void * data, size_t size) {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
@@ -604,6 +687,10 @@ socket_t::~socket_t() = default;
 
 bool socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);
+}
+
+bool socket_t::send_data(const buffer * buffers, size_t count) {
+    return pimpl->send_data(buffers, count);
 }
 
 bool socket_t::recv_data(void * data, size_t size) {

@@ -387,6 +387,7 @@ struct common_spd_pipeline::impl {
         const char * v = getenv("LLAMA_SPD_HOST_TAPS");
         return v == nullptr || atoi(v) != 0;
     }();
+    bool host_embedding_tap = false;
     // LLAMA_SPD_PREFIX_REUSE=0 restores the old behaviour: tear the whole impl
     // down between requests and prefill every prompt from zero. The reuse path
     // keeps the contexts (and therefore the KV cache) alive across requests,
@@ -1215,6 +1216,9 @@ struct common_spd_pipeline::impl {
         if (std::strcmp(target_arch, "glm5-next") == 0) {
             light_rollback = false;
             full_checkpoints = true;
+            // The layer-0 tap is the token embedding. Keep wire rounding when enabled.
+            const char * wire_bf16 = std::getenv("GGML_RPC_WIRE_BF16");
+            host_embedding_tap = wire_bf16 == nullptr || *wire_bf16 == '\0' || *wire_bf16 == '0';
             checkpoint_identity = {
                 model_checkpoint_identity(model_target, params.target_context),
                 model_checkpoint_identity(model_spd, params.sidecar_context),
@@ -1957,9 +1961,8 @@ struct common_spd_pipeline::impl {
     // host computes from item.hidden the moment the PREVIOUS stage finishes
     // (see the end_layer loop in the decode path). Reading the graph tap too
     // costs a second blocking GET_TENSOR per stage per step and then
-    // overwrites the host value with the same numbers. DSV4-s9 anchors are
-    // [0,5,...,40], so this covers 8 of the 9 stages; anchor 0 has no previous
-    // stage and keeps its readback.
+    // overwrites the host value with the same numbers. GLM anchor 0 is already
+    // present too: make_entry stores the completed embed_token result.
     //
     // Decode only. Prefill has no host-side end_layer tap (and with peer
     // boundaries it never reads the hidden state back at all), so it still
@@ -1970,7 +1973,7 @@ struct common_spd_pipeline::impl {
         }
         const uint32_t stage = anchor_stage(ai);
         if (stage == 0) {
-            return false;
+            return anchors[ai] == 0 && host_embedding_tap;
         }
         return anchors[ai] == stage_bounds[stage];
     }

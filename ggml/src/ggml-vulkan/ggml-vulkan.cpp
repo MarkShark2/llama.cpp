@@ -17523,6 +17523,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         ctx->submit_pending = true;
     }
 
+    const bool transfer_wait_pending = ctx->device->async_use_transfer_queue &&
+            ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value;
+    bool fence_submitted = false;
     vk_context compute_ctx;
     vk_command_buffer* cmd_buf = nullptr;
     if (do_transfer) {
@@ -17542,7 +17545,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
         } else {
-            ggml_vk_submit(compute_ctx, {});
+            // Fence the readback itself when no later transfer wait is needed.
+            fence_submitted = !transfer_wait_pending;
+            ggml_vk_submit(compute_ctx, fence_submitted ? ctx->fence : vk::Fence{});
         }
         ctx->submit_pending = true;
     }
@@ -17550,7 +17555,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     if (ctx->submit_pending) {
         if (ctx->device->serialize_submissions) {
             ctx->submit_pending = false;
-        } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+        } else if (transfer_wait_pending) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
                 1, &ctx->transfer_semaphore.value,
                 0, nullptr,
@@ -17564,7 +17569,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             si.setPNext(&tl_info);
             ctx->device->compute_queue->handle->submit({ si }, ctx->fence);
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
-        } else {
+        } else if (!fence_submitted) {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
