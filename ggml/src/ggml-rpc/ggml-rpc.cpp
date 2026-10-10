@@ -48,6 +48,7 @@ namespace fs = std::filesystem;
 
 // [fork] defined next to the cache chunk size, used by set_tensor further up
 static bool rpc_cache_write_file(const fs::path & path, const void * data, size_t size);
+static bool rpc_async_enabled();
 
 // macro for nicer error messages on server crash
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
@@ -898,6 +899,15 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return send_rpc_cmd_data(sock, cmd, input, input_size);
 }
 
+static bool rpc_get_wait_all(enum rpc_cmd cmd, size_t size) {
+    static const bool enabled = [] {
+        const char * v = std::getenv("GGML_RPC_GET_WAITALL");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return enabled && !rpc_async_enabled() && size >= 16384 && size <= 65536 &&
+            (cmd == RPC_CMD_GET_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH);
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
@@ -913,7 +923,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (out_size != output_size) {
         return false;
     }
-    if (!sock->recv_data(output, output_size)) {
+    // The body has no intermediate consumer. Request fewer userspace returns during partial TCP delivery.
+    if (!sock->recv_data(output, output_size, rpc_get_wait_all(cmd, output_size))) {
         return false;
     }
     return true;

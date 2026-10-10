@@ -129,7 +129,7 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool send_data(const socket_t::buffer * buffers, size_t count);
-    bool recv_data(void * data, size_t size);
+    bool recv_data(void * data, size_t size, bool wait_all);
     bool flush();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
@@ -586,7 +586,7 @@ bool socket_t::impl::send_data(const socket_t::buffer * buffers, size_t count) {
     return true;
 }
 
-bool socket_t::impl::recv_data(void * data, size_t size) {
+bool socket_t::impl::recv_data(void * data, size_t size, bool wait_all) {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->recv(data, size);
@@ -596,11 +596,21 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         return rdma_recv(data, size);
     }
 #endif
+    int flags = wait_all ? MSG_WAITALL : 0;
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
-        ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
+        ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, flags);
         if (n < 0) {
+#ifdef _WIN32
+            const bool unsupported = WSAGetLastError() == WSAEOPNOTSUPP;
+#else
+            const bool unsupported = errno == EOPNOTSUPP;
+#endif
+            if (flags != 0 && unsupported) {
+                flags = 0;
+                continue;
+            }
             GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
                            bytes_recv, size_to_recv);
             return false;
@@ -693,8 +703,8 @@ bool socket_t::send_data(const buffer * buffers, size_t count) {
     return pimpl->send_data(buffers, count);
 }
 
-bool socket_t::recv_data(void * data, size_t size) {
-    return pimpl->recv_data(data, size);
+bool socket_t::recv_data(void * data, size_t size, bool wait_all) {
+    return pimpl->recv_data(data, size, wait_all);
 }
 
 bool socket_t::flush() {
