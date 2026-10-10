@@ -3802,6 +3802,13 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
 
 extern "C" {
 GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor * src, const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_RPC_GET_AND_PUSH");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
     auto sdisp = rpc_tensor_dispatcher(src);
     auto ddisp = rpc_tensor_dispatcher(dst);
     return sdisp != nullptr && ddisp != nullptr && sdisp != ddisp &&
