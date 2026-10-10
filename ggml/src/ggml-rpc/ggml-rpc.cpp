@@ -638,6 +638,16 @@ static void rpc_command_payload(rpc_cmd cmd, const void * data, size_t size) {
         b = req.offset;
         c = req.size;
         event = "tensor_id";
+    } else if (cmd == RPC_CMD_SET_TENSOR_DEDUPE && size >= sizeof(rpc_tensor) + 3*sizeof(uint64_t) + 1) {
+        rpc_tensor tensor;
+        memcpy(&tensor, data, sizeof(tensor));
+        a = tensor.id;
+        memcpy(&b, (const uint8_t *) data + sizeof(tensor), sizeof(b));
+        memcpy(&c, (const uint8_t *) data + sizeof(tensor) + 2*sizeof(uint64_t), sizeof(c));
+        const uint8_t encoding = *((const uint8_t *) data + sizeof(tensor) + 3*sizeof(uint64_t));
+        const int64_t now = rpc_command_now();
+        rpc_command_current->emit("set_encoding", now, now, encoding, c, size);
+        event = "tensor_id";
     } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
         rpc_msg_push_tensor_req req;
         memcpy(&req, data, sizeof(req));
