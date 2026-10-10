@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -664,9 +665,30 @@ std::string socket_t::peer_str() const {
     if (getpeername(pimpl->fd, (struct sockaddr *)&addr, &len) != 0) {
         return "unknown";
     }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(addr.sin_addr), (int)ntohs(addr.sin_port));
+    char ip[INET_ADDRSTRLEN], buf[64];
+    if (inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip)) == nullptr) {
+        return "unknown";
+    }
+    snprintf(buf, sizeof(buf), "%s:%u", ip, (unsigned) ntohs(addr.sin_port));
     return std::string(buf);
+}
+
+std::string socket_t::local_str() const {
+    struct sockaddr_in addr;
+#ifdef _WIN32
+    int len = sizeof(addr);
+#else
+    socklen_t len = sizeof(addr);
+#endif
+    if (getsockname(pimpl->fd, (struct sockaddr *) &addr, &len) != 0) {
+        return "unknown";
+    }
+    char ip[INET_ADDRSTRLEN], buf[64];
+    if (inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip)) == nullptr) {
+        return "unknown";
+    }
+    snprintf(buf, sizeof(buf), "%s:%u", ip, (unsigned) ntohs(addr.sin_port));
+    return buf;
 }
 
 socket_ptr socket_t::accept() {

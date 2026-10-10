@@ -38,6 +38,30 @@ constexpr uint32_t SPD_MAX_ROLLBACK_TOKENS = SPD_MAX_STAGE_COUNT - 1;
 
 using clock_type = std::chrono::steady_clock;
 
+struct rpc_command_trace_scope {
+    using context_fn = void (*)(uint64_t, uint64_t, int, int, int);
+    context_fn set_context;
+    rpc_command_trace_scope(uint64_t run, uint64_t wave, int stage, int pos, int active) {
+        static const context_fn fn = []() -> context_fn {
+            const char * e = std::getenv("GGML_RPC_COMMAND_TRACE");
+            if (!e || std::atoi(e) <= 0) {
+                return nullptr;
+            }
+            auto reg = ggml_backend_reg_by_name("RPC");
+            return reg ? (context_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_trace_context") : nullptr;
+        }();
+        set_context = fn;
+        if (set_context) {
+            set_context(run, wave, stage, pos, active);
+        }
+    }
+    ~rpc_command_trace_scope() {
+        if (set_context) {
+            set_context(0, 0, -1, -1, 0);
+        }
+    }
+};
+
 double seconds_since(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
 }
@@ -691,6 +715,7 @@ struct common_spd_pipeline::impl {
     };
     phase_timing timing;
     size_t timing_active_count = 0;
+    uint64_t command_trace_wave = 0;
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params, bool initialize_now = true)
         : model_target(model_target), model_spd(model_spd), params(params) {
@@ -3149,6 +3174,7 @@ struct common_spd_pipeline::impl {
     }
 
     bool advance_entry(uint32_t stage, entry & item, double & elapsed, std::string & error) {
+        rpc_command_trace_scope trace((uint64_t) (uintptr_t) this, command_trace_wave, (int) stage, item.pos, (int) timing_active_count);
         const auto lock_start = clock_type::now();
         std::vector<std::unique_lock<std::mutex>> resource_locks;
         resource_locks.reserve(stage_resources[stage].size());
@@ -3680,6 +3706,7 @@ struct common_spd_pipeline::impl {
         while (verified_up_to - n_prompt < n_final) {
             scope_timer step_timer(timing.step_total);
             ++result.decode_steps;
+            ++command_trace_wave;
 
             llama_token pending_draft = LLAMA_TOKEN_NULL;
             speculation_input local_pending_input;

@@ -447,6 +447,206 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
 // compute; it is not wire time and is not additive with the enclosing service.
 using rpc_phase_clock = std::chrono::steady_clock;
 
+static void rpc_trace_emit(const char * fmt, ...);
+static void rpc_trace_flush();
+
+static uint64_t rpc_command_trace_limit() {
+    static const uint64_t value = [] {
+        const char * e = std::getenv("GGML_RPC_COMMAND_TRACE");
+        return e ? (uint64_t) std::clamp(std::strtol(e, nullptr, 10), 0L, 100000L) : 0;
+    }();
+    return value;
+}
+
+static uint64_t rpc_command_trace_skip() {
+    static const uint64_t value = [] {
+        const char * e = std::getenv("GGML_RPC_COMMAND_TRACE_SKIP");
+        return e ? (uint64_t) std::clamp(std::strtol(e, nullptr, 10), 0L, 1000000000L) : 0;
+    }();
+    return value;
+}
+
+using rpc_command_context = socket_t::command_trace_context;
+
+static thread_local rpc_command_context rpc_command_tag;
+static int64_t rpc_command_now();
+
+struct rpc_command_context_scope {
+    rpc_command_context previous = rpc_command_tag;
+    explicit rpc_command_context_scope(const rpc_command_context & tag) { rpc_command_tag = tag; }
+    ~rpc_command_context_scope() { rpc_command_tag = previous; }
+};
+
+extern "C" {
+GGML_BACKEND_API void ggml_backend_rpc_trace_context(uint64_t run, uint64_t wave, int stage, int pos, int active);
+}
+
+void ggml_backend_rpc_trace_context(uint64_t run, uint64_t wave, int stage, int pos, int active) {
+    static thread_local uint64_t seen = 0;
+    static thread_local int64_t begin = 0;
+    if (run && rpc_command_trace_limit()) {
+        const uint64_t index = seen++;
+        begin = index >= rpc_command_trace_skip() && index - rpc_command_trace_skip() < rpc_command_trace_limit()
+                ? rpc_command_now() : 0;
+    } else if (begin) {
+        rpc_trace_emit("[rpc stage] run=%" PRIu64 " wave=%" PRIu64 " stage=%d pos=%d active=%d begin_us=%" PRId64 " end_us=%" PRId64 "\n",
+                rpc_command_tag.run, rpc_command_tag.wave, rpc_command_tag.stage, rpc_command_tag.pos,
+                rpc_command_tag.active, begin, rpc_command_now());
+        begin = 0;
+    }
+    rpc_command_tag.run = run;
+    rpc_command_tag.wave = wave;
+    rpc_command_tag.stage = stage;
+    rpc_command_tag.pos = pos;
+    rpc_command_tag.active = active;
+}
+
+static int64_t rpc_command_now() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(rpc_phase_clock::now().time_since_epoch()).count();
+}
+
+struct rpc_command_scope;
+static thread_local rpc_command_scope * rpc_command_current = nullptr;
+
+struct rpc_command_record {
+    socket_t::command_trace_state * state = nullptr;
+    rpc_command_context tag = rpc_command_tag;
+    uint64_t ordinal = 0;
+    rpc_cmd cmd = RPC_CMD_NONE;
+    const char * role = "none";
+    int64_t begin = 0;
+    bool active = false, last = false;
+
+    void emit(const char * event, int64_t start, int64_t end, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) const {
+        const int64_t epoch = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        rpc_trace_emit("[rpc command] role=%s local=%s peer=%s seq=%" PRIu64 " cmd=%d event=%s begin_us=%" PRId64
+                " end_us=%" PRId64 " epoch_us=%" PRId64 " thread=%zu run=%" PRIu64 " wave=%" PRIu64
+                " stage=%d pos=%d active=%d caller_wave=%" PRIu64 " dispatch=%" PRIu64 " lock_ms=%.6f queue_ms=%.6f a=%" PRIu64 " b=%" PRIu64 " c=%" PRIu64 "\n",
+                role, state->local.c_str(), state->peer.c_str(), ordinal, (int) cmd, event, start, end, epoch,
+                std::hash<std::thread::id>{}(std::this_thread::get_id()), tag.run, tag.wave, tag.stage, tag.pos,
+                tag.active, rpc_command_tag.wave, tag.dispatch, tag.lock_ms, tag.queue_ms, a, b, c);
+    }
+};
+
+struct rpc_command_scope : rpc_command_record {
+    rpc_command_scope * previous = rpc_command_current;
+
+    rpc_command_scope(const socket_ptr & sock, rpc_cmd command, const char * scope_role, bool sending, bool lane = false, bool response = false) {
+        cmd = command;
+        role = scope_role;
+        rpc_command_current = nullptr;
+        if (!rpc_command_trace_limit() || !sock || cmd == RPC_CMD_HELLO || cmd == RPC_CMD_LANE_ATTACH) {
+            return;
+        }
+        state = sending ? &sock->trace_tx : &sock->trace_rx;
+        if (response) {
+            tag = state->tag;
+            ordinal = state->ordinal;
+            cmd = (rpc_cmd) state->command;
+            active = state->captured;
+            last = state->last;
+            state->response_pending = false;
+            if (active) {
+                begin = rpc_command_now();
+                rpc_command_current = this;
+                emit("begin", begin, begin);
+            }
+            return;
+        }
+        ordinal = ++state->ordinal;
+        state->command = (int) cmd;
+        state->tag = tag;
+        state->captured = false;
+        state->response_pending = sending && lane &&
+                (cmd == RPC_CMD_GET_TENSOR || cmd == RPC_CMD_GET_TENSOR_BF16 || cmd == RPC_CMD_PUSH_TENSOR);
+        state->armed |= lane || cmd == RPC_CMD_GRAPH_COMPUTE || cmd == RPC_CMD_GRAPH_RECOMPUTE;
+        if (!state->armed) {
+            return;
+        }
+        const uint64_t index = state->eligible++;
+        active = index >= rpc_command_trace_skip() && index - rpc_command_trace_skip() < rpc_command_trace_limit();
+        if (!active) {
+            return;
+        }
+        last = index - rpc_command_trace_skip() + 1 == rpc_command_trace_limit();
+        state->captured = active;
+        state->last = last;
+        if (state->local.empty()) {
+            state->local = sock->local_str();
+            state->peer = sock->peer_str();
+        }
+        begin = rpc_command_now();
+        rpc_command_current = this;
+        emit("begin", begin, begin);
+    }
+
+    rpc_command_scope(const rpc_command_record & record, const char * scope_role) : rpc_command_record(record) {
+        role = scope_role;
+        begin = active ? rpc_command_now() : 0;
+        rpc_command_current = active ? this : nullptr;
+        if (active) {
+            emit("begin", begin, begin);
+        }
+    }
+
+    ~rpc_command_scope() {
+        if (active) {
+            emit("end", begin, rpc_command_now());
+            if (last) {
+                rpc_trace_flush();
+            }
+        }
+        rpc_command_current = previous;
+    }
+};
+
+struct rpc_command_span {
+    rpc_command_scope * command = rpc_command_current;
+    const char * event;
+    uint64_t a, b, c;
+    int64_t begin;
+
+    explicit rpc_command_span(const char * event, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0)
+        : event(event), a(a), b(b), c(c), begin(command ? rpc_command_now() : 0) {}
+    ~rpc_command_span() {
+        if (command) {
+            command->emit(event, begin, rpc_command_now(), a, b, c);
+        }
+    }
+};
+
+static void rpc_command_payload(rpc_cmd cmd, const void * data, size_t size) {
+    if (!rpc_command_current) {
+        return;
+    }
+    uint64_t a = 0, b = 0, c = size;
+    const char * event = "payload";
+    if ((cmd == RPC_CMD_GRAPH_COMPUTE || cmd == RPC_CMD_GRAPH_RECOMPUTE) && size >= 12) {
+        uint32_t device;
+        memcpy(&device, data, sizeof(device));
+        memcpy(&a, (const uint8_t *) data + sizeof(device), sizeof(a));
+        b = device;
+        event = "graph_id";
+    } else if ((cmd == RPC_CMD_GET_TENSOR || cmd == RPC_CMD_GET_TENSOR_BF16) && size == sizeof(rpc_msg_get_tensor_req)) {
+        rpc_msg_get_tensor_req req;
+        memcpy(&req, data, sizeof(req));
+        a = req.tensor.id;
+        b = req.offset;
+        c = req.size;
+        event = "tensor_id";
+    } else if (cmd == RPC_CMD_PUSH_TENSOR && size == sizeof(rpc_msg_push_tensor_req)) {
+        rpc_msg_push_tensor_req req;
+        memcpy(&req, data, sizeof(req));
+        a = req.src.id;
+        b = req.dst.id;
+        c = req.size;
+        event = "push_id";
+    }
+    const int64_t now = rpc_command_now();
+    rpc_command_current->emit(event, now, now, a, b, c);
+}
+
 static uint32_t rpc_phase_limit() {
     static const uint32_t limit = [] {
         const char * value = std::getenv("GGML_RPC_PHASE_PROFILE");
@@ -564,11 +764,12 @@ struct rpc_phase_scope {
 };
 
 struct rpc_phase_io {
+    rpc_command_span command_span;
     rpc_phase_sample * sample = rpc_phase_current;
     bool send;
     rpc_phase_clock::time_point start;
 
-    explicit rpc_phase_io(bool send, rpc_cmd cmd = RPC_CMD_NONE) : send(send) {
+    explicit rpc_phase_io(bool send, rpc_cmd cmd = RPC_CMD_NONE) : command_span(send ? "send" : "recv"), send(send) {
         if (sample) {
             sample->kind = std::max(sample->kind, rpc_phase_command(cmd));
             start = rpc_phase_clock::now();
@@ -583,10 +784,11 @@ struct rpc_phase_io {
 };
 
 struct rpc_phase_wait {
+    rpc_command_span command_span;
     double * total;
     rpc_phase_clock::time_point start;
 
-    explicit rpc_phase_wait(bool read) : total(rpc_phase_current
+    explicit rpc_phase_wait(bool read) : command_span(read ? "backend_read" : "dependency"), total(rpc_phase_current
             ? (read ? &rpc_phase_current->read_ms : &rpc_phase_current->dependency_ms) : nullptr) {
         if (total) {
             start = rpc_phase_clock::now();
@@ -611,6 +813,10 @@ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
+    std::optional<rpc_command_scope> trace;
+    if (rpc_command_trace_limit() && !rpc_command_current && sock->trace_tx.response_pending) {
+        trace.emplace(sock, RPC_CMD_NONE, "client-response", true, true, true);
+    }
     rpc_phase_io phase(false);
     uint64_t size;
     if (!sock->recv_data(&size, sizeof(size))) {
@@ -619,10 +825,18 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
     if (size != msg_size) {
         return false;
     }
-    return sock->recv_data(msg, msg_size);
+    const bool ok = sock->recv_data(msg, msg_size);
+    if (ok && rpc_command_current && rpc_command_current->role[0] == 's') {
+        rpc_command_payload(rpc_command_current->cmd, msg, msg_size);
+    }
+    return ok;
 }
 
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+    std::optional<rpc_command_scope> trace;
+    if (rpc_command_trace_limit() && !rpc_command_current && sock->trace_tx.response_pending) {
+        trace.emplace(sock, RPC_CMD_NONE, "client-response", true, true, true);
+    }
     rpc_phase_io phase(false);
     uint64_t size;
     if (!sock->recv_data(&size, sizeof(size))) {
@@ -634,7 +848,11 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
         return false;
     }
-    return sock->recv_data(input.data(), size);
+    const bool ok = sock->recv_data(input.data(), size);
+    if (ok && rpc_command_current && rpc_command_current->role[0] == 's') {
+        rpc_command_payload(rpc_command_current->cmd, input.data(), input.size());
+    }
+    return ok;
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
@@ -653,7 +871,8 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+static bool send_rpc_cmd_data(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    rpc_command_payload(cmd, input, input_size);
     rpc_phase_io phase(true, cmd);
     if (sock == nullptr) {
         return false;
@@ -671,10 +890,16 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return sock->flush();
 }
 
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    rpc_command_scope trace(sock, cmd, "client", true);
+    return send_rpc_cmd_data(sock, cmd, input, input_size);
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+    rpc_command_scope trace(sock, cmd, "client", true);
+    if (!send_rpc_cmd_data(sock, cmd, input, input_size)) {
         return false;
     }
     rpc_phase_io phase(false);
@@ -1019,6 +1244,7 @@ private:
         std::promise<void>            completion;
         rpc_phase_clock::time_point    queued;
         double                        lock_ms = 0;
+        rpc_command_context           trace_tag;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -1066,8 +1292,12 @@ static std::atomic<bool> g_rpc_detached{false};
 static std::atomic<bool> g_rpc_session_lost{false};
 
 void rpc_dispatcher::exec(rpc_msg & msg) {
-    const double queue_ms = profile.enabled() && rpc_async_enabled()
+    const double queue_ms = (profile.enabled() || rpc_command_trace_limit()) && rpc_async_enabled()
             ? std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - msg.queued).count() : 0;
+    auto tag = msg.trace_tag;
+    tag.lock_ms = msg.lock_ms;
+    tag.queue_ms = queue_ms;
+    rpc_command_context_scope trace_context(tag);
     rpc_phase_scope phase(profile, "client", endpoint, msg.cmd, msg.lock_ms, queue_ms);
     socket_ptr s;
     {
@@ -1095,17 +1325,21 @@ void rpc_dispatcher::exec(rpc_msg & msg) {
 }
 
 rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
+    if (rpc_command_trace_limit()) {
+        msg->trace_tag = rpc_command_tag;
+    }
     {
         std::lock_guard<std::mutex> l(seq_m);
         submitted++;
+        msg->trace_tag.dispatch = submitted;
     }
     if (!rpc_async_enabled()) {
         // direct mode: the calling thread owns the wire for the whole message
         {
-            const bool measure = profile.enabled();
+            const bool measure = profile.enabled() || rpc_command_trace_limit();
             const auto begin = measure ? rpc_phase_clock::now() : rpc_phase_clock::time_point{};
             std::lock_guard<std::recursive_mutex> l(io_m);
-            if (profile.enabled()) {
+            if (measure) {
                 msg->lock_ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - begin).count();
             }
             exec(*msg);
@@ -1119,7 +1353,7 @@ rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
         return msg;
     }
     ensure_worker();
-    if (profile.enabled()) {
+    if (profile.enabled() || rpc_command_trace_limit()) {
         msg->queued = rpc_phase_clock::now();
     }
     GGML_ASSERT(queue.push(msg));
@@ -1524,6 +1758,9 @@ static bool rpc_fdx_enabled() {
 // wait_a is always the main-lane count; wait_b is the opposite lane's count.
 static bool send_lane_cmd(const socket_ptr & sock, enum rpc_cmd cmd,
                           uint64_t wait_a, uint64_t wait_b, const void * data, size_t size) {
+    rpc_command_scope trace(sock, cmd, "client-lane", true, true);
+    rpc_command_payload(cmd, data, size);
+    rpc_command_span command_span("lane_send", wait_a, wait_b, size);
     rpc_phase_io phase(true, cmd);
     if (sock == nullptr) {
         return false;
@@ -3947,12 +4184,17 @@ static void rpc_cache_enforce_limit(const char * cache_dir, size_t limit) {
 // The queue is therefore a SOFT cap -- over it we warn, never block. Depth is
 // bounded in practice by the scheduler's in-flight copies (GGML_SCHED_COPIES).
 struct rpc_peer_link {
+    struct message {
+        std::vector<uint8_t> bytes;
+        rpc_command_record source;
+        int64_t queued_us = 0;
+    };
     std::mutex  m;          // guards sock during connect/teardown
     socket_ptr  sock;
 
     std::mutex                        q_m;
     std::condition_variable           q_cv;
-    std::deque<std::vector<uint8_t>>  q;      // pre-framed lane messages, FIFO
+    std::deque<message>               q;
     size_t      q_bytes = 0;
     bool        closing = false;
     bool        failed  = false;
@@ -3984,7 +4226,7 @@ static std::shared_ptr<rpc_peer_link> rpc_peer_link_find(const std::string & end
 // drains the link's queue onto the socket in FIFO order
 static void rpc_peer_sender(rpc_peer_link * link, std::string endpoint) {
     for (;;) {
-        std::vector<uint8_t> msg;
+        rpc_peer_link::message msg;
         {
             std::unique_lock<std::mutex> l(link->q_m);
             link->q_cv.wait(l, [&]{ return !link->q.empty() || link->closing; });
@@ -3993,7 +4235,7 @@ static void rpc_peer_sender(rpc_peer_link * link, std::string endpoint) {
             }
             msg = std::move(link->q.front());
             link->q.pop_front();
-            link->q_bytes -= msg.size();
+            link->q_bytes -= msg.bytes.size();
         }
         link->q_cv.notify_all();
         socket_ptr sock;
@@ -4001,7 +4243,24 @@ static void rpc_peer_sender(rpc_peer_link * link, std::string endpoint) {
             std::lock_guard<std::mutex> l(link->m);
             sock = link->sock;
         }
-        if (sock == nullptr || !sock->send_data(msg.data(), msg.size()) || !sock->flush()) {
+        rpc_command_context_scope context(msg.source.tag);
+        rpc_command_scope trace(sock, (rpc_cmd) msg.bytes[0], "peer-send", true, true);
+        if (trace.active) {
+            trace.emit("peer_queue", msg.queued_us, rpc_command_now(), msg.bytes.size());
+        }
+        const int64_t send_begin = msg.source.active ? rpc_command_now() : 0;
+        const bool sent = sock != nullptr && sock->send_data(msg.bytes.data(), msg.bytes.size()) && sock->flush();
+        if (msg.source.active) {
+            msg.source.emit("peer_queue", msg.queued_us, send_begin, trace.ordinal, msg.bytes.size());
+            msg.source.emit("peer_send", send_begin, rpc_command_now(), trace.ordinal, sent);
+            if (trace.active) {
+                rpc_trace_emit("[rpc handoff] source_local=%s source_peer=%s source_seq=%" PRIu64
+                        " target_local=%s target_peer=%s target_seq=%" PRIu64 "\n",
+                        msg.source.state->local.c_str(), msg.source.state->peer.c_str(), msg.source.ordinal,
+                        trace.state->local.c_str(), trace.state->peer.c_str(), trace.ordinal);
+            }
+        }
+        if (!sent) {
             GGML_LOG_ERROR("[rpc peer] lost the peer lane to %s mid-push\n", endpoint.c_str());
             std::lock_guard<std::mutex> l(link->q_m);
             link->failed = true;
@@ -5230,7 +5489,15 @@ bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_pu
             return true;
         }
         const size_t bytes = msg.size();
-        link->q.push_back(std::move(msg));
+        rpc_peer_link::message queued;
+        queued.bytes = std::move(msg);
+        if (rpc_command_trace_limit()) {
+            queued.queued_us = rpc_command_now();
+            if (rpc_command_current) {
+                queued.source = *rpc_command_current;
+            }
+        }
+        link->q.push_back(std::move(queued));
         link->q_bytes += bytes;
         if (link->q_bytes > rpc_peer_queue_soft_cap() && !link->warned) {
             link->warned = true;
@@ -5504,6 +5771,7 @@ bool rpc_server::imatrix_sqsum(const rpc_msg_imatrix_sqsum_req & request, std::v
 }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response, bool ordered) {
+    rpc_command_span trace("copy_tensor", request.src.id, request.dst.id, ordered);
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -5650,7 +5918,7 @@ static void rpc_trace_emit(const char * fmt, ...) {
     }();
     (void) registered;
 
-    char line[512];
+    char line[1024];
     va_list ap;
     va_start(ap, fmt);
     const int n = vsnprintf(line, sizeof(line), fmt, ap);
@@ -5759,7 +6027,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
     }
     const int64_t t_build = graph_trace ? ggml_time_us() : 0;
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    ggml_status status;
+    {
+        rpc_command_span trace("backend_graph", uid, device, n_nodes);
+        status = ggml_backend_graph_compute(backends[device], graph);
+    }
     const int64_t t_compute = graph_trace ? ggml_time_us() : 0;
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     if (uid != 0) {
@@ -5811,7 +6083,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
     const int64_t t_lookup = graph_trace ? ggml_time_us() : 0;
-    ggml_status status = ggml_backend_graph_compute(backends[device], it->second.graph);
+    ggml_status status;
+    {
+        rpc_command_span trace("backend_graph", request.uid, device, it->second.graph->n_nodes);
+        status = ggml_backend_graph_compute(backends[device], it->second.graph);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     if (graph_trace) {
         const int64_t t_end = ggml_time_us();
@@ -5885,6 +6161,7 @@ struct rpc_lane_set_msg {
     uint64_t wait_main = 0;
     uint64_t wait_get  = 0;
     rpc_phase_clock::time_point queued;
+    rpc_command_record trace;
     std::vector<uint8_t> payload;
 };
 
@@ -5926,6 +6203,7 @@ struct rpc_active_session {
 
     // wait until the counters reach the targets; false once the session failed
     bool wait_counts(uint64_t need_main, uint64_t need_set, uint64_t need_get) {
+        rpc_command_span trace("fence_wait", need_main, need_set, need_get);
         rpc_phase_wait phase(false);
         std::unique_lock<std::mutex> l(sync_m);
         sync_cv.wait(l, [&]{
@@ -5967,6 +6245,8 @@ static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        rpc_command_scope trace(sock, (rpc_cmd) cmd, "server-set-reader", false, true);
+        rpc_command_span receive("reader_work");
         if (cmd != RPC_CMD_SET_TENSOR && cmd != RPC_CMD_SET_TENSOR_BF16 && (is_peer || cmd != RPC_CMD_SET_TENSOR_DEDUPE)) {
             GGML_LOG_ERROR("[rpc fdx] unexpected command %d on %s lane\n", cmd, is_peer ? "peer" : "SET");
             break;
@@ -5981,6 +6261,7 @@ static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is
         }
         rpc_lane_set_msg m;
         m.cmd = cmd;
+        m.trace = trace;
         if (!sock->recv_data(&m.wait_main, sizeof(m.wait_main))) {
             break;
         }
@@ -5991,12 +6272,16 @@ static void rpc_lane_set_reader(rpc_active_session * s, socket_ptr sock, bool is
         if (!sock->recv_data(m.payload.data(), m.payload.size())) {
             break;
         }
+        if (trace.active) {
+            trace.emit("request_received", trace.begin, rpc_command_now(), size, m.wait_main, m.wait_get);
+        }
         const size_t bytes = m.payload.size();
-        if (rpc_phase_limit() > 0) {
+        if (rpc_phase_limit() > 0 || rpc_command_trace_limit()) {
             m.queued = rpc_phase_clock::now();
         }
         {
             std::unique_lock<std::mutex> l(s->q_m);
+            rpc_command_span backpressure("set_backpressure", s->q_bytes, rpc_lane_queue_cap());
             s->q_cv.wait(l, [&]{ return s->q_closed || s->q_bytes < rpc_lane_queue_cap(); });
             if (s->q_closed) {
                 return;
@@ -6036,6 +6321,11 @@ static void rpc_lane_set_exec(rpc_active_session * s) {
             s->q_bytes -= m.payload.size();
         }
         s->q_cv.notify_all();
+        rpc_command_scope trace(m.trace, "server-set");
+        if (trace.active) {
+            const int64_t queued_us = std::chrono::duration_cast<std::chrono::microseconds>(m.queued.time_since_epoch()).count();
+            trace.emit("set_queue", queued_us, rpc_command_now());
+        }
         const double queue_ms = profile.enabled()
                 ? std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - m.queued).count() : 0;
         rpc_phase_scope phase(profile, "server-set", profile_endpoint, (rpc_cmd) m.cmd, 0, queue_ms);
@@ -6064,6 +6354,7 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        rpc_command_scope trace(sock, (rpc_cmd) cmd, "server-get", false, true);
         // PUSH_TENSOR rides the GET lane because it is a local read like the
         // others -- the only difference is where the bytes go afterwards, so it
         // wants exactly the same ordering against this node's compute
@@ -6093,6 +6384,9 @@ static void rpc_lane_get_serve(rpc_active_session * s) {
         rpc_msg_push_tensor_req push_req;
         if (!sock->recv_data(is_push ? (void *) &push_req : (void *) &req, expect)) {
             break;
+        }
+        if (trace.active) {
+            trace.emit("request_received", trace.begin, rpc_command_now(), size, wait_main, wait_set);
         }
         if (!s->wait_counts(wait_main, wait_set, 0)) {
             return;
@@ -6152,6 +6446,7 @@ static void rpc_lane_peer_serve(rpc_active_session * s, socket_ptr sock) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        rpc_command_scope trace(sock, (rpc_cmd) cmd, "server-peer", false, true);
         if (cmd != RPC_CMD_SET_TENSOR && cmd != RPC_CMD_SET_TENSOR_BF16) {
             GGML_LOG_ERROR("[rpc peer] unexpected command %d on a peer lane\n", cmd);
             break;
@@ -6173,6 +6468,9 @@ static void rpc_lane_peer_serve(rpc_active_session * s, socket_ptr sock) {
         std::vector<uint8_t> payload(size - 2*sizeof(uint64_t));
         if (!sock->recv_data(payload.data(), payload.size())) {
             break;
+        }
+        if (trace.active) {
+            trace.emit("request_received", trace.begin, rpc_command_now(), size, wait_main, wait_get);
         }
         if (!s->wait_counts(wait_main, 0, wait_get)) {
             return;
@@ -6287,6 +6585,7 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        rpc_command_scope trace(sock, (rpc_cmd) cmd, "server-main", false);
         session.detached = false;
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -7030,6 +7329,9 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
 }
 
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (std::strcmp(name, "ggml_backend_rpc_trace_context") == 0) {
+        return (void *) ggml_backend_rpc_trace_context;
+    }
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }
