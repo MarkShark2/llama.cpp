@@ -3309,11 +3309,24 @@ struct common_spd_pipeline::impl {
 
         const llama_token * token = stage == 0 ? &item.token : nullptr;
         const float * embd = stage == 0 ? nullptr : item.hidden.data();
-        llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ false,
+        using can_read_push_fn = bool (*)(const ggml_tensor *, const ggml_tensor *);
+        using read_push_fn = int (*)(const ggml_tensor *, const ggml_tensor *, void *, uint64_t *);
+        auto rpc_reg = ggml_backend_reg_by_name("RPC");
+        auto can_read_push = rpc_reg ? (can_read_push_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_can_read_push") : nullptr;
+        auto read_push = rpc_reg ? (read_push_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_read_push") : nullptr;
+        const ggml_tensor * previous_out = llama_spd_peer_out_tensor(stages[stage]);
+        const bool compound_read = pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead &&
+                wanted.empty() && previous_out != nullptr &&
+                ggml_nbytes(previous_out) == (size_t) n_embd_boundary*sizeof(float) &&
+                can_read_push != nullptr && read_push != nullptr &&
+                can_read_push(previous_out, pb_out->staging_dec[slot]);
+        llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ compound_read,
                 /*skip_layer_inp =*/ stage_taps_all_host_derived(stage));
         const bool decoded = decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
                 static_decode_fast_path ? &stage_decode_batches[stage] : nullptr,
-                &timing.stage_decode[stage], &timing.stage_read[stage]);
+                &timing.stage_decode[stage], &timing.stage_read[stage], !compound_read);
         llama_set_spd_peer_io(stages[stage], false, false, false);
         if (!decoded) {
             return false;
@@ -3325,11 +3338,38 @@ struct common_spd_pipeline::impl {
             return false;
         }
 
+        bool handed_off = false;
+        if (compound_read) {
+            scope_timer read_timer(timing.stage_read[stage]);
+            // Resolve after decode: the output descriptor can change on a graph rebuild.
+            ggml_tensor * out = llama_spd_peer_out_tensor(stages[stage]);
+            if (out == nullptr || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+                    ggml_nbytes(out) != (size_t) n_embd_boundary*sizeof(float)) {
+                error = "SPD readback boundary changed for decode stage " + std::to_string(stage);
+                return false;
+            }
+            output.resize(n_embd_boundary);
+            uint64_t ordinal = 0;
+            const int result = read_push(out, pb_out->staging_dec[slot], output.data(), &ordinal);
+            if (result < 0) {
+                error = "SPD readback and peer handoff failed for decode stage " + std::to_string(stage);
+                return false;
+            }
+            if (result > 0) {
+                pb_out->dec_ordinals[slot] = ordinal;
+                pb_out->pushed_pos[slot] = item.pos;
+                ++timing.decode_pushes[stage];
+                handed_off = true;
+            } else {
+                ggml_backend_tensor_get(out, output.data(), 0, output.size()*sizeof(float));
+            }
+        }
+
         // Producer side: ship this boundary straight to the next stage's
         // staging slot. Issued before the host-side tap maths below so the
         // transfer overlaps it. A failure is not fatal -- clearing `dead`
         // ownership on the link puts the pair back on the host path for good.
-        if (pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead) {
+        if (!handed_off && pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead) {
             scope_timer push_timer(timing.stage_push[stage]);
             ggml_tensor * out  = llama_spd_peer_out_tensor(stages[stage]);
             ggml_tensor * dst  = pb_out->staging_dec[slot];

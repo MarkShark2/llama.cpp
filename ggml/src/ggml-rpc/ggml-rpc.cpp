@@ -138,6 +138,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_DEDUPE,
     // Main-stream whole-tensor copy; completion is observed by the next read.
     RPC_CMD_COPY_TENSOR_ORDERED,
+    RPC_CMD_GET_TENSOR_AND_PUSH,
     RPC_CMD_COUNT,
 };
 
@@ -159,6 +160,7 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 // Optional extension of fork 6.0.6: HELLO response byte 3 was zero padding.
 // Old clients ignore it; old servers leave it zero. Transport caps are unchanged.
 static constexpr uint8_t RPC_FEATURE_ORDERED_COPY = 1 << 0;
+static constexpr uint8_t RPC_FEATURE_GET_AND_PUSH = 1 << 1;
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -635,7 +637,7 @@ static void rpc_command_payload(rpc_cmd cmd, const void * data, size_t size) {
         b = req.offset;
         c = req.size;
         event = "tensor_id";
-    } else if (cmd == RPC_CMD_PUSH_TENSOR && size == sizeof(rpc_msg_push_tensor_req)) {
+    } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
         rpc_msg_push_tensor_req req;
         memcpy(&req, data, sizeof(req));
         a = req.src.id;
@@ -673,7 +675,8 @@ static rpc_phase_kind rpc_phase_command(rpc_cmd cmd) {
         case RPC_CMD_GET_TENSOR_BF16: return RPC_PHASE_GET;
         case RPC_CMD_LANE_FENCE:
         case RPC_CMD_PEER_OPEN:
-        case RPC_CMD_PUSH_TENSOR: return RPC_PHASE_PEER;
+        case RPC_CMD_PUSH_TENSOR:
+        case RPC_CMD_GET_TENSOR_AND_PUSH: return RPC_PHASE_PEER;
         case RPC_CMD_COPY_TENSOR:
         case RPC_CMD_COPY_TENSOR_ORDERED:
         case RPC_CMD_MEMSET_TENSOR:
@@ -3797,6 +3800,73 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
     return true;
 }
 
+extern "C" {
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor * src, const ggml_tensor * dst) {
+    auto sdisp = rpc_tensor_dispatcher(src);
+    auto ddisp = rpc_tensor_dispatcher(dst);
+    return sdisp != nullptr && ddisp != nullptr && sdisp != ddisp &&
+            rpc_peer_enabled() && !rpc_async_enabled() && !rpc_wire_bf16_enabled() &&
+            (sdisp->features & RPC_FEATURE_GET_AND_PUSH) && ddisp->patch >= GGML_RPC_PEER_MIN_PATCH &&
+            src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_are_same_layout(src, dst) &&
+            ggml_nbytes(src) != 0;
+}
+
+// 0 means unsupported before submission; -1 means an earlier deferred ACK failed.
+GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
+        const ggml_tensor * src, const ggml_tensor * dst, void * data, uint64_t * ordinal_out) {
+    if (!ggml_backend_rpc_sync_peer_can_read_push(src, dst)) {
+        return 0;
+    }
+    auto sdisp = rpc_tensor_dispatcher(src);
+    auto ddisp = rpc_tensor_dispatcher(dst);
+    auto & st = rpc_sync_peer();
+    uint64_t dst_session;
+    socket_ptr lane;
+    uint64_t pending = 0;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.session_ids.find(ddisp->endpoint);
+        if (it == st.session_ids.end()) {
+            return 0;
+        }
+        dst_session = it->second;
+        auto lit = st.push_lanes.find(sdisp->endpoint);
+        if (lit != st.push_lanes.end()) {
+            lane = lit->second;
+            pending = st.lane_sent[sdisp->endpoint] - st.lane_acked[sdisp->endpoint];
+        }
+    }
+    // Retire ACKs from the legacy path before switching transports; its producer guard already ordered the graph.
+    while (pending > 0) {
+        rpc_msg_push_tensor_rsp ack = {};
+        if (!recv_msg(lane, &ack, sizeof(ack)) || !ack.ok) {
+            return -1;
+        }
+        std::lock_guard<std::mutex> l(st.m);
+        ++st.lane_acked[sdisp->endpoint];
+        --pending;
+    }
+    if (!rpc_peer_route_ready(sdisp, ddisp, dst_session, false)) {
+        return 0;
+    }
+    auto req = std::make_shared<rpc_msg_push_tensor_req>();
+    *req = {};
+    const std::string & via = rpc_peer_addr(ddisp->endpoint);
+    memcpy(req->endpoint, via.c_str(), std::min(via.size(), (size_t) RPC_ENDPOINT_MAX - 1));
+    req->src = serialize_tensor(src);
+    req->dst = serialize_tensor(dst);
+    req->size = ggml_nbytes(src);
+    // Like GET_TENSOR, a failed response is fatal: the peer may already own these bytes.
+    const bool ok = sdisp->send(RPC_CMD_GET_TENSOR_AND_PUSH, req, sizeof(*req), data, req->size);
+    RPC_STATUS_ASSERT(ok);
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        *ordinal_out = ++st.push_counts[ddisp->endpoint];
+    }
+    return 1;
+}
+}
+
 // Order the producer's next main-socket command (its next graph) behind every
 // push it has issued: get_done on its session counts executed get-lane
 // commands, which here are exactly the pushes, and each bumps only after its
@@ -4333,7 +4403,9 @@ public:
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     // [fork] direct remote->remote transfer
     bool peer_open(const rpc_msg_peer_open_req & request, rpc_msg_peer_open_rsp & response);
-    bool push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response);
+    bool push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response,
+                     const std::vector<uint8_t> * readback = nullptr);
+    bool get_tensor_and_push(const rpc_msg_push_tensor_req & request, std::vector<uint8_t> & response);
     // [fork] fleet hibernation: hand this session's buffers to the parking
     // slot so the client can disconnect while the host suspends, and take
     // them back on the connection that returns
@@ -4509,7 +4581,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.features = RPC_FEATURE_ORDERED_COPY;
+    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -5397,7 +5469,8 @@ bool rpc_server::peer_open(const rpc_msg_peer_open_req & request, rpc_msg_peer_o
 // a SET_TENSOR, bypassing the client entirely. Returns false only on a
 // protocol-level error (the caller then drops the connection); a transfer that
 // could not be delivered reports ok=0 so the client can fail loudly.
-bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response) {
+bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_push_tensor_rsp & response,
+                             const std::vector<uint8_t> * readback) {
     response.ok = 0;
     char ep[RPC_ENDPOINT_MAX];
     memcpy(ep, request.endpoint, sizeof(ep));
@@ -5456,7 +5529,12 @@ bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_pu
     uint8_t * body = msg.data() + lane_hdr;
     memcpy(body,                          &request.dst,        sizeof(request.dst));
     memcpy(body + sizeof(request.dst),    &request.dst_offset, sizeof(request.dst_offset));
-    if (bf16) {
+    if (readback != nullptr) {
+        if (bf16 || readback->size() != request.size) {
+            return false;
+        }
+        memcpy(body + RPC_SET_TENSOR_HDR, readback->data(), readback->size());
+    } else if (bf16) {
         std::vector<float> tmp(request.size / sizeof(float));
         {
             rpc_phase_wait phase(true);
@@ -5497,6 +5575,19 @@ bool rpc_server::push_tensor(const rpc_msg_push_tensor_req & request, rpc_msg_pu
     link->q_cv.notify_all();
     response.ok = 1;
     return true;
+}
+
+bool rpc_server::get_tensor_and_push(const rpc_msg_push_tensor_req & request, std::vector<uint8_t> & response) {
+    if (request.bf16 || request.wait_main || request.wait_get || request.size == 0) {
+        return false;
+    }
+    rpc_msg_get_tensor_req get = {};
+    get.tensor = request.src;
+    get.offset = request.src_offset;
+    get.size = request.size;
+    rpc_msg_push_tensor_rsp pushed = {};
+    // The main stream completed the producer graph. Queue owned bytes before replying to the host.
+    return get_tensor(get, response) && push_tensor(request, pushed, &response) && pushed.ok != 0;
 }
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
@@ -6779,6 +6870,18 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 }
                 break;
             }
+            case RPC_CMD_GET_TENSOR_AND_PUSH: {
+                rpc_msg_push_tensor_req request;
+                std::vector<uint8_t> response;
+                if (!recv_msg(sock, &request, sizeof(request)) ||
+                        !server.get_tensor_and_push(request, response) ||
+                        !send_msg(sock, response.data(), response.size())) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -6984,7 +7087,7 @@ static bool rpc_handshake_hello(const socket_ptr & sock) {
     rsp.major = RPC_PROTO_MAJOR_VERSION;
     rsp.minor = RPC_PROTO_MINOR_VERSION;
     rsp.patch = RPC_PROTO_PATCH_VERSION;
-    rsp.features = RPC_FEATURE_ORDERED_COPY;
+    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH;
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
@@ -7348,6 +7451,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_tensor_copy_ordered") == 0) {
         return (void *)ggml_backend_rpc_tensor_copy_ordered;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_read_push") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_can_read_push;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_read_push") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_read_push;
     }
     if (std::strcmp(name, "ggml_backend_rpc_device_endpoint") == 0) {
         return (void *)ggml_backend_rpc_device_get_endpoint;
