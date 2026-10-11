@@ -326,14 +326,35 @@ struct common_spd_pipeline::impl {
     struct pending_hidden {
         using finish_fn = bool (*)(void *, void *);
         using release_fn = void (*)(void *);
+        using compact_finish_fn = bool (*)(void *);
+        using compact_release_fn = bool (*)(void *);
         void * handle = nullptr;
         finish_fn finish = nullptr;
         release_fn release = nullptr;
+        compact_finish_fn compact_finish = nullptr;
+        finish_fn compact_materialize = nullptr;
+        compact_release_fn compact_release = nullptr;
+        std::atomic<bool> * failure = nullptr;
+
+        bool retire() {
+            if (handle == nullptr) {
+                return true;
+            }
+            void * owned = handle;
+            handle = nullptr;
+            if (compact_release != nullptr) {
+                const bool ok = compact_release(owned);
+                if (!ok && failure != nullptr) {
+                    failure->store(true);
+                }
+                return ok;
+            }
+            release(owned);
+            return true;
+        }
 
         ~pending_hidden() {
-            if (handle != nullptr) {
-                release(handle);
-            }
+            retire();
         }
     };
 
@@ -432,6 +453,7 @@ struct common_spd_pipeline::impl {
     std::vector<std::unique_ptr<std::mutex>> resource_mutexes;
     std::array<batch_storage, SPD_MAX_STAGE_COUNT> stage_decode_batches;
     std::array<std::vector<float>, SPD_MAX_STAGE_COUNT> stage_decode_outputs;
+    std::array<std::vector<float>, SPD_MAX_STAGE_COUNT> stage_peer_inputs;
     batch_storage head_decode_batch;
     batch_storage embed_decode_batch;
     batch_storage sidecar_decode_batch;
@@ -595,7 +617,7 @@ struct common_spd_pipeline::impl {
         uint64_t ordinals[2] = { 0, 0 };  // delivery fence target per slot
         ggml_tensor * inp = nullptr;      // consumer graph's wide embd input
         bool ready = false;               // consumer-side setup complete
-        bool dead  = false;               // route refused or a transfer failed
+        std::atomic<bool> dead{false};    // producer failure is observed by the concurrent consumer
         int32_t  pushed_chunks[2] = { -1, -1 }; // exact chunk held by each staging slot
         int32_t  consumed_chunk = -1;     // last chunk the consumer finished
 
@@ -679,13 +701,24 @@ struct common_spd_pipeline::impl {
         }
         item.hidden.resize(n_embd_boundary);
         trace_schedule("materialize_begin", -1, item.pos);
-        if (!item.pending->finish(item.pending->handle, item.hidden.data())) {
+        auto materialize = item.pending->compact_materialize != nullptr
+                ? item.pending->compact_materialize : item.pending->finish;
+        if (!materialize(item.pending->handle, item.hidden.data())) {
             hidden_backup_failed.store(true);
             error = "SPD full hidden backup failed at position " + std::to_string(item.pos);
             return false;
         }
-        item.pending.reset();
         trace_schedule("materialize_done", -1, item.pos);
+        return retire_hidden(item, error);
+    }
+
+    bool retire_hidden(entry & item, std::string & error) {
+        if (item.pending != nullptr && item.pending->compact_release != nullptr && !item.pending->retire()) {
+            hidden_backup_failed.store(true);
+            error = "SPD compact hidden retirement failed at position " + std::to_string(item.pos);
+            return false;
+        }
+        item.pending.reset();
         return true;
     }
 
@@ -3403,11 +3436,10 @@ struct common_spd_pipeline::impl {
         timing.stage_lock[stage] += std::chrono::duration<double>(start - lock_start).count();
         ++timing.stage_calls[stage];
         trace_schedule("stage_lock_ready", (int) stage, item.pos);
-        trace_schedule("incoming_begin", (int) stage, item.pos);
-        if (!finish_hidden_backup(stage, error) || !materialize_hidden(item, error)) {
+        if (!finish_hidden_backup(stage, error)) {
             return false;
         }
-        trace_schedule("incoming_ready", (int) stage, item.pos);
+        trace_schedule("previous_backup_ready", (int) stage, item.pos);
 
         // [fork] Direct stage-to-stage boundary transfer during decode.
         //
@@ -3444,7 +3476,25 @@ struct common_spd_pipeline::impl {
         trace_schedule("peer_guard_ordered", (int) stage, item.pos);
         const bool peer_in = pb_in != nullptr && pb_in->ready && pb_in->dec_ready &&
                              !pb_in->dead && pb_in->pushed_pos[slot] == item.pos;
+        trace_schedule("incoming_begin", (int) stage, item.pos);
+        const bool compact_input = item.pending != nullptr && item.pending->compact_release != nullptr;
+        if (compact_input && !item.pending->compact_finish(item.pending->handle)) {
+            hidden_backup_failed.store(true);
+            error = "SPD compact input expired at position " + std::to_string(item.pos);
+            return false;
+        }
+        if ((!peer_in || !compact_input) && !materialize_hidden(item, error)) {
+            return false;
+        }
+        trace_schedule("incoming_ready", (int) stage, item.pos);
         if (peer_in) {
+            const ggml_tensor * live = llama_spd_peer_inp_tensor(stages[stage]);
+            if (live == nullptr || live != pb_in->inp || live->buffer == nullptr ||
+                    live->type != GGML_TYPE_F32 || live->ne[0] != n_embd_boundary || live->ne[1] < 1 ||
+                    pb_in->inp_dec == nullptr || pb_in->inp_dec->view_src != live || pb_in->inp_dec->view_offs != 0) {
+                error = "SPD peer input layout changed for decode stage " + std::to_string(stage);
+                return false;
+            }
             // stall the endpoint's command loop until the push landed, then
             // move it from staging into the boundary the graph reads
             {
@@ -3503,7 +3553,21 @@ struct common_spd_pipeline::impl {
         }
 
         const llama_token * token = stage == 0 ? &item.token : nullptr;
-        const float * embd = stage == 0 ? nullptr : item.hidden.data();
+        const float * embd = nullptr;
+        if (stage > 0) {
+            if (peer_in && compact_input) {
+                // Host batch preparation copies this span even when the device upload is skipped.
+                auto & scratch = stage_peer_inputs[stage];
+                scratch.resize(n_embd_boundary, 0.0f);
+                embd = scratch.data();
+            } else {
+                if (item.hidden.size() != (size_t) n_embd_boundary) {
+                    error = "SPD missing full input for decode stage " + std::to_string(stage);
+                    return false;
+                }
+                embd = item.hidden.data();
+            }
+        }
         using can_read_push_fn = bool (*)(const ggml_tensor *, const ggml_tensor *);
         using read_push_fn = int (*)(const ggml_tensor *, const ggml_tensor *, void *, uint64_t *);
         using can_mean_fn = bool (*)(const ggml_tensor *, const ggml_tensor *, int64_t);
@@ -3523,6 +3587,16 @@ struct common_spd_pipeline::impl {
                 rpc_reg, "ggml_backend_rpc_sync_peer_release_mean") : nullptr;
         auto abort_mean = rpc_reg ? (abort_mean_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_abort_mean") : nullptr;
+        auto can_compact = rpc_reg ? (can_mean_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_can_compact") : nullptr;
+        auto begin_compact = rpc_reg ? (begin_mean_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_begin_compact") : nullptr;
+        auto finish_compact = rpc_reg ? (pending_hidden::compact_finish_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_finish_compact") : nullptr;
+        auto materialize_compact = rpc_reg ? (pending_hidden::finish_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_materialize_compact") : nullptr;
+        auto release_compact = rpc_reg ? (pending_hidden::compact_release_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_release_compact") : nullptr;
         const ggml_tensor * previous_out = llama_spd_peer_out_tensor(stages[stage]);
         const bool compound_read = pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead &&
                 wanted.empty() && previous_out != nullptr &&
@@ -3530,8 +3604,11 @@ struct common_spd_pipeline::impl {
                 can_read_push != nullptr && read_push != nullptr &&
                 can_read_push(previous_out, pb_out->staging_dec[slot]);
         size_t mean_anchor = anchors.size();
-        if (compound_read && can_mean && begin_mean && finish_mean && release_mean && abort_mean &&
-                can_mean(previous_out, pb_out->staging_dec[slot], n_embd)) {
+        const bool compact_read = compound_read && can_compact && begin_compact && finish_compact &&
+                materialize_compact && release_compact && abort_mean &&
+                can_compact(previous_out, pb_out->staging_dec[slot], n_embd);
+        if (compact_read || (compound_read && can_mean && begin_mean && finish_mean && release_mean && abort_mean &&
+                can_mean(previous_out, pb_out->staging_dec[slot], n_embd))) {
             for (size_t ai = 0; ai < anchors.size(); ++ai) {
                 if (anchors[ai] == stage_bounds[stage + 1]) {
                     mean_anchor = ai;
@@ -3556,6 +3633,10 @@ struct common_spd_pipeline::impl {
             error = "SPD peer boundary input tensor moved under decode stage " + std::to_string(stage);
             return false;
         }
+        // The old input cannot remain attached to this entry after its output replaces it.
+        if (!retire_hidden(item, error)) {
+            return false;
+        }
 
         bool handed_off = false;
         bool mean_ready = false;
@@ -3572,16 +3653,34 @@ struct common_spd_pipeline::impl {
             int result = 0;
             if (mean_anchor < anchors.size()) {
                 auto backup = std::make_shared<pending_hidden>();
-                backup->finish = finish_mean;
-                backup->release = release_mean;
                 auto & tap = item.snap.values[mean_anchor];
                 tap.resize(n_embd);
-                result = begin_mean(out, pb_out->staging_dec[slot], tap.data(), n_embd, &backup->handle, &ordinal);
+                if (compact_read) {
+                    backup->compact_finish = finish_compact;
+                    backup->compact_materialize = materialize_compact;
+                    backup->compact_release = release_compact;
+                    backup->failure = &hidden_backup_failed;
+                    result = begin_compact(out, pb_out->staging_dec[slot], tap.data(), n_embd, &backup->handle, &ordinal);
+                } else {
+                    backup->finish = finish_mean;
+                    backup->release = release_mean;
+                    result = begin_mean(out, pb_out->staging_dec[slot], tap.data(), n_embd, &backup->handle, &ordinal);
+                }
                 if (result == -2) {
                     hidden_backup_failed.store(true);
                 }
                 if (result > 0) {
-                    hidden_backups[stage] = backup;
+                    if (compact_read) {
+                        // Compact begin completes its reply and producer read, without a full download.
+                        if (!finish_compact(backup->handle)) {
+                            hidden_backup_failed.store(true);
+                            error = "SPD compact completion failed for stage " + std::to_string(stage);
+                            return false;
+                        }
+                        llama_synchronize(stages[stage]);
+                    } else {
+                        hidden_backups[stage] = backup;
+                    }
                     item.pending = std::move(backup);
                     item.hidden.clear();
                     item.snap.present[mean_anchor] = true;
@@ -4263,6 +4362,13 @@ struct common_spd_pipeline::impl {
                         if (!embed_token(verified_token, corrected_embedding)) {
                             return false;
                         }
+                        for (auto & item : pipeline) {
+                            std::string error;
+                            if (!retire_hidden(item, error)) {
+                                fail(error);
+                                return false;
+                            }
+                        }
                         pipeline.clear();
                         peer_decode_invalidate();
                         pipeline.push_back(make_entry(verified_token, target_pos, std::move(corrected_embedding)));
@@ -4314,6 +4420,13 @@ struct common_spd_pipeline::impl {
         }
 
         trace_schedule("decode_loop_done");
+        for (auto & item : pipeline) {
+            std::string error;
+            if (!retire_hidden(item, error)) {
+                fail(error);
+                return false;
+            }
+        }
         if (!finish_hidden_backups()) {
             return false;
         }

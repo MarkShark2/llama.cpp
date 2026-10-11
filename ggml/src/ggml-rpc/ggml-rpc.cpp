@@ -141,6 +141,9 @@ enum rpc_cmd {
     RPC_CMD_COPY_TENSOR_ORDERED,
     RPC_CMD_GET_TENSOR_AND_PUSH,
     RPC_CMD_GET_MEAN_AND_PUSH,
+    RPC_CMD_GET_COMPACT_AND_PUSH,
+    RPC_CMD_GET_COMPACT_FULL,
+    RPC_CMD_RELEASE_COMPACT,
     RPC_CMD_COUNT,
 };
 
@@ -165,11 +168,13 @@ static constexpr uint8_t RPC_FEATURE_ORDERED_COPY = 1 << 0;
 static constexpr uint8_t RPC_FEATURE_GET_AND_PUSH = 1 << 1;
 static constexpr uint8_t RPC_FEATURE_MAIN_DEDUPE = 1 << 2;
 static constexpr uint8_t RPC_FEATURE_MEAN_FIRST = 1 << 3;
+static constexpr uint8_t RPC_FEATURE_COMPACT_RETURN = 1 << 4;
 
 static constexpr size_t RPC_MEAN_WIDTH = 4096;
 static constexpr size_t RPC_MEAN_STREAMS = 4;
 static constexpr size_t RPC_MEAN_BYTES = RPC_MEAN_WIDTH * sizeof(float);
 static constexpr size_t RPC_MEAN_FULL_BYTES = RPC_MEAN_BYTES * RPC_MEAN_STREAMS;
+static constexpr size_t RPC_COMPACT_MAX_RECORDS = 64; // 4 MiB per source session, no eviction
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -373,6 +378,21 @@ struct rpc_msg_push_tensor_req {
 
 struct rpc_msg_push_tensor_rsp {
     uint8_t ok;
+};
+
+struct rpc_compact_token {
+    uint64_t session;
+    uint64_t generation;
+};
+
+struct rpc_msg_compact_rsp {
+    rpc_compact_token token;
+    float mean[RPC_MEAN_WIDTH];
+};
+
+struct rpc_msg_compact_full_rsp {
+    rpc_compact_token token;
+    uint8_t full[RPC_MEAN_FULL_BYTES];
 };
 
 // [fork] server-side imatrix reduction. src1 is the activation the client
@@ -657,7 +677,8 @@ static void rpc_command_payload(rpc_cmd cmd, const void * data, size_t size) {
         const int64_t now = rpc_command_now();
         rpc_command_current->emit("set_encoding", now, now, encoding, c, size);
         event = "tensor_id";
-    } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH || cmd == RPC_CMD_GET_MEAN_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
+    } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH || cmd == RPC_CMD_GET_MEAN_AND_PUSH ||
+                cmd == RPC_CMD_GET_COMPACT_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
         rpc_msg_push_tensor_req req;
         memcpy(&req, data, sizeof(req));
         a = req.src.id;
@@ -692,12 +713,14 @@ static rpc_phase_kind rpc_phase_command(rpc_cmd cmd) {
         case RPC_CMD_GRAPH_COMPUTE:
         case RPC_CMD_GRAPH_RECOMPUTE: return RPC_PHASE_GRAPH;
         case RPC_CMD_GET_TENSOR:
-        case RPC_CMD_GET_TENSOR_BF16: return RPC_PHASE_GET;
+        case RPC_CMD_GET_TENSOR_BF16:
+        case RPC_CMD_GET_COMPACT_FULL: return RPC_PHASE_GET;
         case RPC_CMD_LANE_FENCE:
         case RPC_CMD_PEER_OPEN:
         case RPC_CMD_PUSH_TENSOR:
         case RPC_CMD_GET_TENSOR_AND_PUSH:
-        case RPC_CMD_GET_MEAN_AND_PUSH: return RPC_PHASE_PEER;
+        case RPC_CMD_GET_MEAN_AND_PUSH:
+        case RPC_CMD_GET_COMPACT_AND_PUSH: return RPC_PHASE_PEER;
         case RPC_CMD_COPY_TENSOR:
         case RPC_CMD_COPY_TENSOR_ORDERED:
         case RPC_CMD_MEMSET_TENSOR:
@@ -1331,6 +1354,10 @@ public:
     // Access only at the main stream's wire position (direct-mode io_m).
     std::weak_ptr<socket_t> main_dedupe_sock;
     rpc_main_dedupe_lru main_dedupe;
+    // Access only through call(), at the owning main connection's wire position.
+    std::weak_ptr<socket_t> compact_sock;
+    size_t compact_live = 0;
+    uint64_t compact_session = 0, compact_generation = 0;
     rpc_phase_profile peer_profile;
 
 private:
@@ -2163,7 +2190,10 @@ static std::unordered_map<std::string, bool> g_peer_routes;   // "src>dst" -> us
 // (the sync-client SPD path, including promoted mean-first endpoints).
 static bool rpc_peer_route_ready(const std::shared_ptr<rpc_dispatcher> & src,
                                  const std::shared_ptr<rpc_dispatcher> & dst,
-                                 uint64_t dst_session_id, bool counted) {
+                                 uint64_t dst_session_id, bool counted, bool * transport_failed = nullptr) {
+    if (transport_failed != nullptr) {
+        *transport_failed = false;
+    }
     const std::string key = src->endpoint + ">" + dst->endpoint;
     {
         std::lock_guard<std::mutex> l(g_peer_route_m);
@@ -2185,9 +2215,16 @@ static bool rpc_peer_route_ready(const std::shared_ptr<rpc_dispatcher> & src,
         memcpy(req.endpoint, via.c_str(), via.size());
         rpc_msg_peer_open_rsp rsp = { 0 };
         auto fn = [&req, &rsp](const socket_ptr & s) {
-            return send_rpc_cmd(s, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
+            try {
+                return s != nullptr && send_rpc_cmd(s, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
+            } catch (...) {
+                return false;
+            }
         };
         const bool sent = counted ? src->call_counted(fn) : src->call(fn);
+        if (transport_failed != nullptr) {
+            *transport_failed = !sent;
+        }
         ok = sent && rsp.ok != 0;
         if (ok) {
             GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer%s\n",
@@ -4032,6 +4069,75 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
     return true;
 }
 
+// Full bytes avoided counts omitted downloads; mean, token, and ACK traffic is additional.
+struct rpc_compact_stats {
+    std::atomic<uint64_t> started{0}, materialized{0}, released{0}, unfetched{0};
+    std::atomic<uint64_t> eligibility_miss{0}, route_fallback{0}, capacity_fallback{0}, failed{0};
+
+    ~rpc_compact_stats() {
+        if (started || eligibility_miss || route_fallback || capacity_fallback || failed) {
+            GGML_LOG_INFO("[rpc compact] compact=%" PRIu64 " materialize=%" PRIu64 " release=%" PRIu64
+                    " eligibility_miss=%" PRIu64 " route_fallback=%" PRIu64 " capacity_fallback=%" PRIu64
+                    " failed=%" PRIu64 " mean_bytes=%" PRIu64 " lazy_full_bytes=%" PRIu64
+                    " full_bytes_avoided=%" PRIu64 "\n",
+                    started.load(), materialized.load(), released.load(), eligibility_miss.load(), route_fallback.load(),
+                    capacity_fallback.load(), failed.load(), started.load() * RPC_MEAN_BYTES,
+                    materialized.load() * RPC_MEAN_FULL_BYTES, unfetched.load() * RPC_MEAN_FULL_BYTES);
+        }
+    }
+};
+
+static rpc_compact_stats & rpc_compact_profile() {
+    static rpc_compact_stats stats;
+    return stats;
+}
+
+static bool rpc_compact_return_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_RPC_COMPACT_RETURN");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+struct rpc_compact_handle {
+    std::shared_ptr<rpc_dispatcher> owner;
+    std::weak_ptr<socket_t> socket;
+    rpc_compact_token token = {};
+    bool materialized = false;
+};
+
+static bool rpc_compact_connected(const rpc_compact_handle & handle, const socket_ptr & socket) {
+    return socket != nullptr && handle.socket.lock() == socket &&
+            !handle.owner->is_poisoned() && !g_rpc_mean_aborted.load();
+}
+
+static bool rpc_compact_same_token(const rpc_compact_token & a, const rpc_compact_token & b) {
+    return a.session == b.session && a.generation == b.generation;
+}
+
+template <typename F>
+static bool rpc_compact_call(rpc_compact_handle & handle, F && fn) {
+    try {
+        return handle.owner->call([&](const socket_ptr & sock) {
+            try {
+                if (rpc_compact_connected(handle, sock) && fn(sock)) {
+                    return true;
+                }
+            } catch (...) {
+                GGML_LOG_ERROR("[rpc compact] return failed on %s\n", handle.owner->endpoint.c_str());
+            }
+            ++rpc_compact_profile().failed;
+            handle.owner->poison();
+            return false;
+        });
+    } catch (...) {
+        ++rpc_compact_profile().failed;
+        handle.owner->poison();
+        return false;
+    }
+}
+
 static bool rpc_mean_first_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_RPC_MEAN_FIRST");
@@ -4086,6 +4192,187 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor
             (sdisp->features & RPC_FEATURE_GET_AND_PUSH) && ddisp->patch >= GGML_RPC_PEER_MIN_PATCH &&
             src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_are_same_layout(src, dst) &&
             ggml_nbytes(src) != 0;
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_compact(
+        const ggml_tensor * src, const ggml_tensor * dst, int64_t width) {
+    if (!rpc_compact_return_enabled()) {
+        return false;
+    }
+    if (width == (int64_t) RPC_MEAN_WIDTH && src != nullptr && dst != nullptr &&
+            ggml_backend_rpc_sync_peer_can_read_push(src, dst) && ggml_nbytes(src) == RPC_MEAN_FULL_BYTES) {
+        auto sdisp = rpc_tensor_dispatcher(src);
+        auto ddisp = rpc_tensor_dispatcher(dst);
+        if ((sdisp->features & RPC_FEATURE_COMPACT_RETURN) && (ddisp->features & RPC_FEATURE_COMPACT_RETURN)) {
+            return true;
+        }
+    }
+    ++rpc_compact_profile().eligibility_miss;
+    return false;
+}
+
+// 0 is a fallback before the compact command; -2 forbids retry after submission.
+GGML_BACKEND_API int ggml_backend_rpc_sync_peer_begin_compact(
+        const ggml_tensor * src, const ggml_tensor * dst, float * mean_out, int64_t width,
+        void ** handle_out, uint64_t * ordinal_out) try {
+    if (handle_out == nullptr || ordinal_out == nullptr || mean_out == nullptr) {
+        return -1;
+    }
+    *handle_out = nullptr;
+    *ordinal_out = 0;
+    if (!ggml_backend_rpc_sync_peer_can_compact(src, dst, width)) {
+        return 0;
+    }
+    auto sdisp = rpc_tensor_dispatcher(src);
+    auto ddisp = rpc_tensor_dispatcher(dst);
+    if (sdisp->is_poisoned() || g_rpc_mean_aborted.load()) {
+        return -2;
+    }
+    auto & st = rpc_sync_peer();
+    uint64_t dst_session;
+    socket_ptr lane;
+    uint64_t pending = 0;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.session_ids.find(ddisp->endpoint);
+        if (it == st.session_ids.end()) {
+            ++rpc_compact_profile().route_fallback;
+            return 0;
+        }
+        dst_session = it->second;
+        st.push_counts.try_emplace(ddisp->endpoint, 0);
+        auto lit = st.push_lanes.find(sdisp->endpoint);
+        if (lit != st.push_lanes.end()) {
+            lane = lit->second;
+            pending = st.lane_sent[sdisp->endpoint] - st.lane_acked[sdisp->endpoint];
+        }
+    }
+    while (pending > 0) {
+        rpc_msg_push_tensor_rsp ack = {};
+        if (!recv_msg(lane, &ack, sizeof(ack)) || !ack.ok) {
+            ++rpc_compact_profile().failed;
+            return -1;
+        }
+        std::lock_guard<std::mutex> l(st.m);
+        ++st.lane_acked[sdisp->endpoint];
+        --pending;
+    }
+    bool transport_failed = false;
+    if (!rpc_peer_route_ready(sdisp, ddisp, dst_session, false, &transport_failed)) {
+        if (transport_failed) {
+            ++rpc_compact_profile().failed;
+            sdisp->poison();
+            return -2;
+        }
+        ++rpc_compact_profile().route_fallback;
+        return 0;
+    }
+    rpc_msg_push_tensor_req req = {};
+    const std::string & via = rpc_peer_addr(ddisp->endpoint);
+    memcpy(req.endpoint, via.c_str(), std::min(via.size(), (size_t) RPC_ENDPOINT_MAX - 1));
+    req.src = serialize_tensor(src);
+    req.dst = serialize_tensor(dst);
+    req.size = RPC_MEAN_FULL_BYTES;
+    std::unique_ptr<rpc_compact_handle> handle(new rpc_compact_handle{sdisp, sdisp->get_sock(), {}});
+    rpc_msg_compact_rsp response;
+    bool capacity = false;
+    const bool ok = rpc_compact_call(*handle, [&](const socket_ptr & sock) {
+        if (sdisp->compact_sock.lock() != sock) {
+            sdisp->compact_sock = sock;
+            sdisp->compact_live = 0;
+            sdisp->compact_session = 0;
+            sdisp->compact_generation = 0;
+        }
+        if (sdisp->compact_live >= RPC_COMPACT_MAX_RECORDS) {
+            capacity = true;
+            ++rpc_compact_profile().capacity_fallback;
+            return true;
+        }
+        if (sdisp->compact_session == 0) {
+            rpc_msg_session_info_rsp info = {};
+            if (!send_rpc_cmd(sock, RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info)) || info.session_id == 0) {
+                return false;
+            }
+            sdisp->compact_session = info.session_id;
+        }
+        if (!send_rpc_cmd(sock, RPC_CMD_GET_COMPACT_AND_PUSH, &req, sizeof(req), &response, sizeof(response)) ||
+                response.token.session != sdisp->compact_session || response.token.generation <= sdisp->compact_generation) {
+            return false;
+        }
+        ++sdisp->compact_live;
+        sdisp->compact_generation = response.token.generation;
+        ++rpc_compact_profile().started;
+        handle->token = response.token;
+        return true;
+    });
+    if (capacity) {
+        return 0;
+    }
+    if (!ok) {
+        return -2;
+    }
+    // Completion proves the read and peer queue own independent immutable bytes.
+    memcpy(mean_out, response.mean, RPC_MEAN_BYTES);
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        *ordinal_out = ++st.push_counts.at(ddisp->endpoint);
+    }
+    *handle_out = handle.release();
+    return 1;
+} catch (...) {
+    ++rpc_compact_profile().failed;
+    auto owner = rpc_tensor_dispatcher(src);
+    if (owner != nullptr) {
+        owner->poison();
+    }
+    return -2;
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_finish_compact(void * opaque) {
+    if (opaque == nullptr) {
+        return false;
+    }
+    const auto & handle = *static_cast<rpc_compact_handle *>(opaque);
+    return rpc_compact_connected(handle, handle.owner->get_sock());
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_materialize_compact(void * opaque, void * full_out) {
+    if (opaque == nullptr || full_out == nullptr) {
+        return false;
+    }
+    auto & handle = *static_cast<rpc_compact_handle *>(opaque);
+    return rpc_compact_call(handle, [&](const socket_ptr & sock) {
+        rpc_msg_compact_full_rsp response;
+        if (!send_rpc_cmd(sock, RPC_CMD_GET_COMPACT_FULL, &handle.token, sizeof(handle.token), &response, sizeof(response)) ||
+                !rpc_compact_same_token(response.token, handle.token)) {
+            return false;
+        }
+        memcpy(full_out, response.full, RPC_MEAN_FULL_BYTES);
+        handle.materialized = true;
+        ++rpc_compact_profile().materialized;
+        return true;
+    });
+}
+
+// Consumes the handle even on failure. Retirement never downloads the snapshot.
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_release_compact(void * opaque) noexcept {
+    if (opaque == nullptr) {
+        return false;
+    }
+    std::unique_ptr<rpc_compact_handle> handle(static_cast<rpc_compact_handle *>(opaque));
+    return rpc_compact_call(*handle, [&](const socket_ptr & sock) {
+        rpc_compact_token response = {};
+        if (!send_rpc_cmd(sock, RPC_CMD_RELEASE_COMPACT, &handle->token, sizeof(handle->token), &response, sizeof(response)) ||
+                !rpc_compact_same_token(response, handle->token) || handle->owner->compact_live == 0) {
+            return false;
+        }
+        --handle->owner->compact_live;
+        ++rpc_compact_profile().released;
+        if (!handle->materialized) {
+            ++rpc_compact_profile().unfetched;
+        }
+        return true;
+    });
 }
 
 GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_mean(
@@ -5103,7 +5390,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST;
+    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST | RPC_FEATURE_COMPACT_RETURN;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -6154,11 +6441,8 @@ static bool rpc_mean_request(const rpc_msg_push_tensor_req & request) {
     return std::equal(std::begin(request.src.ne), std::end(request.src.ne), std::begin(request.dst.ne));
 }
 
-static bool rpc_send_mean_first(const socket_ptr & sock, const std::vector<uint8_t> & full) {
-    if (full.size() != RPC_MEAN_FULL_BYTES) {
-        return false;
-    }
-    std::array<float, RPC_MEAN_WIDTH> mean;
+static void rpc_make_mean(const std::vector<uint8_t> & full, std::array<float, RPC_MEAN_WIDTH> & mean) {
+    GGML_ASSERT(full.size() == RPC_MEAN_FULL_BYTES);
     memcpy(mean.data(), full.data(), RPC_MEAN_BYTES);
     for (size_t stream = 1; stream < RPC_MEAN_STREAMS; ++stream) {
         for (size_t i = 0; i < RPC_MEAN_WIDTH; ++i) {
@@ -6173,6 +6457,14 @@ static bool rpc_send_mean_first(const socket_ptr & sock, const std::vector<uint8
         volatile float rounded = mean[i] * 0.25f;
         mean[i] = rounded;
     }
+}
+
+static bool rpc_send_mean_first(const socket_ptr & sock, const std::vector<uint8_t> & full) {
+    if (full.size() != RPC_MEAN_FULL_BYTES) {
+        return false;
+    }
+    std::array<float, RPC_MEAN_WIDTH> mean;
+    rpc_make_mean(full, mean);
     rpc_phase_io phase(true);
     const uint64_t size = RPC_MEAN_BYTES + RPC_MEAN_FULL_BYTES;
     const socket_t::buffer prefix[] = {{&size, sizeof(size)}, {mean.data(), RPC_MEAN_BYTES}};
@@ -7242,6 +7534,9 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
 }
 
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
+    // Main-connection ownership only. Disconnect destroys every retained snapshot.
+    std::unordered_map<uint64_t, std::vector<uint8_t>> compact_returns;
+    uint64_t compact_generation = 0;
     rpc_main_dedupe_lru main_dedupe;
     rpc_phase_profile profile;
     const std::string profile_endpoint = std::to_string(session.id);
@@ -7477,6 +7772,65 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 }
                 break;
             }
+            case RPC_CMD_GET_COMPACT_AND_PUSH: {
+                bool ok = false;
+                try {
+                    rpc_msg_push_tensor_req request;
+                    if (recv_msg(sock, &request, sizeof(request)) && rpc_mean_request(request) &&
+                            compact_returns.size() < RPC_COMPACT_MAX_RECORDS && compact_generation != UINT64_MAX) {
+                        auto entry = compact_returns.emplace(++compact_generation, std::vector<uint8_t>{}).first;
+                        if (server.get_tensor_and_push(request, entry->second)) {
+                            std::array<float, RPC_MEAN_WIDTH> mean;
+                            rpc_make_mean(entry->second, mean);
+                            rpc_msg_compact_rsp response;
+                            response.token = {session.id, entry->first};
+                            memcpy(response.mean, mean.data(), RPC_MEAN_BYTES);
+                            ok = send_msg(sock, &response, sizeof(response));
+                        }
+                    }
+                } catch (const std::exception & error) {
+                    GGML_LOG_ERROR("[rpc compact] snapshot failed: %s\n", error.what());
+                }
+                if (!ok) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_COMPACT_FULL:
+            case RPC_CMD_RELEASE_COMPACT: {
+                rpc_compact_token request;
+                if (!recv_msg(sock, &request, sizeof(request)) || request.session != session.id || request.generation == 0) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                auto entry = compact_returns.find(request.generation);
+                if (entry == compact_returns.end() || entry->second.size() != RPC_MEAN_FULL_BYTES) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                bool ok;
+                if (cmd == RPC_CMD_RELEASE_COMPACT) {
+                    compact_returns.erase(entry);
+                    ok = send_msg(sock, &request, sizeof(request));
+                } else {
+                    rpc_phase_io io(true);
+                    const uint64_t size = sizeof(request) + RPC_MEAN_FULL_BYTES;
+                    const socket_t::buffer response[] = {
+                        {&size, sizeof(size)}, {&request, sizeof(request)}, {entry->second.data(), entry->second.size()},
+                    };
+                    ok = sock->send_data(response, 3) && sock->flush();
+                }
+                if (!ok) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_MEAN_AND_PUSH: {
                 rpc_msg_push_tensor_req request;
                 std::vector<uint8_t> response;
@@ -7613,14 +7967,15 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 if (!recv_msg(sock, nullptr, 0)) {
                     return;
                 }
-                rpc_msg_session_detach_rsp response;
-                if (!server.session_detach(response)) {
+                rpc_msg_session_detach_rsp response = {};
+                // A parked graph cannot carry live compact-return ownership.
+                if (compact_returns.empty() && !server.session_detach(response)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
-                session.detached = true;
+                session.detached = response.token != 0;
                 break;
             }
             case RPC_CMD_SESSION_RESUME: {
@@ -7705,7 +8060,7 @@ static bool rpc_handshake_hello(const socket_ptr & sock) {
     rsp.major = RPC_PROTO_MAJOR_VERSION;
     rsp.minor = RPC_PROTO_MINOR_VERSION;
     rsp.patch = RPC_PROTO_PATCH_VERSION;
-    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST;
+    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST | RPC_FEATURE_COMPACT_RETURN;
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
@@ -8075,6 +8430,21 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_read_push") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_read_push;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_compact") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_can_compact;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_begin_compact") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_begin_compact;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_finish_compact") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_finish_compact;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_materialize_compact") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_materialize_compact;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_release_compact") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_release_compact;
     }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_mean") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_can_mean;
