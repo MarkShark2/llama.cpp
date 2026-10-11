@@ -971,6 +971,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_q8_swiglu[mul_mat_vec_max_cols];
     vk_pipeline pipeline_q8_id_direct;
+    vk_pipeline pipeline_q6_full_tiles;
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -3153,14 +3154,19 @@ static bool ggml_vk_iq2_capture_match(const vk_pipeline & pipeline, size_t spv_s
 static bool ggml_vk_q6_capture_match(const vk_device & device, const vk_pipeline & pipeline,
                                    size_t spv_size, const void * spv_data, const std::vector<uint32_t> & spec,
                                    const std::array<uint32_t, 3> & wg, bool full_subgroups, uint32_t subgroup_size) {
+    const char * variant = std::getenv("GGML_VK_Q6_EXECUTABLE_VARIANT");
+    const bool full_tiles = variant && std::strcmp(variant, "full_tiles") == 0;
+    if (variant && variant[0] && !full_tiles && std::strcmp(variant, "baseline") != 0) {
+        return false;
+    }
     return device->vendor_id == VK_VENDOR_ID_AMD &&
            (strstr(device->properties.deviceName, "GFX1013") || strstr(device->properties.deviceName, "gfx1013")) &&
-           pipeline->name == "mul_mat_vec_q6_k_f32_f32" &&
+           pipeline->name == (full_tiles ? "mul_mat_vec_q6_k_f32_f32_full_tiles" : "mul_mat_vec_q6_k_f32_f32") &&
            spv_data == mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem_data &&
            spv_size == mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem_len &&
            spec.size() == 4 && spec[0] == subgroup_size && subgroup_size >= 16 &&
            spec[1] == 2 && wg[0] == 2 && wg[1] == 1 && wg[2] == 1 &&
-           spec[2] == 1 && spec[3] == 0 && full_subgroups;
+           spec[2] == 1 && spec[3] == (full_tiles ? 3u : 0u) && full_subgroups;
 }
 
 static std::string ggml_vk_capture_string(const char * data, size_t size) {
@@ -5996,6 +6002,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
     static constexpr uint32_t mul_mat_vec_idg_num_bindings = 7;
 
+    const char * q6_full_tiles_env = std::getenv("GGML_VK_TARGET_Q6_FULL_TILES");
+    if (target_reuse_device && target_q6_mode == 0 && use_subgroups16 && subgroup_size16 == 64 && rm_kq == 2 &&
+        q6_full_tiles_env && std::strcmp(q6_full_tiles_env, "1") == 0) {
+        ggml_vk_create_pipeline(device, device->pipeline_q6_full_tiles, "mul_mat_vec_q6_k_f32_f32_full_tiles",
+                mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem_len, mul_mat_vec_q6_k_f32_f32_subgroup_no_shmem_data,
+                "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants),
+                {2, 1, 1}, {64, 2, 1, 3}, 1, true, true, force_subgroup_size16);
+    }
+
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
 #define OCP_DMMV_LEN(NAME, REDUC)  (device->ocp_fp4 ? NAME ## _ocp_len[REDUC]  : NAME ## _len[REDUC])
 #define OCP_DMMV_DATA(NAME, REDUC) (device->ocp_fp4 ? NAME ## _ocp_data[REDUC] : NAME ## _data[REDUC])
@@ -7548,9 +7563,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         if (const char * capture_dir = std::getenv("GGML_VK_Q6_EXECUTABLE_DIR")) {
             if (capture_dir[0]) {
+                const char * variant = std::getenv("GGML_VK_Q6_EXECUTABLE_VARIANT");
+                const bool full_tiles = variant && std::strcmp(variant, "full_tiles") == 0;
+                const bool valid_variant = !variant || !variant[0] || full_tiles || std::strcmp(variant, "baseline") == 0;
                 std::cerr << "ggml_vulkan: Q6 executable capture "
-                          << (std::strlen(capture_dir) <= 4096 ? "armed for first requested GFX1013 subgroup F32/F32 rows2 columns1 mode0 pipeline; no artifact until selected" :
-                                                               "disabled: directory exceeds 4096 bytes")
+                          << (std::strlen(capture_dir) > 4096 ? "disabled: directory exceeds 4096 bytes" :
+                              !valid_variant ? "disabled: unknown variant" :
+                              full_tiles ? "armed for first requested GFX1013 full_tiles mode3 pipeline; no artifact until selected" :
+                                           "armed for first requested GFX1013 subgroup F32/F32 rows2 columns1 mode0 pipeline; no artifact until selected")
                           << " on device " << idx << '\n';
             }
         }
@@ -10526,6 +10546,19 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     if (quantize_y) {
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    }
+
+    // Keep the full-tile candidate separate from partial, batched and converted inputs.
+    if (ctx->device->pipeline_q6_full_tiles && src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && !x_non_contig && !y_non_contig && !quantize_y &&
+        ne11 == 1 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+        ne00 % 1024 == 0 && ne01 % 2 == 0 && ne20 == ne01 &&
+        ne01 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+        ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+        ((ne00 == 4096 && (ne01 == 1536 || ne01 == 2048 || ne01 == 8192 || ne01 == 12288)) ||
+         (ne01 == 4096 && (ne00 == 2048 || ne00 == 8192 || ne00 == 12288 || ne00 == 16384))) &&
+        dmmv == ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_SUBGROUP][GGML_TYPE_Q6_K][0]) {
+        dmmv = ctx->device->pipeline_q6_full_tiles;
     }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
