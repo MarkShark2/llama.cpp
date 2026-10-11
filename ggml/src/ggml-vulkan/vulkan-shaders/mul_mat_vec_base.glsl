@@ -43,14 +43,22 @@ layout (push_constant) uniform parameter
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
+#ifdef MUL_MAT_ID_DIRECT
+const uint NUM_COLS = 1;
+#else
 layout (constant_id = 2) const uint NUM_COLS = 1;
+#endif
 
 #ifdef MUL_MAT_ID
 uint expert_id;
 #endif
 
 // per-column B and D offsets, filled by get_offsets
+#ifdef MUL_MAT_ID_DIRECT
+#define MMV_MAX_COLS 1
+#else
 #define MMV_MAX_COLS 8
+#endif
 uint b_off[MMV_MAX_COLS];
 uint d_off[MMV_MAX_COLS];
 
@@ -93,6 +101,17 @@ layout (constant_id = 3) const uint SKIP_INACTIVE_COLS = 0;
 #endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
+#ifdef MUL_MAT_ID_DIRECT
+    const uint token = gl_WorkGroupID.y;
+    expert_id = data_ids[token * p.nbi1];
+    a_offset = expert_id * (p.batch_stride_a / QUANT_K);
+    b_offset = token * p.batch_stride_b;
+    d_offset = token * p.batch_stride_d;
+    b_off[0] = b_offset;
+    d_off[0] = d_offset;
+    ncols_k = p.ncols;
+    return;
+#endif
 #ifdef MUL_MAT_ID_GROUPED
     expert_id = gl_WorkGroupID.y;
     const uint n_as  = p.expert_i1;
