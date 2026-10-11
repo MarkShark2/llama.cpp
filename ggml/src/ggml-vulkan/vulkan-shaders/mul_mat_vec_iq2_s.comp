@@ -93,6 +93,37 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
         calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
 
+#if defined(MUL_MAT_ID) && !defined(MUL_MAT_ID_GROUPED) && defined(USE_SUBGROUP_ADD_NO_SHMEM)
+    if (TARGET_IQ_MODE == 3 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_FUSION_DISJOINT) != 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            temp[0][n] = subgroupAdd(temp[0][n]);
+        }
+        if (tid == 0) {
+            // These inputs cannot alias the output, so store only after the fused operations.
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    temp[0][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
+                }
+            }
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+                const FLOAT_TYPE scale = FLOAT_TYPE(data_fuse0[MMV_FUSE_IDX(0)]);
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    temp[0][n] *= scale;
+                }
+            }
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+                const FLOAT_TYPE scale = FLOAT_TYPE(data_fuse1[MMV_FUSE_IDX(0)]);
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    temp[0][n] *= scale;
+                }
+            }
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                data_d[d_off[0] + first_row + n] = D_TYPE(temp[0][n]);
+            }
+        }
+        return;
+    }
+#endif
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 

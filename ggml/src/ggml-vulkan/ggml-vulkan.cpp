@@ -1174,6 +1174,7 @@ struct vk_device_struct {
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
+    bool target_iq2_fusion_hoist = false;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -1281,6 +1282,7 @@ static void ggml_vk_print_device_fault_info(const vk_device& device) {
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
+    bool imported_host_memory = false;
     vk::MemoryPropertyFlags memory_property_flags;
     void * ptr;
     size_t size = 0;
@@ -1352,6 +1354,7 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 #define MAT_VEC_FLAGS_REUSE_INPUT 0x10
+#define MAT_VEC_FLAGS_FUSION_DISJOINT 0x20
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -4119,6 +4122,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     }
 
     if (import_ptr) {
+        buf->imported_host_memory = true;
         vk::MemoryHostPointerPropertiesEXT host_pointer_props;
         try {
             host_pointer_props = device->device.getMemoryHostPointerPropertiesEXT(vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, import_ptr);
@@ -5893,6 +5897,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const char * target_iq_sign_env = std::getenv("GGML_VK_TARGET_IQ_BITWISE_SIGN");
     const bool bitwise_target_iq = target_reuse_device && target_iq_sign_env != nullptr && std::atoi(target_iq_sign_env) != 0;
     const uint32_t target_iq_mode = bitwise_target_iq ? 2 : reuse_target_iq;
+    const char * target_iq2_hoist_env = std::getenv("GGML_VK_TARGET_IQ2_FUSION_HOIST");
+    device->target_iq2_fusion_hoist = target_reuse_device && target_iq2_hoist_env != nullptr && std::atoi(target_iq2_hoist_env) != 0;
+    const uint32_t target_iq2_mode = device->target_iq2_fusion_hoist ? 3u : target_iq_mode;
+    if (device->target_iq2_fusion_hoist) {
+        std::cerr << "ggml_vulkan: target IQ2 disjoint fusion hoist on " << device->properties.deviceName << std::endl;
+    }
     if (bitwise_target_iq) {
         std::cerr << "ggml_vulkan: target IQ bitwise sign on " << device->properties.deviceName << std::endl;
     }
@@ -6105,7 +6115,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ1_M],   "mul_mat_vec_id_iq1_m_f32",   arr_dmmv_id_iq1_m_f32_f32_len[reduc16],   arr_dmmv_id_iq1_m_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_XXS], "mul_mat_vec_id_iq2_xxs_f32", arr_dmmv_id_iq2_xxs_f32_f32_len[reduc16], arr_dmmv_id_iq2_xxs_f32_f32_data[reduc16], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_XS],  "mul_mat_vec_id_iq2_xs_f32",  arr_dmmv_id_iq2_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq2_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id}, 1, true, use_subgroups16, force_subgroup_size16);
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_S],   "mul_mat_vec_id_iq2_s_f32",   arr_dmmv_id_iq2_s_f32_f32_len[reduc16],   arr_dmmv_id_iq2_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id, 1, target_iq_mode}, 1, true, use_subgroups16, force_subgroup_size16);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_S],   "mul_mat_vec_id_iq2_s_f32",   arr_dmmv_id_iq2_s_f32_f32_len[reduc16],   arr_dmmv_id_iq2_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id, 1, target_iq2_mode}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_XXS], "mul_mat_vec_id_iq3_xxs_f32", arr_dmmv_id_iq3_xxs_f32_f32_len[reduc16], arr_dmmv_id_iq3_xxs_f32_f32_data[reduc16], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_S],   "mul_mat_vec_id_iq3_s_f32",   arr_dmmv_id_iq3_s_f32_f32_len[reduc16],   arr_dmmv_id_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq_id, 1, 1}, {wg_size_subgroup16, rm_iq_id, 1, target_iq_mode}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  arr_dmmv_id_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -11601,6 +11611,27 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
+    }
+
+    if (ctx->device->target_iq2_fusion_hoist && src0->type == GGML_TYPE_IQ2_S &&
+        (fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0) {
+        const auto disjoint_output = [&](const vk_subbuffer & input) {
+            if (input.offset > input.buffer->size || input.size > input.buffer->size - input.offset ||
+                d_D.offset > d_D.buffer->size || d_D.size > d_D.buffer->size - d_D.offset) {
+                return false;
+            }
+            if (input.buffer != d_D.buffer) {
+                // Separate host imports can still name the same storage.
+                return !input.buffer->imported_host_memory && !d_D.buffer->imported_host_memory &&
+                       input.buffer->device_memory != d_D.buffer->device_memory;
+            }
+            return input.offset >= d_D.offset ? input.offset - d_D.offset >= d_D.size :
+                                                d_D.offset - input.offset >= input.size;
+        };
+        if (((fusion_flags & (MAT_VEC_FUSION_FLAGS_BIAS0 | MAT_VEC_FUSION_FLAGS_SCALE0)) == 0 || disjoint_output(d_F0)) &&
+            ((fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) == 0 || disjoint_output(d_F1))) {
+            fusion_flags |= MAT_VEC_FLAGS_FUSION_DISJOINT;
+        }
     }
 
     // Loop over the batch dimension
