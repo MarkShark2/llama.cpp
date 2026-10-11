@@ -20,7 +20,6 @@
 #  include <unistd.h>
 #endif
 #include <cerrno>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -598,7 +597,7 @@ bool socket_t::impl::recv_data(void * data, size_t size, bool wait_all, receive_
     }
 #endif
     const auto now = [] {
-        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        return ggml_time_us();
     };
     if (trace) {
         trace->tcp = true;
