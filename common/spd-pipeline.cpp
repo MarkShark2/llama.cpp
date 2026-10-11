@@ -541,7 +541,8 @@ struct common_spd_pipeline::impl {
     bool state_replaced = false;
     bool static_decode_fast_path = true;
     // Submit the final target projection while earlier stages are still running.
-    // Sampling and all acceptance/budget/grammar updates stay on the main thread.
+    // Backend result handling stays with its worker; acceptance/budget/grammar
+    // updates stay on the main thread.
     bool overlap_head_submit = false;
     bool light_rollback = false;
     bool full_checkpoints = false; // GLM full-state bundles with compact live checkpoints
@@ -4086,7 +4087,7 @@ struct common_spd_pipeline::impl {
                     timing.rollback, timing.rollback_calls, result.n_rejected,
                     other);
             if (overlap_head_submit) {
-                fprintf(stderr, "SPD timing: head total %.3fs | overlapped submission %.3fs | reader ordering wait %.3fs (inside stage wall)\n",
+                fprintf(stderr, "SPD timing: head total %.3fs | overlapped head work %.3fs | reader ordering wait %.3fs (inside stage wall)\n",
                         timing.head, timing.head_overlapped, timing.head_reader_wait);
             }
             if (sidecar_host_fallback_count > 0) {
