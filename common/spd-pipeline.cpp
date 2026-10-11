@@ -359,6 +359,7 @@ struct common_spd_pipeline::impl {
         uint8_t * ok;
         bool * head_decode_ready = nullptr;
         double head_submit_seconds = 0.0;
+        double head_reader_wait_seconds = 0.0;
     };
 
     struct speculation_job {
@@ -669,6 +670,7 @@ struct common_spd_pipeline::impl {
         double sidecar_extra = 0.0;
         double head = 0.0;
         double head_overlapped = 0.0;
+        double head_reader_wait = 0.0;
         double embed = 0.0;
         double rollback = 0.0;
         double rollback_sidecar = 0.0;
@@ -788,6 +790,16 @@ struct common_spd_pipeline::impl {
         auto & job = *static_cast<stage_decode_job *>(data);
         *job.ok = job.owner->advance_entry(job.stage, *job.item, *job.elapsed, *job.error);
         if (*job.ok && job.head_decode_ready != nullptr) {
+            // The reader and head share a Vulkan device, whose diagnostic state
+            // and profiler fence are device-owned. Keep their backend execution
+            // ordered while remote stages continue. Main cannot reach its own
+            // sidecar wait until this final stage worker has returned.
+            const auto wait_start = clock_type::now();
+            if (auto failure = job.owner->sidecar_worker->wait()) {
+                std::rethrow_exception(failure);
+            }
+            job.head_reader_wait_seconds = seconds_since(wait_start);
+            job.owner->timing.head_reader_wait += job.head_reader_wait_seconds;
             const auto start = clock_type::now();
             *job.head_decode_ready = job.owner->target_head_decode(job.item->hidden);
             job.head_submit_seconds = seconds_since(start);
@@ -3902,7 +3914,8 @@ struct common_spd_pipeline::impl {
             if (timing_enabled && active_count > 0 && active_count <= SPD_MAX_STAGE_COUNT) {
                 double slowest = 0.0;
                 for (size_t stage = 0; stage < active_count; ++stage) {
-                    slowest = std::max(slowest, elapsed[stage] + stage_jobs[stage].head_submit_seconds);
+                    slowest = std::max(slowest, elapsed[stage] + stage_jobs[stage].head_submit_seconds +
+                            stage_jobs[stage].head_reader_wait_seconds);
                 }
                 timing.gap_by_active[active_count] += stage_phase_wall - slowest;
                 ++timing.gap_calls[active_count];
@@ -4063,8 +4076,8 @@ struct common_spd_pipeline::impl {
                     timing.rollback, timing.rollback_calls, result.n_rejected,
                     other);
             if (overlap_head_submit) {
-                fprintf(stderr, "SPD timing: head total %.3fs | overlapped submission %.3fs (inside stage wall)\n",
-                        timing.head, timing.head_overlapped);
+                fprintf(stderr, "SPD timing: head total %.3fs | overlapped submission %.3fs | reader ordering wait %.3fs (inside stage wall)\n",
+                        timing.head, timing.head_overlapped, timing.head_reader_wait);
             }
             if (sidecar_host_fallback_count > 0) {
                 fprintf(stderr, "SPD timing: sidecar host-argmax fallbacks %" PRIu64 "\n",
