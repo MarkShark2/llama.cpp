@@ -227,6 +227,14 @@ static bool ggml_vk_recording_reuse_enabled() {
     return enabled;
 }
 
+static bool ggml_vk_recording_plan_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_VK_RECORDING_PLAN");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 typedef std::shared_ptr<struct vk_pipeline_struct> vk_pipeline;
 
 struct vk_pipeline_struct {
@@ -2580,6 +2588,27 @@ struct vk_descriptor_set_contents {
 
 static constexpr size_t VK_DESCRIPTOR_CACHE_SIZE = 4096;
 
+static constexpr size_t VK_RECORDING_PLAN_ENTRIES = 4;
+static constexpr int VK_RECORDING_PLAN_NODES = 2048;
+static constexpr size_t VK_RECORDING_PLAN_TENSORS = 4096;
+static constexpr size_t VK_RECORDING_PLAN_KEY_BYTES = 2 * 1024 * 1024;
+
+struct vk_recording_plan_step {
+    uint64_t flops = 0;
+    int num_additional_fused_ops = 0;
+    int fused_ops_write_mask = 0;
+    topk_moe_mode fused_topk_moe_mode = TOPK_MOE_COUNT;
+    bool fused_topk_moe_scale = false;
+    bool fused_topk_qsa = false;
+    const char * fusion_string = nullptr;
+};
+
+// CPU preparation only: no tensor pointers, descriptors or executable commands are retained.
+struct vk_recording_plan {
+    std::vector<uint8_t> key;
+    std::vector<vk_recording_plan_step> steps;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2598,6 +2627,9 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials;
 
     uint64_t last_total_flops {UINT64_MAX};
+    std::vector<vk_recording_plan> recording_plans;
+    uint64_t recording_plan_generation = 0;
+    size_t recording_plan_next = 0;
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
@@ -3833,7 +3865,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     device->memory_logger->log_allocation(buf, size);
 
     // Vulkan can reuse a destroyed buffer handle. Invalidate cached descriptor contents on allocation.
-    if (ggml_vk_recording_reuse_enabled()) {
+    if (ggml_vk_recording_reuse_enabled() || ggml_vk_recording_plan_enabled()) {
         device->buffer_allocation_generation.fetch_add(1, std::memory_order_relaxed);
     }
     return buf;
@@ -18419,6 +18451,179 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// Serialize every input to fusion selection, including use counts from outside the split.
+// Topology uses local IDs, so rebuilt graphs must match contents, not old tensor addresses.
+static bool ggml_vk_recording_plan_key(ggml_backend_vk_context * ctx, const ggml_cgraph * graph,
+                                       std::vector<uint8_t> & key) {
+    if (graph->n_nodes <= 0 || graph->n_nodes > VK_RECORDING_PLAN_NODES ||
+        graph->n_leafs < 0 || graph->n_leafs > VK_RECORDING_PLAN_NODES) {
+        return false;
+    }
+    std::unordered_map<const ggml_tensor *, uint32_t> ids;
+    std::vector<const ggml_tensor *> tensors;
+    ids.emplace(nullptr, 0);
+    auto add_tensor = [&](const ggml_tensor * tensor) {
+        if (ids.find(tensor) == ids.end()) {
+            if (tensors.size() == VK_RECORDING_PLAN_TENSORS) {
+                return false;
+            }
+            tensors.push_back(tensor);
+            ids.emplace(tensor, (uint32_t) tensors.size());
+        }
+        return true;
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (!graph->nodes[i] || !add_tensor(graph->nodes[i])) {
+            return false;
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        if (!graph->leafs[i] || !add_tensor(graph->leafs[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const ggml_tensor * tensor = tensors[i];
+        if (!add_tensor(tensor->view_src)) {
+            return false;
+        }
+        for (const ggml_tensor * src : tensor->src) {
+            if (!add_tensor(src)) {
+                return false;
+            }
+        }
+    }
+
+    bool complete = true;
+    auto append = [&](const auto & value) {
+        const auto * bytes = reinterpret_cast<const uint8_t *>(&value);
+        if (sizeof(value) > VK_RECORDING_PLAN_KEY_BYTES - key.size()) {
+            complete = false;
+            return false;
+        }
+        key.insert(key.end(), bytes, bytes + sizeof(value));
+        return true;
+    };
+    // Reserve once; the maximum includes ordered IDs, use counts and buffer metadata.
+    key.reserve(std::min(VK_RECORDING_PLAN_KEY_BYTES, size_t(256) + tensors.size() * 512));
+    append(graph->n_nodes);
+    append(graph->n_leafs);
+    append(ctx->recording_plan_generation);
+    append(ctx->device->disable_fusion);
+    append(ctx->device->multi_add);
+    append(ctx->device->driver_id);
+    append(ctx->device->subgroup_arithmetic);
+    append(ctx->device->subgroup_shuffle);
+    append(ctx->device->subgroup_require_full_support);
+    append(ctx->device->subgroup_size_log2);
+    append(ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    append(ctx->device->properties.limits.maxPushConstantsSize);
+    append(bool(ctx->device->pipeline_topk_radix_qsa));
+    for (const auto & pipeline : ctx->device->pipeline_topk_f32) {
+        append(bool(pipeline));
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        append(ids.at(graph->nodes[i]));
+        append(ggml_node_get_use_count(graph, i));
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        append(ids.at(graph->leafs[i]));
+    }
+    for (const ggml_tensor * tensor : tensors) {
+        if (!append(tensor->type) || !append(tensor->op) || !append(tensor->flags) ||
+            !append(tensor->ne) || !append(tensor->nb) || !append(tensor->op_params) ||
+            !append(tensor->data) || !append(tensor->view_offs) || !append(ids.at(tensor->view_src))) {
+            return false;
+        }
+        for (const ggml_tensor * src : tensor->src) {
+            if (!append(ids.at(src))) {
+                return false;
+            }
+        }
+        if (!append(tensor->buffer)) {
+            return false;
+        }
+        if (tensor->buffer) {
+            if (!append(tensor->buffer->buft) || !append(tensor->buffer->usage) || !append(tensor->buffer->size)) {
+                return false;
+            }
+            if (ggml_backend_buffer_is_vk(tensor->buffer)) {
+                const auto * buffer_ctx = (const ggml_backend_vk_buffer_context *) tensor->buffer->context;
+                const vk_buffer & buffer = buffer_ctx->dev_buffer;
+                if (!buffer || buffer->device != ctx->device) {
+                    return false;
+                }
+                const VkBuffer handle = buffer->buffer;
+                // The wrapper identity is also used by the existing overlap predicate.
+                if (!append(buffer.get()) || !append(handle) || !append(buffer->size)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return complete && key.capacity() <= VK_RECORDING_PLAN_KEY_BYTES;
+}
+
+struct vk_recording_plan_run {
+    ggml_backend_vk_context * ctx;
+    vk_recording_plan candidate;
+    const vk_recording_plan * hit = nullptr;
+    bool eligible = false;
+    bool completed = false;
+
+    vk_recording_plan_run(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) : ctx(ctx) {
+        if (!ggml_vk_recording_plan_enabled()) {
+            return;
+        }
+        const uint64_t generation = ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed);
+        if (generation != ctx->recording_plan_generation) {
+            ctx->recording_plans.clear();
+            ctx->recording_plan_next = 0;
+            ctx->recording_plan_generation = generation;
+        }
+        try {
+            ctx->recording_plans.reserve(VK_RECORDING_PLAN_ENTRIES);
+            eligible = ggml_vk_recording_plan_key(ctx, graph, candidate.key);
+            if (!eligible) {
+                return;
+            }
+            for (const auto & plan : ctx->recording_plans) {
+                if (plan.key == candidate.key) {
+                    hit = &plan;
+                    return;
+                }
+            }
+            candidate.steps.resize(graph->n_nodes);
+        } catch (const std::bad_alloc &) {
+            // Optional CPU preparation must not turn allocation pressure into a graph failure.
+            eligible = false;
+            ctx->recording_plans.clear();
+            ctx->recording_plan_next = 0;
+        }
+    }
+
+    void finish() {
+        if (eligible && !hit && ctx->recording_plan_generation ==
+                ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed)) {
+            if (ctx->recording_plans.size() < VK_RECORDING_PLAN_ENTRIES) {
+                ctx->recording_plans.push_back(std::move(candidate));
+            } else {
+                ctx->recording_plans[ctx->recording_plan_next] = std::move(candidate);
+                ctx->recording_plan_next = (ctx->recording_plan_next + 1) % VK_RECORDING_PLAN_ENTRIES;
+            }
+        }
+        completed = true;
+    }
+
+    ~vk_recording_plan_run() {
+        // An interrupted recorder must not publish a partially prepared plan.
+        if (!completed && ggml_vk_recording_plan_enabled()) {
+            ctx->recording_plans.clear();
+            ctx->recording_plan_next = 0;
+        }
+    }
+};
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -18551,14 +18756,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    vk_recording_plan_run plan_run(ctx, cgraph);
+
     host_trace.begin_loop();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
 
+        const vk_recording_plan_step * cached_step = plan_run.hit ? &plan_run.hit->steps[i] : nullptr;
+        const uint64_t node_flops = cached_step ? cached_step->flops : ggml_vk_get_node_flops(cgraph->nodes[i]);
         {
-            auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
             total_flops += node_flops;
 
             // Flush the current batch before recording a node that would push it over the flop threshold
@@ -18585,7 +18793,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        if (cached_step) {
+            ctx->num_additional_fused_ops = cached_step->num_additional_fused_ops;
+            ctx->fused_ops_write_mask = cached_step->fused_ops_write_mask;
+            ctx->fused_topk_moe_mode = cached_step->fused_topk_moe_mode;
+            ctx->fused_topk_moe_scale = cached_step->fused_topk_moe_scale;
+            ctx->fused_topk_qsa = cached_step->fused_topk_qsa;
+            fusion_string = cached_step->fusion_string;
+        }
+        if (!cached_step && !ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -18739,7 +18955,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        if (!cached_step && ctx->num_additional_fused_ops) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -18796,6 +19012,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
             }
+        }
+
+        if (plan_run.eligible && !cached_step) {
+            plan_run.candidate.steps[i] = { node_flops, ctx->num_additional_fused_ops, ctx->fused_ops_write_mask,
+                ctx->fused_topk_moe_mode, ctx->fused_topk_moe_scale, ctx->fused_topk_qsa, fusion_string };
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
@@ -18893,6 +19114,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_synchronize(ctx);
     }
 
+    plan_run.finish();
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
