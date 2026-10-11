@@ -908,23 +908,68 @@ static bool rpc_get_wait_all(enum rpc_cmd cmd, size_t size) {
             (cmd == RPC_CMD_GET_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH);
 }
 
+struct rpc_return_completion {
+    rpc_command_record command;
+    socket_ptr sock;
+    int64_t publish_us = 0;
+};
+
+struct rpc_return_receive_trace {
+    rpc_command_scope * command;
+    socket_t::receive_trace header, body;
+    uint64_t expected;
+    int64_t ready = 0;
+    bool ok = false;
+
+    void emit_calls(const char * event, const socket_t::receive_trace & sample) const {
+        if (sample.tcp && sample.calls) {
+            command->emit(event, sample.first_begin_us, sample.last_end_us, sample.bytes, sample.calls, sample.calls_us);
+        }
+    }
+
+    ~rpc_return_receive_trace() {
+        if (!command) {
+            return;
+        }
+        // Elapsed recv calls include blocking and descheduling, not just kernel work.
+        emit_calls("recv_header_calls", header);
+        emit_calls("recv_body_calls", body);
+        if (body.tcp && body.calls) {
+            command->emit("recv_body_first", body.first_begin_us, body.first_end_us, body.first_bytes, expected);
+        }
+        const int64_t end = ready ? ready : rpc_command_now();
+        command->emit(ok ? "body_ready" : "body_failed", end, end, expected, body.tcp ? body.bytes : (ok ? expected : 0), body.tcp);
+    }
+};
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size,
+        std::unique_ptr<rpc_return_completion> * completion_trace = nullptr) {
     rpc_command_scope trace(sock, cmd, "client", true);
+    const bool capture = trace.active && cmd == RPC_CMD_GET_TENSOR && !rpc_async_enabled();
+    rpc_return_receive_trace receive{capture ? &trace : nullptr, {}, {}, output_size};
+    if (capture && completion_trace) {
+        completion_trace->reset(new rpc_return_completion{trace, sock});
+    }
     if (!send_rpc_cmd_data(sock, cmd, input, input_size)) {
         return false;
     }
     rpc_phase_io phase(false);
     uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+    if (!sock->recv_data(&out_size, sizeof(out_size), false, capture ? &receive.header : nullptr)) {
         return false;
     }
     if (out_size != output_size) {
         return false;
     }
     // The body has no intermediate consumer. Request fewer userspace returns during partial TCP delivery.
-    if (!sock->recv_data(output, output_size, rpc_get_wait_all(cmd, output_size))) {
+    const bool ok = sock->recv_data(output, output_size, rpc_get_wait_all(cmd, output_size), capture ? &receive.body : nullptr);
+    if (capture) {
+        receive.ready = rpc_command_now();
+        receive.ok = ok;
+    }
+    if (!ok) {
         return false;
     }
     return true;
@@ -1288,6 +1333,7 @@ private:
         rpc_phase_clock::time_point    queued;
         double                        lock_ms = 0;
         rpc_command_context           trace_tag;
+        std::unique_ptr<rpc_return_completion> return_trace;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -1361,7 +1407,7 @@ void rpc_dispatcher::exec(rpc_msg & msg) {
         return;
     }
     if (msg.output) {
-        msg.ok = send_rpc_cmd(s, msg.cmd, msg.input.get(), msg.input_size, msg.output, msg.output_size);
+        msg.ok = send_rpc_cmd(s, msg.cmd, msg.input.get(), msg.input_size, msg.output, msg.output_size, &msg.return_trace);
     } else {
         msg.ok = send_rpc_cmd(s, msg.cmd, msg.input.get(), msg.input_size);
     }
@@ -1386,6 +1432,9 @@ rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
                 msg->lock_ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - begin).count();
             }
             exec(*msg);
+        }
+        if (msg->return_trace) {
+            msg->return_trace->publish_us = rpc_command_now();
         }
         msg->completion.set_value();
         {
@@ -1492,6 +1541,14 @@ bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     auto future = msg->completion.get_future();
     submit_counted(msg);
     future.wait();
+    if (msg->return_trace) {
+        const int64_t observed = rpc_command_now();
+        // The promise publishes these fields. Direct mode has no worker wake.
+        msg->return_trace->command.emit("completion_observed", msg->return_trace->publish_us, observed, output_size, 0, msg->ok);
+        if (msg->return_trace->command.last) {
+            rpc_trace_flush();
+        }
+    }
     return msg->ok;
 }
 

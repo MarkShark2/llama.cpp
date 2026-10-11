@@ -22,7 +22,12 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool send_data(const buffer * buffers, size_t count);
     // wait_all requests fewer partial TCP returns for a known-length body; RDMA is unchanged.
-    bool recv_data(void * data, size_t size, bool wait_all = false);
+    struct receive_trace {
+        int64_t first_begin_us = 0, first_end_us = 0, last_end_us = 0, calls_us = 0;
+        uint64_t calls = 0, bytes = 0, first_bytes = 0;
+        bool tcp = false;
+    };
+    bool recv_data(void * data, size_t size, bool wait_all = false, receive_trace * trace = nullptr);
     // Must be called at every message boundary: the RDMA transport coalesces
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
