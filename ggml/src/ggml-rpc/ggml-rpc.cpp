@@ -1663,7 +1663,9 @@ void rpc_dispatcher::event_wait(ggml_backend_event_t event) {
 }
 
 void rpc_dispatcher::synchronize() {
-    if (!worker_mode()) {
+    // ASYNC=0 submissions wait even after promotion. Mean tails have checked handles;
+    // a generic backend sync must not wait on other contexts sharing this endpoint.
+    if (!rpc_async_enabled()) {
         return;
     }
     // to ensure all messages are processed, submit dummy message and wait for it to complete
