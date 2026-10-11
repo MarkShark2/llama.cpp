@@ -330,12 +330,14 @@ struct common_spd_pipeline::impl {
         using finish_fn = bool (*)(void *, void *);
         using release_fn = void (*)(void *);
         using compact_finish_fn = bool (*)(void *);
+        using compact_queue_fn = int (*)(void *);
         using compact_release_fn = bool (*)(void *);
         void * handle = nullptr;
         finish_fn finish = nullptr;
         release_fn release = nullptr;
         compact_finish_fn compact_finish = nullptr;
         finish_fn compact_materialize = nullptr;
+        compact_queue_fn compact_queue = nullptr;
         compact_release_fn compact_release = nullptr;
         std::atomic<bool> * failure = nullptr;
 
@@ -666,6 +668,7 @@ struct common_spd_pipeline::impl {
         llama_pos pos = -1;
         int reason = 0; // 0: consumed input, 1: rejection, 2: terminal
         bool ok = false;
+        bool deferred = false;
     };
     bool parallel_hidden_retirement = false;
     std::array<hidden_retirement, SPD_MAX_STAGE_COUNT> hidden_retirements;
@@ -683,6 +686,14 @@ struct common_spd_pipeline::impl {
     bool finish_hidden_retirements() {
         if (!parallel_hidden_retirement) {
             return true;
+        }
+        // Start every source drain before waiting for any checked reply.
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            auto & job = hidden_retirements[stage];
+            if (job.pending != nullptr && job.deferred) {
+                retirement_workers[stage]->submit(execute_hidden_retirement, &job);
+                job.deferred = false;
+            }
         }
         llama_pos failed_pos = -1;
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
@@ -720,9 +731,19 @@ struct common_spd_pipeline::impl {
         if (retirement_workers[stage] == nullptr) {
             retirement_workers[stage] = std::make_unique<fixed_worker>();
         }
-        job = { this, std::move(item.pending), stage, item.pos, reason, false };
+        // Ledger admission must not wait for the source's occupied I/O dispatcher.
+        const int queued = reason == 0 && item.pending->compact_queue != nullptr
+                ? item.pending->compact_queue(item.pending->handle) : 0;
+        if (queued < 0) {
+            hidden_backup_failed.store(true);
+            error = "SPD compact hidden retirement queue failed at position " + std::to_string(item.pos);
+            return false;
+        }
+        job = { this, std::move(item.pending), stage, item.pos, reason, false, queued > 0 };
         trace_schedule("release_submit", (int) stage, item.pos, reason);
-        retirement_workers[stage]->submit(execute_hidden_retirement, &job);
+        if (!job.deferred) {
+            retirement_workers[stage]->submit(execute_hidden_retirement, &job);
+        }
         return true;
     }
 
@@ -3694,6 +3715,8 @@ struct common_spd_pipeline::impl {
                 rpc_reg, "ggml_backend_rpc_sync_peer_finish_compact") : nullptr;
         auto materialize_compact = rpc_reg ? (pending_hidden::finish_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_materialize_compact") : nullptr;
+        auto queue_compact = rpc_reg ? (pending_hidden::compact_queue_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_queue_compact") : nullptr;
         auto release_compact = rpc_reg ? (pending_hidden::compact_release_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_release_compact") : nullptr;
         const ggml_tensor * previous_out = llama_spd_peer_out_tensor(stages[stage]);
@@ -3757,6 +3780,7 @@ struct common_spd_pipeline::impl {
                 if (compact_read) {
                     backup->compact_finish = finish_compact;
                     backup->compact_materialize = materialize_compact;
+                    backup->compact_queue = queue_compact;
                     backup->compact_release = release_compact;
                     backup->failure = &hidden_backup_failed;
                     result = begin_compact(out, pb_out->staging_dec[slot], tap.data(), n_embd, &backup->handle, &ordinal);
