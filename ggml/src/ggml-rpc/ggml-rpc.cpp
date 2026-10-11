@@ -140,6 +140,7 @@ enum rpc_cmd {
     // Main-stream whole-tensor copy; completion is observed by the next read.
     RPC_CMD_COPY_TENSOR_ORDERED,
     RPC_CMD_GET_TENSOR_AND_PUSH,
+    RPC_CMD_GET_MEAN_AND_PUSH,
     RPC_CMD_COUNT,
 };
 
@@ -163,6 +164,12 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static constexpr uint8_t RPC_FEATURE_ORDERED_COPY = 1 << 0;
 static constexpr uint8_t RPC_FEATURE_GET_AND_PUSH = 1 << 1;
 static constexpr uint8_t RPC_FEATURE_MAIN_DEDUPE = 1 << 2;
+static constexpr uint8_t RPC_FEATURE_MEAN_FIRST = 1 << 3;
+
+static constexpr size_t RPC_MEAN_WIDTH = 4096;
+static constexpr size_t RPC_MEAN_STREAMS = 4;
+static constexpr size_t RPC_MEAN_BYTES = RPC_MEAN_WIDTH * sizeof(float);
+static constexpr size_t RPC_MEAN_FULL_BYTES = RPC_MEAN_BYTES * RPC_MEAN_STREAMS;
 
 enum rpc_lane_id : uint8_t {
     RPC_LANE_SET = 0,   // client -> server bulk uploads (fire-and-forget)
@@ -422,6 +429,7 @@ struct ggml_backend_rpc_buffer_type_context {
 };
 
 class rpc_dispatcher;
+static thread_local rpc_dispatcher * rpc_executing_dispatcher = nullptr;
 struct ggml_backend_rpc_context {
     std::shared_ptr<rpc_dispatcher> dispatcher;
     uint32_t                        device;
@@ -649,7 +657,7 @@ static void rpc_command_payload(rpc_cmd cmd, const void * data, size_t size) {
         const int64_t now = rpc_command_now();
         rpc_command_current->emit("set_encoding", now, now, encoding, c, size);
         event = "tensor_id";
-    } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
+    } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH || cmd == RPC_CMD_GET_MEAN_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
         rpc_msg_push_tensor_req req;
         memcpy(&req, data, sizeof(req));
         a = req.src.id;
@@ -688,7 +696,8 @@ static rpc_phase_kind rpc_phase_command(rpc_cmd cmd) {
         case RPC_CMD_LANE_FENCE:
         case RPC_CMD_PEER_OPEN:
         case RPC_CMD_PUSH_TENSOR:
-        case RPC_CMD_GET_TENSOR_AND_PUSH: return RPC_PHASE_PEER;
+        case RPC_CMD_GET_TENSOR_AND_PUSH:
+        case RPC_CMD_GET_MEAN_AND_PUSH: return RPC_PHASE_PEER;
         case RPC_CMD_COPY_TENSOR:
         case RPC_CMD_COPY_TENSOR_ORDERED:
         case RPC_CMD_MEMSET_TENSOR:
@@ -1062,7 +1071,7 @@ public:
     bool pop(T* out) {
         std::unique_lock<std::mutex> lock(mutex);
         cvar.wait(lock, [this] { return !queue.empty() || interrupted; });
-        if (interrupted) {
+        if (queue.empty()) {
             return false;
         }
         *out = queue.front();
@@ -1297,6 +1306,10 @@ public:
     using task_fn = std::function<bool(const socket_ptr &)>;
     void task(task_fn fn);
     bool call(task_fn fn);
+    bool begin_mean(task_fn fn);
+    bool worker_mode() const { return rpc_async_enabled() || promoted.load(); }
+    bool is_poisoned() const { return poisoned.load(); }
+    void poison();
     // fence-counted variants for the main connection of an endpoint with lanes
     void enqueue_counted(uint32_t n_cmds, task_fn fn);
     bool call_counted(task_fn fn);
@@ -1330,6 +1343,7 @@ private:
         task_fn                       task;       // [fork] closure form
         bool                          ok = true;  // [fork] result of the send / task
         std::promise<void>            completion;
+        std::shared_future<void>      future = completion.get_future().share();
         rpc_phase_clock::time_point    queued;
         double                        lock_ms = 0;
         rpc_command_context           trace_tag;
@@ -1345,7 +1359,7 @@ private:
     // execute one message against the socket on the current thread
     void exec(rpc_msg & msg);
     // enqueue (async mode) or execute inline (direct mode); returns the message
-    rpc_msg_ptr submit(rpc_msg_ptr msg);
+    rpc_msg_ptr submit(rpc_msg_ptr msg, bool early_return = false);
     // [fork] submit a message that puts exactly one command on the main
     // connection, counted for the lane fences (see enqueue_counted)
     void submit_counted(rpc_msg_ptr msg);
@@ -1356,9 +1370,11 @@ private:
     std::mutex       sock_m;    // guards `sock` handoffs (start/adopt/disconnect)
     socket_ptr       sock;
     std::atomic_bool running{false};
+    std::atomic_bool promoted{false};
+    std::atomic_bool poisoned{false};
     std::thread      thread;
-    // [fork] direct mode serializes callers on the socket instead of a worker;
-    // recursive so a task may nest a call on the same dispatcher
+    // Serializes direct I/O, promotion, and queue submission in wire order.
+    // Recursive for nested direct calls and promotion submission.
     std::recursive_mutex io_m;
     // [fork] start() may be raced by several threads reaching one endpoint
     std::mutex       start_m;
@@ -1379,9 +1395,16 @@ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 // worse, connect to one that is halfway through writing its suspend image.
 static std::atomic<bool> g_rpc_detached{false};
 static std::atomic<bool> g_rpc_session_lost{false};
+static std::atomic<bool> g_rpc_mean_aborted{false};
 
 void rpc_dispatcher::exec(rpc_msg & msg) {
-    const double queue_ms = (profile.enabled() || rpc_command_trace_limit()) && rpc_async_enabled()
+    struct execution_scope {
+        rpc_dispatcher * previous = rpc_executing_dispatcher;
+        explicit execution_scope(rpc_dispatcher * current) { rpc_executing_dispatcher = current; }
+        ~execution_scope() { rpc_executing_dispatcher = previous; }
+    } scope(this);
+    const double queue_ms = (profile.enabled() || rpc_command_trace_limit()) && worker_mode() &&
+            msg.queued != rpc_phase_clock::time_point{}
             ? std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - msg.queued).count() : 0;
     auto tag = msg.trace_tag;
     tag.lock_ms = msg.lock_ms;
@@ -1413,42 +1436,53 @@ void rpc_dispatcher::exec(rpc_msg & msg) {
     }
 }
 
-rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
+rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg, bool early_return) {
     if (rpc_command_trace_limit()) {
         msg->trace_tag = rpc_command_tag;
     }
-    {
-        std::lock_guard<std::mutex> l(seq_m);
-        submitted++;
-        msg->trace_tag.dispatch = submitted;
-    }
-    if (!rpc_async_enabled()) {
-        // direct mode: the calling thread owns the wire for the whole message
-        {
-            const bool measure = profile.enabled() || rpc_command_trace_limit();
-            const auto begin = measure ? rpc_phase_clock::now() : rpc_phase_clock::time_point{};
-            std::lock_guard<std::recursive_mutex> l(io_m);
-            if (measure) {
-                msg->lock_ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - begin).count();
-            }
-            exec(*msg);
-        }
-        if (msg->return_trace) {
-            msg->return_trace->publish_us = rpc_command_now();
-        }
+    if (rpc_executing_dispatcher == this) {
+        // Nested work belongs to the current queue position, not a later ordinal.
+        exec(*msg);
         msg->completion.set_value();
-        {
-            std::lock_guard<std::mutex> l(seq_m);
-            completed++;
-        }
-        seq_cv.notify_all();
         return msg;
     }
-    ensure_worker();
-    if (profile.enabled() || rpc_command_trace_limit()) {
-        msg->queued = rpc_phase_clock::now();
+    const bool measure = profile.enabled() || rpc_command_trace_limit();
+    const auto begin = measure ? rpc_phase_clock::now() : rpc_phase_clock::time_point{};
+    std::unique_lock<std::recursive_mutex> l(io_m);
+    if (measure) {
+        msg->lock_ms = std::chrono::duration<double, std::milli>(rpc_phase_clock::now() - begin).count();
     }
-    GGML_ASSERT(queue.push(msg));
+    if (worker_mode()) {
+        ensure_worker();
+        if (measure) {
+            msg->queued = rpc_phase_clock::now();
+        }
+        {
+            std::lock_guard<std::mutex> sl(seq_m);
+            msg->trace_tag.dispatch = submitted + 1;
+            GGML_ASSERT(queue.push(msg));
+            ++submitted;
+        }
+        l.unlock();
+        if (!rpc_async_enabled() && !early_return) {
+            msg->future.wait();
+        }
+        return msg;
+    }
+    {
+        std::lock_guard<std::mutex> sl(seq_m);
+        msg->trace_tag.dispatch = ++submitted;
+    }
+    exec(*msg);
+    if (msg->return_trace) {
+        msg->return_trace->publish_us = rpc_command_now();
+    }
+    msg->completion.set_value();
+    {
+        std::lock_guard<std::mutex> sl(seq_m);
+        ++completed;
+    }
+    seq_cv.notify_all();
     return msg;
 }
 
@@ -1467,9 +1501,7 @@ rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::submit(rpc_msg_ptr msg) {
 // dispatcher port: the pre-port send_rpc_cmd_ordered counted everything.)
 void rpc_dispatcher::submit_counted(rpc_msg_ptr msg) {
     if (!rpc_async_enabled()) {
-        // direct mode never brings the lanes up, and there is no queue to
-        // order against: nothing to count, and enqueue_counted's lock would
-        // otherwise be held across an inline socket round trip
+        // Sync mode has no lanes. Do not hold their lock across a blocking call.
         submit(msg);
         return;
     }
@@ -1515,7 +1547,7 @@ bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
-    auto future = msg->completion.get_future();
+    auto future = msg->future;
     submit_counted(msg);
     future.wait();
     return msg->ok;
@@ -1538,7 +1570,7 @@ bool rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
-    auto future = msg->completion.get_future();
+    auto future = msg->future;
     submit_counted(msg);
     future.wait();
     if (msg->return_trace) {
@@ -1569,7 +1601,7 @@ void rpc_dispatcher::task(task_fn fn) {
 }
 
 bool rpc_dispatcher::call(task_fn fn) {
-    if (rpc_async_enabled() && running && std::this_thread::get_id() == thread.get_id()) {
+    if (rpc_executing_dispatcher == this) {
         // nested from a task on this very worker: run at the socket's current position
         socket_ptr s;
         {
@@ -1580,7 +1612,7 @@ bool rpc_dispatcher::call(task_fn fn) {
     }
     auto msg = std::make_shared<rpc_msg>();
     msg->task = std::move(fn);
-    auto future = msg->completion.get_future();
+    auto future = msg->future;
     submit(msg);
     future.wait();
     return msg->ok;
@@ -1590,7 +1622,7 @@ ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
     rpc_event * ev = new rpc_event;
     ev->msg = std::make_shared<rpc_msg>();
     ev->msg->cmd = RPC_CMD_NONE;
-    ev->sf = ev->msg->completion.get_future().share();
+    ev->sf = ev->msg->future;
     submit(ev->msg);
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -1612,13 +1644,13 @@ void rpc_dispatcher::event_record(ggml_backend_event_t event) {
     rpc_event * ev = (rpc_event *)event->context;
     ev->msg = std::make_shared<rpc_msg>();
     ev->msg->cmd = RPC_CMD_NONE;
-    ev->sf = ev->msg->completion.get_future().share();
+    ev->sf = ev->msg->future;
     submit(ev->msg);
 }
 
 void rpc_dispatcher::event_wait(ggml_backend_event_t event) {
-    if (!rpc_async_enabled()) {
-        return; // direct mode: the record already completed inline
+    if (!worker_mode()) {
+        return;
     }
     // snapshot the future now: the scheduler issues record -> wait in program
     // order on one thread, and a later record must not move this wait's target
@@ -1631,19 +1663,19 @@ void rpc_dispatcher::event_wait(ggml_backend_event_t event) {
 }
 
 void rpc_dispatcher::synchronize() {
-    if (!rpc_async_enabled()) {
-        return; // every message already executed inline
+    if (!worker_mode()) {
+        return;
     }
     // to ensure all messages are processed, submit dummy message and wait for it to complete
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = RPC_CMD_NONE;
-    auto future = msg->completion.get_future();
+    auto future = msg->future;
     submit(msg);
     future.wait();
 }
 
 void rpc_dispatcher::drain() {
-    if (!rpc_async_enabled()) {
+    if (!worker_mode()) {
         return;
     }
     std::unique_lock<std::mutex> l(seq_m);
@@ -1661,15 +1693,24 @@ void rpc_dispatcher::wait_completed(uint64_t target) {
 }
 
 void rpc_dispatcher::ensure_worker() {
+    std::lock_guard<std::recursive_mutex> l(io_m);
     if (running) {
         return;
     }
     running = true;
-    thread = std::thread(rpc_dispatcher_trampoline, this);
+    try {
+        thread = std::thread(rpc_dispatcher_trampoline, this);
+    } catch (...) {
+        running = false;
+        throw;
+    }
 }
 
 bool rpc_dispatcher::start() {
     std::lock_guard<std::mutex> sl(start_m);
+    if (poisoned.load() || g_rpc_mean_aborted.load()) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> l(sock_m);
         if (sock != nullptr) {
@@ -1718,6 +1759,10 @@ bool rpc_dispatcher::start() {
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     {
         std::lock_guard<std::mutex> l(sock_m);
+        if (poisoned.load() || g_rpc_mean_aborted.load()) {
+            s->shutdown_rw();
+            return false;
+        }
         sock  = s;
         patch = server_patch;
         features = server_features;
@@ -1738,6 +1783,12 @@ bool rpc_dispatcher::start() {
 void rpc_dispatcher::adopt(socket_ptr s) {
     {
         std::lock_guard<std::mutex> l(sock_m);
+        if (poisoned.load() || g_rpc_mean_aborted.load()) {
+            if (s != nullptr) {
+                s->shutdown_rw();
+            }
+            return;
+        }
         sock = std::move(s);
     }
     if (rpc_async_enabled()) {
@@ -1768,31 +1819,55 @@ socket_ptr rpc_dispatcher::get_sock() {
 }
 
 void rpc_dispatcher::work() {
-    while (running) {
-        rpc_msg_ptr msg_ptr;
-        if (!queue.pop(&msg_ptr)) {
-            break;
+    rpc_msg_ptr msg;
+    while (queue.pop(&msg)) {
+        exec(*msg);
+        if (msg->return_trace) {
+            msg->return_trace->publish_us = rpc_command_now();
         }
-        exec(*msg_ptr);
-        msg_ptr->completion.set_value();
+        msg->completion.set_value();
         {
             std::lock_guard<std::mutex> l(seq_m);
-            completed++;
+            ++completed;
         }
         seq_cv.notify_all();
+        msg.reset();
     }
 }
 
-rpc_dispatcher::~rpc_dispatcher() {
-    running = false;
-    queue.interrupt();
-    {
-        std::lock_guard<std::mutex> l(sock_m);
-        sock = nullptr;
+bool rpc_dispatcher::begin_mean(task_fn fn) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = RPC_CMD_GET_MEAN_AND_PUSH;
+    msg->task = std::move(fn);
+    std::lock_guard<std::recursive_mutex> l(io_m);
+    if (rpc_async_enabled() || poisoned.load() || rpc_executing_dispatcher == this) {
+        return false;
     }
+    // All prior direct calls retired under io_m. Only this worker owns later I/O.
+    try {
+        ensure_worker();
+        promoted = true;
+        submit(msg, true);
+        return true;
+    } catch (...) {
+        GGML_LOG_ERROR("[rpc mean] could not submit on %s\n", endpoint.c_str());
+        return false;
+    }
+}
+
+void rpc_dispatcher::poison() {
+    poisoned = true;
+    g_rpc_session_lost.store(true);
+    disconnect();
+}
+
+rpc_dispatcher::~rpc_dispatcher() {
+    disconnect();
+    queue.interrupt();
     if (thread.joinable()) {
         thread.join();
     }
+    running = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,6 +1961,10 @@ static bool send_lane_cmd(const socket_ptr & sock, enum rpc_cmd cmd,
 // traffic advanced since the last fence, a LANE_FENCE is sent first so the
 // server orders this command after every lane command submitted before it.
 void rpc_dispatcher::enqueue_counted(uint32_t n_cmds, task_fn fn) {
+    if (!rpc_async_enabled()) {
+        task(std::move(fn));
+        return;
+    }
     rpc_lanes & ep = lanes;
     std::lock_guard<std::mutex> l(ep.m);
     const bool fence = ep.state == 1 && (ep.set_enq != ep.fenced_set || ep.get_enq != ep.fenced_get);
@@ -1911,7 +1990,10 @@ void rpc_dispatcher::enqueue_counted(uint32_t n_cmds, task_fn fn) {
 // inline at the socket's current position (counting it then only makes later
 // fence targets conservative, never too early).
 bool rpc_dispatcher::call_counted(task_fn fn) {
-    if (rpc_async_enabled() && running && std::this_thread::get_id() == thread.get_id()) {
+    if (!rpc_async_enabled()) {
+        return call(std::move(fn));
+    }
+    if (rpc_executing_dispatcher == this) {
         {
             std::lock_guard<std::mutex> l(lanes.m);
             lanes.main_enq++;
@@ -1920,7 +2002,7 @@ bool rpc_dispatcher::call_counted(task_fn fn) {
     }
     auto msg = std::make_shared<rpc_msg>();
     msg->task = std::move(fn);
-    auto future = msg->completion.get_future();
+    auto future = msg->future;
     enqueue_counted(1, [msg](const socket_ptr & s) {
         // the outer task reports the inner's result; the message we hold is
         // completed by the closure so the caller's wait returns
@@ -2075,8 +2157,8 @@ static std::unordered_map<std::string, bool> g_peer_routes;   // "src>dst" -> us
 // per ordered pair; a failure is remembered so the pair quietly keeps using
 // the hairpin (routing is per-pair, so a fabric that only connects some of
 // the nodes still gets the benefit on the pairs that do). `counted` picks the
-// fence-counted ordered send (async client) or a plain send on the caller's
-// thread (the sync-client SPD path, where the caller owns the socket).
+// fence-counted ordered send (async client) or a blocking dispatcher call
+// (the sync-client SPD path, including promoted mean-first endpoints).
 static bool rpc_peer_route_ready(const std::shared_ptr<rpc_dispatcher> & src,
                                  const std::shared_ptr<rpc_dispatcher> & dst,
                                  uint64_t dst_session_id, bool counted) {
@@ -2103,7 +2185,7 @@ static bool rpc_peer_route_ready(const std::shared_ptr<rpc_dispatcher> & src,
         auto fn = [&req, &rsp](const socket_ptr & s) {
             return send_rpc_cmd(s, RPC_CMD_PEER_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
         };
-        const bool sent = counted ? src->call_counted(fn) : fn(src->get_sock());
+        const bool sent = counted ? src->call_counted(fn) : src->call(fn);
         ok = sent && rsp.ok != 0;
         if (ok) {
             GGML_LOG_INFO("[rpc peer] %s -> %s: direct transfer%s\n",
@@ -3779,11 +3861,11 @@ static bool rpc_sync_session_for(const std::shared_ptr<rpc_dispatcher> & disp, u
 // whole process, so the counters stay monotonic across a detach/reattach and
 // an ordinal issued before a hibernation cycle is simply already complete.
 GGML_RPC_SYNC_PEER_API uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t backend) {
-    if (!rpc_async_enabled()) {
-        return 0; // reads were synchronous; nothing to wait for
-    }
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
     const std::shared_ptr<rpc_dispatcher> & disp = rpc_ctx->dispatcher;
+    if (!disp->worker_mode()) {
+        return 0;
+    }
     rpc_lanes * ep = rpc_lanes_get_active(disp);
     if (ep != nullptr) {
         std::lock_guard<std::mutex> l(ep->m);
@@ -3793,7 +3875,7 @@ GGML_RPC_SYNC_PEER_API uint64_t ggml_backend_rpc_read_ordinal(ggml_backend_t bac
 }
 
 GGML_RPC_SYNC_PEER_API void ggml_backend_rpc_read_wait(ggml_backend_t backend, uint64_t ordinal) {
-    if (!rpc_async_enabled() || ordinal == 0) {
+    if (ordinal == 0) {
         return;
     }
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
@@ -3948,6 +4030,28 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
     return true;
 }
 
+static bool rpc_mean_first_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_RPC_MEAN_FIRST");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+struct rpc_mean_result {
+    std::mutex m;
+    std::condition_variable cv;
+    bool anchor_ready = false;
+    bool complete = false;
+    bool ok = false;
+    std::array<float, RPC_MEAN_WIDTH> mean;
+    std::array<float, RPC_MEAN_WIDTH * RPC_MEAN_STREAMS> full;
+};
+
+struct rpc_mean_handle {
+    std::shared_ptr<rpc_mean_result> result;
+};
+
 extern "C" {
 GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor * src, const ggml_tensor * dst) {
     static const bool enabled = [] {
@@ -3964,6 +4068,161 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor
             (sdisp->features & RPC_FEATURE_GET_AND_PUSH) && ddisp->patch >= GGML_RPC_PEER_MIN_PATCH &&
             src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_are_same_layout(src, dst) &&
             ggml_nbytes(src) != 0;
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_mean(
+        const ggml_tensor * src, const ggml_tensor * dst, int64_t width) {
+    if (!rpc_mean_first_enabled() || width != (int64_t) RPC_MEAN_WIDTH || src == nullptr || dst == nullptr ||
+            !ggml_backend_rpc_sync_peer_can_read_push(src, dst) || ggml_nbytes(src) != RPC_MEAN_FULL_BYTES) {
+        return false;
+    }
+    auto disp = rpc_tensor_dispatcher(src);
+    return (disp->features & RPC_FEATURE_MEAN_FIRST) != 0;
+}
+
+// Prefix readiness is provisional. Every successful begin requires a checked finish.
+// -1 is a pre-submission failure; -2 means the main connection is poisoned.
+GGML_BACKEND_API int ggml_backend_rpc_sync_peer_begin_mean(
+        const ggml_tensor * src, const ggml_tensor * dst, float * mean_out, int64_t width,
+        void ** handle_out, uint64_t * ordinal_out) {
+    if (handle_out == nullptr || ordinal_out == nullptr || mean_out == nullptr) {
+        return -1;
+    }
+    *handle_out = nullptr;
+    *ordinal_out = 0;
+    if (!ggml_backend_rpc_sync_peer_can_mean(src, dst, width)) {
+        return 0;
+    }
+    auto sdisp = rpc_tensor_dispatcher(src);
+    auto ddisp = rpc_tensor_dispatcher(dst);
+    if (sdisp->is_poisoned()) {
+        return -2;
+    }
+    auto & st = rpc_sync_peer();
+    uint64_t dst_session;
+    socket_ptr lane;
+    uint64_t pending = 0;
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        auto it = st.session_ids.find(ddisp->endpoint);
+        if (it == st.session_ids.end()) {
+            return 0;
+        }
+        dst_session = it->second;
+        st.push_counts.try_emplace(ddisp->endpoint, 0);
+        auto lit = st.push_lanes.find(sdisp->endpoint);
+        if (lit != st.push_lanes.end()) {
+            lane = lit->second;
+            pending = st.lane_sent[sdisp->endpoint] - st.lane_acked[sdisp->endpoint];
+        }
+    }
+    while (pending > 0) {
+        rpc_msg_push_tensor_rsp ack = {};
+        if (!recv_msg(lane, &ack, sizeof(ack)) || !ack.ok) {
+            return -1;
+        }
+        std::lock_guard<std::mutex> l(st.m);
+        ++st.lane_acked[sdisp->endpoint];
+        --pending;
+    }
+    if (!rpc_peer_route_ready(sdisp, ddisp, dst_session, false)) {
+        return 0;
+    }
+    auto req = std::make_shared<rpc_msg_push_tensor_req>();
+    *req = {};
+    const std::string & via = rpc_peer_addr(ddisp->endpoint);
+    memcpy(req->endpoint, via.c_str(), std::min(via.size(), (size_t) RPC_ENDPOINT_MAX - 1));
+    req->src = serialize_tensor(src);
+    req->dst = serialize_tensor(dst);
+    req->size = RPC_MEAN_FULL_BYTES;
+    auto result = std::make_shared<rpc_mean_result>();
+    std::unique_ptr<rpc_mean_handle> handle(new rpc_mean_handle{result});
+    rpc_dispatcher * owner = sdisp.get();
+    const bool submitted = sdisp->begin_mean([req, result, owner](const socket_ptr & sock) {
+        bool ok = false;
+        try {
+            auto receive = [&] {
+                rpc_command_scope trace(sock, RPC_CMD_GET_MEAN_AND_PUSH, "client", true);
+                if (!send_rpc_cmd_data(sock, RPC_CMD_GET_MEAN_AND_PUSH, req.get(), sizeof(*req))) {
+                    return false;
+                }
+                rpc_phase_io phase(false);
+                uint64_t size = 0;
+                if (!sock->recv_data(&size, sizeof(size)) || size != RPC_MEAN_BYTES + RPC_MEAN_FULL_BYTES ||
+                        !sock->recv_data(result->mean.data(), RPC_MEAN_BYTES)) {
+                    return false;
+                }
+                if (trace.active) {
+                    const int64_t now = rpc_command_now();
+                    trace.emit("anchor_ready", now, now, RPC_MEAN_BYTES, RPC_MEAN_FULL_BYTES);
+                }
+                {
+                    std::lock_guard<std::mutex> l(result->m);
+                    result->anchor_ready = true;
+                }
+                result->cv.notify_all();
+                const bool full = sock->recv_data(result->full.data(), RPC_MEAN_FULL_BYTES);
+                if (trace.active) {
+                    const int64_t now = rpc_command_now();
+                    trace.emit(full ? "full_complete" : "full_failed", now, now, RPC_MEAN_FULL_BYTES);
+                }
+                return full;
+            };
+            ok = receive();
+        } catch (...) {
+            GGML_LOG_ERROR("[rpc mean] return failed on %s\n", owner->endpoint.c_str());
+        }
+        if (!ok) {
+            owner->poison();
+        }
+        {
+            std::lock_guard<std::mutex> l(result->m);
+            result->ok = ok;
+            result->complete = true;
+        }
+        result->cv.notify_all();
+        return ok;
+    });
+    if (!submitted) {
+        return sdisp->is_poisoned() ? -2 : -1;
+    }
+    {
+        std::unique_lock<std::mutex> l(result->m);
+        result->cv.wait(l, [&] { return result->anchor_ready || result->complete; });
+        if (!result->anchor_ready || (result->complete && !result->ok)) {
+            return -2;
+        }
+        memcpy(mean_out, result->mean.data(), RPC_MEAN_BYTES);
+    }
+    {
+        std::lock_guard<std::mutex> l(st.m);
+        *ordinal_out = ++st.push_counts.at(ddisp->endpoint);
+    }
+    *handle_out = handle.release();
+    return 1;
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_finish_mean(void * opaque, void * full_out) {
+    if (opaque == nullptr) {
+        return false;
+    }
+    const auto result = static_cast<rpc_mean_handle *>(opaque)->result;
+    std::unique_lock<std::mutex> l(result->m);
+    result->cv.wait(l, [&] { return result->complete; });
+    if (!result->ok) {
+        return false;
+    }
+    if (full_out != nullptr) {
+        memcpy(full_out, result->full.data(), RPC_MEAN_FULL_BYTES);
+    }
+    return true;
+}
+
+GGML_BACKEND_API void ggml_backend_rpc_sync_peer_release_mean(void * opaque) {
+    if (opaque != nullptr) {
+        ggml_backend_rpc_sync_peer_finish_mean(opaque, nullptr);
+        delete static_cast<rpc_mean_handle *>(opaque);
+    }
 }
 
 // 0 means unsupported before submission; -1 means an earlier deferred ACK failed.
@@ -4129,6 +4388,47 @@ static void rpc_client_reset_peer_state() {
     st.push_counts.clear();
     st.lane_sent.clear();
     st.lane_acked.clear();
+}
+
+extern "C" {
+// Call after the stage workers join, before freeing any peer staging buffers.
+GGML_BACKEND_API void ggml_backend_rpc_sync_peer_abort_mean(void) {
+    g_rpc_mean_aborted.store(true);
+    g_rpc_session_lost.store(true);
+    std::vector<std::shared_ptr<rpc_dispatcher>> live;
+    {
+        std::lock_guard<std::mutex> l(g_dispatchers_m);
+        live.reserve(3 * g_dispatchers.size());
+        for (const auto & item : g_dispatchers) {
+            live.push_back(item.second);
+        }
+    }
+    const size_t mains = live.size();
+    for (size_t i = 0; i < mains; ++i) {
+        auto disp = live[i];
+        std::lock_guard<std::mutex> l(disp->lanes.m);
+        for (const auto & lane : {disp->lanes.set_lane, disp->lanes.get_lane}) {
+            if (lane != nullptr) {
+                live.push_back(lane);
+            }
+        }
+    }
+    // Server disconnect teardown joins peer appliers before it frees buffers.
+    for (const auto & disp : live) {
+        disp->poison();
+    }
+    {
+        auto & st = rpc_sync_peer();
+        std::lock_guard<std::mutex> l(st.m);
+        for (const auto & item : st.push_lanes) {
+            item.second->shutdown_rw();
+        }
+    }
+    for (const auto & disp : live) {
+        disp->drain();
+    }
+    rpc_client_reset_peer_state();
+}
 }
 
 // Park every connected endpoint's session and close the connections.
@@ -4736,7 +5036,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE;
+    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -5760,6 +6060,57 @@ bool rpc_server::get_tensor_and_push(const rpc_msg_push_tensor_req & request, st
     rpc_msg_push_tensor_rsp pushed = {};
     // The main stream completed the producer graph. Queue owned bytes before replying to the host.
     return get_tensor(get, response) && push_tensor(request, pushed, &response) && pushed.ok != 0;
+}
+
+static bool rpc_mean_layout(const rpc_tensor & tensor) {
+    if (tensor.type != GGML_TYPE_F32) {
+        return false;
+    }
+    uint64_t stride = sizeof(float);
+    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (tensor.ne[i] == 0 || (tensor.ne[i] != 1 && tensor.nb[i] != stride)) {
+            return false;
+        }
+        if (tensor.ne[i] > RPC_MEAN_FULL_BYTES / stride) {
+            return false;
+        }
+        stride *= tensor.ne[i];
+    }
+    return stride == RPC_MEAN_FULL_BYTES;
+}
+
+static bool rpc_mean_request(const rpc_msg_push_tensor_req & request) {
+    if (request.src_offset || request.dst_offset || request.bf16 || request.wait_main || request.wait_get ||
+            request.size != RPC_MEAN_FULL_BYTES || !rpc_mean_layout(request.src) || !rpc_mean_layout(request.dst)) {
+        return false;
+    }
+    return std::equal(std::begin(request.src.ne), std::end(request.src.ne), std::begin(request.dst.ne));
+}
+
+static bool rpc_send_mean_first(const socket_ptr & sock, const std::vector<uint8_t> & full) {
+    if (full.size() != RPC_MEAN_FULL_BYTES) {
+        return false;
+    }
+    std::array<float, RPC_MEAN_WIDTH> mean;
+    memcpy(mean.data(), full.data(), RPC_MEAN_BYTES);
+    for (size_t stream = 1; stream < RPC_MEAN_STREAMS; ++stream) {
+        for (size_t i = 0; i < RPC_MEAN_WIDTH; ++i) {
+            float value;
+            memcpy(&value, full.data() + stream * RPC_MEAN_BYTES + i * sizeof(float), sizeof(value));
+            volatile float rounded = mean[i] + value;
+            mean[i] = rounded;
+        }
+    }
+    // Volatile F32 round points keep stream order and separate the reciprocal multiply.
+    for (size_t i = 0; i < RPC_MEAN_WIDTH; ++i) {
+        volatile float rounded = mean[i] * 0.25f;
+        mean[i] = rounded;
+    }
+    rpc_phase_io phase(true);
+    const uint64_t size = RPC_MEAN_BYTES + RPC_MEAN_FULL_BYTES;
+    const socket_t::buffer prefix[] = {{&size, sizeof(size)}, {mean.data(), RPC_MEAN_BYTES}};
+    return sock->send_data(prefix, 2) && sock->flush() &&
+            sock->send_data(full.data(), full.size()) && sock->flush();
 }
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
@@ -7059,6 +7410,17 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                 }
                 break;
             }
+            case RPC_CMD_GET_MEAN_AND_PUSH: {
+                rpc_msg_push_tensor_req request;
+                std::vector<uint8_t> response;
+                if (!recv_msg(sock, &request, sizeof(request)) || !rpc_mean_request(request) ||
+                        !server.get_tensor_and_push(request, response) || !rpc_send_mean_first(sock, response)) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_TENSOR_AND_PUSH: {
                 rpc_msg_push_tensor_req request;
                 std::vector<uint8_t> response;
@@ -7276,7 +7638,7 @@ static bool rpc_handshake_hello(const socket_ptr & sock) {
     rsp.major = RPC_PROTO_MAJOR_VERSION;
     rsp.minor = RPC_PROTO_MINOR_VERSION;
     rsp.patch = RPC_PROTO_PATCH_VERSION;
-    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE;
+    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST;
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
@@ -7646,6 +8008,21 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_read_push") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_read_push;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_mean") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_can_mean;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_begin_mean") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_begin_mean;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_finish_mean") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_finish_mean;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_release_mean") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_release_mean;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_abort_mean") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_abort_mean;
     }
     if (std::strcmp(name, "ggml_backend_rpc_device_endpoint") == 0) {
         return (void *)ggml_backend_rpc_device_get_endpoint;
