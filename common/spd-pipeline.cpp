@@ -811,27 +811,45 @@ struct common_spd_pipeline::impl {
     uint64_t command_trace_wave = 0;
     uint64_t schedule_trace_request = 0;
     uint64_t schedule_trace_prefix = 0;
+    struct schedule_event {
+        int64_t us;
+        uint64_t request, wave, prefix;
+        size_t active;
+        int stage, pos, value;
+        const char * event;
+    };
+    std::vector<schedule_event> schedule_events;
+    std::atomic<uint64_t> schedule_event_count{0};
+    size_t schedule_events_flushed = 0;
+    bool schedule_trace_active = false;
 
-    void trace_schedule(const char * event, int stage = -1, int pos = -1, int value = -1) const {
-        static const uint64_t limit = []() -> uint64_t {
-            const char * env = std::getenv("LLAMA_SPD_SCHEDULE_TRACE");
-            return env ? std::min<uint64_t>(std::strtoull(env, nullptr, 10), 1000000) : 0;
-        }();
-        if (limit == 0) {
+    void trace_schedule(const char * event, int stage = -1, int pos = -1, int value = -1) {
+        if (!schedule_trace_active) {
             return;
         }
-        static std::atomic<uint64_t> emitted{0};
-        const uint64_t seq = emitted.fetch_add(1, std::memory_order_relaxed);
-        if (seq >= limit) {
+        const uint64_t seq = schedule_event_count.fetch_add(1, std::memory_order_relaxed);
+        if (seq >= schedule_events.size()) {
             return;
         }
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now().time_since_epoch()).count();
+        // Workers own distinct slots. Flush only after all generation workers join.
+        schedule_events[seq] = { (int64_t) us, schedule_trace_request, command_trace_wave,
+                schedule_trace_prefix, timing_active_count, stage, pos, value, event };
+    }
+
+    void flush_schedule_trace() {
+        schedule_trace_active = false;
+        const size_t end = std::min<uint64_t>(schedule_event_count.load(std::memory_order_relaxed), schedule_events.size());
         // Same process clock and owner/wave identity as RPC command traces.
-        fprintf(stderr, "[spd schedule] seq=%" PRIu64 " us=%" PRId64 " run=%" PRIu64
-                " request=%" PRIu64 " wave=%" PRIu64 " prefix=%" PRIu64
-                " active=%zu stage=%d pos=%d event=%s value=%d\n",
-                seq, (int64_t) us, (uint64_t) (uintptr_t) this, schedule_trace_request,
-                command_trace_wave, schedule_trace_prefix, timing_active_count, stage, pos, event, value);
+        for (size_t i = schedule_events_flushed; i < end; ++i) {
+            const auto & e = schedule_events[i];
+            fprintf(stderr, "[spd schedule] seq=%" PRIu64 " us=%" PRId64 " run=%" PRIu64
+                    " request=%" PRIu64 " wave=%" PRIu64 " prefix=%" PRIu64
+                    " active=%zu stage=%d pos=%d event=%s value=%d\n",
+                    (uint64_t) i, e.us, (uint64_t) (uintptr_t) this, e.request,
+                    e.wave, e.prefix, e.active, e.stage, e.pos, e.event, e.value);
+        }
+        schedule_events_flushed = end;
     }
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params, bool initialize_now = true)
@@ -844,6 +862,9 @@ struct common_spd_pipeline::impl {
         }
         if (const char * value = std::getenv("LLAMA_SPD_TIMING")) {
             timing_enabled = std::atoi(value) != 0;
+        }
+        if (const char * value = std::getenv("LLAMA_SPD_SCHEDULE_TRACE")) {
+            schedule_events.resize(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 1000000));
         }
         if (const char * value = std::getenv("LLAMA_SPD_DUMP")) {
             dump_dir = value;
@@ -3698,6 +3719,11 @@ struct common_spd_pipeline::impl {
         ++schedule_trace_request;
         schedule_trace_prefix = 0;
         timing_active_count = 0;
+        schedule_trace_active = !schedule_events.empty();
+        struct schedule_flush_guard {
+            impl * self;
+            ~schedule_flush_guard() { self->flush_schedule_trace(); }
+        } flush_schedule{this};
         trace_schedule("request_begin");
         const int32_t n_predict = gparams.n_predict;
         if (prompt.empty()) {
