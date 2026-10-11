@@ -4569,6 +4569,7 @@ llm_graph_params llama_context::graph_params(
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
+        /*.spd_peer_skip_inp =*/ &cparams.spd_peer_skip_inp,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched_use,

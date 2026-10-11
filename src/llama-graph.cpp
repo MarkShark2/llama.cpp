@@ -94,6 +94,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
+    res &= skip_upload == params.spd_peer_skip_inp;
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && (persistent_embd
             ? built_n_tokens == (int64_t) params.ubatch.n_tokens
@@ -1552,6 +1553,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
     cparams          (params.cparams),
+    spd_peer_skip_inp (params.spd_peer_skip_inp),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -2412,9 +2414,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(n_embd_inp >= n_embd);
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-    // cparams here is a reference to the owning llama_context's cparams, so
-    // this stays valid for the lifetime of the (possibly reused) graph
-    inp->skip_upload = &cparams.spd_peer_skip_inp;
+    inp->skip_upload = spd_peer_skip_inp;
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);

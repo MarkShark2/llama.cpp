@@ -808,6 +808,8 @@ struct llm_graph_params {
 
     llama_hparams hparams;
     llama_cparams cparams;
+    // Live context-owned control; cparams above is only a graph-build snapshot.
+    const bool * spd_peer_skip_inp = nullptr;
 
     llama_ubatch ubatch; // note: intentionally make a copy
 
@@ -1050,6 +1052,7 @@ struct llm_graph_context {
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
+    const bool * spd_peer_skip_inp;
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
