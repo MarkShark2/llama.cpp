@@ -6067,7 +6067,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const bool q8_packed = q8_packed_requested &&
             device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_GCN &&
             device->driver_id == vk::DriverId::eMesaRadv && !device->integer_dot_product &&
-            std::strstr(device->properties.deviceName, "V340L") && device->subgroup_size == 64 &&
+            device->properties.deviceID == 0x6864 &&
+            std::strstr(device->properties.deviceName, "V340") && device->subgroup_size == 64 &&
             device->properties.limits.maxComputeWorkGroupInvocations >= 256 &&
             device->properties.limits.maxComputeWorkGroupSize[0] >= 256 &&
             device->properties.limits.maxComputeSharedMemorySize >= 6144 &&
