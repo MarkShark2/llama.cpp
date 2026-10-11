@@ -50,6 +50,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <iomanip>
@@ -2608,6 +2609,8 @@ struct vk_recording_plan_step {
 struct vk_recording_plan {
     std::vector<uint8_t> key;
     std::vector<vk_recording_plan_step> steps;
+    int64_t preparation_ns = 0;
+    bool preparation_measured = false;
 };
 
 struct ggml_backend_vk_context {
@@ -18668,53 +18671,118 @@ static bool ggml_vk_recording_plan_key(ggml_backend_vk_context * ctx, const ggml
     return complete && key.capacity() <= VK_RECORDING_PLAN_KEY_BYTES;
 }
 
+static uint64_t ggml_vk_recording_plan_trace_limit() {
+    static const uint64_t limit = []() -> uint64_t {
+        const char * value = std::getenv("GGML_VK_RECORDING_PLAN_TRACE");
+        if (!value || value[0] == '-') {
+            return 0;
+        }
+        char * end = nullptr;
+        const auto parsed = strtoull(value, &end, 10);
+        return end != value && *end == '\0' ? std::min<uint64_t>(parsed, 65536) : 0;
+    }();
+    return limit;
+}
+
+static int64_t ggml_vk_recording_plan_time_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 struct vk_recording_plan_run {
     ggml_backend_vk_context * ctx;
     vk_recording_plan candidate;
     const vk_recording_plan * hit = nullptr;
     bool eligible = false;
     bool completed = false;
+    uint64_t trace_id = 0;
+    int nodes = 0;
+    size_t invalidated = 0;
+    size_t evicted = 0;
+    size_t key_bytes = 0;
+    int64_t key_ns = 0, lookup_ns = 0, preparation_ns = 0, saved_ns = 0;
+    bool saved_measured = false;
+    const char * outcome = "off";
+    const char * invalidation = "none";
 
-    vk_recording_plan_run(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) : ctx(ctx) {
+    int64_t timer_start() const { return trace_id ? ggml_vk_recording_plan_time_ns() : 0; }
+    void add_preparation(int64_t start) {
+        if (trace_id) { preparation_ns += ggml_vk_recording_plan_time_ns() - start; }
+    }
+
+    void invalidate(const char * reason) {
+        invalidated += ctx->recording_plans.size();
+        invalidation = reason;
+        ctx->recording_plans.clear();
+        ctx->recording_plan_next = 0;
+    }
+
+    vk_recording_plan_run(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) : ctx(ctx), nodes(graph->n_nodes) {
+        if (ggml_vk_recording_plan_trace_limit()) {
+            static std::atomic<uint64_t> sequence{0};
+            auto next = sequence.load(std::memory_order_relaxed);
+            while (next < ggml_vk_recording_plan_trace_limit()) {
+                if (sequence.compare_exchange_weak(next, next + 1, std::memory_order_relaxed)) {
+                    trace_id = next + 1;
+                    break;
+                }
+            }
+        }
         if (!ggml_vk_recording_plan_enabled()) {
             return;
         }
         const uint64_t generation = ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed);
         if (generation != ctx->recording_plan_generation) {
-            ctx->recording_plans.clear();
-            ctx->recording_plan_next = 0;
+            invalidate("allocation");
             ctx->recording_plan_generation = generation;
         }
         try {
             ctx->recording_plans.reserve(VK_RECORDING_PLAN_ENTRIES);
+            const int64_t key_start = timer_start();
             eligible = ggml_vk_recording_plan_key(ctx, graph, candidate.key);
+            if (trace_id) { key_ns = ggml_vk_recording_plan_time_ns() - key_start; }
+            key_bytes = candidate.key.size();
+            outcome = eligible ? "miss" : "ineligible";
             if (!eligible) {
                 return;
             }
+            const int64_t lookup_start = timer_start();
             for (const auto & plan : ctx->recording_plans) {
                 if (plan.key == candidate.key) {
                     hit = &plan;
+                    outcome = "hit";
+                    saved_ns = plan.preparation_ns;
+                    saved_measured = plan.preparation_measured;
+                    if (trace_id) { lookup_ns = ggml_vk_recording_plan_time_ns() - lookup_start; }
                     return;
                 }
             }
+            if (trace_id) { lookup_ns = ggml_vk_recording_plan_time_ns() - lookup_start; }
             candidate.steps.resize(graph->n_nodes);
         } catch (const std::bad_alloc &) {
             // Optional CPU preparation must not turn allocation pressure into a graph failure.
             eligible = false;
-            ctx->recording_plans.clear();
-            ctx->recording_plan_next = 0;
+            outcome = "allocation-failed";
+            invalidate("allocation-failed");
         }
     }
 
     void finish() {
+        candidate.preparation_ns = preparation_ns;
+        candidate.preparation_measured = trace_id != 0;
         if (eligible && !hit && ctx->recording_plan_generation ==
                 ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed)) {
             if (ctx->recording_plans.size() < VK_RECORDING_PLAN_ENTRIES) {
                 ctx->recording_plans.push_back(std::move(candidate));
             } else {
+                evicted = 1;
                 ctx->recording_plans[ctx->recording_plan_next] = std::move(candidate);
                 ctx->recording_plan_next = (ctx->recording_plan_next + 1) % VK_RECORDING_PLAN_ENTRIES;
             }
+        }
+        if (trace_id && ggml_vk_recording_plan_enabled() && ctx->recording_plan_generation !=
+                ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed)) {
+            invalidation = "allocation-deferred";
         }
         completed = true;
     }
@@ -18722,8 +18790,16 @@ struct vk_recording_plan_run {
     ~vk_recording_plan_run() {
         // An interrupted recorder must not publish a partially prepared plan.
         if (!completed && ggml_vk_recording_plan_enabled()) {
-            ctx->recording_plans.clear();
-            ctx->recording_plan_next = 0;
+            invalidate("interrupted");
+        }
+        if (trace_id) {
+            GGML_LOG_INFO("[vk plan] id=%llu host=%llu device=\"%s\" ctx=%p nodes=%d mode=exact outcome=%s "
+                          "complete=%d key_bytes=%zu key_us=%.3f lookup_us=%.3f prepare_us=%.3f "
+                          "saved_prepare_us_est=%.3f saved_prepare_known=%d invalidated=%zu reason=%s evicted=%zu entries=%zu\n",
+                          (unsigned long long) trace_id, (unsigned long long) vk_host_parent_id,
+                          ctx->device->name.c_str(), (void *) ctx, nodes, outcome, completed,
+                          key_bytes, key_ns / 1000.0, lookup_ns / 1000.0, preparation_ns / 1000.0,
+                          saved_ns / 1000.0, saved_measured, invalidated, invalidation, evicted, ctx->recording_plans.size());
         }
     }
 };
@@ -18869,7 +18945,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         const vk_recording_plan_step * cached_step = plan_run.hit ? &plan_run.hit->steps[i] : nullptr;
+        const int64_t flops_start = plan_run.timer_start();
         const uint64_t node_flops = cached_step ? cached_step->flops : ggml_vk_get_node_flops(cgraph->nodes[i]);
+        plan_run.add_preparation(flops_start);
         {
             total_flops += node_flops;
 
@@ -18887,6 +18965,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             batch_flops += node_flops;
         }
 
+        const int64_t preparation_start = plan_run.timer_start();
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
@@ -19128,6 +19207,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             plan_run.candidate.steps[i] = { node_flops, ctx->num_additional_fused_ops, ctx->fused_ops_write_mask,
                 ctx->fused_topk_moe_mode, ctx->fused_topk_moe_scale, ctx->fused_topk_qsa, fusion_string };
         }
+
+        plan_run.add_preparation(preparation_start);
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
