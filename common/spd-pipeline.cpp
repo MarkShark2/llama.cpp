@@ -357,6 +357,8 @@ struct common_spd_pipeline::impl {
         double * elapsed;
         std::string * error;
         uint8_t * ok;
+        bool * head_decode_ready = nullptr;
+        double head_submit_seconds = 0.0;
     };
 
     struct speculation_job {
@@ -536,6 +538,9 @@ struct common_spd_pipeline::impl {
     // note_resident_prefix() can tell a real restore from a no-op lookup
     bool state_replaced = false;
     bool static_decode_fast_path = true;
+    // Submit the final target projection while earlier stages are still running.
+    // Sampling and all acceptance/budget/grammar updates stay on the main thread.
+    bool overlap_head_submit = false;
     bool light_rollback = false;
     bool full_checkpoints = false; // GLM full-state bundles with compact live checkpoints
     std::array<uint64_t, 2> checkpoint_identity = {};
@@ -663,6 +668,7 @@ struct common_spd_pipeline::impl {
         double stage_wall = 0.0;
         double sidecar_extra = 0.0;
         double head = 0.0;
+        double head_overlapped = 0.0;
         double embed = 0.0;
         double rollback = 0.0;
         double rollback_sidecar = 0.0;
@@ -731,6 +737,9 @@ struct common_spd_pipeline::impl {
         if (const char * value = std::getenv("LLAMA_SPD_STATIC_DECODE")) {
             static_decode_fast_path = std::atoi(value) != 0;
         }
+        if (const char * value = std::getenv("LLAMA_SPD_HEAD_OVERLAP")) {
+            overlap_head_submit = std::strcmp(value, "1") == 0;
+        }
         if (const char * value = std::getenv("LLAMA_SPD_TIMING")) {
             timing_enabled = std::atoi(value) != 0;
         }
@@ -778,6 +787,16 @@ struct common_spd_pipeline::impl {
     static void execute_stage_decode_job(void * data) {
         auto & job = *static_cast<stage_decode_job *>(data);
         *job.ok = job.owner->advance_entry(job.stage, *job.item, *job.elapsed, *job.error);
+        if (*job.ok && job.head_decode_ready != nullptr) {
+            const auto start = clock_type::now();
+            *job.head_decode_ready = job.owner->target_head_decode(job.item->hidden);
+            job.head_submit_seconds = seconds_since(start);
+            job.owner->timing.head_overlapped += job.head_submit_seconds;
+            if (!*job.head_decode_ready) {
+                *job.ok = false;
+                *job.error = "overlapped target SPD head decode failed";
+            }
+        }
     }
 
     static void execute_speculation_job(void * data) {
@@ -2073,7 +2092,7 @@ struct common_spd_pipeline::impl {
         return true;
     }
 
-    bool target_head(const std::vector<float> & hidden, llama_token & token) {
+    bool target_head_decode(const std::vector<float> & hidden) {
         scope_timer head_timer(timing.head);
         ++timing.head_calls;
         batch_storage local_storage;
@@ -2083,6 +2102,11 @@ struct common_spd_pipeline::impl {
             fail("target SPD head decode failed");
             return false;
         }
+        return true;
+    }
+
+    bool target_head_sample(llama_token & token) {
+        scope_timer head_timer(timing.head);
         if (head_backend_sampling) {
             token = llama_get_sampled_token_ith(head, -1);
             if (token == LLAMA_TOKEN_NULL) {
@@ -2107,6 +2131,10 @@ struct common_spd_pipeline::impl {
             token = grammar_argmax(logits, token);
         }
         return true;
+    }
+
+    bool target_head(const std::vector<float> & hidden, llama_token & token) {
+        return target_head_decode(hidden) && target_head_sample(token);
     }
 
     size_t depth_to_anchor(int32_t depth) const {
@@ -3804,6 +3832,13 @@ struct common_spd_pipeline::impl {
             std::array<std::string, SPD_MAX_STAGE_COUNT> errors;
             std::array<uint8_t, SPD_MAX_STAGE_COUNT> ok = {};
             std::array<stage_decode_job, SPD_MAX_STAGE_COUNT> stage_jobs = {};
+            bool head_decode_ready = false;
+            // The pipeline and token vector remain unchanged until every worker
+            // has joined. Only the last worker accesses the isolated head context.
+            const bool submit_head_early = overlap_head_submit && head_backend_sampling &&
+                    static_decode_fast_path && params.parallel_stages &&
+                    active_count > 1 && active_count == stage_count &&
+                    pipeline.back().pos + 1 - n_prompt < (int32_t) result.tokens.size();
             std::future<bool> speculation_work;
             speculation_job sidecar_job = {};
             bool speculation_ok = true;
@@ -3835,6 +3870,9 @@ struct common_spd_pipeline::impl {
                         &errors[stage],
                         &ok[stage],
                     };
+                    if (submit_head_early && stage + 1 == stage_count) {
+                        stage_jobs[stage].head_decode_ready = &head_decode_ready;
+                    }
                     stage_workers[stage]->submit(execute_stage_decode_job, &stage_jobs[stage]);
                 }
                 for (size_t stage = 0; stage < active_count; ++stage) {
@@ -3864,7 +3902,7 @@ struct common_spd_pipeline::impl {
             if (timing_enabled && active_count > 0 && active_count <= SPD_MAX_STAGE_COUNT) {
                 double slowest = 0.0;
                 for (size_t stage = 0; stage < active_count; ++stage) {
-                    slowest = std::max(slowest, elapsed[stage]);
+                    slowest = std::max(slowest, elapsed[stage] + stage_jobs[stage].head_submit_seconds);
                 }
                 timing.gap_by_active[active_count] += stage_phase_wall - slowest;
                 ++timing.gap_calls[active_count];
@@ -3883,6 +3921,9 @@ struct common_spd_pipeline::impl {
                 }
             }
             if (worker_failure != nullptr) {
+                if (submit_head_early) {
+                    llama_synchronize(head);
+                }
                 try {
                     std::rethrow_exception(worker_failure);
                 } catch (const std::exception & error) {
@@ -3895,11 +3936,17 @@ struct common_spd_pipeline::impl {
             for (size_t stage = 0; stage < active_count; ++stage) {
                 result.stage_compute_seconds += elapsed[stage];
                 if (!ok[stage]) {
+                    if (submit_head_early) {
+                        llama_synchronize(head);
+                    }
                     fail(errors[stage]);
                     return false;
                 }
             }
             if (!speculation_ok) {
+                if (submit_head_early) {
+                    llama_synchronize(head);
+                }
                 return false;
             }
 
@@ -3914,7 +3961,8 @@ struct common_spd_pipeline::impl {
 
                 if (generated_index < (int32_t) result.tokens.size()) {
                     llama_token verified_token;
-                    if (!target_head(completed_entry.hidden, verified_token)) {
+                    if (!(head_decode_ready ? target_head_sample(verified_token) :
+                            target_head(completed_entry.hidden, verified_token))) {
                         return false;
                     }
                     verified_token = apply_budget(verified_token);
@@ -4001,7 +4049,7 @@ struct common_spd_pipeline::impl {
         result.decode_seconds = seconds_since(decode_start);
         if (timing_enabled && result.decode_steps > 0) {
             const double other = timing.step_total - timing.prepare - timing.stage_wall -
-                    timing.sidecar_extra - timing.head - timing.embed - timing.rollback;
+                    timing.sidecar_extra - (timing.head - timing.head_overlapped) - timing.embed - timing.rollback;
             fprintf(stderr,
                     "SPD timing: steps=%" PRIu64 " decode=%.2fs (%.1f ms/step) rollback_mode=%s | "
                     "prepare %.2fs | stages(wall) %.2fs | sidecar-extra %.2fs | head %.2fs/%" PRIu64 " | "
@@ -4010,10 +4058,14 @@ struct common_spd_pipeline::impl {
                     1e3*result.decode_seconds/(double) result.decode_steps,
                     light_rollback ? "seq_rm" : "seq_cp",
                     timing.prepare, timing.stage_wall, timing.sidecar_extra,
-                    timing.head, timing.head_calls,
+                    timing.head - timing.head_overlapped, timing.head_calls,
                     timing.embed, timing.embed_calls,
                     timing.rollback, timing.rollback_calls, result.n_rejected,
                     other);
+            if (overlap_head_submit) {
+                fprintf(stderr, "SPD timing: head total %.3fs | overlapped submission %.3fs (inside stage wall)\n",
+                        timing.head, timing.head_overlapped);
+            }
             if (sidecar_host_fallback_count > 0) {
                 fprintf(stderr, "SPD timing: sidecar host-argmax fallbacks %" PRIu64 "\n",
                         sidecar_host_fallback_count);
