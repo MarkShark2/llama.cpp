@@ -639,10 +639,12 @@ struct common_spd_pipeline::impl {
         if (backup == nullptr) {
             return true;
         }
+        trace_schedule("backup_wait_begin", (int) stage);
         const bool ok = backup->finish(backup->handle, nullptr);
         // Keep completion accounting on the context owner, after the full body.
         llama_synchronize(stages[stage]);
         backup.reset();
+        trace_schedule("backup_wait_done", (int) stage, -1, ok);
         if (!ok) {
             hidden_backup_failed.store(true);
             error = "SPD full hidden backup failed for stage " + std::to_string(stage);
@@ -676,12 +678,14 @@ struct common_spd_pipeline::impl {
             return true;
         }
         item.hidden.resize(n_embd_boundary);
+        trace_schedule("materialize_begin", -1, item.pos);
         if (!item.pending->finish(item.pending->handle, item.hidden.data())) {
             hidden_backup_failed.store(true);
             error = "SPD full hidden backup failed at position " + std::to_string(item.pos);
             return false;
         }
         item.pending.reset();
+        trace_schedule("materialize_done", -1, item.pos);
         return true;
     }
 
@@ -805,6 +809,30 @@ struct common_spd_pipeline::impl {
     phase_timing timing;
     size_t timing_active_count = 0;
     uint64_t command_trace_wave = 0;
+    uint64_t schedule_trace_request = 0;
+    uint64_t schedule_trace_prefix = 0;
+
+    void trace_schedule(const char * event, int stage = -1, int pos = -1, int value = -1) const {
+        static const uint64_t limit = []() -> uint64_t {
+            const char * env = std::getenv("LLAMA_SPD_SCHEDULE_TRACE");
+            return env ? std::min<uint64_t>(std::strtoull(env, nullptr, 10), 1000000) : 0;
+        }();
+        if (limit == 0) {
+            return;
+        }
+        static std::atomic<uint64_t> emitted{0};
+        const uint64_t seq = emitted.fetch_add(1, std::memory_order_relaxed);
+        if (seq >= limit) {
+            return;
+        }
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now().time_since_epoch()).count();
+        // Same process clock and owner/wave identity as RPC command traces.
+        fprintf(stderr, "[spd schedule] seq=%" PRIu64 " us=%" PRId64 " run=%" PRIu64
+                " request=%" PRIu64 " wave=%" PRIu64 " prefix=%" PRIu64
+                " active=%zu stage=%d pos=%d event=%s value=%d\n",
+                seq, (int64_t) us, (uint64_t) (uintptr_t) this, schedule_trace_request,
+                command_trace_wave, schedule_trace_prefix, timing_active_count, stage, pos, event, value);
+    }
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params, bool initialize_now = true)
         : model_target(model_target), model_spd(model_spd), params(params) {
@@ -870,6 +898,7 @@ struct common_spd_pipeline::impl {
             if (auto failure = job.owner->sidecar_worker->wait()) {
                 std::rethrow_exception(failure);
             }
+            job.owner->trace_schedule("head_reader_join", (int) job.stage, job.item->pos);
             job.head_reader_wait_seconds = seconds_since(wait_start);
             job.owner->timing.head_reader_wait += job.head_reader_wait_seconds;
             const auto start = clock_type::now();
@@ -887,6 +916,7 @@ struct common_spd_pipeline::impl {
                 *job.error = "overlapped target SPD head decode failed";
             }
         }
+        job.owner->trace_schedule("worker_done", (int) job.stage, job.item->pos, *job.ok);
     }
 
     static void execute_speculation_job(void * data) {
@@ -2571,6 +2601,7 @@ struct common_spd_pipeline::impl {
     }
 
     bool run_speculation(const speculation_input & input, llama_token & sampled) {
+        trace_schedule("reader_begin", -1, input.min_pos);
         scope_timer sidecar_timer(timing.sidecar_run);
         ++timing.sidecar_calls;
         {
@@ -2582,10 +2613,12 @@ struct common_spd_pipeline::impl {
         }
         const bool ok = sidecar_decode(input, &sampled,
                 static_decode_fast_path ? &sidecar_decode_batch : nullptr);
+        trace_schedule("reader_sample_ready", -1, input.min_pos, ok);
         if (ok && !dump_dir.empty() && dump_step < dump_limit) {
             dump_rows("spec", input.selectors, input.positions, input.features, sampled);
             ++dump_step;
         }
+        trace_schedule("reader_done", -1, input.min_pos, ok);
         return ok;
     }
 
@@ -2684,12 +2717,14 @@ struct common_spd_pipeline::impl {
 
     static void execute_rollback_job(void * data) {
         auto & job = *static_cast<rollback_job *>(data);
+        job.self->trace_schedule("rollback_group_begin", (int) job.stages->front(), job.target_pos);
         for (uint32_t stage : *job.stages) {
             if (!job.self->rollback_stage(stage, job.target_pos, job.error)) {
                 job.ok = false;
                 return;
             }
         }
+        job.self->trace_schedule("rollback_group_done", (int) job.stages->front(), job.target_pos);
     }
 
     bool rollback(llama_pos target_pos) {
@@ -3336,6 +3371,7 @@ struct common_spd_pipeline::impl {
 
     bool advance_entry(uint32_t stage, entry & item, double & elapsed, std::string & error) {
         rpc_command_trace_scope trace((uint64_t) (uintptr_t) this, command_trace_wave, (int) stage, item.pos, (int) timing_active_count);
+        trace_schedule("stage_begin", (int) stage, item.pos);
         const auto lock_start = clock_type::now();
         std::vector<std::unique_lock<std::mutex>> resource_locks;
         resource_locks.reserve(stage_resources[stage].size());
@@ -3345,9 +3381,12 @@ struct common_spd_pipeline::impl {
         const auto start = clock_type::now();
         timing.stage_lock[stage] += std::chrono::duration<double>(start - lock_start).count();
         ++timing.stage_calls[stage];
+        trace_schedule("stage_lock_ready", (int) stage, item.pos);
+        trace_schedule("incoming_begin", (int) stage, item.pos);
         if (!finish_hidden_backup(stage, error) || !materialize_hidden(item, error)) {
             return false;
         }
+        trace_schedule("incoming_ready", (int) stage, item.pos);
 
         // [fork] Direct stage-to-stage boundary transfer during decode.
         //
@@ -3381,6 +3420,7 @@ struct common_spd_pipeline::impl {
             }
         }
 
+        trace_schedule("peer_guard_ordered", (int) stage, item.pos);
         const bool peer_in = pb_in != nullptr && pb_in->ready && pb_in->dec_ready &&
                              !pb_in->dead && pb_in->pushed_pos[slot] == item.pos;
         if (peer_in) {
@@ -3392,6 +3432,7 @@ struct common_spd_pipeline::impl {
                     error = "SPD peer fence failed for decode stage " + std::to_string(stage);
                     return false;
                 }
+                trace_schedule("peer_fence_issued", (int) stage, item.pos);
             }
             scope_timer copy_timer(timing.stage_copy[stage]);
             using ordered_copy_fn = int (*)(const ggml_tensor *, ggml_tensor *);
@@ -3409,6 +3450,8 @@ struct common_spd_pipeline::impl {
             }
         }
 
+        // These calls order remote work; their return does not prove GPU completion.
+        trace_schedule("peer_input_ordered", (int) stage, item.pos, peer_in);
         const uint32_t n_rollback = stage_rollback_tokens(stage);
         if (!light_rollback && n_rollback > 0) {
             const auto start = timing_enabled ? clock_type::now() : clock_type::time_point{};
@@ -3425,6 +3468,7 @@ struct common_spd_pipeline::impl {
             }
         }
 
+        trace_schedule("checkpoint_recorded", (int) stage, item.pos);
         std::vector<float> local_output;
         std::vector<float> & output = static_decode_fast_path
                 ? stage_decode_outputs[stage]
@@ -3476,10 +3520,12 @@ struct common_spd_pipeline::impl {
         }
         llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ compound_read,
                 /*skip_layer_inp =*/ stage_taps_all_host_derived(stage));
+        trace_schedule("decode_begin", (int) stage, item.pos);
         const bool decoded = decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
                 static_decode_fast_path ? &stage_decode_batches[stage] : nullptr,
                 &timing.stage_decode[stage], &timing.stage_read[stage], !compound_read);
         llama_set_spd_peer_io(stages[stage], false, false, false);
+        trace_schedule("decode_done", (int) stage, item.pos, decoded);
         if (!decoded) {
             return false;
         }
@@ -3613,6 +3659,7 @@ struct common_spd_pipeline::impl {
             }
         }
         elapsed = seconds_since(start);
+        trace_schedule("stage_done", (int) stage, item.pos);
         timing.stage_busy[stage] += elapsed;
         if (timing_active_count <= SPD_MAX_STAGE_COUNT) {
             timing.busy_by_active[stage][timing_active_count] += elapsed;
@@ -3648,6 +3695,10 @@ struct common_spd_pipeline::impl {
         result = {};
         last_error.clear();
         timing = {};
+        ++schedule_trace_request;
+        schedule_trace_prefix = 0;
+        timing_active_count = 0;
+        trace_schedule("request_begin");
         const int32_t n_predict = gparams.n_predict;
         if (prompt.empty()) {
             fail("SPD prompt must not be empty");
@@ -3962,6 +4013,9 @@ struct common_spd_pipeline::impl {
             scope_timer step_timer(timing.step_total);
             ++result.decode_steps;
             ++command_trace_wave;
+            const size_t active_count = pipeline.size();
+            timing_active_count = active_count;
+            trace_schedule("wave_begin");
 
             llama_token pending_draft = LLAMA_TOKEN_NULL;
             speculation_input local_pending_input;
@@ -3970,15 +4024,15 @@ struct common_spd_pipeline::impl {
                     : local_pending_input;
             {
                 scope_timer prepare_timer(timing.prepare);
+                trace_schedule("snapshot_begin");
                 if (!prepare_speculation(pipeline, completed,
                         has_prev_evicted ? &prev_evicted : nullptr,
                         prev_evicted_pos, pending_input)) {
                     return false;
                 }
+                trace_schedule("snapshot_ready");
             }
 
-            const size_t active_count = pipeline.size();
-            timing_active_count = active_count;
             std::array<double, SPD_MAX_STAGE_COUNT> elapsed = {};
             std::array<std::string, SPD_MAX_STAGE_COUNT> errors;
             std::array<uint8_t, SPD_MAX_STAGE_COUNT> ok = {};
@@ -4014,6 +4068,7 @@ struct common_spd_pipeline::impl {
             // while the target pipeline advances.
             if (static_decode_fast_path && params.parallel_stages) {
                 sidecar_job = { this, &pending_input, &pending_draft, &speculation_ok };
+                trace_schedule("reader_submit", -1, pending_input.min_pos);
                 sidecar_worker->submit(execute_speculation_job, &sidecar_job);
                 join_workers.sidecar = sidecar_worker.get();
                 sidecar_job_submitted = true;
@@ -4039,6 +4094,7 @@ struct common_spd_pipeline::impl {
                     if (submit_head_early && stage + 1 == stage_count) {
                         stage_jobs[stage].head_decode_ready = &head_decode_ready;
                     }
+                    trace_schedule("stage_submit", (int) stage, pipeline[stage].pos);
                     stage_workers[stage]->submit(execute_stage_decode_job, &stage_jobs[stage]);
                     join_workers.stages[stage] = stage_workers[stage].get();
                 }
@@ -4066,6 +4122,7 @@ struct common_spd_pipeline::impl {
                 }
             }
             const double stage_phase_wall = seconds_since(stage_phase_start);
+            trace_schedule("stages_joined");
             timing.stage_wall += stage_phase_wall;
             if (timing_enabled && active_count > 0 && active_count <= SPD_MAX_STAGE_COUNT) {
                 double slowest = 0.0;
@@ -4090,6 +4147,7 @@ struct common_spd_pipeline::impl {
                     speculation_ok = speculation_work.get();
                 }
             }
+            trace_schedule("reader_joined");
             if (worker_failure != nullptr) {
                 if (submit_head_early) {
                     llama_synchronize(head);
@@ -4138,13 +4196,18 @@ struct common_spd_pipeline::impl {
                             return false;
                         }
                     }
+                    trace_schedule("head_sample_ready", (int) stage_count - 1, target_pos);
+                    trace_schedule("backups_begin", -1, target_pos);
                     if (!finish_hidden_backups()) {
                         return false;
                     }
+                    trace_schedule("backups_ready", -1, target_pos);
                     verified_token = apply_budget(verified_token);
+                    trace_schedule("verification_ready", (int) stage_count - 1, target_pos);
 
                     dump_verify(target_pos, result.tokens[generated_index], verified_token);
                     if (result.tokens[generated_index] != verified_token) {
+                        trace_schedule("rejected", -1, target_pos);
                         result.tokens.resize(generated_index);
                         result.accepted.resize(generated_index);
                         result.tokens.push_back(verified_token);
@@ -4152,15 +4215,19 @@ struct common_spd_pipeline::impl {
                         ++result.n_rejected;
 
                         if (!finalize(verified_token, generated_index)) {
+                            trace_schedule("terminal_rejection", -1, target_pos);
                             n_final = generated_index + 1;
                             break;
                         }
 
                         {
+                            ++schedule_trace_prefix;
+                            trace_schedule("rollback_begin", -1, target_pos);
                             scope_timer rollback_timer(timing.rollback);
                             if (!rollback(target_pos)) {
                                 return false;
                             }
+                            trace_schedule("rollback_done", -1, target_pos);
                         }
                         for (auto it = completed.lower_bound(target_pos); it != completed.end();) {
                             it = completed.erase(it);
@@ -4176,13 +4243,16 @@ struct common_spd_pipeline::impl {
                         next_position = target_pos + 1;
                         verified_up_to = target_pos + 1;
                         has_prev_evicted = false;
+                        trace_schedule("corrected_ready", 0, target_pos);
                         continue;
                     }
 
                     ++result.n_accepted;
+                    trace_schedule("accepted", -1, target_pos);
                     verified_up_to = target_pos + 1;
 
                     if (!finalize(verified_token, generated_index)) {
+                        trace_schedule("terminal_accepted", -1, target_pos);
                         n_final = generated_index + 1;
                         break;
                     }
@@ -4201,6 +4271,7 @@ struct common_spd_pipeline::impl {
                 return false;
             }
             pipeline.insert(pipeline.begin(), make_entry(pending_draft, next_position, std::move(next_embedding)));
+            trace_schedule("draft_ready", 0, next_position);
             ++next_position;
 
             // Drafts can run stage_count - 1 positions ahead of the verified
@@ -4216,6 +4287,7 @@ struct common_spd_pipeline::impl {
             }
         }
 
+        trace_schedule("decode_loop_done");
         if (!finish_hidden_backups()) {
             return false;
         }
