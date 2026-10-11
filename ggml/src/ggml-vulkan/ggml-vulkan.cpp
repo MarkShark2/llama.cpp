@@ -5897,12 +5897,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const char * target_iq_sign_env = std::getenv("GGML_VK_TARGET_IQ_BITWISE_SIGN");
     const bool bitwise_target_iq = target_reuse_device && target_iq_sign_env != nullptr && std::atoi(target_iq_sign_env) != 0;
     const uint32_t target_iq_mode = bitwise_target_iq ? 2 : reuse_target_iq;
-    const char * target_iq2_hoist_env = std::getenv("GGML_VK_TARGET_IQ2_FUSION_HOIST");
-    device->target_iq2_fusion_hoist = target_reuse_device && target_iq2_hoist_env != nullptr && std::atoi(target_iq2_hoist_env) != 0;
     const uint32_t target_iq2_mode = device->target_iq2_fusion_hoist ? 3u : target_iq_mode;
-    if (device->target_iq2_fusion_hoist) {
-        std::cerr << "ggml_vulkan: target IQ2 disjoint fusion hoist on " << device->properties.deviceName << std::endl;
-    }
     if (bitwise_target_iq) {
         std::cerr << "ggml_vulkan: target IQ bitwise sign on " << device->properties.deviceName << std::endl;
     }
@@ -7895,6 +7890,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
+        // Initialize once before lazy compilation or graph dispatch can share this device.
+        const char * target_iq2_hoist_env = std::getenv("GGML_VK_TARGET_IQ2_FUSION_HOIST");
+        device->target_iq2_fusion_hoist = device->vendor_id == VK_VENDOR_ID_AMD &&
+                (strstr(device->properties.deviceName, "GFX1013") || strstr(device->properties.deviceName, "gfx1013")) &&
+                target_iq2_hoist_env != nullptr && std::atoi(target_iq2_hoist_env) != 0;
+        if (device->target_iq2_fusion_hoist) {
+            std::cerr << "ggml_vulkan: target IQ2 disjoint fusion hoist on " << device->properties.deviceName << std::endl;
+        }
         ggml_vk_load_shaders(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
