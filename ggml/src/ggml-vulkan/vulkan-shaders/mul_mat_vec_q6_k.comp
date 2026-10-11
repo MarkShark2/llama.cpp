@@ -8,7 +8,7 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sccache[2][BLOCK_SIZE/16][16];
 
-// 0: original, 1: cached input and direct scales, 2: direct scales only.
+// 0: original, 1: cached input and direct scales, 2: direct scales only, 3: full tiles.
 layout (constant_id = 3) const uint TARGET_MODE = 0;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
@@ -16,7 +16,7 @@ uint csel = 0;
 
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint ix, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows, const bool all_threads) {
     const uint y_idx = i * QUANT_K + y_offset;
-    const bool direct_scales = TARGET_MODE != 0 && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
+    const bool direct_scales = (TARGET_MODE == 1 || TARGET_MODE == 2) && NUM_COLS == 1 && (p.fusion_flags & MAT_VEC_FLAGS_REUSE_INPUT) != 0;
     const bool reuse_input = TARGET_MODE == 1 && direct_scales;
     if (direct_scales && i >= num_blocks_per_row) {
         return;
@@ -134,7 +134,9 @@ void compute_outputs(const uint first_row, const uint num_rows) {
     uint i0 = 0;
     [[unroll]] for (; i0 < nbr_all_th; i0 += it_size)
         calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, true);
-    calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, false);
+    if (TARGET_MODE != 3) {
+        calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, false);
+    }
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
@@ -143,7 +145,7 @@ void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
-    if (first_row + NUM_ROWS <= p.stride_d) {
+    if (TARGET_MODE == 3 || first_row + NUM_ROWS <= p.stride_d) {
         MMV_COMPUTE(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
