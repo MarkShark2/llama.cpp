@@ -45,7 +45,8 @@ struct rpc_command_trace_scope {
     rpc_command_trace_scope(uint64_t run, uint64_t wave, int stage, int pos, int active) {
         static const context_fn fn = []() -> context_fn {
             const char * e = std::getenv("GGML_RPC_COMMAND_TRACE");
-            if (!e || std::atoi(e) <= 0) {
+            const char * compact = std::getenv("GGML_RPC_COMPACT_TIMING");
+            if ((!e || std::atoi(e) <= 0) && (!compact || std::strcmp(compact, "1") != 0)) {
                 return nullptr;
             }
             auto reg = ggml_backend_reg_by_name("RPC");

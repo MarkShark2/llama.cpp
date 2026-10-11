@@ -976,27 +976,43 @@ struct rpc_return_receive_trace {
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+struct rpc_call_timestamps {
+    int64_t begin = 0, sent = 0, header = 0, body = 0;
+};
+
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size,
-        std::unique_ptr<rpc_return_completion> * completion_trace = nullptr) {
+        std::unique_ptr<rpc_return_completion> * completion_trace = nullptr, rpc_call_timestamps * timestamps = nullptr) {
     rpc_command_scope trace(sock, cmd, "client", true);
     const bool capture = trace.active && cmd == RPC_CMD_GET_TENSOR && !rpc_async_enabled();
     rpc_return_receive_trace receive{capture ? &trace : nullptr, {}, {}, output_size};
     if (capture && completion_trace) {
         completion_trace->reset(new rpc_return_completion{trace, sock});
     }
+    if (timestamps) {
+        timestamps->begin = rpc_command_now();
+    }
     if (!send_rpc_cmd_data(sock, cmd, input, input_size)) {
         return false;
+    }
+    if (timestamps) {
+        timestamps->sent = rpc_command_now();
     }
     rpc_phase_io phase(false);
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size), false, capture ? &receive.header : nullptr)) {
         return false;
     }
+    if (timestamps) {
+        timestamps->header = rpc_command_now();
+    }
     if (out_size != output_size) {
         return false;
     }
     // The body has no intermediate consumer. Request fewer userspace returns during partial TCP delivery.
     const bool ok = sock->recv_data(output, output_size, rpc_get_wait_all(cmd, output_size), capture ? &receive.body : nullptr);
+    if (timestamps) {
+        timestamps->body = rpc_command_now();
+    }
     if (capture) {
         receive.ready = rpc_command_now();
         receive.ok = ok;
@@ -4107,6 +4123,69 @@ struct rpc_compact_handle {
     bool materialized = false;
 };
 
+// Capture only slow releases in fixed storage and print after generation teardown.
+// Receive spans include remote service, blocking and descheduling, not just wire time.
+struct rpc_compact_release_diagnostic {
+    struct sample {
+        rpc_command_context tag = {};
+        rpc_compact_token token = {};
+        rpc_call_timestamps io;
+        int64_t begin = 0, entered = 0, end = 0;
+        char endpoint[RPC_ENDPOINT_MAX] = {};
+        bool ok = false;
+    };
+    std::array<sample, 128> slow;
+    std::atomic<uint64_t> calls{0}, slow_count{0};
+
+    void record(const rpc_compact_handle & handle, const rpc_command_context & tag,
+            int64_t begin, int64_t entered, const rpc_call_timestamps & io, int64_t end, bool ok) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        if (ok && end - begin < 20000) {
+            return;
+        }
+        const auto index = slow_count.fetch_add(1, std::memory_order_relaxed);
+        if (index >= slow.size()) {
+            return;
+        }
+        auto & row = slow[index];
+        row.tag = tag;
+        row.token = handle.token;
+        row.io = io;
+        row.begin = begin;
+        row.entered = entered;
+        row.end = end;
+        row.ok = ok;
+        std::strncpy(row.endpoint, handle.owner->endpoint.c_str(), sizeof(row.endpoint) - 1);
+    }
+
+    ~rpc_compact_release_diagnostic() {
+        GGML_LOG_INFO("[rpc compact timing] calls=%" PRIu64 " slow=%" PRIu64 " retained=%" PRIu64 " threshold_us=20000\n",
+                calls.load(), slow_count.load(), std::min<uint64_t>(slow_count.load(), slow.size()));
+        for (uint64_t i = 0; i < std::min<uint64_t>(slow_count.load(), slow.size()); ++i) {
+            const auto & r = slow[i];
+            GGML_LOG_INFO("[rpc compact slow] endpoint=%s run=%" PRIu64 " wave=%" PRIu64
+                    " stage=%d pos=%d session=%" PRIu64 " generation=%" PRIu64
+                    " begin_us=%" PRId64 " entered_us=%" PRId64 " send_begin_us=%" PRId64
+                    " sent_us=%" PRId64 " header_us=%" PRId64 " body_us=%" PRId64
+                    " end_us=%" PRId64 " ok=%d\n", r.endpoint, r.tag.run, r.tag.wave, r.tag.stage, r.tag.pos,
+                    r.token.session, r.token.generation, r.begin, r.entered, r.io.begin,
+                    r.io.sent, r.io.header, r.io.body, r.end, r.ok);
+        }
+    }
+};
+
+static rpc_compact_release_diagnostic * rpc_compact_release_timing() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_RPC_COMPACT_TIMING");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) {
+        return nullptr;
+    }
+    static rpc_compact_release_diagnostic diagnostic;
+    return &diagnostic;
+}
+
 static bool rpc_compact_connected(const rpc_compact_handle & handle, const socket_ptr & socket) {
     return socket != nullptr && handle.socket.lock() == socket &&
             !handle.owner->is_poisoned() && !g_rpc_mean_aborted.load();
@@ -4360,9 +4439,18 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_release_compact(void * opaque) 
         return false;
     }
     std::unique_ptr<rpc_compact_handle> handle(static_cast<rpc_compact_handle *>(opaque));
-    return rpc_compact_call(*handle, [&](const socket_ptr & sock) {
+    auto * diagnostic = rpc_compact_release_timing();
+    const int64_t begin = diagnostic ? rpc_command_now() : 0;
+    const auto tag = diagnostic ? rpc_command_tag : rpc_command_context{};
+    int64_t entered = 0;
+    rpc_call_timestamps timestamps;
+    const bool ok = rpc_compact_call(*handle, [&](const socket_ptr & sock) {
+        if (diagnostic) {
+            entered = rpc_command_now();
+        }
         rpc_compact_token response = {};
-        if (!send_rpc_cmd(sock, RPC_CMD_RELEASE_COMPACT, &handle->token, sizeof(handle->token), &response, sizeof(response)) ||
+        if (!send_rpc_cmd(sock, RPC_CMD_RELEASE_COMPACT, &handle->token, sizeof(handle->token), &response, sizeof(response),
+                    nullptr, diagnostic ? &timestamps : nullptr) ||
                 !rpc_compact_same_token(response, handle->token) || handle->owner->compact_live == 0) {
             return false;
         }
@@ -4373,6 +4461,10 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_release_compact(void * opaque) 
         }
         return true;
     });
+    if (diagnostic) {
+        diagnostic->record(*handle, tag, begin, entered, timestamps, rpc_command_now(), ok);
+    }
+    return ok;
 }
 
 GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_mean(
