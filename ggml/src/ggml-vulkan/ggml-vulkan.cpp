@@ -2321,6 +2321,7 @@ struct ggml_vk_host_timer {
 };
 
 struct ggml_vk_host_trace {
+    enum detail_slot { FLOPS, FUSION, BUILD, HAZARDS, DISPATCH, CLOSE_SUBMIT, DETAIL_COUNT };
     uint64_t id = 0;
     uint64_t parent = 0;
     const char * kind;
@@ -2328,6 +2329,10 @@ struct ggml_vk_host_trace {
     const void * context;
     int nodes;
     int64_t start = 0, loop = 0, tail = 0, submit = 0, wait = 0;
+    // BUILD contains HAZARDS, DISPATCH and CLOSE_SUBMIT. These are host-wall
+    // intervals; driver calls may block, and instrumentation adds overhead.
+    std::array<int64_t, DETAIL_COUNT> detail = {};
+    std::array<uint32_t, DETAIL_COUNT> detail_calls = {};
     ggml_vk_host_trace(const char * kind, const char * device, const void * context, int nodes = 0) :
         kind(kind), device(device), context(context), nodes(nodes) {
         if (!ggml_vk_host_trace_limit()) {
@@ -2347,6 +2352,13 @@ struct ggml_vk_host_trace {
     }
     void begin_loop() { if (id) { loop = ggml_time_us(); } }
     void begin_tail() { if (id) { tail = ggml_time_us(); } }
+    int64_t detail_start() const { return id ? ggml_time_us() : 0; }
+    void detail_end(detail_slot slot, int64_t begin) {
+        if (id) {
+            detail[slot] += ggml_time_us() - begin;
+            ++detail_calls[slot];
+        }
+    }
     ~ggml_vk_host_trace() {
         if (!id) {
             return;
@@ -2355,13 +2367,19 @@ struct ggml_vk_host_trace {
         vk_host_parent_id = parent;
         GGML_LOG_INFO("[vk host] id=%llu parent=%llu kind=%s device=\"%s\" ctx=%p nodes=%d "
                       "begin_us=%lld end_us=%lld wall_us=%lld setup_us=%lld loop_us=%lld tail_us=%lld "
-                      "nested_submit_us=%lld nested_wait_us=%lld\n",
+                      "nested_submit_us=%lld nested_wait_us=%lld "
+                      "nested_flops_us=%lld nested_fusion_us=%lld nested_build_us=%lld "
+                      "nested_hazards_us=%lld nested_dispatch_us=%lld nested_close_submit_us=%lld "
+                      "build_calls=%u dispatch_calls=%u close_submit_calls=%u\n",
                       (unsigned long long) id, (unsigned long long) parent, kind, device, context, nodes,
                       (long long) start, (long long) end, (long long) (end - start),
                       (long long) (loop ? loop - start : end - start),
                       (long long) (loop && tail ? tail - loop : 0),
                       (long long) (tail ? end - tail : 0),
-                      (long long) (vk_host_submit_us - submit), (long long) (vk_host_wait_us - wait));
+                      (long long) (vk_host_submit_us - submit), (long long) (vk_host_wait_us - wait),
+                      (long long) detail[FLOPS], (long long) detail[FUSION], (long long) detail[BUILD],
+                      (long long) detail[HAZARDS], (long long) detail[DISPATCH], (long long) detail[CLOSE_SUBMIT],
+                      detail_calls[BUILD], detail_calls[DISPATCH], detail_calls[CLOSE_SUBMIT]);
     }
 };
 
@@ -16666,7 +16684,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * 
 
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
-static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit, ggml_vk_host_trace & host_trace){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
         return false;
@@ -16700,6 +16718,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
+    const int64_t hazards_start = host_trace.detail_start();
     {
         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
         // to synchronize them. This handles most "normal" synchronization when computing the graph, and when
@@ -16788,6 +16807,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
         }
     }
+    host_trace.detail_end(ggml_vk_host_trace::HAZARDS, hazards_start);
     if (vk_enable_sync_logger) {
         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
             auto *n = cgraph->nodes[node_idx + i];
@@ -16803,6 +16823,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
     }
 
+    const int64_t dispatch_start = host_trace.detail_start();
     switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
@@ -17210,6 +17231,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         return false;
     }
 
+    host_trace.detail_end(ggml_vk_host_trace::DISPATCH, dispatch_start);
     ctx->tensor_ctxs[node_idx] = compute_ctx;
 
 #if defined(GGML_VULKAN_CHECK_RESULTS)
@@ -17219,6 +17241,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 #endif
 
     if (submit || last_node) {
+        const int64_t close_submit_start = host_trace.detail_start();
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -17232,6 +17255,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ctx->compute_ctx.reset();
 
         ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
+        host_trace.detail_end(ggml_vk_host_trace::CLOSE_SUBMIT, close_submit_start);
     }
     return true;
 }
@@ -19004,9 +19028,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             submit_node_idx = i;
         }
 
+        const int64_t host_flops_start = host_trace.detail_start();
         const int64_t flops_start = plan_run.timer_start();
         const uint64_t node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
         plan_run.add_preparation(flops_start);
+        host_trace.detail_end(ggml_vk_host_trace::FLOPS, host_flops_start);
         {
             total_flops += node_flops;
 
@@ -19024,6 +19050,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             batch_flops += node_flops;
         }
 
+        const int64_t host_fusion_start = host_trace.detail_start();
         const int64_t preparation_start = plan_run.timer_start();
         const uint32_t candidates = plan_run.candidate_mask(i);
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -19256,6 +19283,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         plan_run.add_preparation(preparation_start);
+        host_trace.detail_end(ggml_vk_host_trace::FUSION, host_fusion_start);
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
@@ -19264,7 +19292,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        const int64_t host_build_start = host_trace.detail_start();
+        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit, host_trace);
+        host_trace.detail_end(ggml_vk_host_trace::BUILD, host_build_start);
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
