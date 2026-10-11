@@ -358,6 +358,7 @@ struct common_spd_pipeline::impl {
         std::string * error;
         uint8_t * ok;
         bool * head_decode_ready = nullptr;
+        llama_token head_sampled_token = LLAMA_TOKEN_NULL;
         double head_submit_seconds = 0.0;
         double head_reader_wait_seconds = 0.0;
     };
@@ -802,6 +803,12 @@ struct common_spd_pipeline::impl {
             job.owner->timing.head_reader_wait += job.head_reader_wait_seconds;
             const auto start = clock_type::now();
             *job.head_decode_ready = job.owner->target_head_decode(job.item->hidden);
+            // Keep the backend output's synchronization/reordering with its
+            // submitting owner. Main consumes only the joined scalar token;
+            // acceptance, grammar and budget state remain on main.
+            if (*job.head_decode_ready) {
+                *job.head_decode_ready = job.owner->target_head_sample(job.head_sampled_token);
+            }
             job.head_submit_seconds = seconds_since(start);
             job.owner->timing.head_overlapped += job.head_submit_seconds;
             if (!*job.head_decode_ready) {
@@ -3974,9 +3981,12 @@ struct common_spd_pipeline::impl {
 
                 if (generated_index < (int32_t) result.tokens.size()) {
                     llama_token verified_token;
-                    if (!(head_decode_ready ? target_head_sample(verified_token) :
-                            target_head(completed_entry.hidden, verified_token))) {
-                        return false;
+                    if (head_decode_ready) {
+                        verified_token = stage_jobs[stage_count - 1].head_sampled_token;
+                    } else {
+                        if (!target_head(completed_entry.hidden, verified_token)) {
+                            return false;
+                        }
                     }
                     verified_token = apply_budget(verified_token);
 
