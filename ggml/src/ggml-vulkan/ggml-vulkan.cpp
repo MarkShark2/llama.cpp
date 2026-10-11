@@ -16682,6 +16682,63 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
 
+static bool ggml_vk_hazard_ranges_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_VK_HAZARD_RANGES");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+struct ggml_vk_hazard_ranges {
+    struct range {
+        const vk_buffer_struct * owner;
+        uint64_t base;
+        size_t size;
+        bool resolved;
+    };
+
+    // Cache only this scan block. Unsynced tensor lists can survive graph_compute calls.
+    std::array<range, 64> entries;
+    size_t count = 0;
+
+    bool overlaps(const ggml_tensor * node, const std::vector<const ggml_tensor *> & nodes) {
+        if (nodes.empty()) {
+            return false;
+        }
+        const auto n_base = vk_tensor_offset(node) + node->view_offs;
+        const auto n_size = ggml_nbytes(node);
+        const auto * owner = static_cast<ggml_backend_vk_buffer_context *>(node->buffer->context)->dev_buffer.get();
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const auto * other = nodes[i];
+            range live;
+            range * entry = &live;
+            if (i < entries.size()) {
+                entry = &entries[i];
+            }
+            if (i >= count) {
+                *entry = { static_cast<ggml_backend_vk_buffer_context *>(other->buffer->context)->dev_buffer.get(), 0, 0, false };
+                if (i < entries.size()) {
+                    ++count;
+                }
+            }
+            if (owner == entry->owner) {
+                // No dispatch or metadata mutation occurs between scans in this block.
+                if (!entry->resolved) {
+                    entry->base = vk_tensor_offset(other) + other->view_offs;
+                    entry->size = ggml_nbytes(other);
+                    entry->resolved = true;
+                }
+                if ((entry->base <= n_base && n_base < entry->base + entry->size) ||
+                    (n_base <= entry->base && entry->base < n_base + n_size)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+};
+
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit, ggml_vk_host_trace & host_trace){
@@ -16726,13 +16783,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         // outside of this logic. When a node uses one of the prealloc buffers for something like
         // dequantization or split_k, additional synchronization is needed between those passes.
         bool need_sync = false;
+        const bool resolve_ranges = ggml_vk_hazard_ranges_enabled();
+        ggml_vk_hazard_ranges read_ranges, written_ranges;
 
         // Check whether "node" requires synchronization. The node requires synchronization if it
         // overlaps in memory with another unsynchronized node and at least one of them is a write.
         // Destination nodes are checked against both the written/read lists. Source nodes are only
         // checked against the written list. Two nodes overlap in memory if they come from the same
         // buffer and the tensor or view ranges overlap.
-        auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
+        auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes, ggml_vk_hazard_ranges & ranges) -> bool {
+            if (resolve_ranges) {
+                return ranges.overlaps(node, unsynced_nodes);
+            }
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
@@ -16762,7 +16824,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
-                if (overlaps_unsynced(cur_node, ctx->unsynced_nodes_read) || overlaps_unsynced(cur_node, ctx->unsynced_nodes_written)) {
+                if (overlaps_unsynced(cur_node, ctx->unsynced_nodes_read, read_ranges) || overlaps_unsynced(cur_node, ctx->unsynced_nodes_written, written_ranges)) {
                     need_sync = true;
                     break;
                 }
@@ -16771,7 +16833,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 if (!cur_node->src[j]) {
                     continue;
                 }
-                if (overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written)) {
+                if (overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written, written_ranges)) {
                     need_sync = true;
                     break;
                 }
