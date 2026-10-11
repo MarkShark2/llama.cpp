@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -322,10 +323,25 @@ struct common_spd_pipeline::impl {
         explicit snapshot(size_t n = 0) : values(n), present(n, false) {}
     };
 
+    struct pending_hidden {
+        using finish_fn = bool (*)(void *, void *);
+        using release_fn = void (*)(void *);
+        void * handle = nullptr;
+        finish_fn finish = nullptr;
+        release_fn release = nullptr;
+
+        ~pending_hidden() {
+            if (handle != nullptr) {
+                release(handle);
+            }
+        }
+    };
+
     struct entry {
         llama_token token = LLAMA_TOKEN_NULL;
         llama_pos pos = -1;
         std::vector<float> hidden;
+        std::shared_ptr<pending_hidden> pending;
         snapshot snap;
     };
 
@@ -614,6 +630,60 @@ struct common_spd_pipeline::impl {
     // overwrites the boundary while the push is still reading it, which shows
     // up as a rare, nondeterministic wrong token. Derive the probe fresh.
     std::array<bool, SPD_MAX_STAGE_COUNT> peer_push_pending = {};
+    std::array<std::shared_ptr<pending_hidden>, SPD_MAX_STAGE_COUNT> hidden_backups;
+    std::atomic<bool> hidden_backup_failed{false};
+    using abort_mean_fn = void (*)();
+
+    bool finish_hidden_backup(uint32_t stage, std::string & error) {
+        auto & backup = hidden_backups[stage];
+        if (backup == nullptr) {
+            return true;
+        }
+        const bool ok = backup->finish(backup->handle, nullptr);
+        // Keep completion accounting on the context owner, after the full body.
+        llama_synchronize(stages[stage]);
+        backup.reset();
+        if (!ok) {
+            hidden_backup_failed.store(true);
+            error = "SPD full hidden backup failed for stage " + std::to_string(stage);
+        }
+        return ok;
+    }
+
+    bool finish_hidden_backups() {
+        bool ok = !hidden_backup_failed.load();
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            std::string error;
+            if (!finish_hidden_backup(stage, error)) {
+                fail(error);
+                ok = false;
+            }
+        }
+        if (!ok) {
+            ready = false;
+            auto reg = ggml_backend_reg_by_name("RPC");
+            auto abort_mean = reg ? (abort_mean_fn) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_rpc_sync_peer_abort_mean") : nullptr;
+            if (abort_mean != nullptr) {
+                abort_mean();
+            }
+        }
+        return ok;
+    }
+
+    bool materialize_hidden(entry & item, std::string & error) {
+        if (item.pending == nullptr) {
+            return true;
+        }
+        item.hidden.resize(n_embd_boundary);
+        if (!item.pending->finish(item.pending->handle, item.hidden.data())) {
+            hidden_backup_failed.store(true);
+            error = "SPD full hidden backup failed at position " + std::to_string(item.pos);
+            return false;
+        }
+        item.pending.reset();
+        return true;
+    }
 
     // A rejection clears the pipeline and refills from the verified position,
     // so positions already delivered can be reissued with different hidden
@@ -1500,13 +1570,19 @@ struct common_spd_pipeline::impl {
     }
 
     void reset_memories() {
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            if (stages[stage] != nullptr) {
-                llama_memory_clear(llama_get_memory(stages[stage]), true);
+        finish_hidden_backups();
+        if (hidden_backup_failed.load()) {
+            // A truncated response lost the remote session; do not clear stale handles.
+            ready = false;
+        } else {
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                if (stages[stage] != nullptr) {
+                    llama_memory_clear(llama_get_memory(stages[stage]), true);
+                }
             }
-        }
-        if (sidecar != nullptr) {
-            llama_memory_clear(llama_get_memory(sidecar), true);
+            if (sidecar != nullptr) {
+                llama_memory_clear(llama_get_memory(sidecar), true);
+            }
         }
         aggr_forget(0);
         for (auto & positions : checkpoint_pos) {
@@ -2617,6 +2693,9 @@ struct common_spd_pipeline::impl {
     }
 
     bool rollback(llama_pos target_pos) {
+        if (!finish_hidden_backups()) {
+            return false;
+        }
         if (timing_enabled) {
             ++timing.rollback_calls;
         }
@@ -3266,6 +3345,9 @@ struct common_spd_pipeline::impl {
         const auto start = clock_type::now();
         timing.stage_lock[stage] += std::chrono::duration<double>(start - lock_start).count();
         ++timing.stage_calls[stage];
+        if (!finish_hidden_backup(stage, error) || !materialize_hidden(item, error)) {
+            return false;
+        }
 
         // [fork] Direct stage-to-stage boundary transfer during decode.
         //
@@ -3359,17 +3441,39 @@ struct common_spd_pipeline::impl {
         const float * embd = stage == 0 ? nullptr : item.hidden.data();
         using can_read_push_fn = bool (*)(const ggml_tensor *, const ggml_tensor *);
         using read_push_fn = int (*)(const ggml_tensor *, const ggml_tensor *, void *, uint64_t *);
+        using can_mean_fn = bool (*)(const ggml_tensor *, const ggml_tensor *, int64_t);
+        using begin_mean_fn = int (*)(const ggml_tensor *, const ggml_tensor *, float *, int64_t, void **, uint64_t *);
         auto rpc_reg = ggml_backend_reg_by_name("RPC");
         auto can_read_push = rpc_reg ? (can_read_push_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_can_read_push") : nullptr;
         auto read_push = rpc_reg ? (read_push_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_read_push") : nullptr;
+        auto can_mean = rpc_reg ? (can_mean_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_can_mean") : nullptr;
+        auto begin_mean = rpc_reg ? (begin_mean_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_begin_mean") : nullptr;
+        auto finish_mean = rpc_reg ? (pending_hidden::finish_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_finish_mean") : nullptr;
+        auto release_mean = rpc_reg ? (pending_hidden::release_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_release_mean") : nullptr;
+        auto abort_mean = rpc_reg ? (abort_mean_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_abort_mean") : nullptr;
         const ggml_tensor * previous_out = llama_spd_peer_out_tensor(stages[stage]);
         const bool compound_read = pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead &&
                 wanted.empty() && previous_out != nullptr &&
                 ggml_nbytes(previous_out) == (size_t) n_embd_boundary*sizeof(float) &&
                 can_read_push != nullptr && read_push != nullptr &&
                 can_read_push(previous_out, pb_out->staging_dec[slot]);
+        size_t mean_anchor = anchors.size();
+        if (compound_read && can_mean && begin_mean && finish_mean && release_mean && abort_mean &&
+                can_mean(previous_out, pb_out->staging_dec[slot], n_embd)) {
+            for (size_t ai = 0; ai < anchors.size(); ++ai) {
+                if (anchors[ai] == stage_bounds[stage + 1]) {
+                    mean_anchor = ai;
+                    break;
+                }
+            }
+        }
         llama_set_spd_peer_io(stages[stage], peer_in, /*skip_out =*/ compound_read,
                 /*skip_layer_inp =*/ stage_taps_all_host_derived(stage));
         const bool decoded = decode_stage(stage, token, embd, 1, item.pos, output, wanted, error,
@@ -3387,6 +3491,7 @@ struct common_spd_pipeline::impl {
         }
 
         bool handed_off = false;
+        bool mean_ready = false;
         if (compound_read) {
             scope_timer read_timer(timing.stage_read[stage]);
             // Resolve after decode: the output descriptor can change on a graph rebuild.
@@ -3396,9 +3501,30 @@ struct common_spd_pipeline::impl {
                 error = "SPD readback boundary changed for decode stage " + std::to_string(stage);
                 return false;
             }
-            output.resize(n_embd_boundary);
             uint64_t ordinal = 0;
-            const int result = read_push(out, pb_out->staging_dec[slot], output.data(), &ordinal);
+            int result = 0;
+            if (mean_anchor < anchors.size()) {
+                auto backup = std::make_shared<pending_hidden>();
+                backup->finish = finish_mean;
+                backup->release = release_mean;
+                auto & tap = item.snap.values[mean_anchor];
+                tap.resize(n_embd);
+                result = begin_mean(out, pb_out->staging_dec[slot], tap.data(), n_embd, &backup->handle, &ordinal);
+                if (result == -2) {
+                    hidden_backup_failed.store(true);
+                }
+                if (result > 0) {
+                    hidden_backups[stage] = backup;
+                    item.pending = std::move(backup);
+                    item.hidden.clear();
+                    item.snap.present[mean_anchor] = true;
+                    mean_ready = true;
+                }
+            }
+            if (result == 0) {
+                output.resize(n_embd_boundary);
+                result = read_push(out, pb_out->staging_dec[slot], output.data(), &ordinal);
+            }
             if (result < 0) {
                 error = "SPD readback and peer handoff failed for decode stage " + std::to_string(stage);
                 return false;
@@ -3411,8 +3537,10 @@ struct common_spd_pipeline::impl {
             } else {
                 ggml_backend_tensor_get(out, output.data(), 0, output.size()*sizeof(float));
             }
-            // Preserve the completion/accounting performed by llama_get_embeddings on the normal path.
-            llama_synchronize(stages[stage]);
+            // Mean-first completion accounting is deferred until the full backup joins.
+            if (!mean_ready) {
+                llama_synchronize(stages[stage]);
+            }
         }
 
         // Producer side: ship this boundary straight to the next stage's
@@ -3436,10 +3564,12 @@ struct common_spd_pipeline::impl {
                         stage, stage + 1);
             }
         }
-        if (static_decode_fast_path) {
-            item.hidden.swap(output);
-        } else {
-            item.hidden = std::move(output);
+        if (!mean_ready) {
+            if (static_decode_fast_path) {
+                item.hidden.swap(output);
+            } else {
+                item.hidden = std::move(output);
+            }
         }
         stage_tail_pos[stage] = item.pos;
         for (auto & captured_item : wanted) {
@@ -3456,7 +3586,7 @@ struct common_spd_pipeline::impl {
         // falls back to one aggregation pattern shallower than trained. The
         // tap is the stream mean of the boundary; flat-residual targets have
         // one stream and take a plain copy.
-        {
+        if (!mean_ready) {
             scope_timer tap_timer(timing.stage_tap[stage]);
             const int32_t end_layer = stage_bounds[stage + 1];
             for (size_t ai = 0; ai < anchors.size(); ++ai) {
@@ -3492,7 +3622,8 @@ struct common_spd_pipeline::impl {
     }
 
     bool synchronize_all() {
-        const bool peers_ok = drain_peer_transfers();
+        const bool backups_ok = finish_hidden_backups();
+        const bool peers_ok = backups_ok && drain_peer_transfers();
         for (llama_context * stage : stages) {
             if (stage != nullptr) {
                 llama_synchronize(stage);
@@ -3507,7 +3638,7 @@ struct common_spd_pipeline::impl {
         if (sidecar != nullptr) {
             llama_synchronize(sidecar);
         }
-        return peers_ok;
+        return backups_ok && peers_ok;
     }
 
     bool generate(const std::vector<llama_token> & prompt,
@@ -3864,12 +3995,27 @@ struct common_spd_pipeline::impl {
             bool speculation_ok = true;
             bool sidecar_job_submitted = false;
             std::exception_ptr worker_failure;
+            struct decode_join_guard {
+                std::array<fixed_worker *, SPD_MAX_STAGE_COUNT> stages = {};
+                fixed_worker * sidecar = nullptr;
+                ~decode_join_guard() {
+                    for (auto * worker : stages) {
+                        if (worker != nullptr) {
+                            worker->wait();
+                        }
+                    }
+                    if (sidecar != nullptr) {
+                        sidecar->wait();
+                    }
+                }
+            } join_workers;
             // The features were copied before target stages mutate their
             // snapshots, so an independently placed sidecar can decode them
             // while the target pipeline advances.
             if (static_decode_fast_path && params.parallel_stages) {
                 sidecar_job = { this, &pending_input, &pending_draft, &speculation_ok };
                 sidecar_worker->submit(execute_speculation_job, &sidecar_job);
+                join_workers.sidecar = sidecar_worker.get();
                 sidecar_job_submitted = true;
             } else if (params.parallel_stages) {
                 speculation_work = std::async(std::launch::async, [&]() {
@@ -3894,9 +4040,11 @@ struct common_spd_pipeline::impl {
                         stage_jobs[stage].head_decode_ready = &head_decode_ready;
                     }
                     stage_workers[stage]->submit(execute_stage_decode_job, &stage_jobs[stage]);
+                    join_workers.stages[stage] = stage_workers[stage].get();
                 }
                 for (size_t stage = 0; stage < active_count; ++stage) {
                     std::exception_ptr failure = stage_workers[stage]->wait();
+                    join_workers.stages[stage] = nullptr;
                     if (worker_failure == nullptr && failure != nullptr) {
                         worker_failure = failure;
                     }
@@ -3933,6 +4081,7 @@ struct common_spd_pipeline::impl {
                 scope_timer sidecar_wait_timer(timing.sidecar_extra);
                 if (sidecar_job_submitted) {
                     std::exception_ptr failure = sidecar_worker->wait();
+                    join_workers.sidecar = nullptr;
                     if (worker_failure == nullptr && failure != nullptr) {
                         worker_failure = failure;
                     }
@@ -3988,6 +4137,9 @@ struct common_spd_pipeline::impl {
                         if (!target_head(completed_entry.hidden, verified_token)) {
                             return false;
                         }
+                    }
+                    if (!finish_hidden_backups()) {
+                        return false;
                     }
                     verified_token = apply_budget(verified_token);
 
@@ -4062,6 +4214,10 @@ struct common_spd_pipeline::impl {
             for (auto it = completed.begin(); it != completed.end() && it->first < keep_from;) {
                 it = completed.erase(it);
             }
+        }
+
+        if (!finish_hidden_backups()) {
+            return false;
         }
 
         // finalize() can only stop the loop, so a grammar that failed mid-stream
@@ -4491,6 +4647,9 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t get_size(llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->hidden_backup_failed.load()) {
+            return 0;
+        }
         if (owner()->full_checkpoints) {
             return seq_id == 0 && flags == 0
                     ? write_full_bundle([](const void *, size_t) { return true; }, false) : 0;
@@ -4503,6 +4662,9 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t get_data(uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->hidden_backup_failed.load()) {
+            return 0;
+        }
         if (owner()->full_checkpoints) {
             if (seq_id != 0 || flags != 0) {
                 return 0;
@@ -4550,6 +4712,9 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t set_data(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->hidden_backup_failed.load()) {
+            return 0;
+        }
         if (owner()->full_checkpoints) {
             if (seq_id != 0 || flags != 0) {
                 invalidate();
@@ -4606,6 +4771,9 @@ struct spd_state_io : common_state_seq_io {
     // largest single stage rather than the whole pipeline -- which is the
     // entire reason --cache-disk exists on the UMA boards.
     size_t save_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->hidden_backup_failed.load()) {
+            return 0;
+        }
         const auto ctxs = owner()->state_contexts();
         // Only a *successful* save hands the path to a common_state_file, which
         // is what would otherwise unlink it. Every early return below leaves a
@@ -4673,6 +4841,9 @@ struct spd_state_io : common_state_seq_io {
     }
 
     size_t load_file(const std::string & path, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        if (owner()->hidden_backup_failed.load()) {
+            return 0;
+        }
         if (owner()->full_checkpoints) {
             invalidate();
             owner()->used = true;
