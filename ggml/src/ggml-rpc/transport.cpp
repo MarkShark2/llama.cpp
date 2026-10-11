@@ -20,6 +20,7 @@
 #  include <unistd.h>
 #endif
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -129,7 +130,7 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool send_data(const socket_t::buffer * buffers, size_t count);
-    bool recv_data(void * data, size_t size, bool wait_all);
+    bool recv_data(void * data, size_t size, bool wait_all, receive_trace * trace);
     bool flush();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
@@ -586,7 +587,7 @@ bool socket_t::impl::send_data(const socket_t::buffer * buffers, size_t count) {
     return true;
 }
 
-bool socket_t::impl::recv_data(void * data, size_t size, bool wait_all) {
+bool socket_t::impl::recv_data(void * data, size_t size, bool wait_all, receive_trace * trace) {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->recv(data, size);
@@ -596,17 +597,35 @@ bool socket_t::impl::recv_data(void * data, size_t size, bool wait_all) {
         return rdma_recv(data, size);
     }
 #endif
+    const auto now = [] {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    if (trace) {
+        trace->tcp = true;
+    }
     int flags = wait_all ? MSG_WAITALL : 0;
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+        const int64_t begin = trace ? now() : 0;
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, flags);
-        if (n < 0) {
 #ifdef _WIN32
-            const bool unsupported = WSAGetLastError() == WSAEOPNOTSUPP;
+        const bool unsupported = n < 0 && WSAGetLastError() == WSAEOPNOTSUPP;
 #else
-            const bool unsupported = errno == EOPNOTSUPP;
+        const bool unsupported = n < 0 && errno == EOPNOTSUPP;
 #endif
+        if (trace) {
+            const int64_t end = now();
+            if (trace->calls++ == 0) {
+                trace->first_begin_us = begin;
+                trace->first_end_us = end;
+                trace->first_bytes = n > 0 ? (uint64_t) n : 0;
+            }
+            trace->last_end_us = end;
+            trace->calls_us += end - begin;
+            trace->bytes += n > 0 ? (uint64_t) n : 0;
+        }
+        if (n < 0) {
             if (flags != 0 && unsupported) {
                 flags = 0;
                 continue;
@@ -703,8 +722,8 @@ bool socket_t::send_data(const buffer * buffers, size_t count) {
     return pimpl->send_data(buffers, count);
 }
 
-bool socket_t::recv_data(void * data, size_t size, bool wait_all) {
-    return pimpl->recv_data(data, size, wait_all);
+bool socket_t::recv_data(void * data, size_t size, bool wait_all, receive_trace * trace) {
+    return pimpl->recv_data(data, size, wait_all, trace);
 }
 
 bool socket_t::flush() {
