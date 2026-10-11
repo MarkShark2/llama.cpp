@@ -238,7 +238,9 @@ class fixed_worker {
 public:
     using task_fn = void (*)(void *);
 
-    fixed_worker() : worker([this]() { run(); }) {}
+    fixed_worker() {
+        worker = std::thread([this]() { run(); });
+    }
 
     ~fixed_worker() {
         {
@@ -656,6 +658,89 @@ struct common_spd_pipeline::impl {
     std::atomic<bool> hidden_backup_failed{false};
     using abort_mean_fn = void (*)();
 
+    struct hidden_retirement {
+        impl * owner = nullptr;
+        std::shared_ptr<pending_hidden> pending;
+        uint32_t stage = 0;
+        llama_pos pos = -1;
+        int reason = 0; // 0: consumed input, 1: rejection, 2: terminal
+        bool ok = false;
+    };
+    bool parallel_hidden_retirement = false;
+    std::array<hidden_retirement, SPD_MAX_STAGE_COUNT> hidden_retirements;
+    std::array<std::unique_ptr<fixed_worker>, SPD_MAX_STAGE_COUNT> retirement_workers;
+
+    static void execute_hidden_retirement(void * data) {
+        auto & job = *static_cast<hidden_retirement *>(data);
+        rpc_command_trace_scope trace((uint64_t) (uintptr_t) job.owner, job.owner->command_trace_wave,
+                (int) job.stage, job.pos, (int) job.owner->timing_active_count);
+        job.owner->trace_schedule("release_begin", (int) job.stage, job.pos, job.reason);
+        job.ok = job.pending->retire();
+        job.owner->trace_schedule("release_done", (int) job.stage, job.pos, job.ok);
+    }
+
+    bool finish_hidden_retirements() {
+        if (!parallel_hidden_retirement) {
+            return true;
+        }
+        llama_pos failed_pos = -1;
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            auto & job = hidden_retirements[stage];
+            if (job.pending == nullptr) {
+                continue;
+            }
+            trace_schedule("release_wait_begin", (int) stage, job.pos, job.reason);
+            const auto failure = retirement_workers[stage]->wait();
+            const bool released = failure == nullptr && job.ok;
+            trace_schedule("release_wait_done", (int) stage, job.pos, released);
+            job.pending.reset();
+            if (!released) {
+                hidden_backup_failed.store(true);
+                ready = false;
+                failed_pos = job.pos;
+            }
+        }
+        if (failed_pos >= 0) {
+            fail("SPD compact hidden retirement failed at position " + std::to_string(failed_pos));
+        }
+        return failed_pos < 0;
+    }
+
+    bool queue_hidden_retirement(entry & item, uint32_t stage, int reason, std::string & error) {
+        if (item.pending == nullptr || item.pending->compact_release == nullptr || !parallel_hidden_retirement) {
+            return retire_hidden(item, error);
+        }
+        auto & job = hidden_retirements[stage];
+        if (job.pending != nullptr) {
+            error = "SPD compact hidden retirement slot is still in use";
+            return false;
+        }
+        // Allocate before moving ownership. Each slot holds at most one checked release.
+        if (retirement_workers[stage] == nullptr) {
+            retirement_workers[stage] = std::make_unique<fixed_worker>();
+        }
+        job = { this, std::move(item.pending), stage, item.pos, reason, false };
+        trace_schedule("release_submit", (int) stage, item.pos, reason);
+        retirement_workers[stage]->submit(execute_hidden_retirement, &job);
+        return true;
+    }
+
+    bool retire_pipeline(std::vector<entry> & pipeline, int reason) {
+        trace_schedule("retirement_group_begin", -1, -1, reason);
+        bool ok = true;
+        for (uint32_t stage = 0; stage < pipeline.size(); ++stage) {
+            std::string error;
+            if (!queue_hidden_retirement(pipeline[stage], stage, reason, error)) {
+                fail(error);
+                ok = false;
+            }
+        }
+        // Join every owner, including after a failed release.
+        const bool released = finish_hidden_retirements();
+        trace_schedule("retirement_group_done", -1, -1, reason);
+        return released && ok;
+    }
+
     bool finish_hidden_backup(uint32_t stage, std::string & error) {
         auto & backup = hidden_backups[stage];
         if (backup == nullptr) {
@@ -675,7 +760,7 @@ struct common_spd_pipeline::impl {
     }
 
     bool finish_hidden_backups() {
-        bool ok = !hidden_backup_failed.load();
+        bool ok = finish_hidden_retirements() && !hidden_backup_failed.load();
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
             std::string error;
             if (!finish_hidden_backup(stage, error)) {
@@ -713,12 +798,19 @@ struct common_spd_pipeline::impl {
     }
 
     bool retire_hidden(entry & item, std::string & error) {
+        const bool compact = item.pending != nullptr && item.pending->compact_release != nullptr;
+        if (compact) {
+            trace_schedule("release_sync_begin", -1, item.pos);
+        }
         if (item.pending != nullptr && item.pending->compact_release != nullptr && !item.pending->retire()) {
             hidden_backup_failed.store(true);
             error = "SPD compact hidden retirement failed at position " + std::to_string(item.pos);
             return false;
         }
         item.pending.reset();
+        if (compact) {
+            trace_schedule("release_sync_done", -1, item.pos);
+        }
         return true;
     }
 
@@ -893,6 +985,9 @@ struct common_spd_pipeline::impl {
         if (const char * value = std::getenv("LLAMA_SPD_HEAD_OVERLAP")) {
             overlap_head_submit = std::strcmp(value, "1") == 0;
         }
+        if (const char * value = std::getenv("LLAMA_SPD_COMPACT_RETIRE")) {
+            parallel_hidden_retirement = std::strcmp(value, "1") == 0;
+        }
         if (const char * value = std::getenv("LLAMA_SPD_TIMING")) {
             timing_enabled = std::atoi(value) != 0;
         }
@@ -919,6 +1014,9 @@ struct common_spd_pipeline::impl {
             worker.reset();
         }
         synchronize_all();
+        for (auto & worker : retirement_workers) {
+            worker.reset();
+        }
         for (auto & pb : peer_links) {
             if (pb.staging_buf != nullptr) {
                 ggml_backend_buffer_free(pb.staging_buf);
@@ -3633,8 +3731,8 @@ struct common_spd_pipeline::impl {
             error = "SPD peer boundary input tensor moved under decode stage " + std::to_string(stage);
             return false;
         }
-        // The old input cannot remain attached to this entry after its output replaces it.
-        if (!retire_hidden(item, error)) {
+        // The peer queue owns separate full bytes. Release the consumed snapshot without blocking this stage's return.
+        if (!queue_hidden_retirement(item, stage, 0, error)) {
             return false;
         }
 
@@ -4119,6 +4217,10 @@ struct common_spd_pipeline::impl {
         result.n_accepted = 1;
 
         std::vector<entry> pipeline;
+        struct retirement_join_guard {
+            impl * self;
+            ~retirement_join_guard() { self->finish_hidden_retirements(); }
+        } join_retirements{this};
         pipeline.push_back(make_entry(first_token, n_prompt, std::move(first_embedding)));
         llama_pos next_position = n_prompt + 1;
         llama_pos verified_up_to = n_prompt + 1;
@@ -4175,6 +4277,8 @@ struct common_spd_pipeline::impl {
             bool sidecar_job_submitted = false;
             std::exception_ptr worker_failure;
             struct decode_join_guard {
+                impl * self;
+                std::future<bool> * speculation;
                 std::array<fixed_worker *, SPD_MAX_STAGE_COUNT> stages = {};
                 fixed_worker * sidecar = nullptr;
                 ~decode_join_guard() {
@@ -4186,8 +4290,12 @@ struct common_spd_pipeline::impl {
                     if (sidecar != nullptr) {
                         sidecar->wait();
                     }
+                    if (speculation->valid()) {
+                        speculation->wait();
+                    }
+                    self->finish_hidden_retirements();
                 }
-            } join_workers;
+            } join_workers{this, &speculation_work};
             // The features were copied before target stages mutate their
             // snapshots, so an independently placed sidecar can decode them
             // while the target pipeline advances.
@@ -4273,6 +4381,13 @@ struct common_spd_pipeline::impl {
                 }
             }
             trace_schedule("reader_joined");
+            // Stage jobs may submit releases. Join them first, then check every ACK before publishing tokens.
+            if (!finish_hidden_retirements()) {
+                if (submit_head_early) {
+                    llama_synchronize(head);
+                }
+                return false;
+            }
             if (worker_failure != nullptr) {
                 if (submit_head_early) {
                     llama_synchronize(head);
@@ -4362,12 +4477,8 @@ struct common_spd_pipeline::impl {
                         if (!embed_token(verified_token, corrected_embedding)) {
                             return false;
                         }
-                        for (auto & item : pipeline) {
-                            std::string error;
-                            if (!retire_hidden(item, error)) {
-                                fail(error);
-                                return false;
-                            }
+                        if (!retire_pipeline(pipeline, 1)) {
+                            return false;
                         }
                         pipeline.clear();
                         peer_decode_invalidate();
@@ -4420,12 +4531,8 @@ struct common_spd_pipeline::impl {
         }
 
         trace_schedule("decode_loop_done");
-        for (auto & item : pipeline) {
-            std::string error;
-            if (!retire_hidden(item, error)) {
-                fail(error);
-                return false;
-            }
+        if (!retire_pipeline(pipeline, 2)) {
+            return false;
         }
         if (!finish_hidden_backups()) {
             return false;
