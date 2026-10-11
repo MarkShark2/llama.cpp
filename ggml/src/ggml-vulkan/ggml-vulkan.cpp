@@ -2592,23 +2592,10 @@ static constexpr size_t VK_DESCRIPTOR_CACHE_SIZE = 4096;
 
 static constexpr size_t VK_RECORDING_PLAN_ENTRIES = 4;
 static constexpr int VK_RECORDING_PLAN_NODES = 2048;
-static constexpr size_t VK_RECORDING_PLAN_TENSORS = 4096;
-static constexpr size_t VK_RECORDING_PLAN_KEY_BYTES = 2 * 1024 * 1024;
-
-struct vk_recording_plan_step {
-    uint64_t flops = 0;
-    int num_additional_fused_ops = 0;
-    int fused_ops_write_mask = 0;
-    topk_moe_mode fused_topk_moe_mode = TOPK_MOE_COUNT;
-    bool fused_topk_moe_scale = false;
-    bool fused_topk_qsa = false;
-    const char * fusion_string = nullptr;
-};
-
-// CPU preparation only: no tensor pointers, descriptors or executable commands are retained.
+// Cache only opcode candidates. All fusion eligibility and recording state stay live.
 struct vk_recording_plan {
-    std::vector<uint8_t> key;
-    std::vector<vk_recording_plan_step> steps;
+    std::vector<ggml_op> key;
+    std::vector<uint32_t> candidates;
     int64_t preparation_ns = 0;
     bool preparation_measured = false;
 };
@@ -2632,6 +2619,7 @@ struct ggml_backend_vk_context {
 
     uint64_t last_total_flops {UINT64_MAX};
     std::vector<vk_recording_plan> recording_plans;
+    vk_recording_plan recording_plan_scratch;
     uint64_t recording_plan_generation = 0;
     size_t recording_plan_next = 0;
 
@@ -18558,117 +18546,84 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-// Serialize every input to fusion selection, including use counts from outside the split.
-// Topology uses local IDs, so rebuilt graphs must match contents, not old tensor addresses.
-static bool ggml_vk_recording_plan_key(ggml_backend_vk_context * ctx, const ggml_cgraph * graph,
-                                       std::vector<uint8_t> & key) {
-    if (graph->n_nodes <= 0 || graph->n_nodes > VK_RECORDING_PLAN_NODES ||
-        graph->n_leafs < 0 || graph->n_leafs > VK_RECORDING_PLAN_NODES) {
+enum vk_recording_pattern {
+    VK_RECORDING_MULTI_ADD,
+    VK_RECORDING_Q8_SWIGLU,
+    VK_RECORDING_MUL_MAT_ADD_ADD,
+    VK_RECORDING_MUL_MAT_ADD,
+    VK_RECORDING_MUL_MAT_ID_ADD_ID_MUL,
+    VK_RECORDING_MUL_MAT_ID_ADD_ID,
+    VK_RECORDING_MUL_MAT_ID_MUL,
+    VK_RECORDING_RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
+    VK_RECORDING_RMS_NORM_MUL_ROPE,
+    VK_RECORDING_RMS_NORM_MUL,
+    VK_RECORDING_SSM_CONV_BIAS_SILU,
+    VK_RECORDING_SSM_CONV_SILU,
+    VK_RECORDING_ROPE_VIEW_SET_ROWS,
+    VK_RECORDING_SNAKE,
+    VK_RECORDING_TOPK_QSA,
+    VK_RECORDING_TOPK_MOE_EARLY_SOFTMAX_NORM,
+    VK_RECORDING_TOPK_MOE_SIGMOID_NORM_BIAS,
+    VK_RECORDING_TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS,
+    VK_RECORDING_TOPK_MOE_EARLY_SOFTMAX,
+    VK_RECORDING_TOPK_MOE_LATE_SOFTMAX,
+    VK_RECORDING_PATTERN_COUNT
+};
+
+static constexpr std::initializer_list<ggml_op> vk_recording_patterns[] = {
+    { GGML_OP_ADD, GGML_OP_ADD },
+    { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU },
+    { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD },
+    { GGML_OP_MUL_MAT, GGML_OP_ADD },
+    { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL },
+    { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID },
+    { GGML_OP_MUL_MAT_ID, GGML_OP_MUL },
+    { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS },
+    { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE },
+    { GGML_OP_RMS_NORM, GGML_OP_MUL },
+    { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY },
+    { GGML_OP_SSM_CONV, GGML_OP_UNARY },
+    { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS },
+    snake_pattern,
+    topk_qsa_pattern,
+    topk_moe_early_softmax_norm,
+    topk_moe_sigmoid_norm_bias,
+    topk_moe_sqrt_softplus_norm_bias,
+    topk_moe_early_softmax,
+    topk_moe_late_softmax,
+};
+static_assert(VK_RECORDING_PATTERN_COUNT <= 32, "Fusion candidate mask is too small");
+static_assert(sizeof(vk_recording_patterns) / sizeof(vk_recording_patterns[0]) == VK_RECORDING_PATTERN_COUNT, "Fusion pattern count differs");
+
+static bool ggml_vk_recording_plan_key(const ggml_cgraph * graph, std::vector<ggml_op> & key) {
+    if (graph->n_nodes <= 0 || graph->n_nodes > VK_RECORDING_PLAN_NODES) {
         return false;
     }
-    std::unordered_map<const ggml_tensor *, uint32_t> ids;
-    std::vector<const ggml_tensor *> tensors;
-    ids.emplace(nullptr, 0);
-    auto add_tensor = [&](const ggml_tensor * tensor) {
-        if (ids.find(tensor) == ids.end()) {
-            if (tensors.size() == VK_RECORDING_PLAN_TENSORS) {
-                return false;
-            }
-            tensors.push_back(tensor);
-            ids.emplace(tensor, (uint32_t) tensors.size());
-        }
-        return true;
-    };
+    key.reserve(VK_RECORDING_PLAN_NODES);
+    key.resize(graph->n_nodes);
     for (int i = 0; i < graph->n_nodes; ++i) {
-        if (!graph->nodes[i] || !add_tensor(graph->nodes[i])) {
-            return false;
-        }
+        key[i] = graph->nodes[i]->op;
     }
-    for (int i = 0; i < graph->n_leafs; ++i) {
-        if (!graph->leafs[i] || !add_tensor(graph->leafs[i])) {
-            return false;
-        }
-    }
-    for (size_t i = 0; i < tensors.size(); ++i) {
-        const ggml_tensor * tensor = tensors[i];
-        if (!add_tensor(tensor->view_src)) {
-            return false;
-        }
-        for (const ggml_tensor * src : tensor->src) {
-            if (!add_tensor(src)) {
-                return false;
-            }
-        }
-    }
+    return true;
+}
 
-    bool complete = true;
-    auto append = [&](const auto & value) {
-        const auto * bytes = reinterpret_cast<const uint8_t *>(&value);
-        if (sizeof(value) > VK_RECORDING_PLAN_KEY_BYTES - key.size()) {
-            complete = false;
-            return false;
-        }
-        key.insert(key.end(), bytes, bytes + sizeof(value));
-        return true;
-    };
-    // Reserve once; the maximum includes ordered IDs, use counts and buffer metadata.
-    key.reserve(std::min(VK_RECORDING_PLAN_KEY_BYTES, size_t(256) + tensors.size() * 512));
-    append(graph->n_nodes);
-    append(graph->n_leafs);
-    append(ctx->recording_plan_generation);
-    append(ctx->device->disable_fusion);
-    append(ctx->device->multi_add);
-    append(ctx->device->driver_id);
-    append(ctx->device->subgroup_arithmetic);
-    append(ctx->device->subgroup_shuffle);
-    append(ctx->device->subgroup_require_full_support);
-    append(ctx->device->subgroup_size_log2);
-    append(ctx->device->properties.limits.minStorageBufferOffsetAlignment);
-    append(ctx->device->properties.limits.maxPushConstantsSize);
-    append(bool(ctx->device->pipeline_topk_radix_qsa));
-    for (const auto & pipeline : ctx->device->pipeline_topk_f32) {
-        append(bool(pipeline));
-    }
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        append(ids.at(graph->nodes[i]));
-        append(ggml_node_get_use_count(graph, i));
-    }
-    for (int i = 0; i < graph->n_leafs; ++i) {
-        append(ids.at(graph->leafs[i]));
-    }
-    for (const ggml_tensor * tensor : tensors) {
-        if (!append(tensor->type) || !append(tensor->op) || !append(tensor->flags) ||
-            !append(tensor->ne) || !append(tensor->nb) || !append(tensor->op_params) ||
-            !append(tensor->data) || !append(tensor->view_offs) || !append(ids.at(tensor->view_src))) {
-            return false;
-        }
-        for (const ggml_tensor * src : tensor->src) {
-            if (!append(ids.at(src))) {
-                return false;
+static void ggml_vk_recording_plan_prepare(vk_recording_plan & plan) {
+    plan.candidates.reserve(VK_RECORDING_PLAN_NODES);
+    plan.candidates.resize(plan.key.size());
+    // Include skipped fusion interiors: their live eligibility can change on the next hit.
+    for (size_t i = 0; i < plan.key.size(); ++i) {
+        uint32_t mask = 0;
+        for (uint32_t p = 0; p < VK_RECORDING_PATTERN_COUNT; ++p) {
+            const auto & pattern = vk_recording_patterns[p];
+            if (i + pattern.size() > plan.key.size() || plan.key[i] != *pattern.begin()) {
+                continue;
+            }
+            if (std::equal(pattern.begin(), pattern.end(), plan.key.begin() + i)) {
+                mask |= 1u << p;
             }
         }
-        if (!append(tensor->buffer)) {
-            return false;
-        }
-        if (tensor->buffer) {
-            if (!append(tensor->buffer->buft) || !append(tensor->buffer->usage) || !append(tensor->buffer->size)) {
-                return false;
-            }
-            if (ggml_backend_buffer_is_vk(tensor->buffer)) {
-                const auto * buffer_ctx = (const ggml_backend_vk_buffer_context *) tensor->buffer->context;
-                const vk_buffer & buffer = buffer_ctx->dev_buffer;
-                if (!buffer || buffer->device != ctx->device) {
-                    return false;
-                }
-                const VkBuffer handle = buffer->buffer;
-                // The wrapper identity is also used by the existing overlap predicate.
-                if (!append(buffer.get()) || !append(handle) || !append(buffer->size)) {
-                    return false;
-                }
-            }
-        }
+        plan.candidates[i] = mask;
     }
-    return complete && key.capacity() <= VK_RECORDING_PLAN_KEY_BYTES;
 }
 
 static uint64_t ggml_vk_recording_plan_trace_limit() {
@@ -18691,7 +18646,7 @@ static int64_t ggml_vk_recording_plan_time_ns() {
 
 struct vk_recording_plan_run {
     ggml_backend_vk_context * ctx;
-    vk_recording_plan candidate;
+    vk_recording_plan & candidate;
     const vk_recording_plan * hit = nullptr;
     bool eligible = false;
     bool completed = false;
@@ -18700,14 +18655,18 @@ struct vk_recording_plan_run {
     size_t invalidated = 0;
     size_t evicted = 0;
     size_t key_bytes = 0;
-    int64_t key_ns = 0, lookup_ns = 0, preparation_ns = 0, saved_ns = 0;
+    int64_t key_ns = 0, lookup_ns = 0, preparation_ns = 0, live_preparation_ns = 0, saved_ns = 0;
     bool saved_measured = false;
     const char * outcome = "off";
     const char * invalidation = "none";
 
     int64_t timer_start() const { return trace_id ? ggml_vk_recording_plan_time_ns() : 0; }
     void add_preparation(int64_t start) {
-        if (trace_id) { preparation_ns += ggml_vk_recording_plan_time_ns() - start; }
+        if (trace_id) { live_preparation_ns += ggml_vk_recording_plan_time_ns() - start; }
+    }
+
+    uint32_t candidate_mask(int node) const {
+        return eligible ? (hit ? hit : &candidate)->candidates[node] : UINT32_MAX;
     }
 
     void invalidate(const char * reason) {
@@ -18717,7 +18676,7 @@ struct vk_recording_plan_run {
         ctx->recording_plan_next = 0;
     }
 
-    vk_recording_plan_run(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) : ctx(ctx), nodes(graph->n_nodes) {
+    vk_recording_plan_run(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) : ctx(ctx), candidate(ctx->recording_plan_scratch), nodes(graph->n_nodes) {
         if (ggml_vk_recording_plan_trace_limit()) {
             static std::atomic<uint64_t> sequence{0};
             auto next = sequence.load(std::memory_order_relaxed);
@@ -18736,12 +18695,16 @@ struct vk_recording_plan_run {
             invalidate("allocation");
             ctx->recording_plan_generation = generation;
         }
+        if (ctx->device->disable_fusion) {
+            outcome = "fusion-disabled";
+            return;
+        }
         try {
             ctx->recording_plans.reserve(VK_RECORDING_PLAN_ENTRIES);
             const int64_t key_start = timer_start();
-            eligible = ggml_vk_recording_plan_key(ctx, graph, candidate.key);
+            eligible = ggml_vk_recording_plan_key(graph, candidate.key);
             if (trace_id) { key_ns = ggml_vk_recording_plan_time_ns() - key_start; }
-            key_bytes = candidate.key.size();
+            key_bytes = eligible ? candidate.key.size() * sizeof(ggml_op) : 0;
             outcome = eligible ? "miss" : "ineligible";
             if (!eligible) {
                 return;
@@ -18758,7 +18721,9 @@ struct vk_recording_plan_run {
                 }
             }
             if (trace_id) { lookup_ns = ggml_vk_recording_plan_time_ns() - lookup_start; }
-            candidate.steps.resize(graph->n_nodes);
+            const int64_t preparation_start = timer_start();
+            ggml_vk_recording_plan_prepare(candidate);
+            if (trace_id) { preparation_ns = ggml_vk_recording_plan_time_ns() - preparation_start; }
         } catch (const std::bad_alloc &) {
             // Optional CPU preparation must not turn allocation pressure into a graph failure.
             eligible = false;
@@ -18773,10 +18738,11 @@ struct vk_recording_plan_run {
         if (eligible && !hit && ctx->recording_plan_generation ==
                 ctx->device->buffer_allocation_generation.load(std::memory_order_relaxed)) {
             if (ctx->recording_plans.size() < VK_RECORDING_PLAN_ENTRIES) {
-                ctx->recording_plans.push_back(std::move(candidate));
+                ctx->recording_plans.emplace_back();
+                std::swap(ctx->recording_plans.back(), candidate);
             } else {
                 evicted = 1;
-                ctx->recording_plans[ctx->recording_plan_next] = std::move(candidate);
+                std::swap(ctx->recording_plans[ctx->recording_plan_next], candidate);
                 ctx->recording_plan_next = (ctx->recording_plan_next + 1) % VK_RECORDING_PLAN_ENTRIES;
             }
         }
@@ -18793,12 +18759,12 @@ struct vk_recording_plan_run {
             invalidate("interrupted");
         }
         if (trace_id) {
-            GGML_LOG_INFO("[vk plan] id=%llu host=%llu device=\"%s\" ctx=%p nodes=%d mode=exact outcome=%s "
-                          "complete=%d key_bytes=%zu key_us=%.3f lookup_us=%.3f prepare_us=%.3f "
+            GGML_LOG_INFO("[vk plan] id=%llu host=%llu device=\"%s\" ctx=%p nodes=%d mode=opcode outcome=%s "
+                          "complete=%d key_bytes=%zu key_us=%.3f lookup_us=%.3f prepare_us=%.3f live_prepare_us=%.3f "
                           "saved_prepare_us_est=%.3f saved_prepare_known=%d invalidated=%zu reason=%s evicted=%zu entries=%zu\n",
                           (unsigned long long) trace_id, (unsigned long long) vk_host_parent_id,
                           ctx->device->name.c_str(), (void *) ctx, nodes, outcome, completed,
-                          key_bytes, key_ns / 1000.0, lookup_ns / 1000.0, preparation_ns / 1000.0,
+                          key_bytes, key_ns / 1000.0, lookup_ns / 1000.0, preparation_ns / 1000.0, live_preparation_ns / 1000.0,
                           saved_ns / 1000.0, saved_measured, invalidated, invalidation, evicted, ctx->recording_plans.size());
         }
     }
@@ -18944,9 +18910,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             submit_node_idx = i;
         }
 
-        const vk_recording_plan_step * cached_step = plan_run.hit ? &plan_run.hit->steps[i] : nullptr;
         const int64_t flops_start = plan_run.timer_start();
-        const uint64_t node_flops = cached_step ? cached_step->flops : ggml_vk_get_node_flops(cgraph->nodes[i]);
+        const uint64_t node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
         plan_run.add_preparation(flops_start);
         {
             total_flops += node_flops;
@@ -18966,6 +18931,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         const int64_t preparation_start = plan_run.timer_start();
+        const uint32_t candidates = plan_run.candidate_mask(i);
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
@@ -18976,54 +18942,46 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         const char *fusion_string {};
-        if (cached_step) {
-            ctx->num_additional_fused_ops = cached_step->num_additional_fused_ops;
-            ctx->fused_ops_write_mask = cached_step->fused_ops_write_mask;
-            ctx->fused_topk_moe_mode = cached_step->fused_topk_moe_mode;
-            ctx->fused_topk_moe_scale = cached_step->fused_topk_moe_scale;
-            ctx->fused_topk_qsa = cached_step->fused_topk_qsa;
-            fusion_string = cached_step->fusion_string;
-        }
-        if (!cached_step && !ctx->device->disable_fusion) {
-            uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+        if (!ctx->device->disable_fusion) {
+            uint32_t num_adds = (candidates & (1u << VK_RECORDING_MULTI_ADD)) ? ggml_vk_fuse_multi_add(ctx, cgraph, i) : 0;
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
-            } else if (ggml_vk_can_fuse_q8_swiglu(ctx, cgraph, i)) {
+            } else if ((candidates & (1u << VK_RECORDING_Q8_SWIGLU)) && ggml_vk_can_fuse_q8_swiglu(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "Q8_SWIGLU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
+            } else if ((candidates & (1u << VK_RECORDING_MUL_MAT_ADD_ADD)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            } else if ((candidates & (1u << VK_RECORDING_MUL_MAT_ADD)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
+            } else if ((candidates & (1u << VK_RECORDING_MUL_MAT_ID_ADD_ID_MUL)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
+            } else if ((candidates & (1u << VK_RECORDING_MUL_MAT_ID_ADD_ID)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL })) {
+            } else if ((candidates & (1u << VK_RECORDING_MUL_MAT_ID_MUL)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_RMS_NORM_MUL_ROPE_VIEW_SET_ROWS)) && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i + 2)) {
@@ -19034,7 +18992,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[2] = false;
                 op_srcs_fused_elementwise[3] = false;
                 op_srcs_fused_elementwise[4] = false;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })&&
+            } else if ((candidates & (1u << VK_RECORDING_RMS_NORM_MUL_ROPE)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })&&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "RMS_NORM_MUL_ROPE";
@@ -19042,14 +19000,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            } else if ((candidates & (1u << VK_RECORDING_RMS_NORM_MUL)) && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
                 // rms_norm is not elementwise, but whole rows must be consumed and the scale factor computed before
                 // they are overwritten, and one workgroup per row. So close enough.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
+            } else if ((candidates & (1u << VK_RECORDING_SSM_CONV_BIAS_SILU)) && ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
                 // ssm_conv reads multiple input tokens per output, so it's not elementwise w.r.t. its srcs.
@@ -19057,12 +19015,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 1)) {
+            } else if ((candidates & (1u << VK_RECORDING_SSM_CONV_SILU)) && ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 1)) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_ROPE_VIEW_SET_ROWS)) && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
@@ -19070,7 +19028,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
-            } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
+            } else if ((candidates & (1u << VK_RECORDING_SNAKE)) && ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
                 // elementwise=true: snake.comp is safe under exact aliasing because each
@@ -19078,12 +19036,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
-            } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
+            } else if ((candidates & (1u << VK_RECORDING_TOPK_QSA)) && ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
                 fusion_string = "TOPK_QSA";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax_norm, { i + 3, i + 9 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_TOPK_MOE_EARLY_SOFTMAX_NORM)) && ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax_norm, { i + 3, i + 9 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_norm_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX_NORM)) {
                 ctx->num_additional_fused_ops = topk_moe_early_softmax_norm.size() - 1;
@@ -19092,7 +19050,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_EARLY_SOFTMAX_NORM;
                 fusion_string = "TOPK_MOE_EARLY_SOFTMAX_NORM";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_TOPK_MOE_SIGMOID_NORM_BIAS)) && ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_sigmoid_norm_bias_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SIGMOID_NORM_BIAS)) {
                 ctx->num_additional_fused_ops = topk_moe_sigmoid_norm_bias.size() - 1;
@@ -19101,7 +19059,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_SIGMOID_NORM_BIAS;
                 fusion_string = "TOPK_MOE_SIGMOID_NORM_BIAS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sqrt_softplus_norm_bias, { i + 5, i + 11 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS)) && ggml_can_fuse_subgraph(cgraph, i, topk_moe_sqrt_softplus_norm_bias, { i + 5, i + 11 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_sqrt_softplus_norm_bias_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS)) {
                 ctx->num_additional_fused_ops = topk_moe_sqrt_softplus_norm_bias.size() - 1;
@@ -19110,7 +19068,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS;
                 fusion_string = "TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax, { i + 3, i + 4 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_TOPK_MOE_EARLY_SOFTMAX)) && ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax, { i + 3, i + 4 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX)) {
                 ctx->num_additional_fused_ops = topk_moe_early_softmax.size() - 1;
@@ -19119,7 +19077,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_EARLY_SOFTMAX;
                 fusion_string = "TOPK_MOE_EARLY_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_late_softmax, { i + 1, i + 5 }) &&
+            } else if ((candidates & (1u << VK_RECORDING_TOPK_MOE_LATE_SOFTMAX)) && ggml_can_fuse_subgraph(cgraph, i, topk_moe_late_softmax, { i + 1, i + 5 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_late_softmax_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_LATE_SOFTMAX)) {
                 ctx->num_additional_fused_ops = topk_moe_late_softmax.size() - 1;
@@ -19144,7 +19102,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (!cached_step && ctx->num_additional_fused_ops) {
+        if (ctx->num_additional_fused_ops) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -19201,11 +19159,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
             }
-        }
-
-        if (plan_run.eligible && !cached_step) {
-            plan_run.candidate.steps[i] = { node_flops, ctx->num_additional_fused_ops, ctx->fused_ops_write_mask,
-                ctx->fused_topk_moe_mode, ctx->fused_topk_moe_scale, ctx->fused_topk_qsa, fusion_string };
         }
 
         plan_run.add_preparation(preparation_start);
