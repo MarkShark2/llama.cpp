@@ -971,6 +971,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_q8_swiglu[mul_mat_vec_max_cols];
     vk_pipeline pipeline_q8_id_direct;
+    vk_pipeline pipeline_q8_packed;
+    std::mutex q8_packed_compile_mutex;
+    std::atomic<bool> q8_packed_compile_failed { false };
     vk_pipeline pipeline_q6_full_tiles;
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
@@ -2798,10 +2801,39 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     GGML_UNUSED(src3);
 }
 
+static constexpr size_t vk_q8_packed_bytes = 34u * 1024 * 1024;
+
+struct vk_q8_packed_owner {
+    vk_buffer packed;
+    size_t offset = 0;
+    uint32_t k = 0;
+    bool registered = false;
+    bool conflict = false;
+    bool ready = false;
+    std::vector<uint8_t> upload;
+    std::vector<uint64_t> coverage;
+    size_t remaining = 0;
+    uint64_t packs = 0;
+    uint64_t selections = 0;
+    uint64_t fallbacks = 0;
+    uint32_t selected_columns = 0;
+
+    void discard_upload() {
+        std::vector<uint8_t>().swap(upload);
+        std::vector<uint64_t>().swap(coverage);
+        remaining = 0;
+    }
+};
+
 struct ggml_backend_vk_buffer_context {
     vk_device_ref device;
     vk_buffer dev_buffer;
     std::string name;
+    std::mutex packed_mutex;
+    std::array<vk_q8_packed_owner, 3> q8_packed;
+    bool spd_reader = false;
+    size_t spd_marker_offset = 0;
+    size_t spd_marker_size = 0;
 
     ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
         device(device),
@@ -2810,6 +2842,15 @@ struct ggml_backend_vk_buffer_context {
     }
 
     ~ggml_backend_vk_buffer_context() {
+        for (size_t i = 0; i < q8_packed.size(); ++i) {
+            auto & owner = q8_packed[i];
+            if (owner.packs || owner.selections || owner.fallbacks) {
+                std::cerr << "ggml_vulkan: packed Q8 owner " << i << " packs=" << owner.packs
+                          << " selected=" << owner.selections << " fallback=" << owner.fallbacks
+                          << " bytes=" << (owner.packed ? owner.packed->size : 0) << " released\n";
+            }
+            ggml_vk_destroy_buffer(owner.packed);
+        }
         ggml_vk_destroy_buffer(dev_buffer);
     }
 };
@@ -6018,6 +6059,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define OCP_DMMV_LEN(NAME, REDUC)  NAME ## _len[REDUC]
 #define OCP_DMMV_DATA(NAME, REDUC) NAME ## _data[REDUC]
 #endif
+
+    static const bool q8_packed_requested = [] {
+        const char * value = std::getenv("GGML_VK_GCN_Q8_PACKED");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const bool q8_packed = q8_packed_requested &&
+            device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_GCN &&
+            device->driver_id == vk::DriverId::eMesaRadv && !device->integer_dot_product &&
+            std::strstr(device->properties.deviceName, "V340L") && device->subgroup_size == 64 &&
+            device->properties.limits.maxComputeWorkGroupInvocations >= 256 &&
+            device->properties.limits.maxComputeWorkGroupSize[0] >= 256 &&
+            device->properties.limits.maxComputeSharedMemorySize >= 6144 &&
+            device->properties.limits.maxStorageBufferRange >= vk_q8_packed_bytes;
+    if (q8_packed) {
+        if (!device->pipeline_q8_packed) {
+            std::cerr << "ggml_vulkan: packed Q8 FFN0 enabled on " << device->properties.deviceName << "\n";
+        }
+        ggml_vk_create_pipeline(device, device->pipeline_q8_packed, "mul_mat_q8_0_f32_packed",
+                mul_mat_q8_0_f32_packed_len, mul_mat_q8_0_f32_packed_data, "main", 3, 5 * sizeof(uint32_t),
+                {64, 4, 1}, {}, 1, true, false, 0);
+    }
 
     if (q8_id_direct) {
         ggml_vk_create_pipeline(device, device->pipeline_q8_id_direct, "mul_mat_vec_id_direct_q8_0_f32",
@@ -10480,6 +10542,213 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     GGML_UNUSED(m);
 }
 
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+
+static int ggml_vk_q8_packed_slot(const ggml_tensor * tensor) {
+    if (tensor->type != GGML_TYPE_Q8_0 || tensor->view_src || tensor->view_offs ||
+        tensor->ne[2] != 1 || tensor->ne[3] != 1 || !ggml_is_contiguous(tensor)) {
+        return -1;
+    }
+    if (tensor->ne[0] == 4096 && tensor->ne[1] == 8192) {
+        if (std::strcmp(tensor->name, "blk.0.ffn_gate.weight") == 0) { return 0; }
+        if (std::strcmp(tensor->name, "blk.0.ffn_up.weight") == 0) { return 1; }
+    }
+    if (tensor->ne[0] == 8192 && tensor->ne[1] == 4096 &&
+        std::strcmp(tensor->name, "blk.0.ffn_down.weight") == 0) { return 2; }
+    return -1;
+}
+
+// Keep the allocation alive while dirty: previously submitted descriptors may still use it.
+static void ggml_vk_q8_packed_invalidate_locked(ggml_backend_vk_buffer_context * ctx, size_t offset, size_t size) {
+    for (auto & owner : ctx->q8_packed) {
+        if (owner.registered && offset < owner.offset + vk_q8_packed_bytes &&
+            (offset >= owner.offset || size > owner.offset - offset)) {
+            owner.ready = false;
+            owner.discard_upload();
+        }
+    }
+}
+
+static void ggml_vk_q8_packed_invalidate(ggml_backend_vk_buffer_context * ctx, size_t offset, size_t size) {
+    if (!ctx->device.lock()->pipeline_q8_packed || size == 0) { return; }
+    std::lock_guard<std::mutex> lock(ctx->packed_mutex);
+    ggml_vk_q8_packed_invalidate_locked(ctx, offset, size);
+}
+
+static void ggml_vk_q8_packed_invalidate_tensor(const ggml_tensor * tensor) {
+    if (tensor && tensor->buffer && ggml_backend_buffer_is_vk(tensor->buffer)) {
+        auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+        ggml_vk_q8_packed_invalidate(ctx, vk_tensor_offset(tensor) + tensor->view_offs, ggml_nbytes(tensor));
+    }
+}
+
+static void ggml_vk_q8_packed_upload(ggml_backend_vk_buffer_context * ctx, const ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, ggml_backend_vk_context * async_ctx = nullptr) {
+    auto device = ctx->device.lock();
+    if (!device->pipeline_q8_packed || size == 0) { return; }
+    const int slot = ggml_vk_q8_packed_slot(tensor);
+    const size_t base = vk_tensor_offset(tensor);
+    if (!ctx->spd_reader || ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        device->uma || ctx->dev_buffer->imported_host_memory ||
+        slot < 0 || offset > vk_q8_packed_bytes || size > vk_q8_packed_bytes - offset) {
+        ggml_vk_q8_packed_invalidate(ctx, base + tensor->view_offs + offset, size);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx->packed_mutex);
+    auto & owner = ctx->q8_packed[slot];
+    if (!owner.registered || owner.offset != base || owner.k != tensor->ne[0]) {
+        ggml_vk_q8_packed_invalidate_locked(ctx, base + offset, size);
+        return;
+    }
+    for (auto & other : ctx->q8_packed) {
+        if (&other != &owner && other.registered && base < other.offset + vk_q8_packed_bytes &&
+            other.offset < base + vk_q8_packed_bytes) {
+            other.ready = false;
+            other.discard_upload();
+        }
+    }
+    const bool full = offset == 0 && size == vk_q8_packed_bytes;
+    std::vector<uint8_t> packed;
+    try {
+        if (owner.ready || full) { owner.discard_upload(); }
+        owner.ready = false;
+        const uint8_t * canonical = static_cast<const uint8_t *>(data);
+        if (!full) {
+            if (owner.upload.empty()) {
+                owner.upload.resize(vk_q8_packed_bytes);
+                owner.coverage.assign(vk_q8_packed_bytes / 64, 0);
+                owner.remaining = vk_q8_packed_bytes;
+            }
+            std::memcpy(owner.upload.data() + offset, data, size);
+            for (size_t at = offset; at < offset + size;) {
+                const size_t count = std::min(size_t(64 - at % 64), offset + size - at);
+                const uint64_t mask = count == 64 ? UINT64_MAX : ((uint64_t(1) << count) - 1) << (at % 64);
+                uint64_t added = mask & ~owner.coverage[at / 64];
+                while (added) { added &= added - 1; --owner.remaining; }
+                owner.coverage[at / 64] |= mask;
+                at += count;
+            }
+            if (owner.remaining) { return; }
+            canonical = owner.upload.data();
+        }
+        packed.resize(vk_q8_packed_bytes);
+        const size_t blocks = owner.k / 32;
+        const size_t rows = 33554432u / owner.k;
+        for (size_t tile = 0; tile < rows / 64; ++tile) {
+            for (size_t block = 0; block < blocks; ++block) {
+                uint8_t * out = packed.data() + (tile * blocks + block) * 2176;
+                for (size_t row = 0; row < 64; ++row) {
+                    const uint8_t * in = canonical + ((tile * 64 + row) * blocks + block) * 34;
+                    std::memcpy(out + row * 2, in, 2);
+                    for (size_t q = 0; q < 8; ++q) {
+                        std::memcpy(out + 128 + (q * 64 + row) * 4, in + 2 + q * 4, 4);
+                    }
+                }
+            }
+        }
+        if (!owner.packed) { owner.packed = ggml_vk_create_buffer_device(device, vk_q8_packed_bytes); }
+    } catch (const std::bad_alloc &) {
+        owner.ready = false;
+        owner.discard_upload();
+        std::cerr << "ggml_vulkan: packed Q8 host allocation unavailable; using stock reader\n";
+        return;
+    } catch (const vk::SystemError & e) {
+        owner.ready = false;
+        owner.discard_upload();
+        if (e.code().value() != int(vk::Result::eErrorOutOfDeviceMemory) &&
+            e.code().value() != int(vk::Result::eErrorOutOfHostMemory)) { throw; }
+        std::cerr << "ggml_vulkan: packed Q8 allocation unavailable; using stock reader\n";
+        return;
+    }
+    // Submission failures are not optional-allocation failures. Propagate them normally.
+    if (async_ctx) { ggml_vk_synchronize(async_ctx); }
+    ggml_vk_buffer_write(owner.packed, 0, packed.data(), packed.size());
+    owner.ready = true;
+    ++owner.packs;
+    if (owner.packs == 1) {
+        std::cerr << "ggml_vulkan: packed Q8 owner " << slot << " ready bytes=" << packed.size() << "\n";
+    }
+    owner.discard_upload();
+
+}
+
+static int ggml_vk_q8_packed_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    if (!ctx->device->pipeline_q8_packed || ctx->device->q8_packed_compile_failed) { return -1; }
+    const ggml_tensor * weights = dst->src[0];
+    const ggml_tensor * input = dst->src[1];
+    const int slot = ggml_vk_q8_packed_slot(weights);
+    if (slot < 0 || input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        input->ne[0] != weights->ne[0] || input->ne[1] < 2 || input->ne[1] > 13 ||
+        input->ne[2] != 1 || input->ne[3] != 1 || dst->ne[0] != weights->ne[1] ||
+        dst->ne[1] != input->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+        !weights->buffer || !input->buffer || !dst->buffer ||
+        !ggml_backend_buffer_is_vk(weights->buffer) || !ggml_backend_buffer_is_vk(input->buffer) ||
+        !ggml_backend_buffer_is_vk(dst->buffer)) { return -1; }
+    for (const auto * tensor : { weights, input, static_cast<const ggml_tensor *>(dst) }) {
+        auto * buffer = static_cast<ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+        const size_t offset = vk_tensor_offset(tensor) + tensor->view_offs;
+        if (buffer->dev_buffer->device != ctx->device || offset > buffer->dev_buffer->size ||
+            ggml_nbytes(tensor) > buffer->dev_buffer->size - offset ||
+            offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) { return -1; }
+    }
+    return slot;
+}
+
+static bool ggml_vk_try_q8_packed(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    if (ctx->num_additional_fused_ops != 0) { return false; }
+    const int slot = ggml_vk_q8_packed_eligible(ctx, dst);
+    if (slot < 0) { return false; }
+    const ggml_tensor * weights = dst->src[0];
+    const ggml_tensor * input = dst->src[1];
+    auto * buffer = static_cast<ggml_backend_vk_buffer_context *>(weights->buffer->context);
+    std::lock_guard<std::mutex> lock(buffer->packed_mutex);
+    auto & owner = buffer->q8_packed[slot];
+    if (!buffer->spd_reader || ggml_backend_buffer_get_usage(weights->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        ctx->device->uma || buffer->dev_buffer->imported_host_memory || !owner.registered || owner.offset != vk_tensor_offset(weights) ||
+        owner.k != weights->ne[0] || !owner.ready || !owner.packed) {
+        ++owner.fallbacks;
+        return false;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_q8_packed;
+    {
+        std::lock_guard<std::mutex> compile_lock(ctx->device->q8_packed_compile_mutex);
+        if (ctx->device->q8_packed_compile_failed) { ++owner.fallbacks; return false; }
+        try {
+            if (!pipeline->compiled) { ggml_vk_load_shaders(ctx->device, pipeline); }
+        } catch (const vk::SystemError & e) {
+            if (e.code().value() == int(vk::Result::eErrorDeviceLost)) { throw; }
+            ctx->device->q8_packed_compile_failed = true;
+            std::cerr << "ggml_vulkan: packed Q8 pipeline unavailable; using stock reader: " << e.what() << "\n";
+        } catch (const std::exception & e) {
+            ctx->device->q8_packed_compile_failed = true;
+            std::cerr << "ggml_vulkan: packed Q8 pipeline unavailable; using stock reader: " << e.what() << "\n";
+        }
+        if (ctx->device->q8_packed_compile_failed) {
+            ggml_vk_destroy_pipeline(ctx->device->device, pipeline);
+            pipeline->pipeline = VK_NULL_HANDLE;
+            pipeline->layout = VK_NULL_HANDLE;
+            pipeline->shader_module = VK_NULL_HANDLE;
+            ++owner.fallbacks;
+            return false;
+        }
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::array<uint32_t, 5> pc = { (uint32_t)weights->ne[1], (uint32_t)input->ne[1],
+        (uint32_t)weights->ne[0], (uint32_t)(input->nb[1] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)) };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { vk_subbuffer{owner.packed, 0, vk_q8_packed_bytes}, ggml_vk_tensor_subbuffer(ctx, input), ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], 1 });
+    ++owner.selections;
+    const uint32_t bit = 1u << input->ne[1];
+    if (!(owner.selected_columns & bit)) {
+        owner.selected_columns |= bit;
+        std::cerr << "ggml_vulkan: packed Q8 selected owner=" << slot << " M=" << dst->ne[0]
+                  << " N=" << input->ne[1] << " K=" << input->ne[0] << "\n";
+    }
+    return true;
+}
+
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -11035,6 +11304,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+    if (ggml_vk_try_q8_packed(ctx, subctx, dst)) { return; }
 
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
@@ -17964,6 +18234,43 @@ static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t
     if (tensor->view_src != nullptr) {
         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
     }
+    auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
+    if (ctx->device.lock()->pipeline_q8_packed && !tensor->view_src) {
+        const size_t offset = vk_tensor_offset(tensor);
+        const size_t size = ggml_nbytes(tensor);
+        std::lock_guard<std::mutex> lock(ctx->packed_mutex);
+        if (ctx->spd_reader && offset < ctx->spd_marker_offset + ctx->spd_marker_size &&
+            (offset >= ctx->spd_marker_offset || size > ctx->spd_marker_offset - offset)) {
+            ctx->spd_reader = false;
+        }
+        if (std::strcmp(tensor->name, "blk.0.reader_norm.weight") == 0 &&
+            tensor->ne[0] == 4096 && tensor->ne[1] == 1 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+            tensor->view_offs == 0 && ggml_is_contiguous(tensor) && tensor->op == GGML_OP_NONE &&
+            offset <= ctx->dev_buffer->size && size <= ctx->dev_buffer->size - offset) {
+            ctx->spd_reader = true;
+            ctx->spd_marker_offset = offset;
+            ctx->spd_marker_size = size;
+        }
+        const int slot = ggml_vk_q8_packed_slot(tensor);
+        const bool conflict = slot >= 0 && ctx->q8_packed[slot].registered && ctx->q8_packed[slot].offset != offset;
+        for (auto & owner : ctx->q8_packed) {
+            if (owner.registered && offset < owner.offset + vk_q8_packed_bytes &&
+                (offset >= owner.offset || size > owner.offset - offset)) {
+                owner.ready = false;
+                owner.registered = false;
+                owner.discard_upload();
+            }
+        }
+        if (slot >= 0 && offset <= ctx->dev_buffer->size && vk_q8_packed_bytes <= ctx->dev_buffer->size - offset) {
+            auto & owner = ctx->q8_packed[slot];
+            owner.conflict |= conflict;
+            owner.registered = !owner.conflict;
+            owner.ready = false;
+            owner.offset = offset;
+            owner.k = tensor->ne[0];
+            owner.discard_upload();
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -17977,10 +18284,11 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
     }
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
+    ggml_vk_q8_packed_invalidate(buf_ctx, vk_tensor_offset(tensor) + tensor->view_offs + offset, size);
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
 
-static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) try {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
     vk_buffer buf = buf_ctx->dev_buffer;
@@ -17990,10 +18298,14 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
     }
 
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    ggml_vk_q8_packed_upload(buf_ctx, tensor, data, offset, size);
+} catch (...) {
+    ggml_vk_q8_packed_invalidate_tensor(tensor);
+    throw;
 }
 
 static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
-                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) try {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor_2d(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ", " <<
                  n_copies << ", " << stride_tensor << ", " << stride_data << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
@@ -18004,6 +18316,12 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
     }
 
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
+    for (size_t i = 0; i < n_copies; ++i) {
+        ggml_vk_q8_packed_upload(buf_ctx, tensor, static_cast<const uint8_t *>(data) + i * stride_data, offset + i * stride_tensor, size);
+    }
+} catch (...) {
+    ggml_vk_q8_packed_invalidate_tensor(tensor);
+    throw;
 }
 
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -18046,6 +18364,7 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
+        ggml_vk_q8_packed_invalidate_tensor(dst);
         ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
@@ -18058,7 +18377,22 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
+    ggml_vk_q8_packed_invalidate(ctx, 0, buffer->size);
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
+}
+
+static void ggml_backend_vk_buffer_reset(ggml_backend_buffer_t buffer) {
+    auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
+    if (!ctx->device.lock()->pipeline_q8_packed) { return; }
+    std::lock_guard<std::mutex> lock(ctx->packed_mutex);
+    ctx->spd_reader = false;
+    ctx->spd_marker_size = 0;
+    for (auto & owner : ctx->q8_packed) {
+        owner.ready = false;
+        owner.registered = false;
+        owner.conflict = false;
+        owner.discard_upload();
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
@@ -18072,7 +18406,7 @@ static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
     /* .get_tensor_2d   = */ ggml_backend_vk_buffer_get_tensor_2d,
     /* .cpy_tensor      = */ ggml_backend_vk_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_vk_buffer_clear,
-    /* .reset           = */ NULL,
+    /* .reset           = */ ggml_backend_vk_buffer_reset,
 };
 
 // vk buffer type
@@ -18220,7 +18554,7 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
 }
 
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
-                                                size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+                                                size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) try {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
@@ -18275,6 +18609,14 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         }
         ggml_vk_synchronize(ctx);
     }
+    for (size_t i = 0; i < n_copies; ++i) {
+        ggml_vk_q8_packed_upload(buf_ctx, tensor, static_cast<const uint8_t *>(data) + i * stride_data,
+                                offset + i * stride_tensor, size, ctx);
+    }
+
+} catch (...) {
+    ggml_vk_q8_packed_invalidate_tensor(tensor);
+    throw;
 }
 
 static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -18364,6 +18706,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
+        ggml_vk_q8_packed_invalidate_tensor(dst);
         ggml_vk_buffer_copy_async(compute_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs,
                                    src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
                                    ggml_nbytes(src));
@@ -18385,6 +18728,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
         }
 
+        ggml_vk_q8_packed_invalidate_tensor(dst);
         return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
                                           vk_tensor_offset(dst) + dst->view_offs,
                                           src->data, ggml_nbytes(src));
@@ -19036,6 +19380,17 @@ static bool ggml_vk_match_q8_swiglu(ggml_backend_vk_context * ctx, const ggml_cg
         return false;
     }
     const ggml_tensor * input = first->src[1];
+    for (const auto * projection : { first, second }) {
+        const int packed_slot = ggml_vk_q8_packed_eligible(ctx, projection);
+        if (packed_slot < 0) { continue; }
+        const auto * weight = projection->src[0];
+        auto * buffer = static_cast<ggml_backend_vk_buffer_context *>(weight->buffer->context);
+        std::lock_guard<std::mutex> lock(buffer->packed_mutex);
+        const auto & owner = buffer->q8_packed[packed_slot];
+        if (buffer->spd_reader && ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            !ctx->device->uma && !buffer->dev_buffer->imported_host_memory && owner.registered && owner.ready &&
+            owner.packed && owner.offset == vk_tensor_offset(weight) && owner.k == weight->ne[0]) { return false; }
+    }
     if (input->type != GGML_TYPE_F32 || input->ne[0] != 4096 || input->ne[1] < 1 || input->ne[1] > 13 ||
         input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) {
         return false;
@@ -19411,6 +19766,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     ggml_vk_host_trace host_trace("graph", ctx->device->name.c_str(), ctx, cgraph->n_nodes);
+
+    if (ctx->device->pipeline_q8_packed) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) || ggml_is_empty(node) || ggml_op_is_empty(node->op)) { continue; }
+            ggml_vk_q8_packed_invalidate_tensor(node);
+            if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) {
+                ggml_vk_q8_packed_invalidate_tensor(node->src[0]);
+                if (node->op == GGML_OP_OPT_STEP_ADAMW) {
+                    ggml_vk_q8_packed_invalidate_tensor(node->src[2]);
+                    ggml_vk_q8_packed_invalidate_tensor(node->src[3]);
+                }
+            }
+        }
+    }
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;

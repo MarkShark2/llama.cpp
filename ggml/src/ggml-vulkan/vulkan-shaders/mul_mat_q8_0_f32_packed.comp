@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (binding = 0, std430) readonly buffer A { uint data_a[]; };
+layout (binding = 1, std430) readonly buffer B { float data_b[]; };
+layout (binding = 2, std430) writeonly buffer D { float data_d[]; };
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_b;
+    uint stride_d;
+} p;
+
+const uint TILE_ROWS = 64;
+const uint TILE_COLS = 4;
+const uint TILE_K = 128;
+const uint BLOCK_WORDS = 544;
+
+shared vec4 tile_b[TILE_COLS][TILE_K / 4];
+shared float partials[4][TILE_COLS][TILE_ROWS];
+
+vec4 unpack_q8(uint v) {
+    return vec4(bitfieldExtract(int(v), 0, 8), bitfieldExtract(int(v), 8, 8),
+                bitfieldExtract(int(v), 16, 8), bitfieldExtract(int(v), 24, 8));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = tid % TILE_ROWS;
+    const uint part = tid / TILE_ROWS;
+    const uint out_row = gl_WorkGroupID.x * TILE_ROWS + row;
+    const uint first_col = gl_WorkGroupID.y * TILE_COLS;
+    float acc[TILE_COLS];
+    [[unroll]] for (uint j = 0; j < TILE_COLS; ++j) {
+        acc[j] = 0.0f;
+    }
+
+    for (uint k = 0; k < p.K; k += TILE_K) {
+        if (tid < TILE_COLS * TILE_K / 4) {
+            const uint j = tid / (TILE_K / 4);
+            const uint ik = tid % (TILE_K / 4);
+            vec4 b = vec4(0.0f);
+            if (first_col + j < p.N) {
+                const uint off = (first_col + j) * p.stride_b + k + ik * 4;
+                b = vec4(data_b[off], data_b[off + 1], data_b[off + 2], data_b[off + 3]);
+            }
+            tile_b[j][ik] = b;
+        }
+        barrier();
+
+        if (out_row < p.M) {
+            // Each 64-row Q8 block has 32 scale words, then eight 64-word quant planes.
+            const uint block = (gl_WorkGroupID.x * (p.K / 32) + k / 32 + part) * BLOCK_WORDS;
+            const vec2 scales = unpackHalf2x16(data_a[block + row / 2]);
+            const float d = scales[row % 2];
+            [[unroll]] for (uint q = 0; q < 8; q += 2) {
+                const vec4 a0 = unpack_q8(data_a[block + 32 + q * TILE_ROWS + row]) * d;
+                const vec4 a1 = unpack_q8(data_a[block + 32 + (q + 1) * TILE_ROWS + row]) * d;
+                [[unroll]] for (uint j = 0; j < TILE_COLS; ++j) {
+                    if (first_col + j < p.N) {
+                        // Keep F32 scale-before-dot and the two-dot sum for each eight weights.
+                        acc[j] += dot(tile_b[j][part * 8 + q], a0) + dot(tile_b[j][part * 8 + q + 1], a1);
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint j = 0; j < TILE_COLS; ++j) {
+        partials[part][j][row] = acc[j];
+    }
+    barrier();
+
+    if (part == 0 && out_row < p.M) {
+        [[unroll]] for (uint j = 0; j < TILE_COLS; ++j) {
+            if (first_col + j < p.N) {
+                // Four interleaved 32-value streams change the original matvec reduction order.
+                const float sum = (partials[0][j][row] + partials[1][j][row]) +
+                                  (partials[2][j][row] + partials[3][j][row]);
+                data_d[(first_col + j) * p.stride_d + out_row] = sum;
+            }
+        }
+    }
+}

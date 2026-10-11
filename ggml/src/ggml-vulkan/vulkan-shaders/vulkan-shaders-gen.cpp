@@ -732,6 +732,7 @@ void process_shaders() {
     std::map<std::string, std::string> base_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}};
 
     string_to_spv("mul_mat_vec_q8_swiglu", "mul_mat_vec_q8_swiglu.comp", {});
+    string_to_spv("mul_mat_q8_0_f32_packed", "mul_mat_q8_0_f32_packed.comp", {});
 
     for (const auto& tname : type_names) {
         // mul mat vec
