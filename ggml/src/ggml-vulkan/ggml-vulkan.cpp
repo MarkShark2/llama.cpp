@@ -914,6 +914,7 @@ struct vk_device_struct {
     bool ocp_fp4 {};
 
     bool pipeline_executable_properties_support {};
+    std::atomic<bool> iq2_capture_claimed {};
 
     bool device_fault {};
     PFN_vkGetDeviceFaultInfoEXT pfn_vkGetDeviceFaultInfoEXT {};
@@ -3115,6 +3116,295 @@ static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::
     return true;
 }
 
+// Capture only a lazily requested baseline, never compile another shader for diagnostics.
+static bool ggml_vk_iq2_capture_match(const vk_pipeline & pipeline, size_t spv_size, const void * spv_data,
+                                    const std::vector<uint32_t> & spec, const std::array<uint32_t, 3> & wg,
+                                    bool full_subgroups, uint32_t subgroup_size) {
+    return pipeline->name == "mul_mat_vec_id_iq2_s_f32" &&
+           spv_data == mul_mat_vec_id_iq2_s_f32_f32_subgroup_no_shmem_data &&
+           spv_size == mul_mat_vec_id_iq2_s_f32_f32_subgroup_no_shmem_len &&
+           spec.size() == 4 && spec[0] == subgroup_size && subgroup_size > 0 &&
+           spec[1] > 0 && spec[1] == wg[0] && wg[1] == 1 && wg[2] == 1 &&
+           spec[2] == 1 && spec[3] == 0 && full_subgroups;
+}
+
+static std::string ggml_vk_capture_string(const char * data, size_t size) {
+    std::string result;
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < size && data[i]; ++i) {
+        const unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c >= 32 && c < 127 && c != '\\') {
+            result += char(c);
+        } else {
+            result += "\\x";
+            result += hex[c >> 4];
+            result += hex[c & 15];
+        }
+    }
+    return result;
+}
+
+static void ggml_vk_capture_hex(std::ostream & out, const void * data, size_t size) {
+    static const char hex[] = "0123456789abcdef";
+    const auto * bytes = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        out.put(hex[bytes[i] >> 4]);
+        out.put(hex[bytes[i] & 15]);
+    }
+}
+
+// Raw Vulkan calls avoid Vulkan-Hpp's unbounded VK_INCOMPLETE retry loops.
+template<typename T, typename Query>
+static bool ggml_vk_capture_query(std::ostream & out, const char * label, VkStructureType type,
+                                  uint32_t limit, Query query, std::vector<T> & values) {
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        uint32_t count = 0;
+        VkResult result = query(&count, nullptr);
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+            out << label << " count_query_result=" << int(result) << '\n';
+            return false;
+        }
+        if (count > limit) {
+            out << label << " count=" << count << " exceeds_limit=" << limit << '\n';
+            return false;
+        }
+        if (count == 0 && result == VK_SUCCESS) {
+            values.clear();
+            out << label << " count=0\n";
+            return true;
+        }
+        if (count == 0) {
+            continue;
+        }
+        values.assign(count, T{});
+        for (auto & value : values) { value.sType = type; }
+        const uint32_t capacity = count;
+        result = query(&count, values.data());
+        if (result == VK_SUCCESS && count <= capacity) {
+            values.resize(count);
+            out << label << " count=" << count << '\n';
+            return true;
+        }
+        out << label << " attempt=" << attempt + 1 << " result=" << int(result) << " count=" << count << '\n';
+        if (result != VK_INCOMPLETE && !(result == VK_SUCCESS && count > capacity)) {
+            return false;
+        }
+    }
+    out << label << " retry_limit=3\n";
+    return false;
+}
+
+static void ggml_vk_capture_iq2(vk_device & device, const vk_pipeline & pipeline, const char * directory,
+                                const vk::ShaderModuleCreateInfo & shader, const std::vector<uint32_t> & spec,
+                                uint32_t required_subgroup_size, bool full_subgroups, bool disable_robustness,
+                                bool capture_enabled, bool & statistics_attempted) {
+    auto & dispatch = ggml_vk_default_dispatcher();
+    VkPhysicalDeviceIDProperties id{};
+    id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceDriverProperties driver{};
+    driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    driver.pNext = &id;
+    VkPhysicalDeviceProperties2 props{};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &driver;
+    dispatch.vkGetPhysicalDeviceProperties2(device->physical_device, &props);
+
+    uint64_t fingerprint = UINT64_C(14695981039346656037);
+    const auto * bytes = reinterpret_cast<const unsigned char *>(shader.pCode);
+    for (size_t i = 0; i < shader.codeSize; ++i) {
+        fingerprint = (fingerprint ^ bytes[i]) * UINT64_C(1099511628211);
+    }
+    std::ostringstream out;
+    out << "IQ2 executable capture v1\n"
+        << "limits: executables=16 statistics_per_executable=256 representations_per_executable=32 retries=3\n"
+        << "representation_query_bytes_total=4194304 artifact_bytes=33554432\n"
+        << "Device=" << ggml_vk_capture_string(props.properties.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE)
+        << " vendor=" << props.properties.vendorID << " device=" << props.properties.deviceID
+        << " api_version=" << props.properties.apiVersion << " driver_version=" << props.properties.driverVersion << '\n'
+        << "driver_id=" << int(driver.driverID) << " driver_name=" << ggml_vk_capture_string(driver.driverName, VK_MAX_DRIVER_NAME_SIZE)
+        << " driver_info=" << ggml_vk_capture_string(driver.driverInfo, VK_MAX_DRIVER_INFO_SIZE) << '\n'
+        << "driver_conformance=" << unsigned(driver.conformanceVersion.major) << '.' << unsigned(driver.conformanceVersion.minor)
+        << '.' << unsigned(driver.conformanceVersion.subminor) << '.' << unsigned(driver.conformanceVersion.patch) << '\n'
+        << "device_type=" << int(props.properties.deviceType)
+        << " max_compute_shared_memory=" << props.properties.limits.maxComputeSharedMemorySize
+        << " max_compute_invocations=" << props.properties.limits.maxComputeWorkGroupInvocations << '\n'
+        << "device_uuid=";
+    ggml_vk_capture_hex(out, id.deviceUUID, VK_UUID_SIZE);
+    out << " driver_uuid=";
+    ggml_vk_capture_hex(out, id.driverUUID, VK_UUID_SIZE);
+    out << " pipeline_cache_uuid=";
+    ggml_vk_capture_hex(out, props.properties.pipelineCacheUUID, VK_UUID_SIZE);
+    out << "\npipeline=" << pipeline->name << " entrypoint=main\n"
+        << "spirv_final_bytes=" << shader.codeSize << " fingerprint_algorithm=FNV-1a-64 fingerprint="
+        << std::hex << std::setw(16) << std::setfill('0') << fingerprint << std::dec << '\n';
+    for (size_t i = 0; i < spec.size(); ++i) { out << "specialization_id=" << i << " uint32=" << spec[i] << '\n'; }
+    out << "reduction=subgroup_no_shmem workgroup=" << spec[0] << " rows=" << spec[1]
+        << " columns=" << spec[2] << " mode=" << spec[3] << " index_bits=";
+#if defined(VK_EXT_shader_64bit_indexing)
+    out << (pipeline->is_64b_indexing ? 64 : 32);
+#else
+    out << 32;
+#endif
+    out << "\narchitecture=" << int(device->architecture) << " subgroup_default=" << device->subgroup_size
+        << " subgroup_min=" << device->subgroup_min_size << " subgroup_max=" << device->subgroup_max_size
+        << " subgroup_arithmetic=" << device->subgroup_arithmetic
+        << " subgroup_size_control=" << device->subgroup_size_control
+        << " required_subgroup_requested=" << required_subgroup_size
+        << " required_subgroup_applied=" << (device->subgroup_size_control ? required_subgroup_size : 0)
+        << " full_subgroups_applied=" << (device->subgroup_require_full_support && full_subgroups)
+        << " robustness_disabled=" << (device->pipeline_robustness && disable_robustness) << '\n'
+        << "float_controls_rte_fp16=" << device->float_controls_rte_fp16
+        << " float_controls_denorm_preserve_fp16=" << device->float_controls_denorm_preserve_fp16 << '\n'
+        << "Driver resources are not achieved occupancy, stalls, or throughput.\n"
+        << "Missing or zero NVIDIA Register Count is not AMD no-spill evidence.\n";
+
+    bool any_representation = false;
+    bool any_statistics = false;
+    size_t byte_budget = 4 * 1024 * 1024;
+    if (!capture_enabled) {
+        out << "status=unsupported: pipelineExecutableInfo extension/feature unavailable; no alternate shader compiled\n";
+    } else if (!dispatch.vkGetPipelineExecutablePropertiesKHR || !dispatch.vkGetPipelineExecutableStatisticsKHR) {
+        out << "status=unavailable: executable query entrypoint missing\n";
+    } else {
+        VkPipelineInfoKHR info{};
+        info.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
+        info.pipeline = pipeline->pipeline;
+        std::vector<VkPipelineExecutablePropertiesKHR> executables;
+        const bool queried = ggml_vk_capture_query(out, "executables", VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR, 16,
+            [&](uint32_t * count, VkPipelineExecutablePropertiesKHR * data) {
+                return dispatch.vkGetPipelineExecutablePropertiesKHR(device->device, &info, count, data);
+            }, executables);
+        for (uint32_t e = 0; queried && e < executables.size(); ++e) {
+            const auto & executable = executables[e];
+            out << "\nexecutable=" << e << " name=" << ggml_vk_capture_string(executable.name, sizeof(executable.name))
+                << " description=" << ggml_vk_capture_string(executable.description, sizeof(executable.description))
+                << " stages=" << executable.stages << " subgroup_size=" << executable.subgroupSize << '\n';
+            VkPipelineExecutableInfoKHR ei{};
+            ei.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
+            ei.pipeline = pipeline->pipeline;
+            ei.executableIndex = e;
+            std::vector<VkPipelineExecutableStatisticKHR> statistics;
+            if (e == 0) { statistics_attempted = true; }
+            if (ggml_vk_capture_query(out, "statistics", VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR, 256,
+                [&](uint32_t * count, VkPipelineExecutableStatisticKHR * data) {
+                    return dispatch.vkGetPipelineExecutableStatisticsKHR(device->device, &ei, count, data);
+                }, statistics)) {
+                any_statistics |= !statistics.empty();
+                const bool print_stats = e == 0 && !vk_pipeline_stats_filter.empty() &&
+                        pipeline->name.find(vk_pipeline_stats_filter) != std::string::npos;
+                if (print_stats) { std::cerr << "ggml_vulkan: pipeline stats for " << pipeline->name << ":\n"; }
+                for (const auto & s : statistics) {
+                    if (e == 0 && std::strncmp(s.name, "Register Count", sizeof(s.name)) == 0 &&
+                        s.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR) {
+                        pipeline->register_count = uint32_t(s.value.u64);
+                    }
+                    std::ostringstream statistic;
+                    statistic << "statistic=" << ggml_vk_capture_string(s.name, sizeof(s.name)) << " description="
+                        << ggml_vk_capture_string(s.description, sizeof(s.description)) << " format=" << int(s.format) << " value=";
+                    switch (s.format) {
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: statistic << (s.value.b32 ? "true" : "false"); break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: statistic << s.value.i64; break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: statistic << s.value.u64; break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: statistic << std::setprecision(17) << s.value.f64; break;
+                        default: statistic << "unknown_format"; break;
+                    }
+                    statistic << '\n';
+                    const std::string line = statistic.str();
+                    out << line;
+                    if (print_stats) { std::cerr << "ggml_vulkan: " << line; }
+                }
+            }
+            if (!dispatch.vkGetPipelineExecutableInternalRepresentationsKHR) {
+                out << "representations unavailable: query entrypoint missing\n";
+                continue;
+            }
+            bool complete = false;
+            for (unsigned attempt = 0; attempt < 3 && !complete; ++attempt) {
+                std::vector<VkPipelineExecutableInternalRepresentationKHR> reps;
+                if (!ggml_vk_capture_query(out, "representations", VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR, 32,
+                    [&](uint32_t * count, VkPipelineExecutableInternalRepresentationKHR * data) {
+                        return dispatch.vkGetPipelineExecutableInternalRepresentationsKHR(device->device, &ei, count, data);
+                    }, reps)) { break; }
+                if (reps.empty()) { complete = true; break; }
+                for (size_t r = 0; r < reps.size(); ++r) {
+                    const auto & rep = reps[r];
+                    out << "representation_metadata=" << r << " name=" << ggml_vk_capture_string(rep.name, sizeof(rep.name))
+                        << " description=" << ggml_vk_capture_string(rep.description, sizeof(rep.description))
+                        << " is_text=" << rep.isText << " advertised_bytes=" << rep.dataSize << '\n';
+                }
+                size_t allocation = 0;
+                bool over_limit = false;
+                for (const auto & rep : reps) {
+                    if (rep.dataSize > byte_budget - allocation) { over_limit = true; break; }
+                    allocation += rep.dataSize;
+                }
+                if (over_limit) {
+                    out << "representations skipped: data exceeds remaining byte budget=" << byte_budget << '\n';
+                    break;
+                }
+                byte_budget -= allocation;
+                std::vector<std::vector<unsigned char>> buffers(reps.size());
+                for (size_t r = 0; r < reps.size(); ++r) {
+                    buffers[r].resize(reps[r].dataSize);
+                    reps[r].pData = buffers[r].empty() ? nullptr : buffers[r].data();
+                }
+                uint32_t count = uint32_t(reps.size());
+                VkResult result = dispatch.vkGetPipelineExecutableInternalRepresentationsKHR(device->device, &ei, &count, reps.data());
+                bool fits = count <= reps.size();
+                for (size_t r = 0; fits && r < count; ++r) { fits = reps[r].dataSize <= buffers[r].size(); }
+                if (result != VK_SUCCESS || !fits) {
+                    out << "representations data_attempt=" << attempt + 1 << " result=" << int(result) << " sizes_fit=" << fits << '\n';
+                    if (result == VK_INCOMPLETE || (result == VK_SUCCESS && !fits)) { continue; }
+                    break;
+                }
+                complete = true;
+                for (size_t r = 0; r < count; ++r) {
+                    const auto & rep = reps[r];
+                    out << "representation=" << r << " name=" << ggml_vk_capture_string(rep.name, sizeof(rep.name))
+                        << " description=" << ggml_vk_capture_string(rep.description, sizeof(rep.description))
+                        << " is_text=" << rep.isText << " bytes=" << rep.dataSize << '\n';
+                    any_representation |= rep.dataSize != 0;
+                    if (rep.isText) {
+                        const char * data = reinterpret_cast<const char *>(buffers[r].data());
+                        const char * end = rep.dataSize ? static_cast<const char *>(memchr(data, 0, rep.dataSize)) : nullptr;
+                        const size_t length = end ? size_t(end - data) : rep.dataSize;
+                        out << "encoding=text (nonprinting bytes escaped) nul_terminated=" << (end != nullptr) << "\n";
+                        for (size_t i = 0; i < length; ++i) {
+                            if (data[i] == '\n' || data[i] == '\t') { out.put(data[i]); }
+                            else { out << ggml_vk_capture_string(data + i, 1); }
+                        }
+                    } else {
+                        out << "encoding=hex\n";
+                        ggml_vk_capture_hex(out, buffers[r].data(), rep.dataSize);
+                    }
+                    out << "\nend_representation\n";
+                }
+            }
+            if (!complete) { out << "representations incomplete/unavailable within query limits\n"; }
+        }
+        out << "\nstatus=" << (any_representation ? "driver_representations_captured (may be IR, not machine ISA)" :
+                                  any_statistics ? "statistics_only; no representation captured" : "no_statistics_or_representations_captured") << '\n';
+    }
+    const std::string artifact = out.str();
+    if (artifact.size() > 32 * 1024 * 1024) {
+        std::cerr << "ggml_vulkan: IQ2 executable artifact exceeds byte limit\n";
+        return;
+    }
+    std::ostringstream filename;
+    filename << directory << "/iq2-executable-";
+    ggml_vk_capture_hex(filename, id.deviceUUID, VK_UUID_SIZE);
+    filename << "-" << device->idx << "-" << std::chrono::system_clock::now().time_since_epoch().count() << ".txt";
+    const std::string path = filename.str();
+    FILE * file = std::fopen(path.c_str(), "wbx");
+    if (!file) {
+        std::cerr << "ggml_vulkan: cannot create IQ2 executable artifact in requested directory\n";
+        return;
+    }
+    const bool wrote = std::fwrite(artifact.data(), 1, artifact.size(), file) == artifact.size();
+    const bool closed = std::fclose(file) == 0;
+    std::cerr << "ggml_vulkan: IQ2 executable artifact " << (wrote && closed ? "written: " : "write incomplete: ") << path << '\n';
+}
+
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
                                          bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
@@ -3276,12 +3566,23 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipeline_shader_create_info.setPNext(&pipeline_shader_stage_required_subgroup_size_create_info);
     }
 
+    const char * capture_dir = std::getenv("GGML_VK_IQ2_EXECUTABLE_DIR");
+    const bool capture_requested = capture_dir && capture_dir[0] && std::strlen(capture_dir) <= 4096 && entrypoint == "main" &&
+            ggml_vk_iq2_capture_match(pipeline, spv_size, spv_data, specialization_constants, wg_denoms,
+                                      require_full_subgroups, required_subgroup_size) &&
+            !device->iq2_capture_claimed.exchange(true);
+    const bool capture_enabled = capture_requested && device->pipeline_executable_properties_support;
+
     vk::ComputePipelineCreateInfo compute_pipeline_create_info(
         device->pipeline_executable_properties_support ?
             vk::PipelineCreateFlagBits::eCaptureStatisticsKHR :
             vk::PipelineCreateFlags{},
         pipeline_shader_create_info,
         pipeline->layout);
+
+    if (capture_enabled) {
+        compute_pipeline_create_info.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+    }
 
     vk::PipelineRobustnessCreateInfoEXT rci;
 
@@ -3299,6 +3600,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         if (device->pipeline_executable_properties_support) {
             pipelineFlags2CreateInfo.flags |= vk::PipelineCreateFlagBits2::eCaptureStatisticsKHR;
         }
+        if (capture_enabled) {
+            pipelineFlags2CreateInfo.flags |= vk::PipelineCreateFlagBits2::eCaptureInternalRepresentationsKHR;
+        }
         pipelineFlags2CreateInfo.setPNext(compute_pipeline_create_info.pNext);
         compute_pipeline_create_info.setPNext(&pipelineFlags2CreateInfo);
     }
@@ -3312,6 +3616,16 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         throw e;
     }
 
+    bool captured_statistics_attempted = false;
+    if (capture_requested) {
+        try {
+            ggml_vk_capture_iq2(device, pipeline, capture_dir, shader_module_create_info, specialization_constants,
+                                required_subgroup_size, require_full_subgroups, disable_robustness, capture_enabled, captured_statistics_attempted);
+        } catch (const std::exception &) {
+            std::cerr << "ggml_vulkan: IQ2 executable capture failed; selected pipeline remains usable\n";
+        }
+    }
+
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsObjectNameInfoEXT duoni;
         duoni.objectType = vk::ObjectType::ePipeline;
@@ -3320,11 +3634,40 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         vk_instance.pfn_vkSetDebugUtilsObjectNameEXT(device->device, &static_cast<VkDebugUtilsObjectNameInfoEXT &>(duoni));
     }
 
-    if (device->pipeline_executable_properties_support) {
+    if (device->pipeline_executable_properties_support && !captured_statistics_attempted) {
         vk::PipelineExecutableInfoKHR executableInfo;
         executableInfo.pipeline = pipeline->pipeline;
 
-        auto statistics = device->device.getPipelineExecutableStatisticsKHR(executableInfo);
+        std::vector<vk::PipelineExecutableStatisticKHR> statistics;
+        if (capture_requested) {
+            try {
+                auto & dispatch = ggml_vk_default_dispatcher();
+                std::vector<VkPipelineExecutableStatisticKHR> raw_statistics;
+                std::ostringstream status;
+                VkPipelineInfoKHR info{};
+                info.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
+                info.pipeline = pipeline->pipeline;
+                uint32_t executable_count = 0;
+                const VkResult count_result = dispatch.vkGetPipelineExecutablePropertiesKHR ?
+                        dispatch.vkGetPipelineExecutablePropertiesKHR(device->device, &info, &executable_count, nullptr) :
+                        VK_ERROR_EXTENSION_NOT_PRESENT;
+                status << "executable_count_result=" << int(count_result) << " count=" << executable_count << '\n';
+                if (count_result == VK_SUCCESS && executable_count > 0 && dispatch.vkGetPipelineExecutableStatisticsKHR &&
+                    ggml_vk_capture_query(status, "fallback statistics", VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR, 256,
+                        [&](uint32_t * count, VkPipelineExecutableStatisticKHR * data) {
+                            return dispatch.vkGetPipelineExecutableStatisticsKHR(device->device,
+                                    reinterpret_cast<const VkPipelineExecutableInfoKHR *>(&executableInfo), count, data);
+                        }, raw_statistics)) {
+                    for (const auto & statistic : raw_statistics) { statistics.emplace_back(statistic); }
+                } else {
+                    std::cerr << "ggml_vulkan: IQ2 fallback statistics unavailable: " << status.str();
+                }
+            } catch (const std::exception &) {
+                std::cerr << "ggml_vulkan: IQ2 fallback statistics failed\n";
+            }
+        } else {
+            statistics = device->device.getPipelineExecutableStatisticsKHR(executableInfo);
+        }
 
         bool print_stats = !vk_pipeline_stats_filter.empty() &&
                            pipeline->name.find(vk_pipeline_stats_filter) != std::string::npos;
@@ -3333,6 +3676,10 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         }
 
         for (auto & s : statistics) {
+            if (capture_requested) {
+                s.name[VK_MAX_DESCRIPTION_SIZE - 1] = 0;
+                s.description[VK_MAX_DESCRIPTION_SIZE - 1] = 0;
+            }
             if (print_stats) {
                 std::cerr << "ggml_vulkan:   " << s.name.data() << ": ";
                 switch (s.format) {
@@ -7140,7 +7487,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
         }
 
-        device->pipeline_executable_properties_support = pipeline_executable_properties_support;
+        device->pipeline_executable_properties_support = pipeline_executable_properties_support && pep_features.pipelineExecutableInfo;
+        if (const char * capture_dir = std::getenv("GGML_VK_IQ2_EXECUTABLE_DIR")) {
+            if (capture_dir[0]) {
+                std::cerr << "ggml_vulkan: IQ2 executable capture "
+                          << (std::strlen(capture_dir) <= 4096 ? "armed for first requested subgroup ID/F32 mode0 pipeline; no artifact until selected" :
+                                                               "disabled: directory exceeds 4096 bytes")
+                          << " on device " << idx << '\n';
+            }
+        }
 
         device->fp16 = device->fp16 && vk12_features.shaderFloat16;
 
