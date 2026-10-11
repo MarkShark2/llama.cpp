@@ -1,0 +1,99 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define DATA_A_Q8_0 1
+#include "types.glsl"
+
+layout (binding = 0) readonly buffer Gate { block_q8_0_packed16 data_gate[]; };
+layout (binding = 1) readonly buffer Up { block_q8_0_packed16 data_up[]; };
+layout (binding = 2) readonly buffer B { vec4 data_b[]; };
+layout (binding = 3) writeonly buffer D { float data_d[]; };
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
+layout (constant_id = 1) const uint NUM_ROWS = 8;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint column_offset;
+} p;
+
+vec4 gate4(uint ib, uint iqs) {
+    const i8vec2 v0 = unpack8(int32_t(data_gate[ib].qs[iqs/2])).xy;
+    const i8vec2 v1 = unpack8(int32_t(data_gate[ib].qs[iqs/2 + 1])).xy;
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+
+vec4 up4(uint ib, uint iqs) {
+    const i8vec2 v0 = unpack8(int32_t(data_up[ib].qs[iqs/2])).xy;
+    const i8vec2 v1 = unpack8(int32_t(data_up[ib].qs[iqs/2 + 1])).xy;
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+
+void iter(inout float gate[NUM_COLS][NUM_ROWS], inout float up[NUM_COLS][NUM_ROWS], uint first_row, uint i) {
+    const uint col = i * 8 * BLOCK_SIZE + 8 * gl_LocalInvocationID.x;
+    const uint iqs = col % 32;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint ib = ((first_row + n) * 4096 + col) / 32;
+        const float dg = float(data_gate[ib].d);
+        const float du = float(data_up[ib].d);
+        const vec4 g0 = gate4(ib, iqs) * dg;
+        const vec4 g1 = gate4(ib, iqs + 4) * dg;
+        const vec4 u0 = up4(ib, iqs) * du;
+        const vec4 u1 = up4(ib, iqs + 4) * du;
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b = ((p.column_offset + j) * 4096 + col) / 4;
+            const vec4 b0 = data_b[b];
+            const vec4 b1 = data_b[b + 1];
+            // Each projection keeps the unfused dot/dot/add/accumulate chain.
+            gate[j][n] += dot(b0, g0) + dot(b1, g1);
+            up[j][n] += dot(b0, u0) + dot(b1, u1);
+        }
+    }
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    float gate[NUM_COLS][NUM_ROWS];
+    float up[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            gate[j][n] = 0.0f;
+            up[j][n] = 0.0f;
+        }
+    }
+    const uint num_iters = 4096 / (8 * BLOCK_SIZE);
+    uint i = 0;
+    while (i < (num_iters & ~3u)) {
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            iter(gate, up, first_row, i++);
+        }
+    }
+    while (i < (num_iters & ~1u)) {
+        [[unroll]] for (uint k = 0; k < 2; ++k) {
+            iter(gate, up, first_row, i++);
+        }
+    }
+    while (i < num_iters) {
+        iter(gate, up, first_row, i++);
+    }
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            gate[j][n] = subgroupAdd(gate[j][n]);
+            up[j][n] = subgroupAdd(up[j][n]);
+        }
+    }
+    if (gl_LocalInvocationID.x == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const float a = gate[j][n];
+                const float b = up[j][n];
+                data_d[(p.column_offset + j) * 8192 + first_row + n] = a / (1.0f + exp(-a)) * b;
+            }
+        }
+    }
+}
