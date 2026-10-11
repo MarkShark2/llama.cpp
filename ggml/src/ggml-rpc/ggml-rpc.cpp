@@ -144,6 +144,8 @@ enum rpc_cmd {
     RPC_CMD_GET_COMPACT_AND_PUSH,
     RPC_CMD_GET_COMPACT_FULL,
     RPC_CMD_RELEASE_COMPACT,
+    RPC_CMD_GET_COMPACT_AND_PUSH_CHECKED,
+    RPC_CMD_RELEASE_COMPACT_CHECKED,
     RPC_CMD_COUNT,
 };
 
@@ -169,6 +171,7 @@ static constexpr uint8_t RPC_FEATURE_GET_AND_PUSH = 1 << 1;
 static constexpr uint8_t RPC_FEATURE_MAIN_DEDUPE = 1 << 2;
 static constexpr uint8_t RPC_FEATURE_MEAN_FIRST = 1 << 3;
 static constexpr uint8_t RPC_FEATURE_COMPACT_RETURN = 1 << 4;
+static constexpr uint8_t RPC_FEATURE_COMPACT_RETIRE = 1 << 5;
 
 static constexpr size_t RPC_MEAN_WIDTH = 4096;
 static constexpr size_t RPC_MEAN_STREAMS = 4;
@@ -385,9 +388,25 @@ struct rpc_compact_token {
     uint64_t generation;
 };
 
+struct rpc_compact_retire_list {
+    uint64_t session;
+    uint32_t count;
+    rpc_compact_token tokens[RPC_COMPACT_MAX_RECORDS];
+};
+
 struct rpc_msg_compact_rsp {
     rpc_compact_token token;
     float mean[RPC_MEAN_WIDTH];
+};
+
+struct rpc_msg_compact_checked_req {
+    rpc_msg_push_tensor_req push;
+    rpc_compact_retire_list retire;
+};
+
+struct rpc_msg_compact_checked_rsp {
+    rpc_msg_compact_rsp output;
+    rpc_compact_retire_list retired;
 };
 
 struct rpc_msg_compact_full_rsp {
@@ -677,8 +696,9 @@ static void rpc_command_payload(rpc_cmd cmd, const void * data, size_t size) {
         const int64_t now = rpc_command_now();
         rpc_command_current->emit("set_encoding", now, now, encoding, c, size);
         event = "tensor_id";
-    } else if ((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH || cmd == RPC_CMD_GET_MEAN_AND_PUSH ||
-                cmd == RPC_CMD_GET_COMPACT_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) {
+    } else if (((cmd == RPC_CMD_PUSH_TENSOR || cmd == RPC_CMD_GET_TENSOR_AND_PUSH || cmd == RPC_CMD_GET_MEAN_AND_PUSH ||
+                cmd == RPC_CMD_GET_COMPACT_AND_PUSH) && size == sizeof(rpc_msg_push_tensor_req)) ||
+            (cmd == RPC_CMD_GET_COMPACT_AND_PUSH_CHECKED && size == sizeof(rpc_msg_compact_checked_req))) {
         rpc_msg_push_tensor_req req;
         memcpy(&req, data, sizeof(req));
         a = req.src.id;
@@ -720,7 +740,8 @@ static rpc_phase_kind rpc_phase_command(rpc_cmd cmd) {
         case RPC_CMD_PUSH_TENSOR:
         case RPC_CMD_GET_TENSOR_AND_PUSH:
         case RPC_CMD_GET_MEAN_AND_PUSH:
-        case RPC_CMD_GET_COMPACT_AND_PUSH: return RPC_PHASE_PEER;
+        case RPC_CMD_GET_COMPACT_AND_PUSH:
+        case RPC_CMD_GET_COMPACT_AND_PUSH_CHECKED: return RPC_PHASE_PEER;
         case RPC_CMD_COPY_TENSOR:
         case RPC_CMD_COPY_TENSOR_ORDERED:
         case RPC_CMD_MEMSET_TENSOR:
@@ -1370,7 +1391,17 @@ public:
     // Access only at the main stream's wire position (direct-mode io_m).
     std::weak_ptr<socket_t> main_dedupe_sock;
     rpc_main_dedupe_lru main_dedupe;
-    // Access only through call(), at the owning main connection's wire position.
+    // Retirement admission never waits for the main connection's I/O mutex.
+    struct compact_record {
+        rpc_compact_token token = {};
+        uint64_t sequence = 0;
+        enum { empty, reserved, live, queued, submitted } state = empty;
+        bool materialized = false;
+    };
+    std::mutex compact_m;
+    std::array<compact_record, RPC_COMPACT_MAX_RECORDS> compact_records = {};
+    uint64_t compact_issued = 0, compact_proved = 0;
+    // Mutate at the main stream's wire position, under compact_m.
     std::weak_ptr<socket_t> compact_sock;
     size_t compact_live = 0;
     uint64_t compact_session = 0, compact_generation = 0;
@@ -4089,8 +4120,18 @@ GGML_RPC_SYNC_PEER_API bool ggml_backend_rpc_sync_peer_push(
 struct rpc_compact_stats {
     std::atomic<uint64_t> started{0}, materialized{0}, released{0}, unfetched{0};
     std::atomic<uint64_t> eligibility_miss{0}, route_fallback{0}, capacity_fallback{0}, failed{0};
+    std::atomic<uint64_t> retire_selected{0}, retire_fallback{0}, retire_queued{0}, retire_carried{0};
+    std::atomic<uint64_t> retire_batches{0}, retire_drained{0}, retire_proofs{0}, retire_failed{0}, retire_peak{0};
 
     ~rpc_compact_stats() {
+        if (retire_selected || retire_fallback || retire_failed) {
+            GGML_LOG_INFO("[rpc compact retirement] selected=%" PRIu64 " fallback=%" PRIu64
+                    " queued=%" PRIu64 " carried=%" PRIu64 " drain_batches=%" PRIu64 " drain_tokens=%" PRIu64
+                    " proofs=%" PRIu64 " failed=%" PRIu64 " peak_charged_records=%" PRIu64 " peak_charged_bytes=%" PRIu64 "\n",
+                    retire_selected.load(), retire_fallback.load(), retire_queued.load(), retire_carried.load(),
+                    retire_batches.load(), retire_drained.load(), retire_proofs.load(), retire_failed.load(),
+                    retire_peak.load(), retire_peak.load() * RPC_MEAN_FULL_BYTES);
+        }
         if (started || eligibility_miss || route_fallback || capacity_fallback || failed) {
             GGML_LOG_INFO("[rpc compact] compact=%" PRIu64 " materialize=%" PRIu64 " release=%" PRIu64
                     " eligibility_miss=%" PRIu64 " route_fallback=%" PRIu64 " capacity_fallback=%" PRIu64
@@ -4121,7 +4162,17 @@ struct rpc_compact_handle {
     std::weak_ptr<socket_t> socket;
     rpc_compact_token token = {};
     bool materialized = false;
+    bool checked = false;
+    uint64_t retirement = 0;
 };
+
+static bool rpc_compact_retire_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_RPC_COMPACT_RETIRE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 // Capture only slow releases in fixed storage and print after generation teardown.
 // Receive spans include remote service, blocking and descheduling, not just wire time.
@@ -4195,6 +4246,63 @@ static bool rpc_compact_same_token(const rpc_compact_token & a, const rpc_compac
     return a.session == b.session && a.generation == b.generation;
 }
 
+// Caller holds compact_m. No record is reusable until its exact proof arrives.
+static rpc_dispatcher::compact_record * rpc_compact_find(rpc_dispatcher & owner, const rpc_compact_token & token) {
+    for (auto & record : owner.compact_records) {
+        if (record.state != rpc_dispatcher::compact_record::empty && rpc_compact_same_token(record.token, token)) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+static rpc_compact_retire_list rpc_compact_take(rpc_dispatcher & owner, uint64_t frontier) {
+    std::lock_guard<std::mutex> lock(owner.compact_m);
+    rpc_compact_retire_list list = {};
+    list.session = owner.compact_session;
+    for (auto & record : owner.compact_records) {
+        if (record.state == rpc_dispatcher::compact_record::queued && record.sequence <= frontier) {
+            list.tokens[list.count++] = record.token;
+            record.state = rpc_dispatcher::compact_record::submitted;
+        }
+    }
+    return list;
+}
+
+static bool rpc_compact_prove(rpc_dispatcher & owner,
+        const rpc_compact_retire_list & sent, const rpc_compact_retire_list & response) {
+    if (std::memcmp(&sent, &response, sizeof(sent)) != 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(owner.compact_m);
+    if (sent.session != owner.compact_session || sent.count > RPC_COMPACT_MAX_RECORDS || sent.count > owner.compact_live) {
+        return false;
+    }
+    for (uint32_t i = 0; i < sent.count; ++i) {
+        auto * record = rpc_compact_find(owner, sent.tokens[i]);
+        if (!record || record->state != rpc_dispatcher::compact_record::submitted || record->sequence == 0) {
+            return false;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (rpc_compact_same_token(sent.tokens[i], sent.tokens[j])) {
+                return false;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < sent.count; ++i) {
+        auto * record = rpc_compact_find(owner, sent.tokens[i]);
+        owner.compact_proved = std::max(owner.compact_proved, record->sequence);
+        if (!record->materialized) {
+            ++rpc_compact_profile().unfetched;
+        }
+        *record = {};
+    }
+    owner.compact_live -= sent.count;
+    rpc_compact_profile().released += sent.count;
+    rpc_compact_profile().retire_proofs += sent.count;
+    return true;
+}
+
 template <typename F>
 static bool rpc_compact_call(rpc_compact_handle & handle, F && fn) {
     try {
@@ -4207,11 +4315,17 @@ static bool rpc_compact_call(rpc_compact_handle & handle, F && fn) {
                 GGML_LOG_ERROR("[rpc compact] return failed on %s\n", handle.owner->endpoint.c_str());
             }
             ++rpc_compact_profile().failed;
+            if (handle.checked) {
+                ++rpc_compact_profile().retire_failed;
+            }
             handle.owner->poison();
             return false;
         });
     } catch (...) {
         ++rpc_compact_profile().failed;
+        if (handle.checked) {
+            ++rpc_compact_profile().retire_failed;
+        }
         handle.owner->poison();
         return false;
     }
@@ -4353,33 +4467,94 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_begin_compact(
     req.dst = serialize_tensor(dst);
     req.size = RPC_MEAN_FULL_BYTES;
     std::unique_ptr<rpc_compact_handle> handle(new rpc_compact_handle{sdisp, sdisp->get_sock(), {}});
+    handle->checked = rpc_compact_retire_enabled() && (sdisp->features & RPC_FEATURE_COMPACT_RETIRE);
+    if (rpc_compact_retire_enabled()) {
+        if (handle->checked) {
+            ++rpc_compact_profile().retire_selected;
+        } else {
+            ++rpc_compact_profile().retire_fallback;
+        }
+    }
     rpc_msg_compact_rsp response;
     bool capacity = false;
     const bool ok = rpc_compact_call(*handle, [&](const socket_ptr & sock) {
-        if (sdisp->compact_sock.lock() != sock) {
-            sdisp->compact_sock = sock;
-            sdisp->compact_live = 0;
-            sdisp->compact_session = 0;
-            sdisp->compact_generation = 0;
-        }
-        if (sdisp->compact_live >= RPC_COMPACT_MAX_RECORDS) {
-            capacity = true;
-            ++rpc_compact_profile().capacity_fallback;
-            return true;
+        {
+            std::lock_guard<std::mutex> lock(sdisp->compact_m);
+            if (sdisp->compact_sock.lock() != sock) {
+                if (sdisp->compact_live != 0) {
+                    return false;
+                }
+                sdisp->compact_sock = sock;
+                sdisp->compact_session = 0;
+                sdisp->compact_generation = 0;
+                sdisp->compact_issued = 0;
+                sdisp->compact_proved = 0;
+            }
+            if (sdisp->compact_live >= RPC_COMPACT_MAX_RECORDS) {
+                capacity = true;
+                ++rpc_compact_profile().capacity_fallback;
+                if (handle->checked) {
+                    ++rpc_compact_profile().retire_fallback;
+                }
+                return true;
+            }
         }
         if (sdisp->compact_session == 0) {
             rpc_msg_session_info_rsp info = {};
             if (!send_rpc_cmd(sock, RPC_CMD_SESSION_INFO, nullptr, 0, &info, sizeof(info)) || info.session_id == 0) {
                 return false;
             }
+            std::lock_guard<std::mutex> lock(sdisp->compact_m);
             sdisp->compact_session = info.session_id;
         }
-        if (!send_rpc_cmd(sock, RPC_CMD_GET_COMPACT_AND_PUSH, &req, sizeof(req), &response, sizeof(response)) ||
-                response.token.session != sdisp->compact_session || response.token.generation <= sdisp->compact_generation) {
-            return false;
+        rpc_dispatcher::compact_record * reservation = nullptr;
+        if (handle->checked) {
+            {
+                std::lock_guard<std::mutex> lock(sdisp->compact_m);
+                for (auto & record : sdisp->compact_records) {
+                    if (record.state == rpc_dispatcher::compact_record::empty) {
+                        reservation = &record;
+                        record.state = rpc_dispatcher::compact_record::reserved;
+                        break;
+                    }
+                }
+                if (!reservation) {
+                    return false;
+                }
+                ++sdisp->compact_live;
+                auto & peak = rpc_compact_profile().retire_peak;
+                uint64_t previous = peak.load();
+                while (previous < sdisp->compact_live && !peak.compare_exchange_weak(previous, sdisp->compact_live)) {}
+            }
+            rpc_msg_compact_checked_req checked = {};
+            checked.push = req;
+            checked.retire = rpc_compact_take(*sdisp, UINT64_MAX);
+            rpc_msg_compact_checked_rsp reply = {};
+            rpc_compact_profile().retire_carried += checked.retire.count;
+            if (!send_rpc_cmd(sock, RPC_CMD_GET_COMPACT_AND_PUSH_CHECKED, &checked, sizeof(checked), &reply, sizeof(reply)) ||
+                    reply.output.token.session != sdisp->compact_session ||
+                    sdisp->compact_generation == UINT64_MAX ||
+                    reply.output.token.generation != sdisp->compact_generation + 1 ||
+                    !rpc_compact_prove(*sdisp, checked.retire, reply.retired)) {
+                return false;
+            }
+            response = reply.output;
+        } else {
+            if (!send_rpc_cmd(sock, RPC_CMD_GET_COMPACT_AND_PUSH, &req, sizeof(req), &response, sizeof(response)) ||
+                    response.token.session != sdisp->compact_session || response.token.generation <= sdisp->compact_generation) {
+                return false;
+            }
         }
-        ++sdisp->compact_live;
-        sdisp->compact_generation = response.token.generation;
+        {
+            std::lock_guard<std::mutex> lock(sdisp->compact_m);
+            if (reservation) {
+                reservation->token = response.token;
+                reservation->state = rpc_dispatcher::compact_record::live;
+            } else {
+                ++sdisp->compact_live;
+            }
+            sdisp->compact_generation = response.token.generation;
+        }
         ++rpc_compact_profile().started;
         handle->token = response.token;
         return true;
@@ -4415,12 +4590,51 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_finish_compact(void * opaque) {
     return rpc_compact_connected(handle, handle.owner->get_sock());
 }
 
+// Admit only an already-dead owner. The caller keeps its handle until a checked join.
+GGML_BACKEND_API int ggml_backend_rpc_sync_peer_queue_compact(void * opaque) noexcept {
+    if (!opaque) {
+        return -1;
+    }
+    auto & handle = *static_cast<rpc_compact_handle *>(opaque);
+    if (!handle.checked) {
+        return 0;
+    }
+    try {
+        if (rpc_compact_connected(handle, handle.owner->get_sock())) {
+            std::lock_guard<std::mutex> lock(handle.owner->compact_m);
+            auto * record = rpc_compact_find(*handle.owner, handle.token);
+            if (record && record->state == rpc_dispatcher::compact_record::live &&
+                    handle.retirement == 0 && handle.owner->compact_issued != UINT64_MAX &&
+                    handle.token.session == handle.owner->compact_session) {
+                record->sequence = ++handle.owner->compact_issued;
+                record->state = rpc_dispatcher::compact_record::queued;
+                record->materialized = handle.materialized;
+                handle.retirement = record->sequence;
+                ++rpc_compact_profile().retire_queued;
+                return 1;
+            }
+        }
+    } catch (...) {
+    }
+    ++rpc_compact_profile().failed;
+    ++rpc_compact_profile().retire_failed;
+    handle.owner->poison();
+    return -1;
+}
+
 GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_materialize_compact(void * opaque, void * full_out) {
     if (opaque == nullptr || full_out == nullptr) {
         return false;
     }
     auto & handle = *static_cast<rpc_compact_handle *>(opaque);
     return rpc_compact_call(handle, [&](const socket_ptr & sock) {
+        if (handle.checked) {
+            std::lock_guard<std::mutex> lock(handle.owner->compact_m);
+            auto * record = rpc_compact_find(*handle.owner, handle.token);
+            if (handle.retirement || !record || record->state != rpc_dispatcher::compact_record::live) {
+                return false;
+            }
+        }
         rpc_msg_compact_full_rsp response;
         if (!send_rpc_cmd(sock, RPC_CMD_GET_COMPACT_FULL, &handle.token, sizeof(handle.token), &response, sizeof(response)) ||
                 !rpc_compact_same_token(response.token, handle.token)) {
@@ -4439,6 +4653,32 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_release_compact(void * opaque) 
         return false;
     }
     std::unique_ptr<rpc_compact_handle> handle(static_cast<rpc_compact_handle *>(opaque));
+    if (handle->checked) {
+        if (handle->retirement == 0 && ggml_backend_rpc_sync_peer_queue_compact(handle.get()) != 1) {
+            return false;
+        }
+        const uint64_t frontier = handle->retirement;
+        return rpc_compact_call(*handle, [&](const socket_ptr & sock) {
+            {
+                std::lock_guard<std::mutex> lock(handle->owner->compact_m);
+                if (handle->token.session != handle->owner->compact_session) {
+                    return false;
+                }
+                if (handle->owner->compact_proved >= frontier) {
+                    return true;
+                }
+            }
+            const auto list = rpc_compact_take(*handle->owner, frontier);
+            if (list.count == 0) {
+                return false;
+            }
+            rpc_compact_retire_list response = {};
+            ++rpc_compact_profile().retire_batches;
+            rpc_compact_profile().retire_drained += list.count;
+            return send_rpc_cmd(sock, RPC_CMD_RELEASE_COMPACT_CHECKED, &list, sizeof(list), &response, sizeof(response)) &&
+                    rpc_compact_prove(*handle->owner, list, response);
+        });
+    }
     auto * diagnostic = rpc_compact_release_timing();
     const int64_t begin = diagnostic ? rpc_command_now() : 0;
     const auto tag = diagnostic ? rpc_command_tag : rpc_command_context{};
@@ -4451,7 +4691,11 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_release_compact(void * opaque) 
         rpc_compact_token response = {};
         if (!send_rpc_cmd(sock, RPC_CMD_RELEASE_COMPACT, &handle->token, sizeof(handle->token), &response, sizeof(response),
                     nullptr, diagnostic ? &timestamps : nullptr) ||
-                !rpc_compact_same_token(response, handle->token) || handle->owner->compact_live == 0) {
+                !rpc_compact_same_token(response, handle->token)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(handle->owner->compact_m);
+        if (handle->owner->compact_live == 0) {
             return false;
         }
         --handle->owner->compact_live;
@@ -5482,7 +5726,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST | RPC_FEATURE_COMPACT_RETURN;
+    response.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST | RPC_FEATURE_COMPACT_RETURN | RPC_FEATURE_COMPACT_RETIRE;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -7625,6 +7869,35 @@ static void rpc_session_shutdown_lanes(rpc_active_session & s) {
     rpc_peer_links_close(abort_pending);
 }
 
+static bool rpc_compact_validate_retire(const rpc_compact_retire_list & list, uint64_t session,
+        const std::unordered_map<uint64_t, std::vector<uint8_t>> & snapshots) {
+    if (list.session != session || list.count > RPC_COMPACT_MAX_RECORDS) {
+        return false;
+    }
+    for (size_t i = 0; i < RPC_COMPACT_MAX_RECORDS; ++i) {
+        const rpc_compact_token & token = list.tokens[i];
+        if (i >= list.count) {
+            if (token.session != 0 || token.generation != 0) {
+                return false;
+            }
+            continue;
+        }
+        if (token.session != session || token.generation == 0) {
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (list.tokens[j].generation == token.generation) {
+                return false;
+            }
+        }
+        const auto entry = snapshots.find(token.generation);
+        if (entry == snapshots.end() || entry->second.size() != RPC_MEAN_FULL_BYTES) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void rpc_serve_client(rpc_server & server, rpc_active_session & session, socket_ptr sock) {
     // Main-connection ownership only. Disconnect destroys every retained snapshot.
     std::unordered_map<uint64_t, std::vector<uint8_t>> compact_returns;
@@ -7860,6 +8133,63 @@ static void rpc_serve_client(rpc_server & server, rpc_active_session & session, 
                     return;
                 }
                 if (!server.init_tensor(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_COMPACT_AND_PUSH_CHECKED: {
+                bool ok = false;
+                try {
+                    rpc_msg_compact_checked_req request;
+                    if (recv_msg(sock, &request, sizeof(request)) && rpc_mean_request(request.push) &&
+                            rpc_compact_validate_retire(request.retire, session.id, compact_returns) &&
+                            compact_generation != UINT64_MAX &&
+                            compact_returns.size() - request.retire.count < RPC_COMPACT_MAX_RECORDS) {
+                        for (size_t i = 0; i < request.retire.count; ++i) {
+                            compact_returns.erase(request.retire.tokens[i].generation);
+                        }
+                        auto entry = compact_returns.emplace(++compact_generation, std::vector<uint8_t>{}).first;
+                        if (server.get_tensor_and_push(request.push, entry->second) && entry->second.size() == RPC_MEAN_FULL_BYTES) {
+                            std::array<float, RPC_MEAN_WIDTH> mean;
+                            rpc_make_mean(entry->second, mean);
+                            rpc_msg_compact_checked_rsp response = {};
+                            response.output.token = {session.id, entry->first};
+                            memcpy(response.output.mean, mean.data(), RPC_MEAN_BYTES);
+                            response.retired = request.retire;
+                            ok = send_msg(sock, &response, sizeof(response));
+                        }
+                    }
+                } catch (const std::exception & error) {
+                    GGML_LOG_ERROR("[rpc compact] checked snapshot failed: %s\n", error.what());
+                } catch (...) {
+                    GGML_LOG_ERROR("[rpc compact] checked snapshot failed\n");
+                }
+                if (!ok) {
+                    session.fail();
+                    sock->shutdown_rw();
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_RELEASE_COMPACT_CHECKED: {
+                bool ok = false;
+                try {
+                    rpc_compact_retire_list request;
+                    if (recv_msg(sock, &request, sizeof(request)) && request.count != 0 &&
+                            rpc_compact_validate_retire(request, session.id, compact_returns)) {
+                        for (size_t i = 0; i < request.count; ++i) {
+                            compact_returns.erase(request.tokens[i].generation);
+                        }
+                        ok = send_msg(sock, &request, sizeof(request));
+                    }
+                } catch (const std::exception & error) {
+                    GGML_LOG_ERROR("[rpc compact] checked release failed: %s\n", error.what());
+                } catch (...) {
+                    GGML_LOG_ERROR("[rpc compact] checked release failed\n");
+                }
+                if (!ok) {
+                    session.fail();
+                    sock->shutdown_rw();
                     return;
                 }
                 break;
@@ -8152,7 +8482,7 @@ static bool rpc_handshake_hello(const socket_ptr & sock) {
     rsp.major = RPC_PROTO_MAJOR_VERSION;
     rsp.minor = RPC_PROTO_MINOR_VERSION;
     rsp.patch = RPC_PROTO_PATCH_VERSION;
-    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST | RPC_FEATURE_COMPACT_RETURN;
+    rsp.features = RPC_FEATURE_ORDERED_COPY | RPC_FEATURE_GET_AND_PUSH | RPC_FEATURE_MAIN_DEDUPE | RPC_FEATURE_MEAN_FIRST | RPC_FEATURE_COMPACT_RETURN | RPC_FEATURE_COMPACT_RETIRE;
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
@@ -8537,6 +8867,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_release_compact") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_release_compact;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_queue_compact") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_queue_compact;
     }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_mean") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_can_mean;
