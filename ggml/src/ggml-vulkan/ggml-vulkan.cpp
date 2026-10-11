@@ -966,6 +966,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
+    vk_pipeline pipeline_q8_swiglu[mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -5557,6 +5558,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const char * q8_pair_env = std::getenv("GGML_VK_GCN_Q8_PAIR_REUSE");
     const uint32_t q8_pair_reuse = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_GCN &&
             !device->integer_dot_product && q8_pair_env != nullptr && std::atoi(q8_pair_env) != 0;
+    const char * q8_swiglu_env = std::getenv("GGML_VK_GCN_Q8_SWIGLU");
+    const bool q8_swiglu = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_GCN &&
+            !device->integer_dot_product && device->subgroup_arithmetic &&
+            device->subgroup_size > 0 && device->subgroup_size <= 512 && 512 % device->subgroup_size == 0 &&
+            q8_swiglu_env != nullptr && std::strcmp(q8_swiglu_env, "1") == 0;
     // Opt-in: the GCN driver can lose more to uniform control flow than it saves
     // by skipping padded columns. Keep the established dispatch as the default.
     const char * q8_skip_padded = std::getenv("GGML_VK_GCN_Q8_SKIP_PADDED");
@@ -5602,6 +5608,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define OCP_DMMV_LEN(NAME, REDUC)  NAME ## _len[REDUC]
 #define OCP_DMMV_DATA(NAME, REDUC) NAME ## _data[REDUC]
 #endif
+
+    if (q8_swiglu) {
+        for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+            ggml_vk_create_pipeline(device, device->pipeline_q8_swiglu[i], "mul_mat_vec_q8_swiglu",
+                    mul_mat_vec_q8_swiglu_len, mul_mat_vec_q8_swiglu_data, "main", 4, sizeof(uint32_t),
+                    {rm_q8_0, 1, 1}, {subgroup_size, rm_q8_0, i + 1}, 1, true, true, force_subgroup_size);
+        }
+    }
 
     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
         const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
@@ -9918,6 +9932,21 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
     if (y_non_contig || quantize_y) {
         ctx->prealloc_y_need_sync = true;
+    }
+}
+
+static void ggml_vk_q8_swiglu(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 2];
+    const vk_subbuffer gate = ggml_vk_tensor_subbuffer(ctx, dst->src[0]->src[0]);
+    const vk_subbuffer up = ggml_vk_tensor_subbuffer(ctx, dst->src[1]->src[0]);
+    const vk_subbuffer input = ggml_vk_tensor_subbuffer(ctx, dst->src[0]->src[1]);
+    const vk_subbuffer output = ggml_vk_tensor_subbuffer(ctx, dst);
+    for (uint32_t col = 0; col < (uint32_t) dst->ne[1]; col += mul_mat_vec_max_cols) {
+        const uint32_t cols = std::min((uint32_t) dst->ne[1] - col, mul_mat_vec_max_cols);
+        vk_pipeline pipeline = ctx->device->pipeline_q8_swiglu[cols - 1];
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const std::array<uint32_t, 1> pc = { col };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { gate, up, input, output }, pc, { 8192, 1, 1 });
     }
 }
 
@@ -17016,7 +17045,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL_MAT:
-        ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL_MAT) {
+            ggml_vk_q8_swiglu(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
     case GGML_OP_MUL_MAT_ID:
@@ -18353,6 +18386,77 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
     return false;
 }
 
+static bool ggml_vk_match_q8_swiglu(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->pipeline_q8_swiglu[0] || node_idx + 2 >= cgraph->n_nodes ||
+        cgraph->nodes[node_idx]->op != GGML_OP_MUL_MAT ||
+        cgraph->nodes[node_idx + 1]->op != GGML_OP_MUL_MAT ||
+        cgraph->nodes[node_idx + 2]->op != GGML_OP_GLU) {
+        return false;
+    }
+    for (int j = 0; j < 3; ++j) {
+        const auto flags = cgraph->nodes[node_idx + j]->flags;
+        if (!(flags & GGML_TENSOR_FLAG_COMPUTE) || (j < 2 && (flags & GGML_TENSOR_FLAG_OUTPUT))) {
+            return false;
+        }
+    }
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    const ggml_tensor * second = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 2];
+    if (ggml_get_glu_op(dst) != GGML_GLU_OP_SWIGLU ||
+        !((dst->src[0] == first && dst->src[1] == second) || (dst->src[0] == second && dst->src[1] == first)) ||
+        !first->src[0] || !first->src[1] || !second->src[0] || first->src[1] != second->src[1]) {
+        return false;
+    }
+    const ggml_tensor * input = first->src[1];
+    if (input->type != GGML_TYPE_F32 || input->ne[0] != 4096 || input->ne[1] < 1 || input->ne[1] > 13 ||
+        input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) {
+        return false;
+    }
+    for (const ggml_tensor * mm : { first, second }) {
+        const ggml_tensor * weight = mm->src[0];
+        if (weight->type != GGML_TYPE_Q8_0 || weight->ne[0] != 4096 || weight->ne[1] != 8192 ||
+            weight->ne[2] != 1 || weight->ne[3] != 1 || !ggml_is_contiguous(weight) ||
+            mm->type != GGML_TYPE_F32 || mm->ne[0] != 8192 || mm->ne[1] != input->ne[1] ||
+            mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm) || mm->view_src ||
+            (mm->flags & GGML_TENSOR_FLAG_INPUT)) {
+            return false;
+        }
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(dst, first) || !ggml_is_contiguous(dst) || dst->view_src) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_vk_can_fuse_q8_swiglu(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_match_q8_swiglu(ctx, cgraph, node_idx) ||
+        !ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { node_idx + 2 })) {
+        return false;
+    }
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    const ggml_tensor * second = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * input = first->src[1];
+    for (const ggml_tensor * tensor : std::initializer_list<const ggml_tensor *>{ first, second, dst, input, first->src[0], second->src[0] }) {
+        if (!tensor->buffer || !ggml_backend_buffer_is_vk(tensor->buffer)) {
+            return false;
+        }
+        const auto * buf_ctx = (const ggml_backend_vk_buffer_context *) tensor->buffer->context;
+        if (!buf_ctx->dev_buffer ||
+            (vk_tensor_offset(tensor) + tensor->view_offs) % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
+            ggml_nbytes(tensor) > ctx->device->properties.limits.maxStorageBufferRange) {
+            return false;
+        }
+    }
+    // The final write must not overwrite any projection input, including constant leaves.
+    for (const ggml_tensor * src : std::initializer_list<const ggml_tensor *>{ input, first->src[0], second->src[0] }) {
+        if (ggml_vk_tensors_overlap(src, dst, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     GGML_UNUSED(ctx);
@@ -18807,6 +18911,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_q8_swiglu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "Q8_SWIGLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -19214,6 +19324,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(topk_moe_late_softmax)) {
             continue;
         }
+        if (!ctx->device->disable_fusion && ggml_vk_match_q8_swiglu(ctx, graph, first_unused) &&
+            keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+            continue;
+        }
         if (keep_pattern(snake_pattern)) {
             continue;
         }
@@ -19253,6 +19367,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
+                (!ctx->device->disable_fusion &&
+                 ((ggml_vk_match_q8_swiglu(ctx, graph, j) && match_pattern({ GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, j)) ||
+                  (j > 0 && ggml_vk_match_q8_swiglu(ctx, graph, j - 1) && match_pattern({ GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, j - 1)))) ||
                 match_pattern(snake_pattern, j) ||
                 in_qsa_pattern(j)) {
                 continue;
