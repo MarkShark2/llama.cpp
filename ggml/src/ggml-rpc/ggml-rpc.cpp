@@ -4040,12 +4040,28 @@ static bool rpc_mean_first_enabled() {
     return enabled;
 }
 
+// A sampled mean can outlive its socket. Keep only immutable trace identity,
+// never a transport owner or a pointer into the receiver's stack/state.
+struct rpc_mean_trace {
+    socket_t::command_trace_state identity;
+    rpc_command_record command;
+    bool waited = false;
+    bool materialized = false;
+
+    explicit rpc_mean_trace(const rpc_command_record & record) : command(record) {
+        identity.local = record.state->local;
+        identity.peer = record.state->peer;
+        command.state = &identity;
+    }
+};
+
 struct rpc_mean_result {
     std::mutex m;
     std::condition_variable cv;
     bool anchor_ready = false;
     bool complete = false;
     bool ok = false;
+    std::unique_ptr<rpc_mean_trace> trace;
     std::array<float, RPC_MEAN_WIDTH> mean;
     std::array<float, RPC_MEAN_WIDTH * RPC_MEAN_STREAMS> full;
 };
@@ -4145,6 +4161,15 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_begin_mean(
         try {
             auto receive = [&] {
                 rpc_command_scope trace(sock, RPC_CMD_GET_MEAN_AND_PUSH, "client", true);
+                if (trace.active) {
+                    // Diagnostic allocation failure must not poison a valid return.
+                    try {
+                        std::lock_guard<std::mutex> l(result->m);
+                        result->trace.reset(new rpc_mean_trace(trace));
+                    } catch (const std::bad_alloc &) {
+                        GGML_LOG_WARN("[rpc mean] consumer trace allocation failed\n");
+                    }
+                }
                 if (!send_rpc_cmd_data(sock, RPC_CMD_GET_MEAN_AND_PUSH, req.get(), sizeof(*req))) {
                     return false;
                 }
@@ -4188,10 +4213,21 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_begin_mean(
     if (!submitted) {
         return sdisp->is_poisoned() ? -2 : -1;
     }
+    int64_t observed = 0;
+    rpc_mean_trace * trace = nullptr;
     {
         std::unique_lock<std::mutex> l(result->m);
         result->cv.wait(l, [&] { return result->anchor_ready || result->complete; });
+        trace = result->trace.get();
+        observed = trace ? rpc_command_now() : 0;
         if (!result->anchor_ready || (result->complete && !result->ok)) {
+            l.unlock();
+            if (trace) {
+                trace->command.emit("anchor_failed_observed", observed, observed);
+                if (trace->command.last) {
+                    rpc_trace_flush();
+                }
+            }
             return -2;
         }
         memcpy(mean_out, result->mean.data(), RPC_MEAN_BYTES);
@@ -4201,6 +4237,15 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_begin_mean(
         *ordinal_out = ++st.push_counts.at(ddisp->endpoint);
     }
     *handle_out = handle.release();
+    if (trace) {
+        const int64_t ready = rpc_command_now();
+        // These are consumer timestamps, not notification or wire timings.
+        trace->command.emit("anchor_observed", observed, observed, RPC_MEAN_BYTES);
+        trace->command.emit("mean_return_ready", ready, ready, RPC_MEAN_BYTES);
+        if (trace->command.last) {
+            rpc_trace_flush();
+        }
+    }
     return 1;
 }
 
@@ -4209,15 +4254,35 @@ GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_finish_mean(void * opaque, void
         return false;
     }
     const auto result = static_cast<rpc_mean_handle *>(opaque)->result;
+    const int64_t begin = rpc_command_trace_limit() ? rpc_command_now() : 0;
     std::unique_lock<std::mutex> l(result->m);
-    result->cv.wait(l, [&] { return result->complete; });
-    if (!result->ok) {
-        return false;
+    auto * trace = result->trace.get();
+    // At most one join and one materialization sample per selected command;
+    // release's repeated finish must not create an unbounded event population.
+    const bool capture = trace && !(full_out ? trace->materialized : trace->waited);
+    if (capture) {
+        (full_out ? trace->materialized : trace->waited) = true;
     }
-    if (full_out != nullptr) {
+    const bool already_complete = result->complete;
+    result->cv.wait(l, [&] { return result->complete; });
+    const int64_t observed = capture ? rpc_command_now() : 0;
+    const bool ok = result->ok;
+    if (ok && full_out != nullptr) {
         memcpy(full_out, result->full.data(), RPC_MEAN_FULL_BYTES);
     }
-    return true;
+    const int64_t ready = capture ? rpc_command_now() : 0;
+    l.unlock();
+    if (capture) {
+        trace->command.emit(ok ? "full_observed" : "full_failed_observed", begin, observed,
+                full_out != nullptr, already_complete, (uint64_t) (rpc_command_tag.stage + 1));
+        if (ok && full_out != nullptr) {
+            trace->command.emit("full_materialized", observed, ready, RPC_MEAN_FULL_BYTES);
+        }
+        if (trace->command.last) {
+            rpc_trace_flush();
+        }
+    }
+    return ok;
 }
 
 GGML_BACKEND_API void ggml_backend_rpc_sync_peer_release_mean(void * opaque) {
