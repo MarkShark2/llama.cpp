@@ -2854,9 +2854,15 @@ int llama_context::encode(const llama_batch & batch_inp) {
          !res->t_sampled_logits.empty() || !res->t_candidates.empty())) {
         // the SPD head runs one ubatch, so its rows start at 0
         copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,       0, sched.get());
-        copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
-        copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      n_vocab, 0, sched.get(), &sampling.probs_count);
-        copy_tensor_async_rows(res->t_candidates,     sampling.candidates, n_vocab, 0, sched.get(), &sampling.candidates_count);
+        // SPD reads only the sampled token. A greedy chain still leaves its
+        // vocab-wide logits row attached, and on a remote head that row is a
+        // 620 KB readback per verified token.
+        const bool token_only = !res->t_sampled.empty() && res->t_sampled[0] != nullptr;
+        if (!token_only) {
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      n_vocab, 0, sched.get(), &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, n_vocab, 0, sched.get(), &sampling.candidates_count);
+        }
     }
 
     // extract embeddings
