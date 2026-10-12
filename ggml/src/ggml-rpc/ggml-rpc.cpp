@@ -4369,20 +4369,33 @@ struct rpc_mean_handle {
     std::shared_ptr<rpc_mean_result> result;
 };
 
-extern "C" {
-GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor * src, const ggml_tensor * dst) {
+static bool rpc_sync_peer_read_push_supported(
+        const std::shared_ptr<rpc_dispatcher> & sdisp, const std::shared_ptr<rpc_dispatcher> & ddisp) {
     static const bool enabled = [] {
         const char * v = getenv("GGML_RPC_GET_AND_PUSH");
         return v == nullptr || atoi(v) != 0;
     }();
-    if (!enabled) {
-        return false;
-    }
+    return enabled && sdisp != nullptr && ddisp != nullptr && sdisp != ddisp &&
+            rpc_peer_enabled() && !rpc_async_enabled() && !rpc_wire_bf16_enabled() &&
+            (sdisp->features & RPC_FEATURE_GET_AND_PUSH) && ddisp->patch >= GGML_RPC_PEER_MIN_PATCH;
+}
+
+extern "C" {
+// Call while both endpoints are idle. Prefill and decode probes may have different shapes.
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_prepare_read_push(const ggml_tensor * src, const ggml_tensor * dst) {
     auto sdisp = rpc_tensor_dispatcher(src);
     auto ddisp = rpc_tensor_dispatcher(dst);
-    return sdisp != nullptr && ddisp != nullptr && sdisp != ddisp &&
-            rpc_peer_enabled() && !rpc_async_enabled() && !rpc_wire_bf16_enabled() &&
-            (sdisp->features & RPC_FEATURE_GET_AND_PUSH) && ddisp->patch >= GGML_RPC_PEER_MIN_PATCH &&
+    if (!rpc_sync_peer_read_push_supported(sdisp, ddisp)) {
+        return false;
+    }
+    uint64_t dst_session = 0;
+    return rpc_sync_session_for(ddisp, dst_session) && rpc_peer_route_ready(sdisp, ddisp, dst_session, true);
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_sync_peer_can_read_push(const ggml_tensor * src, const ggml_tensor * dst) {
+    auto sdisp = rpc_tensor_dispatcher(src);
+    auto ddisp = rpc_tensor_dispatcher(dst);
+    return rpc_sync_peer_read_push_supported(sdisp, ddisp) &&
             src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_are_same_layout(src, dst) &&
             ggml_nbytes(src) != 0;
 }
@@ -4915,9 +4928,9 @@ GGML_BACKEND_API void ggml_backend_rpc_sync_peer_release_mean(void * opaque) {
     }
 }
 
-// 0 means unsupported before submission; -1 means an earlier deferred ACK failed.
-GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
-        const ggml_tensor * src, const ggml_tensor * dst, void * data, uint64_t * ordinal_out) {
+static int rpc_sync_peer_read_push(
+        const ggml_tensor * src, const ggml_tensor * dst, void * data, uint64_t * ordinal_out,
+        void (*on_issue)(void *, uint64_t), void * user_data) {
     if (!ggml_backend_rpc_sync_peer_can_read_push(src, dst)) {
         return 0;
     }
@@ -4934,6 +4947,9 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
             return 0;
         }
         dst_session = it->second;
+        if (on_issue != nullptr) {
+            st.push_counts.try_emplace(ddisp->endpoint, 0);
+        }
         auto lit = st.push_lanes.find(sdisp->endpoint);
         if (lit != st.push_lanes.end()) {
             lane = lit->second;
@@ -4950,7 +4966,7 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
         ++st.lane_acked[sdisp->endpoint];
         --pending;
     }
-    if (!rpc_peer_route_ready(sdisp, ddisp, dst_session, false)) {
+    if (!rpc_peer_route_ready(sdisp, ddisp, dst_session, on_issue != nullptr)) {
         return 0;
     }
     auto req = std::make_shared<rpc_msg_push_tensor_req>();
@@ -4960,6 +4976,33 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
     req->src = serialize_tensor(src);
     req->dst = serialize_tensor(dst);
     req->size = ggml_nbytes(src);
+    if (on_issue != nullptr) {
+        const bool ok = sdisp->call_counted([&](const socket_ptr & sock) {
+            rpc_command_scope trace(sock, RPC_CMD_GET_TENSOR_AND_PUSH, "client", true);
+            if (!send_rpc_cmd_data(sock, RPC_CMD_GET_TENSOR_AND_PUSH, req.get(), sizeof(*req))) {
+                return false;
+            }
+            uint64_t ordinal;
+            {
+                std::lock_guard<std::mutex> l(st.m);
+                ordinal = ++st.push_counts.at(ddisp->endpoint);
+            }
+            *ordinal_out = ordinal;
+            // The consumer can now fence delivery without waiting for this host return.
+            try {
+                on_issue(user_data, ordinal);
+            } catch (...) {
+                GGML_ABORT("RPC peer issue callback threw after command submission");
+            }
+            rpc_phase_io phase(false);
+            uint64_t out_size = 0;
+            return sock->recv_data(&out_size, sizeof(out_size)) && out_size == req->size &&
+                    sock->recv_data(data, req->size, rpc_get_wait_all(RPC_CMD_GET_TENSOR_AND_PUSH, req->size));
+        });
+        // Never retry a partial send or a failed return: the consumer may already be waiting for its push.
+        RPC_STATUS_ASSERT(ok);
+        return 1;
+    }
     // Like GET_TENSOR, a failed response is fatal: the peer may already own these bytes.
     const bool ok = sdisp->send(RPC_CMD_GET_TENSOR_AND_PUSH, req, sizeof(*req), data, req->size);
     RPC_STATUS_ASSERT(ok);
@@ -4968,6 +5011,24 @@ GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
         *ordinal_out = ++st.push_counts[ddisp->endpoint];
     }
     return 1;
+}
+
+// 0 means unsupported before submission; -1 means an earlier deferred ACK failed.
+GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push(
+        const ggml_tensor * src, const ggml_tensor * dst, void * data, uint64_t * ordinal_out) {
+    return rpc_sync_peer_read_push(src, dst, data, ordinal_out, nullptr, nullptr);
+}
+
+// The producer's socket owner calls this. on_issue must not wait for peer completion, throw, or use that socket.
+// It runs once after the command flush and ordinal reservation, before receiving any host reply.
+GGML_BACKEND_API int ggml_backend_rpc_sync_peer_read_push_issued(
+        const ggml_tensor * src, const ggml_tensor * dst, void * data, uint64_t * ordinal_out,
+        void (*on_issue)(void *, uint64_t), void * user_data) {
+    if (data == nullptr || ordinal_out == nullptr || on_issue == nullptr) {
+        return -1;
+    }
+    *ordinal_out = 0;
+    return rpc_sync_peer_read_push(src, dst, data, ordinal_out, on_issue, user_data);
 }
 }
 
@@ -8850,8 +8911,14 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_read_push") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_can_read_push;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_prepare_read_push") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_prepare_read_push;
+    }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_read_push") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_read_push;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_sync_peer_read_push_issued") == 0) {
+        return (void *)ggml_backend_rpc_sync_peer_read_push_issued;
     }
     if (std::strcmp(name, "ggml_backend_rpc_sync_peer_can_compact") == 0) {
         return (void *)ggml_backend_rpc_sync_peer_can_compact;

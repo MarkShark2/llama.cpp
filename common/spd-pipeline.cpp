@@ -39,6 +39,22 @@ constexpr uint32_t SPD_MAX_ROLLBACK_TOKENS = SPD_MAX_STAGE_COUNT - 1;
 
 using clock_type = std::chrono::steady_clock;
 
+struct schedule_prefix_scope {
+    inline static thread_local const void * owner = nullptr;
+    inline static thread_local uint64_t prefix = 0;
+    const void * previous_owner;
+    uint64_t previous_prefix;
+    schedule_prefix_scope(const void * value, uint64_t epoch)
+        : previous_owner(owner), previous_prefix(prefix) {
+        owner = value;
+        prefix = epoch;
+    }
+    ~schedule_prefix_scope() {
+        owner = previous_owner;
+        prefix = previous_prefix;
+    }
+};
+
 struct rpc_command_trace_scope {
     using context_fn = void (*)(uint64_t, uint64_t, int, int, int);
     context_fn set_context;
@@ -589,6 +605,8 @@ struct common_spd_pipeline::impl {
     bool overlap_head_submit = false;
     // The overlapped head waits for the reader only when both run on one device.
     bool head_shares_sidecar = true;
+    bool async_requested = false;
+    bool async_fallback_warned = false;
     bool light_rollback = false;
     bool full_checkpoints = false; // GLM full-state bundles with compact live checkpoints
     std::array<uint64_t, 2> checkpoint_identity = {};
@@ -959,7 +977,7 @@ struct common_spd_pipeline::impl {
     size_t timing_active_count = 0;
     uint64_t command_trace_wave = 0;
     uint64_t schedule_trace_request = 0;
-    uint64_t schedule_trace_prefix = 0;
+    std::atomic<uint64_t> schedule_trace_prefix{0};
     struct schedule_event {
         int64_t us;
         uint64_t request, wave, prefix;
@@ -983,7 +1001,8 @@ struct common_spd_pipeline::impl {
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now().time_since_epoch()).count();
         // Workers own distinct slots. Flush only after all generation workers join.
         schedule_events[seq] = { (int64_t) us, schedule_trace_request, command_trace_wave,
-                schedule_trace_prefix, timing_active_count, stage, pos, value, event };
+                schedule_prefix_scope::owner == this ? schedule_prefix_scope::prefix : schedule_trace_prefix.load(),
+                timing_active_count, stage, pos, value, event };
     }
 
     void flush_schedule_trace() {
@@ -1003,6 +1022,9 @@ struct common_spd_pipeline::impl {
 
     impl(llama_model * model_target, llama_model * model_spd, const common_spd_params & params, bool initialize_now = true)
         : model_target(model_target), model_spd(model_spd), params(params) {
+        if (const char * value = std::getenv("LLAMA_SPD_ASYNC")) {
+            async_requested = std::strcmp(value, "1") == 0;
+        }
         if (const char * value = std::getenv("LLAMA_SPD_STATIC_DECODE")) {
             static_decode_fast_path = std::atoi(value) != 0;
         }
@@ -2429,6 +2451,10 @@ struct common_spd_pipeline::impl {
             fail("target SPD head produced no logits");
             return false;
         }
+        return target_head_select(logits, token);
+    }
+
+    bool target_head_select(const float * logits, llama_token & token) {
         token = argmax(logits, n_vocab);
         if (ignore_eos_active && llama_vocab_is_eog(llama_model_get_vocab(model_target), token)) {
             token = argmax_no_eog(logits, token);
@@ -2709,7 +2735,8 @@ struct common_spd_pipeline::impl {
             const std::map<llama_pos, snapshot> & completed,
             const snapshot * prev_evicted,
             llama_pos prev_evicted_pos,
-            speculation_input & input) {
+            speculation_input & input,
+            llama_pos restart_pos = -1) {
         if (pipeline.empty()) {
             fail("SPD pipeline is empty before speculation");
             return false;
@@ -2751,7 +2778,10 @@ struct common_spd_pipeline::impl {
             }
 
             const int32_t nominal_depth = newest_pos - pos;
-            const int32_t search_hi = nominal_depth == 0 ? 0 : has_evicted ? stage_count - 1 : stage_count;
+            int32_t search_hi = nominal_depth == 0 ? 0 : has_evicted ? stage_count - 1 : stage_count;
+            if (restart_pos >= 0 && pos >= restart_pos) {
+                search_hi = std::min(search_hi, nominal_depth);
+            }
             const size_t selector = choose_anchor(*snap, search_hi);
             append_row(input, pos, selector, [&](size_t i) { return snap->values[i].data(); }, true);
         }
@@ -3552,7 +3582,13 @@ struct common_spd_pipeline::impl {
         return item;
     }
 
-    bool advance_entry(uint32_t stage, entry & item, double & elapsed, std::string & error) {
+    struct async_handoff {
+        void (*issued)(void *, uint64_t);
+        void * data;
+    };
+
+    bool advance_entry(uint32_t stage, entry & item, double & elapsed, std::string & error,
+            const async_handoff * handoff = nullptr) {
         rpc_command_trace_scope trace((uint64_t) (uintptr_t) this, command_trace_wave, (int) stage, item.pos, (int) timing_active_count);
         trace_schedule("stage_begin", (int) stage, item.pos);
         const auto lock_start = clock_type::now();
@@ -3684,7 +3720,7 @@ struct common_spd_pipeline::impl {
         const llama_token * token = stage == 0 ? &item.token : nullptr;
         const float * embd = nullptr;
         if (stage > 0) {
-            if (peer_in && compact_input) {
+            if (peer_in && (compact_input || handoff != nullptr)) {
                 // Host batch preparation copies this span even when the device upload is skipped.
                 auto & scratch = stage_peer_inputs[stage];
                 scratch.resize(n_embd_boundary, 0.0f);
@@ -3699,6 +3735,8 @@ struct common_spd_pipeline::impl {
         }
         using can_read_push_fn = bool (*)(const ggml_tensor *, const ggml_tensor *);
         using read_push_fn = int (*)(const ggml_tensor *, const ggml_tensor *, void *, uint64_t *);
+        using read_push_issued_fn = int (*)(const ggml_tensor *, const ggml_tensor *, void *, uint64_t *,
+                void (*)(void *, uint64_t), void *);
         using can_mean_fn = bool (*)(const ggml_tensor *, const ggml_tensor *, int64_t);
         using begin_mean_fn = int (*)(const ggml_tensor *, const ggml_tensor *, float *, int64_t, void **, uint64_t *);
         auto rpc_reg = ggml_backend_reg_by_name("RPC");
@@ -3706,6 +3744,8 @@ struct common_spd_pipeline::impl {
                 rpc_reg, "ggml_backend_rpc_sync_peer_can_read_push") : nullptr;
         auto read_push = rpc_reg ? (read_push_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_read_push") : nullptr;
+        auto read_push_issued = handoff != nullptr && rpc_reg ? (read_push_issued_fn) ggml_backend_reg_get_proc_address(
+                rpc_reg, "ggml_backend_rpc_sync_peer_read_push_issued") : nullptr;
         auto can_mean = rpc_reg ? (can_mean_fn) ggml_backend_reg_get_proc_address(
                 rpc_reg, "ggml_backend_rpc_sync_peer_can_mean") : nullptr;
         auto begin_mean = rpc_reg ? (begin_mean_fn) ggml_backend_reg_get_proc_address(
@@ -3730,15 +3770,19 @@ struct common_spd_pipeline::impl {
                 rpc_reg, "ggml_backend_rpc_sync_peer_release_compact") : nullptr;
         const ggml_tensor * previous_out = llama_spd_peer_out_tensor(stages[stage]);
         const bool compound_read = pb_out != nullptr && pb_out->ready && pb_out->dec_ready && !pb_out->dead &&
-                wanted.empty() && previous_out != nullptr &&
-                ggml_nbytes(previous_out) == (size_t) n_embd_boundary*sizeof(float) &&
-                can_read_push != nullptr && read_push != nullptr &&
-                can_read_push(previous_out, pb_out->staging_dec[slot]);
+                wanted.empty() && (handoff != nullptr ? read_push_issued != nullptr :
+                (previous_out != nullptr && ggml_nbytes(previous_out) == (size_t) n_embd_boundary*sizeof(float) &&
+                 can_read_push != nullptr && read_push != nullptr &&
+                 can_read_push(previous_out, pb_out->staging_dec[slot])));
+        if (handoff != nullptr && ((stage > 0 && !peer_in) || (pb_out != nullptr && !compound_read))) {
+            error = "SPD async peer boundary unavailable for stage " + std::to_string(stage);
+            return false;
+        }
         size_t mean_anchor = anchors.size();
-        const bool compact_read = compound_read && can_compact && begin_compact && finish_compact &&
+        const bool compact_read = handoff == nullptr && compound_read && can_compact && begin_compact && finish_compact &&
                 materialize_compact && release_compact && abort_mean &&
                 can_compact(previous_out, pb_out->staging_dec[slot], n_embd);
-        if (compact_read || (compound_read && can_mean && begin_mean && finish_mean && release_mean && abort_mean &&
+        if (compact_read || (handoff == nullptr && compound_read && can_mean && begin_mean && finish_mean && release_mean && abort_mean &&
                 can_mean(previous_out, pb_out->staging_dec[slot], n_embd))) {
             for (size_t ai = 0; ai < anchors.size(); ++ai) {
                 if (anchors[ai] == stage_bounds[stage + 1]) {
@@ -3821,15 +3865,19 @@ struct common_spd_pipeline::impl {
             }
             if (result == 0) {
                 output.resize(n_embd_boundary);
-                result = read_push(out, pb_out->staging_dec[slot], output.data(), &ordinal);
+                result = handoff != nullptr
+                        ? read_push_issued(out, pb_out->staging_dec[slot], output.data(), &ordinal, handoff->issued, handoff->data)
+                        : read_push(out, pb_out->staging_dec[slot], output.data(), &ordinal);
             }
-            if (result < 0) {
+            if (result < 0 || (handoff != nullptr && result == 0)) {
                 error = "SPD readback and peer handoff failed for decode stage " + std::to_string(stage);
                 return false;
             }
             if (result > 0) {
-                pb_out->dec_ordinals[slot] = ordinal;
-                pb_out->pushed_pos[slot] = item.pos;
+                if (handoff == nullptr) {
+                    pb_out->dec_ordinals[slot] = ordinal;
+                    pb_out->pushed_pos[slot] = item.pos;
+                }
                 ++timing.decode_pushes[stage];
                 handed_off = true;
             } else {
@@ -3916,6 +3964,698 @@ struct common_spd_pipeline::impl {
         if (timing_active_count <= SPD_MAX_STAGE_COUNT) {
             timing.busy_by_active[stage][timing_active_count] += elapsed;
             ++timing.calls_by_active[stage][timing_active_count];
+        }
+        return true;
+    }
+
+    bool use_async_decode() {
+        if (!async_requested) {
+            return false;
+        }
+        const char * why = nullptr;
+        auto enabled = [](const char * name) {
+            const char * value = std::getenv(name);
+            return value != nullptr && std::atoi(value) != 0;
+        };
+        using prepare_fn = bool (*)(const ggml_tensor *, const ggml_tensor *);
+        auto reg = ggml_backend_reg_by_name("RPC");
+        auto prepare = reg ? (prepare_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_rpc_sync_peer_prepare_read_push") : nullptr;
+        if (!static_decode_fast_path || !params.parallel_stages || !full_checkpoints) {
+            why = "requires static parallel GLM decode";
+        } else if (enabled("GGML_RPC_ASYNC")) {
+            why = "requires synchronous RPC";
+        } else if (!enabled("GGML_RPC_GET_AND_PUSH")) {
+            why = "requires GGML_RPC_GET_AND_PUSH=1";
+        } else if (enabled("GGML_RPC_COMPACT_RETURN") || enabled("GGML_RPC_MEAN_FIRST") ||
+                enabled("GGML_RPC_COMPACT_RETIRE") || parallel_hidden_retirement) {
+            why = "compact return, mean-first and compact retirement must be off";
+        } else if (!peer_boundaries_enabled || prepare == nullptr ||
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_sync_peer_read_push_issued") == nullptr) {
+            why = "requires issue-time compound peer support";
+        }
+        // Delivery counts are endpoint-scoped. One input producer must own each counter domain.
+        for (uint32_t stage = 0; why == nullptr && stage < stage_count; ++stage) {
+            for (uint32_t prior = 0; prior < stage; ++prior) {
+                for (size_t resource : stage_resources[stage]) {
+                    if (std::find(stage_resources[prior].begin(), stage_resources[prior].end(), resource) !=
+                            stage_resources[prior].end()) {
+                        why = "requires a distinct endpoint owner for each stage";
+                    }
+                }
+            }
+        }
+        for (uint32_t stage = 0; why == nullptr && stage + 1 < stage_count; ++stage) {
+            auto & pb = peer_links[stage + 1];
+            if (!pb.ready || !pb.dec_ready || pb.dead || !stage_taps_all_host_derived(stage) ||
+                    !prepare(llama_spd_peer_out_tensor(stages[stage]), pb.staging_dec[0])) {
+                why = "requires ready compound peer boundaries and host anchors on every link";
+            }
+        }
+        if (why != nullptr && !async_fallback_warned) {
+            fprintf(stderr, "SPD async: using lock-step: %s\n", why);
+            async_fallback_warned = true;
+        }
+        return why == nullptr;
+    }
+
+    bool run_async_decode(entry first, std::map<llama_pos, snapshot> & completed,
+            llama_pos n_prompt, int32_t & n_final, llama_pos & cached_upto,
+            const common_spd_gen_params & gparams, common_spd_result & result,
+            const std::function<llama_token(llama_token)> & apply_budget,
+            const std::function<bool(llama_token, int32_t)> & finalize) {
+        struct token_state {
+            entry item;
+            std::array<bool, SPD_MAX_STAGE_COUNT> done = {};
+            uint32_t depth = 0;
+            bool head_ready = false;
+            llama_token sampled = LLAMA_TOKEN_NULL;
+            std::vector<float> logits;
+            bool corrected = false;
+            clock_type::time_point started;
+        };
+        struct scheduler {
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::map<llama_pos, std::shared_ptr<token_state>> tokens;
+            std::array<llama_pos, SPD_MAX_STAGE_COUNT> next = {};
+            std::array<std::array<llama_pos, 2>, SPD_MAX_STAGE_COUNT> credits;
+            std::array<bool, SPD_MAX_STAGE_COUNT> active = {};
+            std::array<uint64_t, SPD_MAX_STAGE_COUNT> reset_done = {};
+            uint64_t epoch = 1;
+            uint64_t reader_reset_done = 1;
+            llama_pos restart;
+            llama_pos frontier;
+            llama_pos next_draft;
+            llama_pos finished_draft;
+            bool stop = false;
+            bool failed = false;
+            bool cancelling = false;
+            bool resetting = false;
+            bool reset_go = false;
+            bool reader_reset_go = false;
+            bool reader_active = false;
+            bool device_busy = false;
+            bool head_waiting = false;
+            uint64_t anchor_waits = 0;
+            uint64_t reader_waits = 0;
+            uint64_t device_waits = 0;
+            uint64_t traversals = 0;
+            double traversal_seconds = 0.0;
+            double head_seconds = 0.0;
+            std::array<double, SPD_MAX_STAGE_COUNT> busy = {};
+            std::array<double, SPD_MAX_STAGE_COUNT> idle = {};
+        } state;
+        const auto begin = clock_type::now();
+        const auto head_key = execution_resource_key(llama_model_output_device(model_target));
+        bool async_head_shares_sidecar = head_key == execution_resource_key(llama_model_output_device(model_spd));
+        for (int32_t layer = 0; layer < llama_model_n_layer(model_spd); ++layer) {
+            async_head_shares_sidecar |= head_key == execution_resource_key(llama_model_layer_device(model_spd, layer));
+        }
+        state.restart = first.pos;
+        state.frontier = first.pos + 1;
+        state.next_draft = first.pos + 1;
+        state.finished_draft = first.pos;
+        state.next.fill(first.pos);
+        state.reset_done.fill(state.epoch);
+        for (auto & slots : state.credits) {
+            slots.fill(-1);
+        }
+        auto initial = std::make_shared<token_state>();
+        initial->item = std::move(first);
+        initial->corrected = true;
+        state.tokens.emplace(initial->item.pos, initial);
+        timing_active_count = stage_count;
+        ++command_trace_wave;
+
+        auto report_failure = [&](const std::string & error) {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.failed = true;
+                state.stop = true;
+            }
+            state.cv.notify_all();
+            fail(error);
+        };
+        auto protect = [&](auto && work) {
+            try {
+                work();
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.failed = true;
+                    state.stop = true;
+                }
+                state.cv.notify_all();
+                try {
+                    std::rethrow_exception(std::current_exception());
+                } catch (const std::exception & error) {
+                    fail(std::string("SPD async worker failed: ") + error.what());
+                } catch (...) {
+                    fail("SPD async worker failed");
+                }
+            }
+        };
+        auto head_resource_locks = [&]() {
+            std::vector<std::unique_lock<std::mutex>> locks;
+            const auto key = execution_resource_key(llama_model_output_device(model_target));
+            std::vector<size_t> resources;
+            for (uint32_t stage = 0; stage < stage_count; ++stage) {
+                for (int32_t layer = stage_bounds[stage]; layer < stage_bounds[stage + 1]; ++layer) {
+                    if (execution_resource_key(llama_model_layer_device(model_target, layer)) == key) {
+                        resources.insert(resources.end(), stage_resources[stage].begin(), stage_resources[stage].end());
+                        break;
+                    }
+                }
+            }
+            std::sort(resources.begin(), resources.end());
+            resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+            for (size_t resource : resources) {
+                locks.emplace_back(*resource_mutexes[resource]);
+            }
+            return locks;
+        };
+        std::array<std::function<void()>, SPD_MAX_STAGE_COUNT> stage_tasks;
+        std::function<void()> reader_task;
+        struct join_guard {
+            impl * owner;
+            scheduler & state;
+            std::array<bool, SPD_MAX_STAGE_COUNT> submitted = {};
+            bool reader = false;
+            bool joined = false;
+            void join() {
+                if (joined) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.stop = true;
+                }
+                state.cv.notify_all();
+                for (uint32_t stage = 0; stage < owner->stage_count; ++stage) {
+                    if (submitted[stage]) {
+                        owner->stage_workers[stage]->wait();
+                    }
+                }
+                if (reader) {
+                    owner->sidecar_worker->wait();
+                }
+                joined = true;
+            }
+            ~join_guard() { join(); }
+        } workers{this, state};
+        struct summary_guard {
+            join_guard & workers;
+            scheduler & state;
+            phase_timing & timing;
+            common_spd_result & result;
+            uint32_t stages;
+            clock_type::time_point begin;
+            ~summary_guard() {
+                workers.join();
+                char stages_text[SPD_MAX_STAGE_COUNT*96 + 1] = {};
+                size_t offset = 0;
+                for (uint32_t stage = 0; stage < stages && offset < sizeof(stages_text) - 1; ++stage) {
+                    const int count = snprintf(stages_text + offset, sizeof(stages_text) - offset,
+                            " s%u=%.3f/%.3f", stage, state.busy[stage], state.idle[stage]);
+                    if (count > 0) {
+                        offset += std::min((size_t) count, sizeof(stages_text) - offset - 1);
+                    }
+                }
+                fprintf(stderr, "SPD async: tokens=%zu accepted=%" PRIu64 " rejections=%" PRIu64
+                        " decode=%.3fs corrected_ms=%.3f/%" PRIu64 " drafter=%" PRIu64
+                        " drafter_ms=%.3f wait_anchors=%" PRIu64 " verify_wait_drafter=%" PRIu64
+                        " wait_device=%" PRIu64 " head_ms=%.3f stage_busy/idle_s:%s%s\n",
+                        result.tokens.size(), result.n_accepted, result.n_rejected, seconds_since(begin),
+                        state.traversals ? 1e3*state.traversal_seconds/state.traversals : 0.0, state.traversals,
+                        timing.sidecar_calls, timing.sidecar_calls ? 1e3*timing.sidecar_run/timing.sidecar_calls : 0.0,
+                        state.anchor_waits, state.reader_waits, state.device_waits, 1e3*state.head_seconds, stages_text,
+                        state.failed ? " failed" : "");
+            }
+        } summary{workers, state, timing, result, stage_count, begin};
+
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            stage_tasks[stage] = [&, stage]() { protect([&]() {
+                while (true) {
+                    std::shared_ptr<token_state> token;
+                    uint64_t epoch;
+                    bool reset = false;
+                    {
+                        const auto wait_begin = clock_type::now();
+                        std::unique_lock<std::mutex> lock(state.mutex);
+                        state.cv.wait(lock, [&]() {
+                            if (state.stop) {
+                                return true;
+                            }
+                            if (state.resetting) {
+                                return state.reset_go && state.reset_done[stage] != state.epoch;
+                            }
+                            const llama_pos pos = state.next[stage];
+                            if (pos > state.frontier - 1 + (llama_pos) stage_rollback_tokens(stage) ||
+                                    (state.cancelling && pos >= state.frontier)) {
+                                return false;
+                            }
+                            const auto it = state.tokens.find(pos);
+                            if (it == state.tokens.end()) {
+                                return false;
+                            }
+                            if (stage > 0 && peer_links[stage].pushed_pos[pos & 1] != pos) {
+                                return false;
+                            }
+                            return stage + 1 == stage_count || state.credits[stage + 1][pos & 1] < 0;
+                        });
+                        state.idle[stage] += seconds_since(wait_begin);
+                        if (state.stop) {
+                            return;
+                        }
+                        epoch = state.epoch;
+                        reset = state.resetting;
+                        state.active[stage] = true;
+                        if (!reset) {
+                            token = state.tokens.at(state.next[stage]);
+                            if (stage + 1 < stage_count) {
+                                state.credits[stage + 1][token->item.pos & 1] = token->item.pos;
+                            }
+                            if (stage == 0 && token->corrected) {
+                                token->started = clock_type::now();
+                            }
+                        }
+                    }
+                    schedule_prefix_scope prefix(this, epoch - 1);
+                    if (reset) {
+                        std::string error;
+                        std::vector<std::unique_lock<std::mutex>> locks;
+                        for (size_t resource : stage_resources[stage]) {
+                            locks.emplace_back(*resource_mutexes[resource]);
+                        }
+                        bool ok = guard_peer_output(stage);
+                        if (stage > 0) {
+                            auto & pb = peer_links[stage];
+                            const uint64_t ordinal = std::max({pb.ordinals[0], pb.ordinals[1],
+                                    pb.dec_ordinals[0], pb.dec_ordinals[1]});
+                            if (ordinal != 0) {
+                                ok = ggml_backend_rpc_sync_peer_fence(pb.inp, ordinal) && ok;
+                            }
+                            // The following checkpoint commands are ordered after this delivery fence.
+                        }
+                        ok = ok && rollback_stage(stage, state.restart, error);
+                        if (!ok) {
+                            report_failure(error.empty() ? "SPD async epoch drain failed" : error);
+                            return;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(state.mutex);
+                            if (stage > 0) {
+                                auto & pb = peer_links[stage];
+                                pb.ordinals[0] = pb.ordinals[1] = 0;
+                                pb.dec_ordinals[0] = pb.dec_ordinals[1] = 0;
+                                pb.pushed_pos[0] = pb.pushed_pos[1] = -1;
+                                state.credits[stage].fill(-1);
+                            }
+                            state.next[stage] = state.restart;
+                            state.reset_done[stage] = epoch;
+                            state.active[stage] = false;
+                        }
+                        state.cv.notify_all();
+                        continue;
+                    }
+
+                    entry local;
+                    local.token = token->item.token;
+                    local.pos = token->item.pos;
+                    local.snap = snapshot(anchors.size());
+                    if (stage == 0) {
+                        // Only stage zero needs the embedding; other stages copy their peer slot.
+                        local.hidden = token->item.hidden;
+                    }
+                    struct issue_context {
+                        impl * owner;
+                        scheduler * state;
+                        uint32_t stage;
+                        llama_pos pos;
+                    } issue{this, &state, stage, local.pos};
+                    async_handoff handoff{
+                        [](void * data, uint64_t ordinal) {
+                            auto & issued = *static_cast<issue_context *>(data);
+                            std::lock_guard<std::mutex> lock(issued.state->mutex);
+                            auto & pb = issued.owner->peer_links[issued.stage + 1];
+                            pb.dec_ordinals[issued.pos & 1] = ordinal;
+                            pb.pushed_pos[issued.pos & 1] = issued.pos;
+                            issued.state->cv.notify_all();
+                        }, &issue};
+                    double elapsed = 0.0;
+                    std::string error;
+                    const auto busy_begin = clock_type::now();
+                    if (!advance_entry(stage, local, elapsed, error, &handoff)) {
+                        report_failure(error);
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+                            if (local.snap.present[ai]) {
+                                token->item.snap.values[ai] = std::move(local.snap.values[ai]);
+                                token->item.snap.present[ai] = true;
+                            }
+                        }
+                        token->done[stage] = true;
+                        while (token->depth < stage_count && token->done[token->depth]) {
+                            ++token->depth;
+                        }
+                        if (token->depth == stage_count && (epoch == state.epoch || local.pos < state.restart)) {
+                            completed[local.pos] = token->item.snap;
+                        }
+                        // A completed GET follows the consumer's ordered copy, so the parity slot is free.
+                        if (stage > 0) {
+                            state.credits[stage][local.pos & 1] = -1;
+                        }
+                        if (stage + 1 == stage_count && token->corrected) {
+                            state.traversal_seconds += seconds_since(token->started);
+                            ++state.traversals;
+                        }
+                        if (stage + 1 == stage_count && async_head_shares_sidecar) {
+                            state.head_waiting = true;
+                        }
+                    }
+                    state.cv.notify_all();
+                    if (stage + 1 == stage_count) {
+                        if (async_head_shares_sidecar) {
+                            std::unique_lock<std::mutex> lock(state.mutex);
+                            state.cv.wait(lock, [&]() { return !state.device_busy || state.failed; });
+                            if (state.failed) {
+                                return;
+                            }
+                            state.device_busy = true;
+                            state.head_waiting = false;
+                        }
+                        const auto head_begin = clock_type::now();
+                        auto locks = head_resource_locks();
+                        bool ok = target_head_decode(local.hidden);
+                        llama_token sampled = LLAMA_TOKEN_NULL;
+                        std::vector<float> logits;
+                        if (ok && head_backend_sampling) {
+                            ok = target_head_sample(sampled);
+                        } else if (ok) {
+                            const float * values = llama_get_logits_ith(head, -1);
+                            if (values != nullptr) {
+                                logits.assign(values, values + n_vocab);
+                            } else {
+                                ok = false;
+                            }
+                        }
+                        locks.clear();
+                        {
+                            std::lock_guard<std::mutex> lock(state.mutex);
+                            state.head_seconds += seconds_since(head_begin);
+                            state.device_busy = false;
+                            token->sampled = sampled;
+                            token->logits = std::move(logits);
+                            token->head_ready = ok;
+                        }
+                        state.cv.notify_all();
+                        if (!ok) {
+                            report_failure("SPD async target head failed");
+                            return;
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        state.busy[stage] += seconds_since(busy_begin);
+                        ++state.next[stage];
+                        state.active[stage] = false;
+                    }
+                    state.cv.notify_all();
+                }
+            }); };
+        }
+
+        reader_task = [&]() { protect([&]() {
+            bool waiting_anchors = false;
+            bool waiting_reader = false;
+            while (true) {
+                speculation_input input;
+                llama_pos pos = -1;
+                uint64_t epoch;
+                bool reset = false;
+                {
+                    std::unique_lock<std::mutex> lock(state.mutex);
+                    state.cv.wait(lock, [&]() {
+                        if (state.stop) {
+                            return true;
+                        }
+                        if (state.resetting && state.reader_reset_done != state.epoch) {
+                            return state.reader_reset_go;
+                        }
+                        if (state.cancelling || state.next_draft > state.frontier + (llama_pos) stage_count - 1) {
+                            return false;
+                        }
+                        const llama_pos n = state.next_draft;
+                        const llama_pos oldest = std::max<llama_pos>(state.restart, n - (llama_pos) stage_count - 1);
+                        for (llama_pos m = oldest; m < n; ++m) {
+                            const auto it = state.tokens.find(m);
+                            if (it == state.tokens.end() || it->second->depth < (uint32_t) std::min<llama_pos>(stage_count, n - 1 - m)) {
+                                if (!waiting_anchors) {
+                                    ++state.anchor_waits;
+                                    waiting_anchors = true;
+                                }
+                                return false;
+                            }
+                        }
+                        if (async_head_shares_sidecar && (state.device_busy || state.head_waiting)) {
+                            if (!waiting_reader) {
+                                ++state.device_waits;
+                                waiting_reader = true;
+                            }
+                            return false;
+                        }
+                        return true;
+                    });
+                    if (state.stop) {
+                        return;
+                    }
+                    epoch = state.epoch;
+                    reset = state.resetting && state.reader_reset_done != epoch;
+                    state.reader_active = true;
+                    if (!reset) {
+                        waiting_anchors = waiting_reader = false;
+                        pos = state.next_draft;
+                        std::vector<entry> window;
+                        for (llama_pos m = pos - 1; m >= std::max<llama_pos>(state.restart, pos - (llama_pos) stage_count); --m) {
+                            entry row;
+                            row.pos = m;
+                            row.snap = state.tokens.at(m)->item.snap;
+                            window.push_back(std::move(row));
+                        }
+                        const llama_pos prev = pos - (llama_pos) stage_count - 1;
+                        const snapshot * evicted = prev >= state.restart ? &state.tokens.at(prev)->item.snap : nullptr;
+                        if (!prepare_speculation(window, completed, evicted, prev, input, state.restart)) {
+                            state.failed = state.stop = true;
+                            state.reader_active = false;
+                            state.cv.notify_all();
+                            return;
+                        }
+                        if (async_head_shares_sidecar) {
+                            state.device_busy = true;
+                        }
+                    }
+                }
+                schedule_prefix_scope prefix(this, epoch - 1);
+                if (reset) {
+                    std::vector<std::unique_lock<std::mutex>> locks;
+                    for (size_t resource : sidecar_resources) {
+                        locks.emplace_back(*resource_mutexes[resource]);
+                    }
+                    if (!llama_memory_seq_rm(llama_get_memory(sidecar), 0, state.restart, -1)) {
+                        report_failure("failed to roll back SPD async sidecar");
+                        return;
+                    }
+                    aggr_forget(state.restart);
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        state.reader_reset_done = epoch;
+                        state.reader_active = false;
+                    }
+                    state.cv.notify_all();
+                    continue;
+                }
+                llama_token sampled = LLAMA_TOKEN_NULL;
+                const bool ok = run_speculation(input, sampled);
+                std::vector<float> embedding;
+                // This context is stateless and has one owner, including across epoch changes.
+                const bool embedded = ok && embed_token(sampled, embedding);
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.device_busy = false;
+                    state.reader_active = false;
+                    ++result.decode_steps;
+                    if (embedded && epoch == state.epoch) {
+                        auto drafted = std::make_shared<token_state>();
+                        drafted->item = make_entry(sampled, pos, std::move(embedding));
+                        state.tokens.emplace(pos, std::move(drafted));
+                        state.finished_draft = pos;
+                        ++state.next_draft;
+                    }
+                }
+                state.cv.notify_all();
+                if (!embedded) {
+                    report_failure("SPD async drafter failed");
+                    return;
+                }
+            }
+        }); };
+        if ((int32_t) result.tokens.size() >= n_final) {
+            return true;
+        }
+        auto execute = [](void * task) { (*static_cast<std::function<void()> *>(task))(); };
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            stage_workers[stage]->submit(execute, &stage_tasks[stage]);
+            workers.submitted[stage] = true;
+        }
+        sidecar_worker->submit(execute, &reader_task);
+        workers.reader = true;
+
+        while ((int32_t) result.tokens.size() < n_final) {
+            std::shared_ptr<token_state> verified;
+            llama_token proposed = LLAMA_TOKEN_NULL;
+            bool waited_reader = false;
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                while (!state.stop) {
+                    auto it = state.tokens.find(state.frontier - 1);
+                    if (it != state.tokens.end() && it->second->head_ready &&
+                            (state.cancelling || state.finished_draft >= state.frontier - 1 + (llama_pos) stage_count)) {
+                        verified = it->second;
+                        if (!state.cancelling) {
+                            proposed = state.tokens.at(state.frontier)->item.token;
+                        }
+                        break;
+                    }
+                    if (!waited_reader && it != state.tokens.end() && it->second->head_ready && state.reader_active) {
+                        ++state.reader_waits;
+                        waited_reader = true;
+                    }
+                    lock.unlock();
+                    const bool cancelled = gparams.should_cancel && gparams.should_cancel();
+                    lock.lock();
+                    if (cancelled && !state.cancelling) {
+                        state.cancelling = true;
+                        result.cancelled = true;
+                        state.cv.notify_all();
+                    }
+                    if (!state.stop) {
+                        state.cv.wait_for(lock, std::chrono::milliseconds(10));
+                    }
+                }
+                if (state.failed) {
+                    return false;
+                }
+                if (verified == nullptr) {
+                    return false;
+                }
+                cached_upto = verified->item.pos + 1;
+                if (state.cancelling) {
+                    n_final = (int32_t) result.tokens.size();
+                    break;
+                }
+            }
+            llama_token sampled = verified->sampled;
+            if (!head_backend_sampling && !target_head_select(verified->logits.data(), sampled)) {
+                return false;
+            }
+            sampled = apply_budget(sampled);
+            const llama_pos pos = verified->item.pos + 1;
+            const int32_t index = pos - n_prompt;
+            const bool accepted = proposed == sampled;
+            dump_verify(pos, proposed, sampled);
+            result.tokens.push_back(sampled);
+            result.accepted.push_back(accepted);
+            if (accepted) {
+                ++result.n_accepted;
+            } else {
+                ++result.n_rejected;
+            }
+            // Do not relax the alias bound until a nonterminal decision has been finalized.
+            if (!finalize(sampled, index) || (int32_t) result.tokens.size() >= n_final) {
+                n_final = (int32_t) result.tokens.size();
+                break;
+            }
+            if (accepted) {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.frontier = pos + 1;
+                const llama_pos keep = std::max<llama_pos>(0, state.frontier - (llama_pos) stage_count);
+                completed.erase(completed.begin(), completed.lower_bound(keep));
+                state.tokens.erase(state.tokens.begin(), state.tokens.lower_bound(keep));
+                state.cv.notify_all();
+                continue;
+            }
+
+            const auto rollback_begin = clock_type::now();
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                ++state.epoch;
+                state.restart = pos;
+                state.resetting = true;
+                state.reset_go = false;
+                state.reader_reset_go = false;
+                state.cv.notify_all();
+                state.cv.wait(lock, [&]() { return state.failed || !state.reader_active; });
+                if (state.failed) {
+                    return false;
+                }
+            }
+            std::vector<float> corrected_embedding;
+            if (!embed_token(sampled, corrected_embedding)) {
+                return false;
+            }
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                completed.erase(completed.lower_bound(pos), completed.end());
+                state.tokens.erase(state.tokens.lower_bound(pos), state.tokens.end());
+                auto corrected = std::make_shared<token_state>();
+                corrected->item = make_entry(sampled, pos, std::move(corrected_embedding));
+                corrected->corrected = true;
+                state.tokens.emplace(pos, std::move(corrected));
+                state.frontier = pos + 1;
+                state.next_draft = pos + 1;
+                state.finished_draft = pos;
+                ++schedule_trace_prefix;
+                // The new reader needs only this embedding and its own completed reset.
+                state.reader_reset_go = true;
+                state.cv.notify_all();
+                state.cv.wait(lock, [&]() {
+                    return state.failed || std::none_of(state.active.begin(), state.active.begin() + stage_count,
+                            [](bool active) { return active; });
+                });
+                if (state.failed) {
+                    return false;
+                }
+                // Every old compound command has now published its delivery ordinal.
+                state.reset_go = true;
+                state.cv.notify_all();
+                state.cv.wait(lock, [&]() {
+                    return state.failed || (state.reader_reset_done == state.epoch &&
+                            std::all_of(state.reset_done.begin(), state.reset_done.begin() + stage_count,
+                                    [&](uint64_t epoch) { return epoch == state.epoch; }));
+                });
+                if (state.failed) {
+                    return false;
+                }
+                // Connection push counters stay monotonic; only drained epoch slot records reset.
+                peer_decode_invalidate();
+                state.resetting = false;
+                state.reset_go = false;
+                state.reader_reset_go = false;
+            }
+            timing.rollback += seconds_since(rollback_begin);
+            ++timing.rollback_calls;
+            state.cv.notify_all();
+        }
+        workers.join();
+        if (state.failed || !drain_peer_transfers() || result.cancelled) {
+            return false;
+        }
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            result.stage_compute_seconds += timing.stage_busy[stage];
         }
         return true;
     }
@@ -4270,7 +5010,15 @@ struct common_spd_pipeline::impl {
         if (!finalize(first_token, 0)) {
             n_final = 1;
         }
-        while (verified_up_to - n_prompt < n_final) {
+        const bool async_decode = use_async_decode();
+        if (async_decode) {
+            if (!run_async_decode(std::move(pipeline.front()), completed, n_prompt, n_final, cached_upto,
+                    gparams, result, apply_budget, finalize)) {
+                return false;
+            }
+            pipeline.clear();
+        }
+        while (!async_decode && verified_up_to - n_prompt < n_final) {
             scope_timer step_timer(timing.step_total);
             ++result.decode_steps;
             ++command_trace_wave;
@@ -4579,7 +5327,7 @@ struct common_spd_pipeline::impl {
         }
 
         result.decode_seconds = seconds_since(decode_start);
-        if (timing_enabled && result.decode_steps > 0) {
+        if (!async_decode && timing_enabled && result.decode_steps > 0) {
             const double other = timing.step_total - timing.prepare - timing.stage_wall -
                     timing.sidecar_extra - (timing.head - timing.head_overlapped) - timing.embed - timing.rollback;
             fprintf(stderr,
