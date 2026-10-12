@@ -1725,6 +1725,18 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
             !params.speculative.draft.devices.empty()) {
             mparams.mtp_dev = params.speculative.draft.devices[0];
         }
+        // SPD verifies on the target head, which otherwise shares the drafter's
+        // device and queues behind every draft. LLAMA_SPD_HEAD_DEVICE moves only
+        // the head (it must be in --device); the layer split is unchanged.
+        const char * spd_head_dev = getenv("LLAMA_SPD_HEAD_DEVICE");
+        if (spec_spd && spd_head_dev != nullptr && *spd_head_dev != '\0') {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(spd_head_dev);
+            if (dev != nullptr) {
+                mparams.mtp_dev = dev;
+            } else {
+                LOG_WRN("%s: LLAMA_SPD_HEAD_DEVICE=%s is not a device, keeping the draft device\n", __func__, spd_head_dev);
+            }
+        }
     }
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;

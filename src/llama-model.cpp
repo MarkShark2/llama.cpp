@@ -3692,6 +3692,10 @@ ggml_backend_dev_t llama_model_layer_device(const struct llama_model * model, in
     return model->dev_layer(layer);
 }
 
+ggml_backend_dev_t llama_model_output_device(const struct llama_model * model) {
+    return model == nullptr ? nullptr : model->dev_output();
+}
+
 //
 // llama_model_base
 //

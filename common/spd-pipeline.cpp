@@ -587,6 +587,8 @@ struct common_spd_pipeline::impl {
     // Backend result handling stays with its worker; acceptance/budget/grammar
     // updates stay on the main thread.
     bool overlap_head_submit = false;
+    // The overlapped head waits for the reader only when both run on one device.
+    bool head_shares_sidecar = true;
     bool light_rollback = false;
     bool full_checkpoints = false; // GLM full-state bundles with compact live checkpoints
     std::array<uint64_t, 2> checkpoint_identity = {};
@@ -1069,8 +1071,10 @@ struct common_spd_pipeline::impl {
             // ordered while remote stages continue. Main cannot reach its own
             // sidecar wait until this final stage worker has returned.
             const auto wait_start = clock_type::now();
-            if (auto failure = job.owner->sidecar_worker->wait()) {
-                std::rethrow_exception(failure);
+            if (job.owner->head_shares_sidecar) {
+                if (auto failure = job.owner->sidecar_worker->wait()) {
+                    std::rethrow_exception(failure);
+                }
             }
             job.owner->trace_schedule("head_reader_join", (int) job.stage, job.item->pos);
             job.head_reader_wait_seconds = seconds_since(wait_start);
@@ -1728,6 +1732,11 @@ struct common_spd_pipeline::impl {
                     head_eog_masked, head_mask_unsupported, head_sampler_capable, false);
         }
         configure_static_context(head, true);
+        head_shares_sidecar = execution_resource_key(llama_model_output_device(model_target)) ==
+                execution_resource_key(llama_model_layer_device(model_spd, 0));
+        fprintf(stderr, "SPD head: output on %s, %s the reader device\n",
+                execution_resource_key(llama_model_output_device(model_target)).c_str(),
+                head_shares_sidecar ? "shares" : "separate from");
 
         llama_context_params ep = make_context_params(1);
         ep.ctx_type = LLAMA_CONTEXT_TYPE_SPD_EMBED;
